@@ -168,16 +168,16 @@ get_pool_host_addresses() {
   local host="$1"
   local pass="$2"
 
+  # Ask for both fields; do NOT rely on ordering
   local out
-  out="$(run_remote "$host" "$pass" "xe host-list params=address,uuid")"
+  out="$(run_remote "$host" "$pass" "xe host-list params=uuid,address 2>/dev/null || true" | tr -d '\r')"
 
   POOL_HOST_IPS=()
-  POOL_HOST_UUIDS=()
-  local ip uuid
+  POOL_HOST_UUIDS=()   # clears associative array (bash keeps it associative)
 
+  # Build address -> uuid mapping, regardless of whether uuid or address appears first
   while read -r ip uuid; do
-    [[ -n "${ip:-}" ]] || continue
-    [[ -n "${uuid:-}" ]] || continue
+    [[ -n "${ip:-}" && -n "${uuid:-}" ]] || continue
 
     if [[ -z "${POOL_HOST_UUIDS[$ip]+x}" ]]; then
       POOL_HOST_IPS+=("$ip")
@@ -185,23 +185,19 @@ get_pool_host_addresses() {
     POOL_HOST_UUIDS["$ip"]="$uuid"
   done < <(
     awk -F': ' '
-      /^[[:space:]]*address[[:space:]]*\(/ {
-        a=$2
-        gsub(/^[[:space:]]+|[[:space:]]+$/, "", a)
-        next
-      }
-      /^[[:space:]]*uuid[[:space:]]*\(/ {
-        u=$2
-        gsub(/^[[:space:]]+|[[:space:]]+$/, "", u)
-        if (a != "" && u != "") {
-          print a, u
-          a=""; u=""
-        }
-        next
+      function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); return s }
+      /^[[:space:]]*uuid[[:space:]]*\(/    { u=trim($2) }
+      /^[[:space:]]*address[[:space:]]*\(/ { a=trim($2) }
+
+      # whenever we have both, emit and reset (works no matter which came first)
+      (u != "" && a != "") {
+        print a, u
+        u=""; a=""
       }
     ' <<< "$out"
   )
 }
+
 
 # --- Pool RAM match (pool mode) ---
 # round to nearest GB for sanity
@@ -626,31 +622,19 @@ check_dns_gw_non_mgmt_pifs() {
   local out
   out="$(run_remote "$host" "$pass" "xe pif-list params=gateway,DNS management=false host-uuid=$host_uuid 2>/dev/null || true" | tr -d '\r')"
 
-  # Return "found" if ANY gateway/DNS line has any non-empty value after the colon.
-  if awk '
-    function val(s) {
-      sub(/^[^:]*:/, "", s)          # drop everything through the first colon
-      gsub(/^[[:space:]]+/, "", s)   # trim leading spaces
-      gsub(/[[:space:]]+$/, "", s)   # trim trailing spaces
-      return s
-    }
-    /^[[:space:]]*gateway[[:space:]]*\(/ {
-      v = val($0)
-      if (v != "") found=1
-    }
-    /^[[:space:]]*DNS[[:space:]]*\(/ {
-      v = val($0)
-      if (v != "") found=1
-    }
-    END { exit(found ? 0 : 1) }
-  ' <<< "$out"; then
-    printf "DNS/GW on Non-Mgmt PIFs: %s\n" "$(yellow_text 'True')"
+  # If ANY gateway/DNS line has ANY non-empty value -> True (fail)
+  if grep -Eq '^[[:space:]]*(gateway|DNS)[[:space:]]*\([^)]*\):[[:space:]]*[^[:space:]]' <<< "$out"; then
+    printf "DNS/GW on Non-Mgmt PIFs: %s (host-uuid=%s)\n" "$(yellow_text 'True')"
     return 1
   fi
 
-  printf "DNS/GW on Non-Mgmt PIFs: %s\n" "$(green_text 'False')"
+  printf "DNS/GW on Non-Mgmt PIFs: %s (host-uuid=%s)\n" "$(green_text 'False')"
   return 0
 }
+
+
+
+
 
 
 # NEW TEST: Overlapping Subnets (IPv4)
@@ -1038,6 +1022,28 @@ print_pool_status_section() {
   echo
 }
 
+get_host_uuid_by_address() {
+  local host="$1"   # run xe on THIS host
+  local pass="$2"
+  local ip="$3"     # the address we're matching
+
+  run_remote "$host" "$pass" "xe host-list params=uuid,address 2>/dev/null || true" \
+    | awk -v want="$ip" -F': ' '
+        function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); return s }
+
+        /^[[:space:]]*uuid[[:space:]]*\(/    { u=trim($2) }
+        /^[[:space:]]*address[[:space:]]*\(/ { a=trim($2) }
+
+        # when we have a full record, evaluate + reset
+        (u != "" && a != "") {
+          if (a == want) { print u; exit }
+          u=""; a=""
+        }
+      ' | tr -d '\r' | head -n 1
+}
+
+
+
 run_checks_for_host() {
   local ip="$1"
   local pass="$2"
@@ -1118,19 +1124,22 @@ run_checks_for_host() {
     if ! check_silly_mtus "$ip" "$pass"; then rc_any=1; fi
   fi
 
-  if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_dns_gw_non_mgmt_pifs; then
-    local host_uuid="${POOL_HOST_UUIDS[$ip]:-}"
-    if [[ -z "$host_uuid" ]]; then
-      host_uuid="$(run_remote "$ip" "$pass" "xe host-list params=uuid --minimal" 2>/dev/null | tr -d '\r' | awk -F',' '{print $1; exit}')"
-    fi
+if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_dns_gw_non_mgmt_pifs; then
+  local host_uuid="${POOL_HOST_UUIDS[$ip]:-}"
 
-    if [[ -n "$host_uuid" ]]; then
-      if ! check_dns_gw_non_mgmt_pifs "$ip" "$pass" "$host_uuid"; then rc_any=1; fi
-    else
-      printf "DNS/GW on Non-Mgmt PIFs: %s\n" "$(yellow_text 'Unknown')"
-      rc_any=1
-    fi
+  # If mapping is missing (or wrong), resolve UUID by matching THIS host's address to uuid
+  if [[ -z "$host_uuid" ]]; then
+    host_uuid="$(get_host_uuid_by_address "$ip" "$pass" "$ip")"
   fi
+
+  if [[ -n "$host_uuid" ]]; then
+    if ! check_dns_gw_non_mgmt_pifs "$ip" "$pass" "$host_uuid"; then rc_any=1; fi
+  else
+    printf "DNS/GW on Non-Mgmt PIFs: %s (could not resolve host-uuid for address=%s)\n" "$(yellow_text 'Unknown')" "$ip"
+    rc_any=1
+  fi
+fi
+
 
   # NEW TEST call
   if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_overlapping_subnets; then
