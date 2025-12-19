@@ -59,7 +59,6 @@ cyan_text()   { printf "%s%s%s" "$CYAN" "$1" "$RESET"; }
 POOL_MODE=0
 DETAILS_OUTPUT=""
 POOLCONF_SUMMARY=""
-CONTROLLERS_CSV=""
 POOL_HOST_IPS=()
 declare -A POOL_HOST_UUIDS=()
 SSH_PORT=22
@@ -258,8 +257,7 @@ detect_pool_master_by_poolconf() {
   local ip
   for ip in "${POOL_HOST_IPS[@]}"; do
     local pc
-    pc="$(run_remote "$ip" "$pass" "cat /etc/xensource/pool.conf 2>/dev/null || true" | tr -d '\r' | head -n 1)"
-    pc="$(echo "$pc" | awk '{$1=$1;print}')"   # trim
+    pc="$(run_remote "$ip" "$pass" "cat /etc/xensource/pool.conf 2>/dev/null || true" | tr -d '\r' | head -n 1 | awk '{$1=$1;print}')"
 
     if [[ "${pc,,}" == "master" ]]; then
       DETECTED_MASTER_IP="$ip"
@@ -353,31 +351,38 @@ build_context_block() {
     BEGIN{
       nr=0
       n=split(match_lines, a, "\n")
+      # For each matched line number, create a range of +/- 3 lines for context
       for (i=1;i<=n;i++) if (a[i] ~ /^[0-9]+$/) add_range(a[i]-3, a[i]+3)
     }
     { lines[NR]=$0; max=NR }
     END{
       if (nr==0) exit
 
+      # Sort ranges by start position using selection sort
       for (i=1;i<=nr;i++) {
         min=i
         for (j=i+1;j<=nr;j++) if (rs[j] < rs[min]) min=j
+        # Swap range i with range min
         ts=rs[i]; te=re[i]
         rs[i]=rs[min]; re[i]=re[min]
         rs[min]=ts; re[min]=te
       }
 
+      # Merge overlapping ranges and print output with context
       ms=rs[1]; me=re[1]
       for (i=2;i<=nr;i++) {
         if (rs[i] <= me+1) {
+          # Ranges overlap or touch - extend the merged range
           if (re[i] > me) me=re[i]
         } else {
+          # Gap between ranges - print current merged range and start new one
           if (me > max) me=max
           for (k=ms;k<=me;k++) print "  " lines[k]
           print ""
           ms=rs[i]; me=re[i]
         }
       }
+      # Print final merged range
       if (me > max) me=max
       for (k=ms;k<=me;k++) print "  " lines[k]
     }
@@ -622,8 +627,25 @@ check_dns_gw_non_mgmt_pifs() {
   local out
   out="$(run_remote "$host" "$pass" "xe pif-list params=gateway,DNS management=false host-uuid=$host_uuid 2>/dev/null || true" | tr -d '\r')"
 
-  # If ANY gateway/DNS line has ANY value at all -> Yes (big fail)
-  if grep -Eq '^[[:space:]]*(gateway|DNS)[[:space:]]*\([^)]*\):[[:space:]]*[^[:space:]]' <<< "$out"; then
+  # Check if ANY gateway or DNS line has a non-empty value after the colon
+  # Match format: "gateway ( RO)    : 10.6.0.1" or "        DNS ( RO): 8.8.8.8"
+  local found
+  found="$(
+    awk '
+      /gateway[[:space:]]*\([^)]*\)[[:space:]]*:/ {
+        # Extract everything after the colon
+        sub(/^[^:]*:[[:space:]]*/, "")
+        if (length($0) > 0) { print "found"; exit }
+      }
+      /DNS[[:space:]]*\([^)]*\)[[:space:]]*:/ {
+        # Extract everything after the colon
+        sub(/^[^:]*:[[:space:]]*/, "")
+        if (length($0) > 0) { print "found"; exit }
+      }
+    ' <<< "$out"
+  )"
+
+  if [[ -n "$found" ]]; then
     printf "DNS/GW on Non-Mgmt PIFs: %s\n" "$(yellow_text 'Yes')"
     return 1
   fi
@@ -778,7 +800,7 @@ check_ha_enabled() {
     return 0
   elif [[ "$ha" == "true" ]]; then
     printf "HA Enabled: %s\n" "$(yellow_text 'Yes')"
-    return 0
+    return 1  # Return 1 to flag as warning/issue
   else
     printf "HA Enabled: %s - unexpected output: %s\n" "$(yes)" "${ha:-<empty>}"
     return 1
@@ -867,14 +889,15 @@ check_xostor_in_use_and_ram() {
   fi
 }
 
-check_xostor_faulty_resouces() {
+check_xostor_faulty_resources() {
   local host="$1"
   local pass="$2"
+  local controllers_csv="$3"
 
-  XOSTOR_FAULTY_RESOUCES_BLOCK=""
+  XOSTOR_FAULTY_RESOURCES_BLOCK=""
 
   local out
-  out="$(run_remote "$host" "$pass" "linstor --controllers=${CONTROLLERS_CSV} r l --faulty 2>/dev/null || true")"
+  out="$(run_remote "$host" "$pass" "linstor --controllers=${controllers_csv} r l --faulty 2>/dev/null || true")"
 
   local has_rows
   has_rows="$(
@@ -884,12 +907,12 @@ check_xostor_faulty_resouces() {
   )"
 
   if [[ -n "$has_rows" ]]; then
-    XOSTOR_FAULTY_RESOUCES_BLOCK="$out"
-    printf "XOSTOR Faulty Resouces: %s\n" "$(yellow_text 'Yes, See Below')"
+    XOSTOR_FAULTY_RESOURCES_BLOCK="$out"
+    printf "XOSTOR Faulty Resources: %s\n" "$(yellow_text 'Yes, See Below')"
     return 1
   fi
 
-  printf "XOSTOR Faulty Resouces: %s\n" "$(green_text 'No')"
+  printf "XOSTOR Faulty Resources: %s\n" "$(green_text 'No')"
   return 0
 }
 
@@ -1048,6 +1071,7 @@ run_checks_for_host() {
   local ip="$1"
   local pass="$2"
   local is_master="$3"             # 1/0
+  local controllers_csv="$4"       # optional: for XOSTOR checks
 
   local hn
   hn="$(get_remote_hostname "$ip" "$pass" | tr -d '\r')"
@@ -1078,7 +1102,8 @@ run_checks_for_host() {
 
   load_mem_stats "$ip" "$pass"
 
-  local DMESG_ISSUES_BLOCK="" OOM_EVENTS_BLOCK="" LACP_OUTPUT_BLOCK="" SMLOG_EXCEPTIONS_BLOCK="" XOSTOR_FAULTY_RESOUCES_BLOCK=""
+  # Blocks that accumulate detailed output for issues found
+  local DMESG_ISSUES_BLOCK OOM_EVENTS_BLOCK LACP_OUTPUT_BLOCK SMLOG_EXCEPTIONS_BLOCK XOSTOR_FAULTY_RESOURCES_BLOCK
 
   local hostlabel="${hn} (${ip})"
   local rc_any=0
@@ -1175,9 +1200,9 @@ fi
   fi
 
   if (( do_faulty == 1 )); then
-    if ! check_xostor_faulty_resouces "$ip" "$pass"; then rc_any=1; fi
-    if [[ -n "$XOSTOR_FAULTY_RESOUCES_BLOCK" ]]; then
-      append_details "$hostlabel" "XOSTOR Faulty Resouces" "$XOSTOR_FAULTY_RESOUCES_BLOCK"
+    if ! check_xostor_faulty_resources "$ip" "$pass" "$controllers_csv"; then rc_any=1; fi
+    if [[ -n "$XOSTOR_FAULTY_RESOURCES_BLOCK" ]]; then
+      append_details "$hostlabel" "XOSTOR Faulty Resources" "$XOSTOR_FAULTY_RESOURCES_BLOCK"
     fi
   fi
 
@@ -1218,14 +1243,15 @@ main() {
     exit 1
   fi
 
+  # Build comma-separated list of controllers for XOSTOR/LINSTOR commands
   local IFS=,
-  CONTROLLERS_CSV="${POOL_HOST_IPS[*]}"
+  local CONTROLLERS_CSV="${POOL_HOST_IPS[*]}"
   unset IFS
 
   local overall_rc=0
 
   if (( POOL_MODE == 0 )); then
-    if ! run_checks_for_host "$seed_host" "$pass" 1; then overall_rc=1; fi
+    if ! run_checks_for_host "$seed_host" "$pass" 1 ""; then overall_rc=1; fi
   else
     if ! detect_pool_master_by_poolconf "$pass"; then
       echo "ERROR: Could not determine pool master (no host had 'master' in /etc/xensource/pool.conf)." >&2
@@ -1240,12 +1266,12 @@ main() {
 
     print_pool_status_section "$pass"
 
-    if ! run_checks_for_host "$DETECTED_MASTER_IP" "$pass" 1; then overall_rc=1; fi
+    if ! run_checks_for_host "$DETECTED_MASTER_IP" "$pass" 1 "$CONTROLLERS_CSV"; then overall_rc=1; fi
 
     local ip
     for ip in "${POOL_HOST_IPS[@]}"; do
       [[ "$ip" == "$DETECTED_MASTER_IP" ]] && continue
-      if ! run_checks_for_host "$ip" "$pass" 0; then overall_rc=1; fi
+      if ! run_checks_for_host "$ip" "$pass" 0 "$CONTROLLERS_CSV"; then overall_rc=1; fi
     done
 
     echo
