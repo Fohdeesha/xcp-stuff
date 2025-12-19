@@ -7,19 +7,20 @@ set +H 2>/dev/null || true   # make ! in args no explode
 # =========================
 # config
 # =========================
+ssh_timeout=45                                  # SSH timeot in secs
 dom0_max_used=75                                # dom0 percent disk / storage use allowed before flagging as failed
 dom0_mem_used_max_pct=65                        # dom0 percent memory allowed in use before flagging as failed
 xostor_min_avail_gb=15                          # Minimum RAM dom0 should have if xostor is in use
 mtu_dmesg_keywords="mtu large fragment"         # keywords in dom0 to flag MTU issues
 dmesg_issue_words="panic crash rip kill"        # words that trigger dmesg contents issues
-dmesg_issue_phrases="call trace"                # matches that trigger dmesg contents issues (whole phrase matched)
+dmesg_issue_phrases="call trace"                # matches that trigger dmesg contents issues (whole phrase matched, pipe seperated)
 oom_phrase="out of memory"                      # phrase that flags OOM runs
 crash_ignore_file=".sacrificial-space-for-logs" # file in /var/crash to ignore (don't flag on crash logs cuz of this)
 pkg_diff_max_lines=100                          # max amt of mismatched yum packages to list
 
-## which tests should run on ALL hosts when script is ran in pool mode
+## which tests should run on ALL hosts when script is ran in pool mode (which is default)
 ## setting to 0 means the command is only ran on the master, not every single host
-## these settings have no effect when the script is ran in normal (not pool) mode, all checks are always done
+## these settings have no effect when the script is ran in single (not pool) mode, all checks are always done
 pool_run_dom0_disk_usage=1
 pool_run_dom0_memory=1
 pool_run_mtu_issues=1
@@ -56,7 +57,7 @@ yellow_text() { printf "%s%s%s" "$YELLOW" "$1" "$RESET"; }
 cyan_text()   { printf "%s%s%s" "$CYAN" "$1" "$RESET"; }
 
 # globals
-POOL_MODE=0
+POOL_MODE=1
 DETAILS_OUTPUT=""
 POOLCONF_SUMMARY=""
 POOL_HOST_IPS=()
@@ -77,16 +78,17 @@ MEM_AVAIL_GB="0.0"
 
 usage() {
   echo "Usage:"
-  echo "  $0 pool_master_or_host[:ssh_port] [root_password] [pool]"
+  echo "  $0 pool_master_or_host[:ssh_port] [root_password] [single]"
   echo ""
-  echo "  - SSH port, password, and pool mode are optional "
+  echo "  - SSH port, password, and single mode are optional "
   echo "  - If a password is not supplied, I will look it up locally in xo-server-db"
-  echo "  - if the pool flag is not supplied, I will only check the IP supplied"
+  echo "  - By default, the script runs in pool mode (checks all hosts in the pool)"
+  echo "  - Use 'single' flag to only check the specified host"
   echo ""
   echo "  Examples:"
-  echo "  $0 192.168.1.5 pool"
+  echo "  $0 192.168.1.5"
   echo "  $0 192.168.1.6 'mypass'"
-  echo "  $0 192.168.1.9:2222 pool"
+  echo "  $0 192.168.1.7 'mypass' single"
   exit 2
 }
 
@@ -128,7 +130,7 @@ get_password_from_xoa_db_simple() {
     return 1
   }
 
-  # AWK-only parsing so "no match" is not an error under set -e/pipefail.
+  # AWK-only parsing so no match is not an error with pipefail
   xo-server-db ls server "host=$host_only" 2>/dev/null \
     | awk -F"'" 'tolower($0) ~ /password:/ {print $2; exit}'
 }
@@ -143,7 +145,7 @@ run_remote() {
     -o StrictHostKeyChecking=no \
     -o UserKnownHostsFile=/dev/null \
     -o LogLevel=ERROR \
-    -o ConnectTimeout=30 \
+    -o ConnectTimeout="$ssh_timeout" \
     -o BatchMode=no \
     root@"$host" \
     "$cmd"
@@ -159,54 +161,54 @@ get_pool_uuid() {
   local host="$1"
   local pass="$2"
 
-  run_remote "$host" "$pass" "xe pool-list params=uuid" \
-    | awk -F': ' '/uuid[[:space:]]*\(/ {print $2; exit}'
+  local out
+  out="$(run_remote "$host" "$pass" "xe pool-list params=uuid" | tr -d '\r')"
+
+  # Extract UUID
+  if [[ "$out" =~ ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}) ]]; then
+    echo "${BASH_REMATCH[1]}"
+  else
+    echo ""
+  fi
 }
 
 get_pool_host_addresses() {
   local host="$1"
   local pass="$2"
 
-  # Ask for both fields; do NOT rely on ordering
+  # Ask for both fields; don't rely on ordering cuz it seems random ?
   local out
   out="$(run_remote "$host" "$pass" "xe host-list params=uuid,address 2>/dev/null || true" | tr -d '\r')"
 
   POOL_HOST_IPS=()
-  POOL_HOST_UUIDS=()   # clears associative array (bash keeps it associative)
+  POOL_HOST_UUIDS=()
 
-  # Build address -> uuid mapping, regardless of whether uuid or address appears first
-  while read -r ip uuid; do
-    [[ -n "${ip:-}" && -n "${uuid:-}" ]] || continue
-
-    if [[ -z "${POOL_HOST_UUIDS[$ip]+x}" ]]; then
-      POOL_HOST_IPS+=("$ip")
+  # Build address -> uuid mapping
+  local u="" a=""
+  while IFS= read -r line; do
+    # Match UUID pattern (8-4-4-4-12 hex digits seperated by hyphens)
+    if [[ "$line" =~ ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}) ]]; then
+      u="${BASH_REMATCH[1]}"
     fi
-    POOL_HOST_UUIDS["$ip"]="$uuid"
-  done < <(
-    awk '
-      function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); return s }
-      /uuid[[:space:]]*\([^)]*\)[[:space:]]*:/ {
-        # Extract everything after the colon
-        sub(/^[^:]*:[[:space:]]*/, "")
-        u=trim($0)
-      }
-      /address[[:space:]]*\([^)]*\)[[:space:]]*:/ {
-        # Extract everything after the colon
-        sub(/^[^:]*:[[:space:]]*/, "")
-        a=trim($0)
-      }
+    # Match IPv4 pattern (v6 is definitely going to break this)
+    if [[ "$line" =~ ([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}) ]]; then
+      a="${BASH_REMATCH[1]}"
+    fi
 
-      # whenever we have both, emit and reset (works no matter which came first)
-      (u != "" && a != "") {
-        print a, u
-        u=""; a=""
-      }
-    ' <<< "$out"
-  )
+    # When we have both, store them
+    if [[ -n "$u" && -n "$a" ]]; then
+      if [[ -z "${POOL_HOST_UUIDS[$a]+x}" ]]; then
+        POOL_HOST_IPS+=("$a")
+      fi
+      POOL_HOST_UUIDS["$a"]="$u"
+      u=""
+      a=""
+    fi
+  done <<< "$out"
 }
 
 
-# --- Pool RAM match (pool mode) ---
+# Pool RAM match
 # round to nearest GB for sanity
 compute_pool_ram_match() {
   local seed_host="$1"
@@ -397,7 +399,7 @@ build_context_block() {
   ' <<< "$text"
 }
 
-# the actual tests!
+# the actual tests
 check_xcpng_version() {
   local host="$1"
   local pass="$2"
@@ -410,12 +412,12 @@ check_xcpng_version() {
     return 1
   fi
 
-  # Compare version: extract major.minor (e.g., 8.3 from 8.3.0)
+  # Compare version: extract major.minor (eg 8.3 from 8.3.0)
   local major minor
   major="$(echo "$version" | cut -d. -f1)"
   minor="$(echo "$version" | cut -d. -f2)"
 
-  # Check if version >= 8.3
+  # Check if version >= 8.3 (8.2 is no longer supported)
   if [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]]; then
     if (( major > 8 )) || (( major == 8 && minor >= 3 )); then
       printf "XCP-ng Version: %s\n" "$(green_text "$version")"
@@ -664,8 +666,7 @@ check_dns_gw_non_mgmt_pifs() {
   local out
   out="$(run_remote "$host" "$pass" "xe pif-list params=gateway,DNS management=false host-uuid=$host_uuid 2>/dev/null || true" | tr -d '\r')"
 
-  # Check if ANY gateway or DNS line has a non-empty value after the colon
-  # Match format: "gateway ( RO)    : 10.6.0.1" or "        DNS ( RO): 8.8.8.8"
+  # Check if ANY gateway or DNS line has a non-empty value 
   local found
   found="$(
     awk '
@@ -696,7 +697,7 @@ check_dns_gw_non_mgmt_pifs() {
 
 
 
-# NEW TEST: Overlapping Subnets (IPv4)
+# this is ipv4 only currently and will probably explode if fed v6
 check_overlapping_subnets() {
   local host="$1"
   local pass="$2"
@@ -704,7 +705,6 @@ check_overlapping_subnets() {
   local ip_out
   ip_out="$(run_remote "$host" "$pass" "ip -o -4 addr show 2>/dev/null || ip -o -4 address show 2>/dev/null || true" | tr -d '\r')"
 
-  # Build "ifname ip/prefix" list, excluding lo/lo0
   local lst
   lst="$(
     awk '
@@ -717,7 +717,6 @@ check_overlapping_subnets() {
     ' <<< "$ip_out"
   )"
 
-  # If <2 addresses, cannot overlap
   if [[ -z "${lst//[[:space:]]/}" ]] || (( $(wc -l <<< "$lst") < 2 )); then
     printf "Overlapping Subnets: %s\n" "$(green_text 'No')"
     return 0
@@ -751,7 +750,7 @@ check_overlapping_subnets() {
       END{
         for (i=1;i<=n;i++){
           for (j=i+1;j<=n;j++){
-            if (IF[i]==IF[j]) continue  # only care about overlap across different interfaces
+            if (IF[i]==IF[j]) continue  # only care about overlap across different interfaces, not multiple addr on one int
             if (!(BC[i] < NET[j] || BC[j] < NET[i])) { print "yes"; exit }
           }
         }
@@ -828,18 +827,18 @@ check_ha_enabled() {
   local pass="$2"
   local pool_uuid="$3"
 
-  local ha
-  ha="$(run_remote "$host" "$pass" "xe pool-list uuid=$pool_uuid params=ha-enabled" \
-    | awk -F': ' '/ha-enabled/ {print $2; exit}' | tr -d '\r')"
+  local out
+  out="$(run_remote "$host" "$pass" "xe pool-list uuid=$pool_uuid params=ha-enabled" | tr -d '\r')"
 
-  if [[ "$ha" == "false" ]]; then
+  # Match on "true" or "false" anywhere in the output
+  if [[ "$out" =~ false ]]; then
     printf "HA Enabled: %s\n" "$(green_text 'No')"
     return 0
-  elif [[ "$ha" == "true" ]]; then
+  elif [[ "$out" =~ true ]]; then
     printf "HA Enabled: %s\n" "$(yellow_text 'Yes')"
     return 1  # Return 1 to flag as warning/issue
   else
-    printf "HA Enabled: %s - unexpected output: %s\n" "$(yes)" "${ha:-<empty>}"
+    printf "HA Enabled: %s\n" "$(yellow_text 'Unknown')"
     return 1
   fi
 }
@@ -914,14 +913,14 @@ check_xostor_in_use_and_ram() {
   XOSTOR_IN_USE=1
   printf "XOSTOR In Use: %s\n" "$(yellow_text 'Yes')"
 
-  local avail_gb_int
-  avail_gb_int="$(awk -v g="$MEM_AVAIL_GB" 'BEGIN{printf "%d", g+0.00001}')"
+  local total_gb_int
+  total_gb_int="$(awk -v g="$MEM_TOTAL_GB" 'BEGIN{printf "%d", g+0.00001}')"
 
-  if (( avail_gb_int <= xostor_min_avail_gb )); then
-    printf "XOSTOR RAM: %s\n" "$(yellow_text "Not Enough: ${MEM_AVAIL_GB}G")"
+  if (( total_gb_int <= xostor_min_avail_gb )); then
+    printf "XOSTOR RAM: %s\n" "$(yellow_text "Not Enough: ${MEM_TOTAL_GB}G (Need >${xostor_min_avail_gb}G)")"
     return 1
   else
-    printf "XOSTOR RAM: %s\n" "$(green_text "${MEM_AVAIL_GB}G")"
+    printf "XOSTOR RAM: %s\n" "$(green_text "${MEM_TOTAL_GB}G")"
     return 0
   fi
 }
@@ -1051,16 +1050,16 @@ append_poolconf_summary() {
   POOLCONF_SUMMARY+="${poolconf}"$'\n\n'
 }
 
-# pool Status stuff
+# pool status stuff
 print_pool_status_section() {
   local pass="$1"
 
   echo "$(cyan_text "== Pool Status ==")"
 
   if [[ -n "$DETECTED_MASTER_HOSTNAME" && -n "$DETECTED_MASTER_IP" ]]; then
-    echo "Pool Master: ${DETECTED_MASTER_HOSTNAME} (${DETECTED_MASTER_IP})"
+    printf "Pool Master: %s\n" "$(green_text "${DETECTED_MASTER_HOSTNAME} (${DETECTED_MASTER_IP})")"
   else
-    echo "Pool Master: (unknown)"
+    printf "Pool Master: %s\n" "$(yellow_text '(unknown)')"
   fi
 
   if (( POOL_RAM_MATCH == 1 )); then
@@ -1079,13 +1078,22 @@ print_pool_status_section() {
   check_xostor_in_use_and_ram "$DETECTED_MASTER_IP" "$pass" || true
   MASTER_XOSTOR_IN_USE=$(( XOSTOR_IN_USE ))
 
+
+  if (( MASTER_XOSTOR_IN_USE == 1 )); then
+    # Build comma-separated list of controllers for LINSTOR cmds
+    local IFS=,
+    local controllers_csv="${POOL_HOST_IPS[*]}"
+    unset IFS
+    check_xostor_faulty_resources "$DETECTED_MASTER_IP" "$pass" "$controllers_csv" || true
+  fi
+
   echo
 }
 
 get_host_uuid_by_address() {
   local host="$1"   # run xe on THIS host
   local pass="$2"
-  local ip="$3"     # the address we're matching
+  local ip="$3"     # the address we matching
 
   run_remote "$host" "$pass" "xe host-list params=uuid,address 2>/dev/null || true" \
     | awk -v want="$ip" -F': ' '
@@ -1107,7 +1115,7 @@ get_host_uuid_by_address() {
 run_checks_for_host() {
   local ip="$1"
   local pass="$2"
-  local is_master="$3"             # 1/0
+  local is_master="$3"             
   local controllers_csv="$4"       # optional: for XOSTOR checks
 
   local hn
@@ -1141,7 +1149,7 @@ run_checks_for_host() {
 
   load_mem_stats "$ip" "$pass"
 
-  # Blocks that accumulate detailed output for issues found
+
   local DMESG_ISSUES_BLOCK OOM_EVENTS_BLOCK LACP_OUTPUT_BLOCK SMLOG_EXCEPTIONS_BLOCK XOSTOR_FAULTY_RESOURCES_BLOCK
 
   local hostlabel="${hn} (${ip})"
@@ -1191,7 +1199,7 @@ run_checks_for_host() {
 if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_dns_gw_non_mgmt_pifs; then
   local host_uuid="${POOL_HOST_UUIDS[$ip]:-}"
 
-  # If mapping is missing (or wrong), resolve UUID by matching THIS host's address to uuid
+
   if [[ -z "$host_uuid" ]]; then
     host_uuid="$(get_host_uuid_by_address "$ip" "$pass" "$ip")"
   fi
@@ -1231,28 +1239,14 @@ fi
     fi
   fi
 
-  local do_faulty=0
-  if (( POOL_MODE == 1 )) && (( MASTER_XOSTOR_IN_USE == 1 )); then
-    if (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_xostor_faulty; then
-      do_faulty=1
-    fi
-  fi
-
-  if (( do_faulty == 1 )); then
-    if ! check_xostor_faulty_resources "$ip" "$pass" "$controllers_csv"; then rc_any=1; fi
-    if [[ -n "$XOSTOR_FAULTY_RESOURCES_BLOCK" ]]; then
-      append_details "$hostlabel" "XOSTOR Faulty Resources" "$XOSTOR_FAULTY_RESOURCES_BLOCK"
-    fi
-  fi
-
   return "$rc_any"
 }
 
 main() {
   ORIGINAL_ARGS=("$@")
 
-  if (( $# >= 2 )) && [[ "${!#}" == "pool" ]]; then
-    POOL_MODE=1
+  if (( $# >= 2 )) && [[ "${!#}" == "single" ]]; then
+    POOL_MODE=0
     set -- "${@:1:$(($#-1))}"
   fi
 
@@ -1282,11 +1276,6 @@ main() {
     exit 1
   fi
 
-  # Build comma-separated list of controllers for XOSTOR/LINSTOR commands
-  local IFS=,
-  local CONTROLLERS_CSV="${POOL_HOST_IPS[*]}"
-  unset IFS
-
   local overall_rc=0
 
   if (( POOL_MODE == 0 )); then
@@ -1305,12 +1294,12 @@ main() {
 
     print_pool_status_section "$pass"
 
-    if ! run_checks_for_host "$DETECTED_MASTER_IP" "$pass" 1 "$CONTROLLERS_CSV"; then overall_rc=1; fi
+    if ! run_checks_for_host "$DETECTED_MASTER_IP" "$pass" 1 ""; then overall_rc=1; fi
 
     local ip
     for ip in "${POOL_HOST_IPS[@]}"; do
       [[ "$ip" == "$DETECTED_MASTER_IP" ]] && continue
-      if ! run_checks_for_host "$ip" "$pass" 0 "$CONTROLLERS_CSV"; then overall_rc=1; fi
+      if ! run_checks_for_host "$ip" "$pass" 0 ""; then overall_rc=1; fi
     done
 
     echo
