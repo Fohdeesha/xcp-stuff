@@ -622,13 +622,13 @@ check_dns_gw_non_mgmt_pifs() {
   local out
   out="$(run_remote "$host" "$pass" "xe pif-list params=gateway,DNS management=false host-uuid=$host_uuid 2>/dev/null || true" | tr -d '\r')"
 
-  # If ANY gateway/DNS line has ANY non-empty value -> True (fail)
+  # If ANY gateway/DNS line has ANY value at all -> Yes (big fail)
   if grep -Eq '^[[:space:]]*(gateway|DNS)[[:space:]]*\([^)]*\):[[:space:]]*[^[:space:]]' <<< "$out"; then
-    printf "DNS/GW on Non-Mgmt PIFs: %s (host-uuid=%s)\n" "$(yellow_text 'True')"
+    printf "DNS/GW on Non-Mgmt PIFs: %s\n" "$(yellow_text 'Yes')"
     return 1
   fi
 
-  printf "DNS/GW on Non-Mgmt PIFs: %s (host-uuid=%s)\n" "$(green_text 'False')"
+  printf "DNS/GW on Non-Mgmt PIFs: %s\n" "$(green_text 'No')"
   return 0
 }
 
@@ -1135,7 +1135,7 @@ if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave 
   if [[ -n "$host_uuid" ]]; then
     if ! check_dns_gw_non_mgmt_pifs "$ip" "$pass" "$host_uuid"; then rc_any=1; fi
   else
-    printf "DNS/GW on Non-Mgmt PIFs: %s (could not resolve host-uuid for address=%s)\n" "$(yellow_text 'Unknown')" "$ip"
+    printf "DNS/GW on Non-Mgmt PIFs: %s (could not resolve host identity for address=%s)\n" "$(yellow_text 'Unknown')" "$ip"
     rc_any=1
   fi
 fi
