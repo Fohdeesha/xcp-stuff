@@ -5,7 +5,7 @@ set -euo pipefail
 set +H 2>/dev/null || true   # make ! in args no explode
 
 # =========================
-# config 
+# config
 # =========================
 dom0_max_used=75                                # dom0 percent disk / storage use allowed before flagging as failed
 dom0_mem_used_max_pct=65                        # dom0 percent memory allowed in use before flagging as failed
@@ -29,13 +29,14 @@ pool_run_crash_logs_present=1
 pool_run_lacp_negotiation=1
 pool_run_silly_mtus=1
 pool_run_dns_gw_non_mgmt_pifs=1
+pool_run_overlapping_subnets=1
 pool_run_smapi_exceptions=1
 pool_run_smapi_hidden_leaves=1
 pool_run_rebooted_after_updates=1
 pool_run_yum_patch_level=1
-pool_run_ha_enabled=0     
-pool_run_xostor_in_use=0    
-pool_run_xostor_faulty=0   
+pool_run_ha_enabled=0
+pool_run_xostor_in_use=0
+pool_run_xostor_faulty=0
 
 # petula clark - color my world
 GREEN=$'\033[32m'
@@ -623,16 +624,105 @@ check_dns_gw_non_mgmt_pifs() {
   local host_uuid="$3"
 
   local out
-  out="$(run_remote "$host" "$pass" "xe pif-list params=gateway,DNS management=false host-uuid=$host_uuid 2>/dev/null || true")"
+  out="$(run_remote "$host" "$pass" "xe pif-list params=gateway,DNS management=false host-uuid=$host_uuid 2>/dev/null || true" | tr -d '\r')"
 
-  if grep -Eqi '^[[:space:]]*gateway[[:space:]]*\(.*\)[[:space:]]*:[[:space:]]*[^[:space:]]' <<< "$out" \
-     || grep -Eqi '^[[:space:]]*DNS[[:space:]]*\(.*\)[[:space:]]*:[[:space:]]*[^[:space:]]' <<< "$out"; then
+  # Return "found" if ANY gateway/DNS line has any non-empty value after the colon.
+  if awk '
+    function val(s) {
+      sub(/^[^:]*:/, "", s)          # drop everything through the first colon
+      gsub(/^[[:space:]]+/, "", s)   # trim leading spaces
+      gsub(/[[:space:]]+$/, "", s)   # trim trailing spaces
+      return s
+    }
+    /^[[:space:]]*gateway[[:space:]]*\(/ {
+      v = val($0)
+      if (v != "") found=1
+    }
+    /^[[:space:]]*DNS[[:space:]]*\(/ {
+      v = val($0)
+      if (v != "") found=1
+    }
+    END { exit(found ? 0 : 1) }
+  ' <<< "$out"; then
     printf "DNS/GW on Non-Mgmt PIFs: %s\n" "$(yellow_text 'True')"
     return 1
   fi
 
   printf "DNS/GW on Non-Mgmt PIFs: %s\n" "$(green_text 'False')"
   return 0
+}
+
+
+# NEW TEST: Overlapping Subnets (IPv4)
+check_overlapping_subnets() {
+  local host="$1"
+  local pass="$2"
+
+  local ip_out
+  ip_out="$(run_remote "$host" "$pass" "ip -o -4 addr show 2>/dev/null || ip -o -4 address show 2>/dev/null || true" | tr -d '\r')"
+
+  # Build "ifname ip/prefix" list, excluding lo/lo0
+  local lst
+  lst="$(
+    awk '
+      $2=="lo" || $2=="lo0" {next}
+      {
+        for (i=1;i<=NF;i++) {
+          if ($i=="inet") { print $2, $(i+1); break }
+        }
+      }
+    ' <<< "$ip_out"
+  )"
+
+  # If <2 addresses, cannot overlap
+  if [[ -z "${lst//[[:space:]]/}" ]] || (( $(wc -l <<< "$lst") < 2 )); then
+    printf "Overlapping Subnets: %s\n" "$(green_text 'No')"
+    return 0
+  fi
+
+  local hit
+  hit="$(
+    awk '
+      function ip2int(s,    a) {
+        split(s,a,".")
+        return (((a[1]*256)+a[2])*256+a[3])*256+a[4]
+      }
+      {
+        ifname=$1
+        cidr=$2
+        split(cidr, p, "/")
+        ip=p[1]; plen=p[2]+0
+        if (plen<0 || plen>32 || ip=="") next
+
+        ipi=ip2int(ip)
+        # range size = 2^(32-plen)
+        pow = 2^(32-plen)
+        net = int(ipi/pow)*pow
+        bcast = net + pow - 1
+
+        n++
+        IF[n]=ifname
+        NET[n]=net
+        BC[n]=bcast
+      }
+      END{
+        for (i=1;i<=n;i++){
+          for (j=i+1;j<=n;j++){
+            if (IF[i]==IF[j]) continue  # only care about overlap across different interfaces
+            if (!(BC[i] < NET[j] || BC[j] < NET[i])) { print "yes"; exit }
+          }
+        }
+      }
+    ' <<< "$lst"
+  )"
+
+  if [[ -n "$hit" ]]; then
+    printf "Overlapping Subnets: %s\n" "$(yellow_text 'Yes')"
+    return 1
+  else
+    printf "Overlapping Subnets: %s\n" "$(green_text 'No')"
+    return 0
+  fi
 }
 
 check_smapi_exceptions() {
@@ -917,7 +1007,6 @@ append_poolconf_summary() {
   POOLCONF_SUMMARY+="${poolconf}"$'\n\n'
 }
 
-
 # pool Status stuff
 print_pool_status_section() {
   local pass="$1"
@@ -1041,6 +1130,11 @@ run_checks_for_host() {
       printf "DNS/GW on Non-Mgmt PIFs: %s\n" "$(yellow_text 'Unknown')"
       rc_any=1
     fi
+  fi
+
+  # NEW TEST call
+  if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_overlapping_subnets; then
+    if ! check_overlapping_subnets "$ip" "$pass"; then rc_any=1; fi
   fi
 
   if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_smapi_exceptions; then
