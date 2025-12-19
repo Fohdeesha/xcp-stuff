@@ -28,6 +28,7 @@ pool_run_oom_events=1
 pool_run_crash_logs_present=1
 pool_run_lacp_negotiation=1
 pool_run_silly_mtus=1
+pool_run_dns_gw_non_mgmt_pifs=1
 pool_run_smapi_exceptions=1
 pool_run_smapi_hidden_leaves=1
 pool_run_rebooted_after_updates=1
@@ -59,6 +60,7 @@ DETAILS_OUTPUT=""
 POOLCONF_SUMMARY=""
 CONTROLLERS_CSV=""
 POOL_HOST_IPS=()
+declare -A POOL_HOST_UUIDS=()
 SSH_PORT=22
 PARSED_HOST=""
 ORIGINAL_ARGS=()
@@ -166,16 +168,37 @@ get_pool_host_addresses() {
   local pass="$2"
 
   local out
-  out="$(run_remote "$host" "$pass" "xe host-list params=address")"
+  out="$(run_remote "$host" "$pass" "xe host-list params=address,uuid")"
 
-  mapfile -t POOL_HOST_IPS < <(
+  POOL_HOST_IPS=()
+  POOL_HOST_UUIDS=()
+  local ip uuid
+
+  while read -r ip uuid; do
+    [[ -n "${ip:-}" ]] || continue
+    [[ -n "${uuid:-}" ]] || continue
+
+    if [[ -z "${POOL_HOST_UUIDS[$ip]+x}" ]]; then
+      POOL_HOST_IPS+=("$ip")
+    fi
+    POOL_HOST_UUIDS["$ip"]="$uuid"
+  done < <(
     awk -F': ' '
       /^[[:space:]]*address[[:space:]]*\(/ {
         a=$2
         gsub(/^[[:space:]]+|[[:space:]]+$/, "", a)
-        if (a != "") print a
+        next
       }
-    ' <<< "$out" | awk '!seen[$0]++'
+      /^[[:space:]]*uuid[[:space:]]*\(/ {
+        u=$2
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", u)
+        if (a != "" && u != "") {
+          print a, u
+          a=""; u=""
+        }
+        next
+      }
+    ' <<< "$out"
   )
 }
 
@@ -594,6 +617,24 @@ check_silly_mtus() {
   fi
 }
 
+check_dns_gw_non_mgmt_pifs() {
+  local host="$1"
+  local pass="$2"
+  local host_uuid="$3"
+
+  local out
+  out="$(run_remote "$host" "$pass" "xe pif-list params=gateway,DNS management=false host-uuid=$host_uuid 2>/dev/null || true")"
+
+  if grep -Eqi '^[[:space:]]*gateway[[:space:]]*\(.*\)[[:space:]]*:[[:space:]]*[^[:space:]]' <<< "$out" \
+     || grep -Eqi '^[[:space:]]*DNS[[:space:]]*\(.*\)[[:space:]]*:[[:space:]]*[^[:space:]]' <<< "$out"; then
+    printf "DNS/GW on Non-Mgmt PIFs: %s\n" "$(yellow_text 'True')"
+    return 1
+  fi
+
+  printf "DNS/GW on Non-Mgmt PIFs: %s\n" "$(green_text 'False')"
+  return 0
+}
+
 check_smapi_exceptions() {
   local smlog_out="$1"
   SMLOG_EXCEPTIONS_BLOCK=""
@@ -986,6 +1027,20 @@ run_checks_for_host() {
 
   if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_silly_mtus; then
     if ! check_silly_mtus "$ip" "$pass"; then rc_any=1; fi
+  fi
+
+  if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_dns_gw_non_mgmt_pifs; then
+    local host_uuid="${POOL_HOST_UUIDS[$ip]:-}"
+    if [[ -z "$host_uuid" ]]; then
+      host_uuid="$(run_remote "$ip" "$pass" "xe host-list params=uuid --minimal" 2>/dev/null | tr -d '\r' | awk -F',' '{print $1; exit}')"
+    fi
+
+    if [[ -n "$host_uuid" ]]; then
+      if ! check_dns_gw_non_mgmt_pifs "$ip" "$pass" "$host_uuid"; then rc_any=1; fi
+    else
+      printf "DNS/GW on Non-Mgmt PIFs: %s\n" "$(yellow_text 'Unknown')"
+      rc_any=1
+    fi
   fi
 
   if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_smapi_exceptions; then
