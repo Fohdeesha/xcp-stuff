@@ -183,10 +183,18 @@ get_pool_host_addresses() {
     fi
     POOL_HOST_UUIDS["$ip"]="$uuid"
   done < <(
-    awk -F': ' '
+    awk '
       function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); return s }
-      /^[[:space:]]*uuid[[:space:]]*\(/    { u=trim($2) }
-      /^[[:space:]]*address[[:space:]]*\(/ { a=trim($2) }
+      /uuid[[:space:]]*\([^)]*\)[[:space:]]*:/ {
+        # Extract everything after the colon
+        sub(/^[^:]*:[[:space:]]*/, "")
+        u=trim($0)
+      }
+      /address[[:space:]]*\([^)]*\)[[:space:]]*:/ {
+        # Extract everything after the colon
+        sub(/^[^:]*:[[:space:]]*/, "")
+        a=trim($0)
+      }
 
       # whenever we have both, emit and reset (works no matter which came first)
       (u != "" && a != "") {
@@ -390,6 +398,35 @@ build_context_block() {
 }
 
 # the actual tests!
+check_xcpng_version() {
+  local host="$1"
+  local pass="$2"
+
+  local version
+  version="$(run_remote "$host" "$pass" "grep '^VERSION=' /etc/os-release 2>/dev/null | cut -d'\"' -f2 || echo 'unknown'" | tr -d '\r' | head -n 1)"
+
+  if [[ "$version" == "unknown" ]]; then
+    printf "XCP-ng Version: %s\n" "$(yellow_text 'Unknown')"
+    return 1
+  fi
+
+  # Compare version: extract major.minor (e.g., 8.3 from 8.3.0)
+  local major minor
+  major="$(echo "$version" | cut -d. -f1)"
+  minor="$(echo "$version" | cut -d. -f2)"
+
+  # Check if version >= 8.3
+  if [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]]; then
+    if (( major > 8 )) || (( major == 8 && minor >= 3 )); then
+      printf "XCP-ng Version: %s\n" "$(green_text "$version")"
+      return 0
+    fi
+  fi
+
+  printf "XCP-ng Version: %s\n" "$(yellow_text "$version")"
+  return 1
+}
+
 check_uptime() {
   local host="$1"
   local pass="$2"
@@ -1079,15 +1116,17 @@ run_checks_for_host() {
 
   if (( POOL_MODE == 1 )); then
     if (( is_master == 1 )); then
-      echo "$(cyan_text "== XCP-ng health check on: $hn ==")"
+      echo "$(cyan_text "== Individual Hosts ==")"
+      echo "$(cyan_text "$hn ($ip) (Master) Results:")"
     else
       echo
-      echo "$hn ($ip) Results:"
+      echo "$(cyan_text "$hn ($ip) Results:")"
     fi
   else
     echo "$(cyan_text "== XCP-ng health check on: $hn ==")"
   fi
 
+  check_xcpng_version "$ip" "$pass" || true
   check_uptime "$ip" "$pass"
 
   local dmesg_t smlog
