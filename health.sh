@@ -132,8 +132,8 @@ get_password_from_xoa_db_simple() {
   }
 
   # AWK-only parsing so no match is not an error with pipefail
-  xo-server-db ls server "host=$host_only" 2>/dev/null \
-    | awk -F"'" 'tolower($0) ~ /password:/ {print $2; exit}'
+  xo-server-db ls server "host=$host_only" 2>/dev/null | \
+    awk -F"'" 'tolower($0) ~ /password:/ {print $2; exit}'
 }
 
 run_remote() {
@@ -1096,8 +1096,8 @@ get_host_uuid_by_address() {
   local pass="$2"
   local ip="$3"     # the address we matching
 
-  run_remote "$host" "$pass" "xe host-list params=uuid,address 2>/dev/null || true" \
-    | awk -v want="$ip" -F': ' '
+  run_remote "$host" "$pass" "xe host-list params=uuid,address 2>/dev/null || true" | \
+    awk -v want="$ip" -F': ' '
         function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); return s }
 
         /^[[:space:]]*uuid[[:space:]]*\(/    { u=trim($2) }
