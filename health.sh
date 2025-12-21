@@ -917,7 +917,7 @@ check_xostor_in_use_and_ram() {
   local total_gb_int
   total_gb_int="$(awk -v g="$MEM_TOTAL_GB" 'BEGIN{printf "%d", g+0.00001}')"
 
-  if (( total_gb_int <= xostor_min_avail_gb )); then
+  if (( total_gb_int < xostor_min_avail_gb )); then
     printf "XOSTOR RAM: %s\n" "$(yellow_text "Not Enough: ${MEM_TOTAL_GB}G (Need >${xostor_min_avail_gb}G)")"
     return 1
   else
