@@ -926,6 +926,59 @@ check_xostor_in_use_and_ram() {
   fi
 }
 
+check_xostor_nodes() {
+  local host="$1"
+  local pass="$2"
+  local controllers_csv="$3"
+
+  XOSTOR_FAULTY_NODES_BLOCK=""
+
+  local out
+  out="$(run_remote "$host" "$pass" "linstor --controllers=${controllers_csv} n l 2>/dev/null || true")"
+
+  local node_not_online
+
+  node_not_online="$(
+      printf '%s\n' "$out" | 
+      awk -F '\\|' '
+      # Skip borders and separators
+      /^[+]/ || /^\|=/ { next }
+
+      # Header row: find State column
+      /Node/ && /State/ {
+        for (i=1; i<=NF; i++) {
+            gsub(/^[ \t]+|[ \t]+$/, "", $i)
+            if ($i=="State") state=i
+        }
+        next
+      }
+
+      # Data rows
+      /^\|/ && state {
+        # strip ANSI escape codes
+        gsub(/\x1B\[[0-9;]*[mK]/, "", $state)
+
+        # trim whitespace
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $state)
+
+        if ($state!="Online") {
+            print "yes"
+            exit
+        }
+      }
+      '
+  )"
+
+  if [[ -n "$node_not_online" ]]; then
+    XOSTOR_FAULTY_NODES_BLOCK="$out"
+    printf "XOSTOR Faulty Nodes: %s\n" "$(yellow_text 'Yes, See Below')"
+    return 1
+  fi
+
+  printf "XOSTOR Faulty Nodes: %s\n" "$(green_text 'No')"
+  return 0
+}
+
 check_xostor_faulty_resources() {
   local host="$1"
   local pass="$2"
@@ -1086,6 +1139,7 @@ print_pool_status_section() {
     local controllers_csv="${POOL_HOST_IPS[*]}"
     unset IFS
     check_xostor_faulty_resources "$DETECTED_MASTER_IP" "$pass" "$controllers_csv" || true
+    check_xostor_nodes "$DETECTED_MASTER_IP" "$pass" "$controllers_csv" || true
   fi
 
   echo
