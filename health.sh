@@ -1362,6 +1362,11 @@ main() {
     printf "%s" "$POOLCONF_SUMMARY"
   fi
 
+  if [[ -n "$XOSTOR_FAULTY_NODES_BLOCK" ]]; then
+    echo "$(yellow_text "---xostor node status---")"
+    printf "%s\n" "$XOSTOR_FAULTY_NODES_BLOCK"
+  fi
+
   if [[ -n "${DETAILS_OUTPUT//[[:space:]]/}" ]]; then
     printf "%s\n" "$DETAILS_OUTPUT"
   fi
