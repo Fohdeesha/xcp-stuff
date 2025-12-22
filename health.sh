@@ -59,6 +59,7 @@ cyan_text()   { printf "%s%s%s" "$CYAN" "$1" "$RESET"; }
 # globals
 POOL_MODE=1
 DETAILS_OUTPUT=""
+POOLDETAILS_OUTPUT=""
 POOLCONF_SUMMARY=""
 POOL_HOST_IPS=()
 declare -A POOL_HOST_UUIDS=()
@@ -931,8 +932,6 @@ check_xostor_nodes() {
   local pass="$2"
   local controllers_csv="$3"
 
-  XOSTOR_FAULTY_NODES_BLOCK=""
-
   local out
   out="$(run_remote "$host" "$pass" "linstor --controllers=${controllers_csv} n l 2>/dev/null || true")"
 
@@ -970,8 +969,8 @@ check_xostor_nodes() {
   )"
 
   if [[ -n "$node_not_online" ]]; then
-    XOSTOR_FAULTY_NODES_BLOCK="$out"
     printf "XOSTOR Faulty Nodes: %s\n" "$(yellow_text 'Yes, See Below')"
+    append_pool_details "---xostor node status---" "$out"
     return 1
   fi
 
@@ -984,8 +983,6 @@ check_xostor_faulty_resources() {
   local pass="$2"
   local controllers_csv="$3"
 
-  XOSTOR_FAULTY_RESOURCES_BLOCK=""
-
   local out
   out="$(run_remote "$host" "$pass" "linstor --controllers=${controllers_csv} r l --faulty 2>/dev/null || true")"
 
@@ -997,8 +994,8 @@ check_xostor_faulty_resources() {
   )"
 
   if [[ -n "$has_rows" ]]; then
-    XOSTOR_FAULTY_RESOURCES_BLOCK="$out"
     printf "XOSTOR Faulty Resources: %s\n" "$(yellow_text 'Yes, See Below')"
+    append_pool_details "---xostor faulty resources---" "$out"
     return 1
   fi
 
@@ -1090,6 +1087,12 @@ append_details() {
   local title="$2"
   local content="$3"
   DETAILS_OUTPUT+=$'\n\n\n'"$(yellow_text "${hostlabel} - ${title}:")"$'\n'"${content}"$'\n'
+}
+
+append_pool_details() {
+  local title="$1"
+  local content="$2"
+  POOLDETAILS_OUTPUT+=$'\n\n\n'"$(yellow_text "${title}:")"$'\n'"${content}"$'\n'
 }
 
 append_poolconf_summary() {
@@ -1362,9 +1365,8 @@ main() {
     printf "%s" "$POOLCONF_SUMMARY"
   fi
 
-  if [[ -n "$XOSTOR_FAULTY_NODES_BLOCK" ]]; then
-    echo "$(yellow_text "---xostor node status---")"
-    printf "%s\n" "$XOSTOR_FAULTY_NODES_BLOCK"
+  if [[ -n "${POOLDETAILS_OUTPUT//[[:space:]]/}" ]]; then
+    printf "%s\n" "$POOLDETAILS_OUTPUT"
   fi
 
   if [[ -n "${DETAILS_OUTPUT//[[:space:]]/}" ]]; then
