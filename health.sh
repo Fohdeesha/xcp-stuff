@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # J-Sands / Vates
-# V1.1
+# V1.2
 set -euo pipefail
 set +H 2>/dev/null || true   # make ! in args no explode
 
