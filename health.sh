@@ -989,7 +989,7 @@ check_xostor_faulty_resources() {
   local has_rows
   has_rows="$(
     awk '
-      /[[:space:]]*\|/ && $0 !~ /ResourceName/ { print "yes"; exit }
+      /^\|[[:space:]]/ && $0 !~ /ResourceName/ { print "yes"; exit }
     ' <<< "$out"
   )"
 
