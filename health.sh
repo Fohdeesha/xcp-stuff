@@ -50,7 +50,6 @@ ok()        { printf "%sOK%s"   "$GREEN" "$RESET"; }
 none()      { printf "%sNone%s" "$GREEN" "$RESET"; }
 fail()      { printf "%sFail%s" "$YELLOW" "$RESET"; }
 yes()       { printf "%sYes%s"  "$YELLOW" "$RESET"; }
-det_mtu()   { printf "%sDetected, check dmesg%s" "$YELLOW" "$RESET"; }
 found()     { printf "%sFound:%s" "$YELLOW" "$RESET"; }
 green_text()  { printf "%s%s%s" "$GREEN" "$1" "$RESET"; }
 yellow_text() { printf "%s%s%s" "$YELLOW" "$1" "$RESET"; }
@@ -495,7 +494,7 @@ check_mtu_issues() {
   local kw
   for kw in $mtu_dmesg_keywords; do
     if grep -qiF -- "$kw" <<< "$dmesg_out"; then
-      printf "MTU Issues: %s\n" "$(det_mtu)"
+      printf "MTU Issues: %s\n" "$(yellow_text 'Detected, check output from `dmesg -T`')"
       return 1
     fi
   done
