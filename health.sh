@@ -267,19 +267,14 @@ compute_pool_ram_match() {
   done
 
   for ip in "${all_ips[@]}"; do
-    local gb
-    gb="$(run_remote "$ip" "$pass" "awk '
-      /^MemTotal:/ {
-        # MemTotal is kB; 1 GiB = 1048576 kB
-        printf \"%d\", int(($2/1048576)+0.5);
-        exit
-      }
-    ' /proc/meminfo 2>/dev/null || echo" | tr -d '\r' | head -n 1)"
-    gb="${gb//[[:space:]]/}"
+    local gb total_mb uuid
+    uuid="${POOL_HOST_UUIDS[$ip]}"
+    total_mb="${POOL_HOSTS_MEM[$uuid"_total"]}"
+    gb="$(awk -v m="$total_mb" 'BEGIN{printf "%d", m/1024+.5}')"
 
     if [[ -z "$gb" || ! "$gb" =~ ^[0-9]+$ ]]; then
       mismatch=1
-      continue
+      break
     fi
 
     if [[ -z "$expected_gb" ]]; then
