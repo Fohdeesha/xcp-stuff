@@ -62,6 +62,7 @@ POOLDETAILS_OUTPUT=""
 POOLCONF_SUMMARY=""
 POOL_HOST_IPS=()
 declare -A POOL_HOST_UUIDS=()
+declare -A POOL_HOSTS_MEM=()
 SSH_PORT=22
 PARSED_HOST=""
 ORIGINAL_ARGS=()
@@ -208,6 +209,45 @@ get_pool_host_addresses() {
   done <<< "$out"
 }
 
+get_pool_host_memory() {
+  local pass="$1"
+
+  local ip
+  for ip in "${POOL_HOST_IPS[@]}"; do
+
+    local mi
+    mi="$(run_remote "$ip" "$pass" "awk '
+      /^MemTotal:/ {t=\$2}
+      /^MemAvailable:/ {a=\$2}
+      END {
+        if (t==0) {print \"0 0\"; exit}
+        printf \"%d %d\", int(t/1024), int(a/1024)
+      }
+    ' /proc/meminfo" | tr -d '\r')"
+
+    local tmb amb
+    tmb="$(awk '{print $1}' <<< "$mi")"
+    amb="$(awk '{print $2}' <<< "$mi")"
+
+    if [[ "$tmb" =~ ^[0-9]+$ ]] && [[ "$amb" =~ ^[0-9]+$ ]] && (( tmb > 0 )); then
+      total_mb="$tmb"
+      avail_mb="$amb"
+      if (( total_mb >= avail_mb )); then
+        used_mb=$(( total_mb - avail_mb ))
+      else
+        used_mb=0
+      fi
+    else
+      total_mb=0; used_mb=0; avail_mb=0
+    fi
+    
+    local uuid="${POOL_HOST_UUIDS[$ip]}"
+
+    POOL_HOSTS_MEM[$uuid"_total"]=$total_mb
+    POOL_HOSTS_MEM[$uuid"_used"]=$used_mb
+    POOL_HOSTS_MEM[$uuid"_avail"]=$avail_mb
+  done 
+}
 
 # Pool RAM match
 # round to nearest GB for sanity
@@ -227,19 +267,14 @@ compute_pool_ram_match() {
   done
 
   for ip in "${all_ips[@]}"; do
-    local gb
-    gb="$(run_remote "$ip" "$pass" "awk '
-      /^MemTotal:/ {
-        # MemTotal is kB; 1 GiB = 1048576 kB
-        printf \"%d\", int(($2/1048576)+0.5);
-        exit
-      }
-    ' /proc/meminfo 2>/dev/null || echo" | tr -d '\r' | head -n 1)"
-    gb="${gb//[[:space:]]/}"
+    local gb total_mb uuid
+    uuid="${POOL_HOST_UUIDS[$ip]}"
+    total_mb="${POOL_HOSTS_MEM[$uuid"_total"]}"
+    gb="$(awk -v m="$total_mb" 'BEGIN{printf "%d", m/1024+.5}')"
 
     if [[ -z "$gb" || ! "$gb" =~ ^[0-9]+$ ]]; then
       mismatch=1
-      continue
+      break
     fi
 
     if [[ -z "$expected_gb" ]]; then
@@ -284,48 +319,13 @@ detect_pool_master_by_poolconf() {
 # --- RAM calculatios ---
 load_mem_stats() {
   local host="$1"
-  local pass="$2"
 
-  local free_m
-  free_m="$(run_remote "$host" "$pass" "free -m" | tr -d '\r')"
+  local uuid="${POOL_HOST_UUIDS[$host]}"
 
   local total_mb used_mb avail_mb
-  read -r total_mb used_mb avail_mb < <(
-    awk '$1 ~ /^[Mm]em:$/ {print $2, $3, $NF; exit}' <<< "$free_m"
-  )
-
-  total_mb="${total_mb:-0}"
-  used_mb="${used_mb:-0}"
-  avail_mb="${avail_mb:-0}"
-
-  # fallback if/when the above fails to calc correctly for some reason
-  if [[ ! "$total_mb" =~ ^[0-9]+$ ]] || (( total_mb <= 0 )); then
-    local mi
-    mi="$(run_remote "$host" "$pass" "awk '
-      /^MemTotal:/ {t=\$2}
-      /^MemAvailable:/ {a=\$2}
-      END {
-        if (t==0) {print \"0 0\"; exit}
-        printf \"%d %d\", int(t/1024), int(a/1024)
-      }
-    ' /proc/meminfo" | tr -d '\r')"
-
-    local tmb amb
-    tmb="$(awk '{print $1}' <<< "$mi")"
-    amb="$(awk '{print $2}' <<< "$mi")"
-
-    if [[ "$tmb" =~ ^[0-9]+$ ]] && [[ "$amb" =~ ^[0-9]+$ ]] && (( tmb > 0 )); then
-      total_mb="$tmb"
-      avail_mb="$amb"
-      if (( total_mb >= avail_mb )); then
-        used_mb=$(( total_mb - avail_mb ))
-      else
-        used_mb=0
-      fi
-    else
-      total_mb=0; used_mb=0; avail_mb=0
-    fi
-  fi
+  total_mb="${POOL_HOSTS_MEM[$uuid"_total"]}"
+  used_mb="${POOL_HOSTS_MEM[$uuid"_used"]}"
+  avail_mb="${POOL_HOSTS_MEM[$uuid"_avail"]}"
 
   MEM_TOTAL_GB="$(awk -v m="$total_mb" 'BEGIN{printf "%.1f", m/1024}')"
   MEM_USED_PCT="$(awk -v u="$used_mb" -v t="$total_mb" 'BEGIN{ if (t<=0) printf "0.0"; else printf "%.1f", (u/t)*100 }')"
@@ -1130,7 +1130,7 @@ print_pool_status_section() {
     printf "HA Enabled: %s\n" "$(yellow_text 'Unknown')"
   fi
 
-  load_mem_stats "$DETECTED_MASTER_IP" "$pass"
+  load_mem_stats "$DETECTED_MASTER_IP"
   check_xostor_in_use_and_ram "$DETECTED_MASTER_IP" "$pass" || true
   MASTER_XOSTOR_IN_USE=$(( XOSTOR_IN_USE ))
 
@@ -1204,7 +1204,7 @@ run_checks_for_host() {
     append_poolconf_summary "$hn" "$ip" "$poolconf_line"
   fi
 
-  load_mem_stats "$ip" "$pass"
+  load_mem_stats "$ip"
 
 
   local DMESG_ISSUES_BLOCK OOM_EVENTS_BLOCK LACP_OUTPUT_BLOCK SMLOG_EXCEPTIONS_BLOCK XOSTOR_FAULTY_RESOURCES_BLOCK
@@ -1344,6 +1344,8 @@ main() {
     fi
 
     MASTER_POOL_UUID="$(get_pool_uuid "$DETECTED_MASTER_IP" "$pass")"
+    get_pool_host_memory "$pass"
+
     compute_pool_ram_match "$DETECTED_MASTER_IP" "$pass"
 
     MASTER_RPMLIST="$(get_rpm_manifest_remote "$DETECTED_MASTER_IP" "$pass")"
