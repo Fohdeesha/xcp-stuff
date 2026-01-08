@@ -1002,6 +1002,24 @@ check_xostor_faulty_resources() {
   return 0
 }
 
+check_xostor_controller() {
+  local host="$1"
+  local pass="$2"
+  local controllers_csv="$3"
+
+  local out ip
+  out="$(run_remote "$host" "$pass" "linstor --controllers=${controllers_csv} c which 2>/dev/null || true")"
+
+  if [[ $out == *localhost* ]]; then
+      ip=$host
+  else
+      ip="${out#*://}"
+  fi
+
+  printf "XOSTOR Controller IP: %s\n" "$(green_text "$ip")"
+  return 0
+}
+
 check_yum_patch_level() {
   local host="$1"
   local pass="$2"
@@ -1142,6 +1160,7 @@ print_pool_status_section() {
     unset IFS
     check_xostor_faulty_resources "$DETECTED_MASTER_IP" "$pass" "$controllers_csv" || true
     check_xostor_nodes "$DETECTED_MASTER_IP" "$pass" "$controllers_csv" || true
+    check_xostor_controller "$DETECTED_MASTER_IP" "$pass" "$controllers_csv" || true
   fi
 
   echo
