@@ -17,6 +17,7 @@ dmesg_issue_phrases="call trace"                # matches that trigger dmesg con
 oom_phrase="out of memory"                      # phrase that flags OOM runs
 crash_ignore_file=".sacrificial-space-for-logs" # file in /var/crash to ignore (don't flag on crash logs cuz of this)
 pkg_diff_max_lines=100                          # max amt of mismatched yum packages to list
+time_sync_allowance_secs=300                    # max allowed time difference between hosts in seconds
 
 ## which tests should run on ALL hosts when script is ran in pool mode (which is default)
 ## setting to 0 means the command is only ran on the master, not every single host
@@ -63,12 +64,14 @@ POOLCONF_SUMMARY=""
 POOL_HOST_IPS=()
 declare -A POOL_HOST_UUIDS=()
 declare -A POOL_HOSTS_MEM=()
+declare -A POOL_HOSTS_NTP=()
 SSH_PORT=22
 PARSED_HOST=""
 ORIGINAL_ARGS=()
 MASTER_RPMLIST=""
 MASTER_RPMHASH=""
 POOL_RAM_MATCH=1
+POOL_NTP_MATCH=1
 DETECTED_MASTER_IP=""
 DETECTED_MASTER_HOSTNAME=""
 MASTER_XOSTOR_IN_USE=0
@@ -439,6 +442,67 @@ check_uptime() {
   up="${up:-unknown}"
   printf "Uptime: %s\n" "$up"
   return 0
+}
+
+check_host_timesync() {
+  local ip="$1"
+  
+  local uuid ntp sync utc
+  uuid="${POOL_HOST_UUIDS[$ip]}"
+  ntp="${POOL_HOSTS_NTP[$uuid"_ntp"]}"
+  sync="${POOL_HOSTS_NTP[$uuid"_sync"]}"
+
+  if [[ "$ntp" != "yes" ]]; then
+    printf "NTP: Enabled - %s" "$(yellow_text "$ntp")"
+  else
+    printf "NTP: Enabled - %s" "$(green_text "$ntp")"
+  fi
+
+  if [[ "$sync" != "yes" ]]; then
+    printf " Synced - %s\n" "$(yellow_text "$sync")"
+  else
+    printf " Synced - %s\n" "$(green_text "$sync")"
+  fi
+}
+
+get_pool_timesync() {
+  local pass="$1"
+
+  # save time from XOA to compare against later
+  local xo_time=$(date +%s)
+
+  # check each host's time sync status
+  local ip out utc ntp sync uuid unix_time time_diff
+  for ip in "${POOL_HOST_IPS[@]}"; do
+    out="$(run_remote "$ip" "$pass" "timedatectl")"
+
+    eval "$(
+    awk -F': ' '
+    / Universal time:/ {print "utc=\"" $2 "\""}
+    /NTP enabled:/ {print "ntp=\"" $2 "\""}
+    /NTP synchronized:/ {print "sync=\"" $2 "\""}
+    ' <<< "$out"
+    )"
+
+    uuid="${POOL_HOST_UUIDS[$ip]}"
+
+    POOL_HOSTS_NTP[$uuid"_ntp"]=$ntp
+    POOL_HOSTS_NTP[$uuid"_sync"]=$sync
+    POOL_HOSTS_NTP[$uuid"_utc"]=$utc
+
+    if [[ "$ntp" != "yes" || "$sync" != "yes" ]]; then
+      POOL_NTP_MATCH=0
+    else
+      unix_time=$(date -d "$utc" +%s)
+      time_diff=$((xo_time - unix_time))
+      if [[ $time_diff -lt 0 ]]; then
+        time_diff=$(( -time_diff ))
+      fi
+      if (( time_diff > time_sync_allowance_secs )); then
+        POOL_NTP_MATCH=0
+      fi
+    fi
+  done 
 }
 
 check_dom0_disk_usage() {
@@ -1141,6 +1205,12 @@ print_pool_status_section() {
   else
     printf "Dom0 RAM Allocations: %s\n" "$(yellow_text 'Mismatched')"
   fi
+  
+  if (( POOL_NTP_MATCH == 1 )); then
+    printf "Pool Time Synchronization: %s\n" "$(green_text 'Matched')"
+  else
+    printf "Pool Time Synchronization: %s\n" "$(yellow_text 'Mismatched')"
+  fi
 
   if [[ -n "$MASTER_POOL_UUID" ]]; then
     check_ha_enabled "$DETECTED_MASTER_IP" "$pass" "$MASTER_POOL_UUID" || true
@@ -1212,6 +1282,7 @@ run_checks_for_host() {
 
   check_xcpng_version "$ip" "$pass" || true
   check_uptime "$ip" "$pass"
+  check_host_timesync "$ip"
 
   local dmesg_t smlog
   dmesg_t="$(run_remote "$ip" "$pass" "dmesg -T")"
@@ -1364,7 +1435,7 @@ main() {
 
     MASTER_POOL_UUID="$(get_pool_uuid "$DETECTED_MASTER_IP" "$pass")"
     get_pool_host_memory "$pass"
-
+    get_pool_timesync "$pass"
     compute_pool_ram_match "$DETECTED_MASTER_IP" "$pass"
 
     MASTER_RPMLIST="$(get_rpm_manifest_remote "$DETECTED_MASTER_IP" "$pass")"
