@@ -83,17 +83,19 @@ MEM_AVAIL_GB="0.0"
 
 usage() {
   echo "Usage:"
-  echo "  $0 pool_master_or_host[:ssh_port] [root_password] [single]"
+  echo "  $0 [-f] [-s] [pool_master_or_host[:ssh_port] [root_password]]"
   echo ""
-  echo "  - SSH port, password, and single mode are optional "
-  echo "  - If a password is not supplied, I will look it up locally in xo-server-db"
+  echo "  - All parameters are optional"
+  echo "  - If a host is not supplied, the first one from xo-server-db will be used"
+  echo "  - If a password is not supplied, it will be looked up locally in xo-server-db"
   echo "  - By default, the script runs in pool mode (checks all hosts in the pool)"
-  echo "  - Use 'single' flag to only check the specified host"
+  echo "  - Use '-f' flag to filter output to only show issues found"
+  echo "  - Use '-s' flag to only check the specified host"
   echo ""
   echo "  Examples:"
   echo "  $0 192.168.1.5"
   echo "  $0 192.168.1.6 'mypass'"
-  echo "  $0 192.168.1.7 'mypass' single"
+  echo "  $0 -s 192.168.1.7 'mypass'"
   exit 2
 }
 
@@ -1412,7 +1414,7 @@ main() {
 
   eval set -- "$VALID_ARGS"
 
-  while [ : ]; do
+  while [ true ]; do
     case "$1" in
       -f | --filter)
           FILTER_OUTPUT=1
