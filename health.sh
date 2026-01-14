@@ -1424,6 +1424,8 @@ main() {
   fi
 
   local overall_rc=0
+  get_pool_timesync "$pass"
+  get_pool_host_memory "$pass"
 
   if (( POOL_MODE == 0 )); then
     if ! run_checks_for_host "$seed_host" "$pass" 1 ""; then overall_rc=1; fi
@@ -1434,8 +1436,6 @@ main() {
     fi
 
     MASTER_POOL_UUID="$(get_pool_uuid "$DETECTED_MASTER_IP" "$pass")"
-    get_pool_host_memory "$pass"
-    get_pool_timesync "$pass"
     compute_pool_ram_match "$DETECTED_MASTER_IP" "$pass"
 
     MASTER_RPMLIST="$(get_rpm_manifest_remote "$DETECTED_MASTER_IP" "$pass")"
