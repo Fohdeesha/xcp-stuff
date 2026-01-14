@@ -467,16 +467,18 @@ check_host_timesync() {
   ntp="${POOL_HOSTS_NTP[$uuid"_ntp"]}"
   sync="${POOL_HOSTS_NTP[$uuid"_sync"]}"
 
-  if [[ "$ntp" != "yes" ]]; then
-    printf "NTP: Enabled - %s" "$(yellow_text "$ntp")"
-  else
-    printf "NTP: Enabled - %s" "$(green_text "$ntp")"
-  fi
+  if [[ "$ntp" != "yes" || "$sync" != "yes" || "$FILTER_OUTPUT" -eq 0 ]]; then
+    if [[ "$ntp" != "yes" ]]; then
+      printf "NTP: Enabled - %s" "$(yellow_text "$ntp")"
+    else
+      printf "NTP: Enabled - %s" "$(green_text "$ntp")"
+    fi
 
-  if [[ "$sync" != "yes" ]]; then
-    printf " Synced - %s\n" "$(yellow_text "$sync")"
-  else
-    printf " Synced - %s\n" "$(green_text "$sync")"
+    if [[ "$sync" != "yes" ]]; then
+      printf " Synced - %s\n" "$(yellow_text "$sync")"
+    else
+      printf " Synced - %s\n" "$(green_text "$sync")"
+    fi
   fi
 }
 
@@ -541,7 +543,7 @@ check_dom0_disk_usage() {
   done <<< "$df_out"
 
   if (( ${#bad[@]} == 0 )); then
-    printf "XCP-ng Dom0 Disk Usage: %s\n" "$(ok)"
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "XCP-ng Dom0 Disk Usage: %s\n" "$(ok)"
     return 0
   else
     local msg
@@ -578,7 +580,7 @@ check_mtu_issues() {
     fi
   done
 
-  printf "MTU Issues: %s\n" "$(none)"
+  [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "MTU Issues: %s\n" "$(none)"
   return 0
 }
 
@@ -620,7 +622,7 @@ check_dmesg_content() {
   )"
 
   if [[ -z "${matches:-}" ]]; then
-    printf "Dmesg Content: %s\n" "$(green_text 'Clean')"
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Dmesg Content: %s\n" "$(green_text 'Clean')"
     return 0
   fi
 
@@ -642,7 +644,7 @@ check_oom_events() {
   )"
 
   if [[ -z "${matches:-}" ]]; then
-    printf "OOM Events: %s\n" "$(green_text 'No')"
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "OOM Events: %s\n" "$(green_text 'No')"
     return 0
   fi
 
@@ -664,7 +666,7 @@ check_crash_logs_present() {
     printf "Crash Logs Present: %s\n" "$(yellow_text 'Yes - check /var/crash')"
     return 1
   else
-    printf "Crash Logs Present: %s\n" "$(green_text 'No')"
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Crash Logs Present: %s\n" "$(green_text 'No')"
     return 0
   fi
 }
@@ -679,7 +681,7 @@ check_lacp_negotiation_issues() {
   out="$(run_remote "$host" "$pass" "ovs-appctl lacp/show 2>/dev/null || true")"
 
   if [[ -z "${out//[[:space:]]/}" ]]; then
-    printf "LACP Negotiation Issues: %s\n" "$(green_text 'No')"
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "LACP Negotiation Issues: %s\n" "$(green_text 'No')"
     return 0
   fi
 
@@ -700,7 +702,7 @@ check_lacp_negotiation_issues() {
     return 1
   fi
 
-  printf "LACP Negotiation Issues: %s\n" "$(green_text 'No')"
+  [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "LACP Negotiation Issues: %s\n" "$(green_text 'No')"
   return 0
 }
 
@@ -733,7 +735,7 @@ check_silly_mtus() {
     printf "Silly MTUs: %s - Non-standard MTUs found, check \"ip a\" output\n" "$(yes)"
     return 1
   else
-    printf "Silly MTUs: %s\n" "$(green_text 'OK - All 1500')"
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Silly MTUs: %s\n" "$(green_text 'OK - All 1500')"
     return 0
   fi
 }
@@ -768,7 +770,7 @@ check_dns_gw_non_mgmt_pifs() {
     return 1
   fi
 
-  printf "DNS/GW on Non-Mgmt PIFs: %s\n" "$(green_text 'No')"
+  [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "DNS/GW on Non-Mgmt PIFs: %s\n" "$(green_text 'No')"
   return 0
 }
 
@@ -798,7 +800,7 @@ check_overlapping_subnets() {
   )"
 
   if [[ -z "${lst//[[:space:]]/}" ]] || (( $(wc -l <<< "$lst") < 2 )); then
-    printf "Overlapping Subnets: %s\n" "$(green_text 'No')"
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Overlapping Subnets: %s\n" "$(green_text 'No')"
     return 0
   fi
 
@@ -842,7 +844,7 @@ check_overlapping_subnets() {
     printf "Overlapping Subnets: %s\n" "$(yellow_text 'Yes')"
     return 1
   else
-    printf "Overlapping Subnets: %s\n" "$(green_text 'No')"
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Overlapping Subnets: %s\n" "$(green_text 'No')"
     return 0
   fi
 }
@@ -861,7 +863,7 @@ check_smapi_exceptions() {
   )"
 
   if [[ -z "${last_line:-}" ]]; then
-    printf "SMAPI Exceptions: %s\n" "$(none)"
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "SMAPI Exceptions: %s\n" "$(none)"
     return 0
   fi
 
@@ -891,7 +893,7 @@ check_smapi_hidden_leaves() {
   )"
 
   if [[ -z "${matches:-}" ]]; then
-    printf "SMAPI Hidden Leaves: %s\n" "$(none)"
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "SMAPI Hidden Leaves: %s\n" "$(none)"
     return 0
   fi
 
@@ -912,7 +914,7 @@ check_ha_enabled() {
 
   # Match on "true" or "false" anywhere in the output
   if [[ "$out" =~ false ]]; then
-    printf "HA Enabled: %s\n" "$(green_text 'No')"
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "HA Enabled: %s\n" "$(green_text 'No')"
     return 0
   elif [[ "$out" =~ true ]]; then
     printf "HA Enabled: %s\n" "$(yellow_text 'Yes')"
@@ -954,7 +956,7 @@ check_rebooted_after_updates() {
   '")"
 
   if [[ "${out:-}" == "NOUPDATES" ]]; then
-    printf "Rebooted After Updates: %s\n" "$(green_text 'Yes')"
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Rebooted After Updates: %s\n" "$(green_text 'Yes')"
     return 0
   fi
 
@@ -968,7 +970,7 @@ check_rebooted_after_updates() {
   fi
 
   if (( boot_epoch >= upd_epoch )); then
-    printf "Rebooted After Updates: %s\n" "$(green_text 'Yes')"
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Rebooted After Updates: %s\n" "$(green_text 'Yes')"
     return 0
   else
     printf "Rebooted After Updates: %s\n" "$(yellow_text 'No')"
@@ -986,7 +988,7 @@ check_xostor_in_use_and_ram() {
   out="$(run_remote "$host" "$pass" "xe sr-list type=linstor 2>/dev/null || true")"
 
   if [[ -z "${out//[[:space:]]/}" ]]; then
-    printf "XOSTOR In Use: %s\n" "$(green_text 'No')"
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "XOSTOR In Use: %s\n" "$(green_text 'No')"
     return 0
   fi
 
@@ -1052,7 +1054,7 @@ check_xostor_nodes() {
     return 1
   fi
 
-  printf "XOSTOR Faulty Nodes: %s\n" "$(green_text 'No')"
+  [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "XOSTOR Faulty Nodes: %s\n" "$(green_text 'No')"
   return 0
 }
 
@@ -1077,7 +1079,7 @@ check_xostor_faulty_resources() {
     return 1
   fi
 
-  printf "XOSTOR Faulty Resources: %s\n" "$(green_text 'No')"
+  [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "XOSTOR Faulty Resources: %s\n" "$(green_text 'No')"
   return 0
 }
 
@@ -1123,7 +1125,7 @@ check_yum_patch_level() {
   h="$(get_rpm_manifest_hash_remote "$host" "$pass" | tr -d '\r' | head -n 1)"
 
   if [[ -n "$h" && "$h" == "$MASTER_RPMHASH" ]]; then
-    printf "Yum Patch Level: %s\n" "$(green_text 'Match')"
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Yum Patch Level: %s\n" "$(green_text 'Match')"
     return 0
   fi
 
@@ -1216,13 +1218,13 @@ print_pool_status_section() {
   fi
 
   if (( POOL_RAM_MATCH == 1 )); then
-    printf "Dom0 RAM Allocations: %s\n" "$(green_text 'Matched')"
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Dom0 RAM Allocations: %s\n" "$(green_text 'Matched')"
   else
     printf "Dom0 RAM Allocations: %s\n" "$(yellow_text 'Mismatched')"
   fi
   
   if (( POOL_NTP_MATCH == 1 )); then
-    printf "Pool Time Synchronization: %s\n" "$(green_text 'Matched')"
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Pool Time Synchronization: %s\n" "$(green_text 'Matched')"
   else
     printf "Pool Time Synchronization: %s\n" "$(yellow_text 'Mismatched')"
   fi
