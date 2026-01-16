@@ -142,7 +142,7 @@ print_xoa_status_section() {
   ' <<< "$out"
   )"
 
-  XOA_DEBIAN=$(lsb_release -a | awk '/Description:/ { sub(/^Description:[[:space:]]*/, ""); print }')
+  XOA_DEBIAN=$(lsb_release -a 2>&1 | awk '/Description:/ { sub(/^Description:[[:space:]]*/, ""); print }')
 
   echo "$(cyan_text "== XOA Status ==")"
 
@@ -1487,12 +1487,12 @@ main() {
       set -- "$first_host"    
   fi
 
-  print_xoa_status_section
-
   parse_target_host_and_port "$1"
   local seed_host="$PARSED_HOST"
 
   ensure_sshpass
+
+  print_xoa_status_section
 
   local pass=""
   if [[ $# -eq 2 ]]; then
