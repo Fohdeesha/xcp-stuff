@@ -131,7 +131,7 @@ ensure_sshpass() {
 }
 
 print_xoa_status_section() {
-  local out DMESG_ISSUES_BLOCK XOA_CHANNEL XOA_CURRENT XOA_DEBIAN
+  local out DMESG_ISSUES_BLOCK XOA_CHANNEL XOA_CURRENT XOA_DEBIAN XOA_UNREGISTERED
 
   out="$(xoa-updater || true)"
 
@@ -139,6 +139,7 @@ print_xoa_status_section() {
   awk '
   /channel selected/ {print "XOA_CHANNEL=\"" $1 "\""}
   /All up to date/   {print "XOA_CURRENT=1"}
+  /not registered/   {print "XOA_UNREGISTERED=1"}
   ' <<< "$out"
   )"
 
@@ -146,7 +147,9 @@ print_xoa_status_section() {
 
   echo "$(cyan_text "== XOA Status ==")"
 
-  if [[ -n "${XOA_CHANNEL:-}" ]]; then
+  if [[ -n "${XOA_UNREGISTERED:-}" ]]; then
+    printf "XOA Channel: %s\n" "$(yellow_text 'Unregistered')"
+  elif [[ -n "${XOA_CHANNEL:-}" ]]; then
     printf "XOA Channel: %s\n" "$(green_text "${XOA_CHANNEL}")"
   else
     printf "XOA Channel: %s\n" "$(yellow_text '(unknown)')"
