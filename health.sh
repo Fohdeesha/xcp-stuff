@@ -160,6 +160,24 @@ print_xoa_status_section() {
 
   printf "OS Version: %s\n" "$(green_text "${XOA_DEBIAN}")"
 
+ local XOA_TOTAL_MEM XOA_AVAIL_MEM
+  eval "$(
+  awk '
+  /^MemTotal:/ {print "XOA_TOTAL_MEM=\"" $2 "\""}
+  /^MemAvailable:/ {print "XOA_AVAIL_MEM=\"" $2 "\""}
+  ' /proc/meminfo
+  )"
+
+  if [[ -n "$XOA_TOTAL_MEM" && -n "$XOA_AVAIL_MEM" ]]; then
+    local total_gb avail_gb used_gb used_pct
+    total_gb="$(awk -v m="$XOA_TOTAL_MEM" 'BEGIN{printf "%.1f", m/1024/1024}')"
+    avail_gb="$(awk -v m="$XOA_AVAIL_MEM" 'BEGIN{printf "%.1f", m/1024/1024}')"
+    used_gb="$(awk -v t="$total_gb" -v a="$avail_gb" 'BEGIN{printf "%.1f", t - a}')"
+    used_pct="$(awk -v t="$total_gb" -v u="$used_gb" 'BEGIN{ if (t<=0) printf "0.0"; else printf "%.1f", (u/t)*100 }')"
+
+    printf "Memory Usage: %s GB used of %s GB (%s%%)\n" "$(green_text "$used_gb")" "$(green_text "$total_gb")" "$(green_text "$used_pct")"
+  fi
+
   local dmesg_t="$(dmesg -T)"
   check_dmesg_content "$dmesg_t"
 
