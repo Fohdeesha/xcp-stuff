@@ -646,7 +646,7 @@ check_mtu_issues() {
 
   local kw
   for kw in $mtu_dmesg_keywords; do
-    if grep -qiF -- "$kw" <<< "$dmesg_out"; then
+    if grep -qiFw -- "$kw" <<< "$dmesg_out"; then
       printf "MTU Issues: %s\n" "$(yellow_text 'Detected, check output from dmesg -T')"
       return 1
     fi
