@@ -130,6 +130,78 @@ ensure_sshpass() {
   return 0
 }
 
+print_xoa_status_section() {
+  local out DMESG_ISSUES_BLOCK XOA_CHANNEL XOA_CURRENT XOA_DEBIAN
+  local XOA_PLAN XOA_REGIST
+
+  out=$(xoa-updater raw-api-call isRegistered || true)
+  XOA_REGIST=$(echo "$out" | awk -F"email: '" '{ if(NF>1){split($2,a,"'\'',"); print a[1]} }')
+
+  out="$(xoa-updater || true)"
+
+  eval "$(
+  awk '
+  /channel selected/ {print "XOA_CHANNEL=\"" $1 "\""}
+  /All up to date/   {print "XOA_CURRENT=1"}
+  ' <<< "$out"
+  )"
+
+  XOA_DEBIAN=$(lsb_release -a 2>&1 | awk '/Description:/ { sub(/^Description:[[:space:]]*/, ""); print }')
+
+  echo "$(cyan_text "== XOA Status ==")"
+
+  if [[ -z "${XOA_REGIST:-}" ]]; then
+    printf "Registration: %s\n" "$(yellow_text 'Unregistered')"
+  else
+    printf "Registration: %s\n" "$(green_text "${XOA_REGIST}")"
+  fi
+
+  if [[ -z "${XOA_CHANNEL:-}" ]]; then
+    printf "XOA Channel: %s\n" "$(yellow_text '(unknown)')"
+  else
+    printf "XOA Channel: %s\n" "$(green_text "${XOA_CHANNEL}")"
+  fi
+
+  XOA_PLAN=$(xoa-updater raw-api-call getXoaPlan \
+    | awk 'NF>0 { gsub(/[^\x00-\x7F]/, ""); print $1 }')
+  printf "XOA Plan: %s\n" "$(green_text "${XOA_PLAN}")"
+
+  if [[ -z "${XOA_CURRENT:-}" ]]; then
+    printf "XOA Status: %s\n" "$(yellow_text 'Updates available')"
+  else
+    printf "XOA Status: %s\n" "$(green_text 'Up to date')"
+  fi
+
+  printf "OS Version: %s\n" "$(green_text "${XOA_DEBIAN}")"
+
+ local XOA_TOTAL_MEM XOA_AVAIL_MEM
+  eval "$(
+  awk '
+  /^MemTotal:/ {print "XOA_TOTAL_MEM=\"" $2 "\""}
+  /^MemAvailable:/ {print "XOA_AVAIL_MEM=\"" $2 "\""}
+  ' /proc/meminfo
+  )"
+
+  if [[ -n "$XOA_TOTAL_MEM" && -n "$XOA_AVAIL_MEM" ]]; then
+    local total_gb avail_gb used_gb used_pct
+    total_gb="$(awk -v m="$XOA_TOTAL_MEM" 'BEGIN{printf "%.1f", m/1024/1024}')"
+    avail_gb="$(awk -v m="$XOA_AVAIL_MEM" 'BEGIN{printf "%.1f", m/1024/1024}')"
+    used_gb="$(awk -v t="$total_gb" -v a="$avail_gb" 'BEGIN{printf "%.1f", t - a}')"
+    used_pct="$(awk -v t="$total_gb" -v u="$used_gb" 'BEGIN{ if (t<=0) printf "0.0"; else printf "%.1f", (u/t)*100 }')"
+
+    printf "Memory Usage: %s GB used of %s GB (%s%%)\n" "$(green_text "$used_gb")" "$(green_text "$total_gb")" "$(green_text "$used_pct")"
+  fi
+
+  local dmesg_t="$(dmesg -T)"
+  check_dmesg_content "$dmesg_t"
+
+  if [[ -n "$DMESG_ISSUES_BLOCK" ]]; then
+    append_details "XOA" "Dmesg Issues" "$DMESG_ISSUES_BLOCK"
+  fi
+
+  echo ""
+}
+
 get_password_from_xoa_db_simple() {
   local host_only="$1"
 
@@ -1452,6 +1524,8 @@ main() {
 
   ensure_sshpass
 
+  print_xoa_status_section
+
   local pass=""
   if [[ $# -eq 2 ]]; then
     pass="$2"
@@ -1498,6 +1572,7 @@ main() {
       [[ "$ip" == "$DETECTED_MASTER_IP" ]] && continue
       if ! run_checks_for_host "$ip" "$pass" 0 ""; then overall_rc=1; fi
     done
+
 
     echo
     echo "$(cyan_text "---pool.conf contents---")"
