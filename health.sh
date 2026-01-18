@@ -131,7 +131,15 @@ ensure_sshpass() {
 }
 
 print_xoa_status_section() {
-  local out DMESG_ISSUES_BLOCK XOA_CHANNEL XOA_CURRENT XOA_DEBIAN XOA_UNREGISTERED
+  local out DMESG_ISSUES_BLOCK XOA_CHANNEL XOA_CURRENT XOA_DEBIAN
+  local XOA_PLAN XOA_REGIST
+
+  out=$(xoa-updater raw-api-call isRegistered || true)
+  eval "$(
+  awk '
+  /email:/   {print "XOA_REGIST=\"" $1 "\""}
+  ' <<< "$out"
+  )"
 
   out="$(xoa-updater || true)"
 
@@ -139,7 +147,6 @@ print_xoa_status_section() {
   awk '
   /channel selected/ {print "XOA_CHANNEL=\"" $1 "\""}
   /All up to date/   {print "XOA_CURRENT=1"}
-  /not registered/   {print "XOA_UNREGISTERED=1"}
   ' <<< "$out"
   )"
 
@@ -147,18 +154,26 @@ print_xoa_status_section() {
 
   echo "$(cyan_text "== XOA Status ==")"
 
-  if [[ -n "${XOA_UNREGISTERED:-}" ]]; then
-    printf "XOA Channel: %s\n" "$(yellow_text 'Unregistered')"
-  elif [[ -n "${XOA_CHANNEL:-}" ]]; then
-    printf "XOA Channel: %s\n" "$(green_text "${XOA_CHANNEL}")"
+  if [[ -z "${XOA_REGIST:-}" ]]; then
+    printf "Registration: %s\n" "$(yellow_text 'Unregistered')"
   else
-    printf "XOA Channel: %s\n" "$(yellow_text '(unknown)')"
+    printf "Registration: %s\n" "$(green_text "${XOA_REGIST}")"
   fi
 
-  if [[ -n "${XOA_CURRENT:-}" ]]; then
-    printf "XOA Status: %s\n" "$(green_text 'Up to date')"
+  if [[ -z "${XOA_CHANNEL:-}" ]]; then
+    printf "XOA Channel: %s\n" "$(yellow_text '(unknown)')"
   else
+    printf "XOA Channel: %s\n" "$(green_text "${XOA_CHANNEL}")"
+  fi
+
+  XOA_PLAN=$(xoa-updater raw-api-call getXoaPlan \
+    | awk 'NF>0 { gsub(/[^\x00-\x7F]/, ""); print $1 }')
+  printf "XOA Plan: %s\n" "$(green_text "${XOA_PLAN}")"
+
+  if [[ -z "${XOA_CURRENT:-}" ]]; then
     printf "XOA Status: %s\n" "$(yellow_text 'Updates available')"
+  else
+    printf "XOA Status: %s\n" "$(green_text 'Up to date')"
   fi
 
   printf "OS Version: %s\n" "$(green_text "${XOA_DEBIAN}")"
