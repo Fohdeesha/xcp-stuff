@@ -135,11 +135,7 @@ print_xoa_status_section() {
   local XOA_PLAN XOA_REGIST
 
   out=$(xoa-updater raw-api-call isRegistered || true)
-  eval "$(
-  awk '
-  /email:/   {print "XOA_REGIST=\"" $1 "\""}
-  ' <<< "$out"
-  )"
+  XOA_REGIST=$(echo "$out" | awk -F"email: '" '{ if(NF>1){split($2,a,"'\'',"); print a[1]} }')
 
   out="$(xoa-updater || true)"
 
