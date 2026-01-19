@@ -73,6 +73,7 @@ MASTER_RPMLIST=""
 MASTER_RPMHASH=""
 POOL_RAM_MATCH=1
 POOL_NTP_MATCH=1
+POOL_MISSING_PATCHES=0
 DETECTED_MASTER_IP=""
 DETECTED_MASTER_HOSTNAME=""
 MASTER_XOSTOR_IN_USE=0
@@ -162,8 +163,7 @@ print_xoa_status_section() {
     printf "XOA Channel: %s\n" "$(green_text "${XOA_CHANNEL}")"
   fi
 
-  XOA_PLAN=$(xoa-updater raw-api-call getXoaPlan \
-    | awk 'NF>0 { gsub(/[^\x00-\x7F]/, ""); print $1 }')
+  XOA_PLAN=$(xoa-updater raw-api-call getXoaPlan | awk 'NF>0 { gsub(/[^\x00-\x7F]/, ""); print $1 }')
   printf "XOA Plan: %s\n" "$(green_text "${XOA_PLAN}")"
 
   if [[ -z "${XOA_CURRENT:-}" ]]; then
@@ -337,6 +337,12 @@ get_pool_host_memory() {
     POOL_HOSTS_MEM[$uuid"_used"]=$used_mb
     POOL_HOSTS_MEM[$uuid"_avail"]=$avail_mb
   done 
+}
+
+get_pool_missing_patches() {
+  local pass="$1"
+
+  POOL_MISSING_PATCHES="$(run_remote "$DETECTED_MASTER_IP" "$pass" "sudo yum check-update -q | egrep -v \"Loaded plugins:.*|^$\" | wc -l")"
 }
 
 # Pool RAM match
@@ -1307,6 +1313,12 @@ print_pool_status_section() {
     printf "HA Enabled: %s\n" "$(yellow_text 'Unknown')"
   fi
 
+  if (( POOL_MISSING_PATCHES == 0 )); then
+    printf "Missing Patches: %s\n" "$(green_text "${POOL_MISSING_PATCHES}")"
+  else
+    printf "Missing Patches: %s\n" "$(yellow_text "${POOL_MISSING_PATCHES}")"
+  fi
+
   load_mem_stats "$DETECTED_MASTER_IP"
   check_xostor_in_use_and_ram "$DETECTED_MASTER_IP" "$pass" || true
   MASTER_XOSTOR_IN_USE=$(( XOSTOR_IN_USE ))
@@ -1548,7 +1560,7 @@ main() {
   local overall_rc=0
   get_pool_timesync "$pass"
   get_pool_host_memory "$pass"
-
+  
   if (( POOL_MODE == 0 )); then
     if ! run_checks_for_host "$seed_host" "$pass" 1 ""; then overall_rc=1; fi
   else
@@ -1559,6 +1571,7 @@ main() {
 
     MASTER_POOL_UUID="$(get_pool_uuid "$DETECTED_MASTER_IP" "$pass")"
     compute_pool_ram_match "$DETECTED_MASTER_IP" "$pass"
+    get_pool_missing_patches "$pass"
 
     MASTER_RPMLIST="$(get_rpm_manifest_remote "$DETECTED_MASTER_IP" "$pass")"
     MASTER_RPMHASH="$(get_rpm_manifest_hash_remote "$DETECTED_MASTER_IP" "$pass" | tr -d '\r' | head -n 1)"
@@ -1572,7 +1585,6 @@ main() {
       [[ "$ip" == "$DETECTED_MASTER_IP" ]] && continue
       if ! run_checks_for_host "$ip" "$pass" 0 ""; then overall_rc=1; fi
     done
-
 
     echo
     echo "$(cyan_text "---pool.conf contents---")"
