@@ -13,7 +13,7 @@ dom0_mem_used_max_pct=65                        # dom0 percent memory allowed in
 xostor_min_avail_gb=15                          # Minimum RAM dom0 should have if xostor is in use
 mtu_dmesg_keywords="mtu large fragment"         # keywords in dom0 to flag MTU issues
 dmesg_issue_words="panic crash rip kill"        # words that trigger dmesg contents issues
-dmesg_issue_phrases="call trace"                # matches that trigger dmesg contents issues (whole phrase matched, pipe seperated)
+dmesg_issue_phrases="call trace|timed out"      # matches that trigger dmesg contents issues (whole phrase matched, pipe seperated)
 oom_phrase="out of memory"                      # phrase that flags OOM runs
 crash_ignore_file=".sacrificial-space-for-logs" # file in /var/crash to ignore (don't flag on crash logs cuz of this)
 pkg_diff_max_lines=100                          # max amt of mismatched yum packages to list
@@ -192,11 +192,13 @@ print_xoa_status_section() {
     printf "Memory Usage: %s GB used of %s GB (%s%%)\n" "$(green_text "$used_gb")" "$(green_text "$total_gb")" "$(green_text "$used_pct")"
   fi
 
-  local dmesg_t="$(dmesg -T)"
-  check_dmesg_content "$dmesg_t"
+  local dmesg_t
+  dmesg_t="$(dmesg -T)"
 
-  if [[ -n "$DMESG_ISSUES_BLOCK" ]]; then
-    append_details "XOA" "Dmesg Issues" "$DMESG_ISSUES_BLOCK"
+  if ! check_dmesg_content "$dmesg_t"; then 
+    if [[ -n "$DMESG_ISSUES_BLOCK" ]]; then
+      append_details "XOA" "Dmesg Issues" "$DMESG_ISSUES_BLOCK"
+    fi
   fi
 
   echo ""
@@ -1535,9 +1537,7 @@ main() {
   local seed_host="$PARSED_HOST"
 
   ensure_sshpass
-
-  print_xoa_status_section
-
+  
   local pass=""
   if [[ $# -eq 2 ]]; then
     pass="$2"
@@ -1561,6 +1561,8 @@ main() {
   get_pool_timesync "$pass"
   get_pool_host_memory "$pass"
   
+  print_xoa_status_section
+
   if (( POOL_MODE == 0 )); then
     if ! run_checks_for_host "$seed_host" "$pass" 1 ""; then overall_rc=1; fi
   else
