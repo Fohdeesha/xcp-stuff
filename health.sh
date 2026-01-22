@@ -225,8 +225,9 @@ get_first_host_from_xoa_db() {
   }
 
   # AWK-only parsing so no match is not an error with pipefail
-  xo-server-db ls server 2>/dev/null | \
-    awk -F"'" 'tolower($0) ~ /host:/ {print $2; exit}'
+  xo-server-db ls server 2>/dev/null | awk '/^\{/{e=0;h=""} /enabled:[[:space:]]*'\''true'\''/{e=1}
+     /host:/{match($0,/'\''[^'\'']+'\''/);h=substr($0,RSTART+1,RLENGTH-2)}
+     /^\}/{if(e){print h;exit}}'    
 }
 
 run_remote() {
