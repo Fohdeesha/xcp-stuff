@@ -66,6 +66,7 @@ POOL_HOST_IPS=()
 declare -A POOL_HOST_UUIDS=()
 declare -A POOL_HOSTS_MEM=()
 declare -A POOL_HOSTS_NTP=()
+SSHPASS_RC=0
 SSH_PORT=22
 PARSED_HOST=""
 ORIGINAL_ARGS=()
@@ -243,7 +244,10 @@ run_remote() {
     -o ConnectTimeout="$ssh_timeout" \
     -o BatchMode=no \
     root@"$host" \
-    "$cmd"
+    "$cmd" \
+	  2>&1
+
+  SSHPASS_RC=$?
 }
 
 get_remote_hostname() {
