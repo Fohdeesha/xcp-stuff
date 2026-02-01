@@ -165,7 +165,14 @@ print_xoa_status_section() {
   fi
 
   XOA_PLAN=$(xoa-updater raw-api-call getXoaPlan | awk 'NF>0 { gsub(/[^\x00-\x7F]/, ""); print $1 }')
-  printf "XOA Plan: %s\n" "$(green_text "${XOA_PLAN}")"
+  printf "XOA Plan: %s" "$(green_text "${XOA_PLAN}")"
+
+  out=$(xoa-updater raw-api-call getSelfLicenses | awk 'NF>0 { gsub(/[^\x00-\x7F]/, ""); print $1 }')
+  if [[ "$out" == "[]" ]]; then
+      printf " (%s)\n" "$(yellow_text "Unbound")"
+  else
+    printf " (%s)\n" "$(green_text "Bound")"
+  fi
 
   if [[ -z "${XOA_CURRENT:-}" ]]; then
     printf "XOA Status: %s\n" "$(yellow_text 'Updates available')"
