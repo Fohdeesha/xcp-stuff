@@ -356,7 +356,7 @@ get_pool_host_memory() {
 get_pool_missing_patches() {
   local pass="$1"
 
-  POOL_MISSING_PATCHES="$(run_remote "$DETECTED_MASTER_IP" "$pass" "sudo yum check-update -q | egrep -v \"Loaded plugins:.*|^$\" | wc -l")"
+  POOL_MISSING_PATCHES="$(run_remote "$DETECTED_MASTER_IP" "$pass" "sudo yum check-update -q | awk '/^Loaded plugins:/||NF==0{next} /^Obsoleting Packages/{exit} NF==1&&!/^[[:space:]]/{pkg=\$0;next} pkg&&/^[[:space:]]+/{sub(/^[[:space:]]+/,\"\");print pkg,\$0;pkg=\"\";next} {print}' | wc -l")"
 }
 
 # Pool RAM match
