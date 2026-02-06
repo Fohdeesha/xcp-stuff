@@ -1183,14 +1183,12 @@ check_xostor_controller() {
 
   local out ip
   out="$(run_remote "$host" "$pass" "linstor --controllers=${controllers_csv} c which 2>/dev/null || true")"
-  ip=$(echo "$out" | awk '!/^Error:/ 
-    {
-      if ($0 ~ /^linstor:\/\//) {
-        sub(/^linstor:\/\//, "")
-      }
-      print
-    }'
-  )
+  ip="$(echo "$out" | awk '!/^Error:/ {
+    if ($0 ~ /^linstor:\/\//) {
+      sub(/^linstor:\/\//, "")
+    }
+    print
+  }')"
 
   if [[ -z "${ip//[[:space:]]/}" ]]; then
     printf "XOSTOR Controller IP: %s\n" "$(yellow_text "None")"
