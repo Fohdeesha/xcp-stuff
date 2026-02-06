@@ -180,6 +180,14 @@ print_xoa_status_section() {
     printf "XOA Status: %s\n" "$(green_text 'Up to date')"
   fi
 
+  out=$(xoa check 2>&1 >/dev/null || true)
+  if [[ -z "${out//[[:space:]]/}" ]]; then
+    printf "XOA Check: %s\n" "$(green_text 'All OK')"
+  else
+    printf "XOA Check: %s\n" "$(yellow_text 'Issues Found, See Output Below')"
+    append_details "XOA" "XOA Check Issues" "$out"
+  fi
+
   printf "OS Version: %s\n" "$(green_text "${XOA_DEBIAN}")"
 
  local XOA_TOTAL_MEM XOA_AVAIL_MEM
