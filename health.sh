@@ -251,18 +251,30 @@ run_remote() {
   local pass="$2"
   local cmd="$3"
 
-  sshpass -p "$pass" ssh \
-    -p "$SSH_PORT" \
-    -o StrictHostKeyChecking=no \
-    -o UserKnownHostsFile=/dev/null \
-    -o LogLevel=ERROR \
-    -o ConnectTimeout="$ssh_timeout" \
-    -o BatchMode=no \
-    root@"$host" \
-    "$cmd" \
-	  2>&1
+  local output
+  local rc
 
-  SSHPASS_RC=$?
+  output=$(
+    sshpass -p "$pass" ssh \
+      -p "$SSH_PORT" \
+      -o StrictHostKeyChecking=no \
+      -o UserKnownHostsFile=/dev/null \
+      -o LogLevel=ERROR \
+      -o ConnectTimeout="$ssh_timeout" \
+      -o BatchMode=no \
+      root@"$host" \
+      "$cmd" \
+      2>&1
+  )
+  rc=$?
+
+  if (( rc != 0 )); then
+    echo "SSH failed on host $host (exit code $rc)" >&2
+    echo "$output" >&2
+    return "$rc"
+  fi
+
+  echo "$output"
 }
 
 get_remote_hostname() {
