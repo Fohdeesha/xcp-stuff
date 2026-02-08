@@ -63,6 +63,8 @@ DETAILS_OUTPUT=""
 POOLDETAILS_OUTPUT=""
 POOLCONF_SUMMARY=""
 POOL_HOST_IPS=()
+POOL_HOST_NOACCESS_IPS=()
+POOL_HOST_ACCESS_IPS=()
 declare -A POOL_HOST_UUIDS=()
 declare -A POOL_HOSTS_MEM=()
 declare -A POOL_HOSTS_NTP=()
@@ -313,6 +315,31 @@ get_pool_uuid() {
   fi
 
   return $rc
+}
+
+check_pool_hosts_access() {
+  local pass="$1"
+
+  POOL_HOST_NOACCESS_IPS=()
+  POOL_HOST_ACCESS_IPS=()
+
+  local ip
+  for ip in "${POOL_HOST_IPS[@]}"; do
+    if ! run_remote "$ip" "$pass" "echo SSH_OK 2>/dev/null || true" | grep -q "SSH_OK"; then
+      POOL_HOST_NOACCESS_IPS+=("$ip")
+    else
+      POOL_HOST_ACCESS_IPS+=("$ip")
+    fi
+  done
+
+  if (( ${#POOL_HOST_NOACCESS_IPS[@]} > 0 )); then
+    local ips_str
+    # ips_str="$(printf "%s, " "${POOL_HOST_NOACCESS_IPS[@]}")"
+    # ips_str="${ips_str%, }"
+    ips_str="${POOL_HOST_NOACCESS_IPS[*]}"
+
+    echo "Warning: SSH access failed for the following pool hosts: $ips_str" >&2
+  fi
 }
 
 get_pool_host_addresses() {
