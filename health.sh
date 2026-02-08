@@ -389,7 +389,7 @@ get_pool_host_memory() {
   local pass="$1"
 
   local ip
-  for ip in "${POOL_HOST_IPS[@]}"; do
+  for ip in "${POOL_HOST_ACCESS_IPS[@]}"; do
 
     local mi rc cmd
     cmd="awk '
@@ -437,8 +437,9 @@ get_pool_host_memory() {
 get_pool_missing_patches() {
   local pass="$1"
 
-  local out rc
-  if out=$(run_remote "$DETECTED_MASTER_IP" "$pass" "sudo yum check-update -q | egrep -v \"Loaded plugins:.*|^$\" | wc -l"); then
+  local out rc cmd
+  cmd="sudo yum check-update -q | awk '/^Loaded plugins:/||NF==0{next} /^Obsoleting Packages/{exit} NF==1&&!/^[[:space:]]/{pkg=\$0;next} pkg&&/^[[:space:]]+/{sub(/^[[:space:]]+/,\"\");print pkg,\$0;pkg=\"\";next} {print}' | wc -l"
+  if out=$(run_remote "$DETECTED_MASTER_IP" "$pass" "$cmd"); then
     rc=0
     POOL_MISSING_PATCHES=$out
   else
@@ -461,7 +462,7 @@ compute_pool_ram_match() {
   local -a all_ips=()
   all_ips+=("$seed_host")
   local ip
-  for ip in "${POOL_HOST_IPS[@]}"; do
+  for ip in "${POOL_HOST_ACCESS_IPS[@]}"; do
     [[ "$ip" == "$seed_host" ]] && continue
     all_ips+=("$ip")
   done
@@ -501,7 +502,7 @@ detect_pool_master_by_poolconf() {
   DETECTED_MASTER_HOSTNAME=""
 
   local ip
-  for ip in "${POOL_HOST_IPS[@]}"; do
+  for ip in "${POOL_HOST_ACCESS_IPS[@]}"; do
     local pc
     if pc=$(run_remote "$ip" "$pass" "cat /etc/xensource/pool.conf 2>/dev/null | tr -d '\r' | head -n 1 | awk '{\$1=\$1;print}'"); then
 
@@ -697,7 +698,7 @@ get_pool_timesync() {
 
   # check each host's time sync status
   local ip out utc ntp sync uuid unix_time time_diff rc
-  for ip in "${POOL_HOST_IPS[@]}"; do
+  for ip in "${POOL_HOST_ACCESS_IPS[@]}"; do
     if out=$(run_remote "$ip" "$pass" "timedatectl"); then
       rc=0
     else
@@ -1533,7 +1534,7 @@ print_pool_status_section() {
   if (( MASTER_XOSTOR_IN_USE == 1 )); then
     # Build comma-separated list of controllers for LINSTOR cmds
     local IFS=,
-    local controllers_csv="${POOL_HOST_IPS[*]}"
+    local controllers_csv="${POOL_HOST_ACCESS_IPS[*]}"
     unset IFS
     check_xostor_faulty_resources "$DETECTED_MASTER_IP" "$pass" "$controllers_csv" || true
     check_xostor_nodes "$DETECTED_MASTER_IP" "$pass" "$controllers_csv" || true
@@ -1781,13 +1782,14 @@ main() {
     fi
   fi
 
-  POOL_HOST_IPS=()
   get_pool_host_addresses "$seed_host" "$pass"
 
   if (( ${#POOL_HOST_IPS[@]} == 0 )); then
     echo "ERROR: Could not retrieve pool host addresses from '$seed_host'." >&2
     exit 1
   fi
+
+  check_pool_hosts_access "$pass"
 
   local overall_rc=0
   get_pool_timesync "$pass"
@@ -1815,7 +1817,7 @@ main() {
     if ! run_checks_for_host "$DETECTED_MASTER_IP" "$pass" 1 ""; then overall_rc=1; fi
 
     local ip
-    for ip in "${POOL_HOST_IPS[@]}"; do
+    for ip in "${POOL_HOST_ACCESS_IPS[@]}"; do
       [[ "$ip" == "$DETECTED_MASTER_IP" ]] && continue
       if ! run_checks_for_host "$ip" "$pass" 0 ""; then overall_rc=1; fi
     done
