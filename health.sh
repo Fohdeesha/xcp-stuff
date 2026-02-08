@@ -545,10 +545,13 @@ get_rpm_manifest_remote() {
 
   local out rc
   if out=$(run_remote "$host" "$pass" "bash -lc \"$(rpm_manifest_cmd)\""); then
+    echo "$out"
     rc=0
   else
     rc=$?
   fi
+
+  return "$rc"
 }
 
 get_rpm_manifest_hash_remote() {
@@ -557,10 +560,13 @@ get_rpm_manifest_hash_remote() {
 
   local out rc
   if out=$(run_remote "$host" "$pass" "bash -lc \"$(rpm_manifest_cmd) | (command -v sha256sum >/dev/null 2>&1 && sha256sum || md5sum) | cut -d' ' -f1\""); then
+    echo $out
     rc=0
   else
     rc=$?
   fi
+
+  return "$rc"
 }
 
 build_context_block() {
