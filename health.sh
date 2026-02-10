@@ -241,10 +241,24 @@ get_first_host_from_xoa_db() {
     return 1
   }
 
-  # AWK-only parsing so no match is not an error with pipefail
-  xo-server-db ls server 2>/dev/null | awk '/^\{/{e=0;h=""} /enabled:[[:space:]]*'\''true'\''/{e=1}
-     /host:/{match($0,/'\''[^'\'']+'\''/);h=substr($0,RSTART+1,RLENGTH-2)}
-     /^\}/{if(e){print h;exit}}'
+  xo-server-db ls server 2>/dev/null | node -e "
+    const fs = require(\"fs\");
+
+    const input = fs.readFileSync(0, \"utf8\");
+
+    // split into object blocks
+    const blocks = input.match(/\{[\s\S]*?\}/g) || [];
+
+    for (const block of blocks) {
+      // turn JS object literal into a real object
+      const obj = Function('\"use strict\"; return (' + block + ')')();
+      if (obj.enabled === \"true\" && obj.host) {
+        console.log(obj.host);
+        break;
+      }
+    }
+    "
+
 }
 
 run_remote() {
