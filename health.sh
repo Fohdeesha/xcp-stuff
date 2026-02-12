@@ -244,7 +244,8 @@ get_first_host_from_xoa_db() {
   xo-server-db ls server 2>/dev/null | node -e "
     const fs = require(\"fs\");
 
-    const input = fs.readFileSync(0, \"utf8\");
+    const input = fs.readFileSync(0, \"utf8\")
+      .replace(/^\s*error:\s*'.*',?\s*$/gm, \"\");
 
     // split into object blocks
     const blocks = input.match(/\{[\s\S]*?\}/g) || [];
@@ -442,9 +443,9 @@ get_pool_host_memory() {
     
     local uuid="${POOL_HOST_UUIDS[$ip]}"
 
-    POOL_HOSTS_MEM[${uuid}_total]=$total_mb
-    POOL_HOSTS_MEM[${uuid}_used]=$used_mb
-    POOL_HOSTS_MEM[${uuid}_avail]=$avail_mb
+    POOL_HOSTS_MEM[$uuid"_total"]=$total_mb
+    POOL_HOSTS_MEM[$uuid"_used"]=$used_mb
+    POOL_HOSTS_MEM[$uuid"_avail"]=$avail_mb
   done 
 }
 
@@ -484,7 +485,7 @@ compute_pool_ram_match() {
   for ip in "${all_ips[@]}"; do
     local gb total_mb uuid
     uuid="${POOL_HOST_UUIDS[$ip]}"
-    total_mb="${POOL_HOSTS_MEM[${uuid}_total]:-0}"
+    total_mb="${POOL_HOSTS_MEM[{$uuid}_total]:-0}"
     gb="$(awk -v m="$total_mb" 'BEGIN{printf "%d", m/1024+.5}')"
 
     if [[ -z "$gb" || ! "$gb" =~ ^[0-9]+$ ]]; then
@@ -539,9 +540,9 @@ load_mem_stats() {
   local uuid="${POOL_HOST_UUIDS[$host]}"
 
   local total_mb used_mb avail_mb
-  total_mb="${POOL_HOSTS_MEM[${uuid}_total]:-0}"
-  used_mb="${POOL_HOSTS_MEM[${uuid}_used]:-0}"
-  avail_mb="${POOL_HOSTS_MEM[${uuid}_avail]:-0}"
+  total_mb="${POOL_HOSTS_MEM[{$uuid}_total]:-0}"
+  used_mb="${POOL_HOSTS_MEM[{$uuid}_used]:-0}"
+  avail_mb="${POOL_HOSTS_MEM[{$uuid}_avail]:-0}"
 
   MEM_TOTAL_GB="$(awk -v m="$total_mb" 'BEGIN{printf "%.1f", m/1024}')"
   MEM_USED_PCT="$(awk -v u="$used_mb" -v t="$total_mb" 'BEGIN{ if (t<=0) printf "0.0"; else printf "%.1f", (u/t)*100 }')"
@@ -692,8 +693,8 @@ check_host_timesync() {
   
   local uuid ntp sync utc
   uuid="${POOL_HOST_UUIDS[$ip]}"
-  ntp="${POOL_HOSTS_NTP[${uuid}_ntp]:-Unknown}"
-  sync="${POOL_HOSTS_NTP[${uuid}_sync]:-Unknown}"
+  ntp="${POOL_HOSTS_NTP[{$uuid}_ntp]:-Unknown}"
+  sync="${POOL_HOSTS_NTP[{$uuid}_sync]:-Unknown}"
 
   if [[ "$ntp" != "yes" || "$sync" != "yes" || "$FILTER_OUTPUT" -eq 0 ]]; then
     if [[ "$ntp" != "yes" ]]; then
