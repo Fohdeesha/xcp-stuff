@@ -244,7 +244,8 @@ get_first_host_from_xoa_db() {
   xo-server-db ls server 2>/dev/null | node -e "
     const fs = require(\"fs\");
 
-    const input = fs.readFileSync(0, \"utf8\");
+    const input = fs.readFileSync(0, \"utf8\")
+      .replace(/^\s*error:\s*'.*',?\s*$/gm, \"\");
 
     // split into object blocks
     const blocks = input.match(/\{[\s\S]*?\}/g) || [];
