@@ -83,6 +83,7 @@ MASTER_POOL_UUID=""
 MEM_TOTAL_GB="0.0"
 MEM_USED_PCT="0.0"
 MEM_AVAIL_GB="0.0"
+PW_NOTIFY=0                         # flag to indicate we should print a warning about backslash in password
 
 usage() {
   echo "Usage:"
@@ -229,10 +230,23 @@ get_password_from_xoa_db_simple() {
     return 1
   }
 
-  # AWK-only parsing so no match is not an error with pipefail
   xo-server-db ls server "host=$host_only" 2>/dev/null | \
-    awk -F"'" 'tolower($0) ~ /password:/ {print $2; exit}'
+    awk -F"'" '
+      tolower($0) ~ /password:/ {
+        pwd = $2
+        if (pwd ~ /\\\\/) {
+          gsub(/\\\\/, "PLACEHOLDER", pwd)
+          gsub(/\\/, "", pwd)
+          gsub(/PLACEHOLDER/, "\\\\", pwd)
+          print pwd
+          exit 2   # flag: password had backslashes
+        }
+        print pwd
+        exit 0
+      }
+    '
 }
+
 
 get_first_host_from_xoa_db() {
 
@@ -1547,6 +1561,10 @@ print_pool_status_section() {
     printf "Missing Patches: %s\n" "$(yellow_text "${POOL_MISSING_PATCHES}")"
   fi
 
+  if (( PW_NOTIFY == 1 )); then
+    printf "Root Password: %s\n" "$(yellow_text 'Contains Backslash')"
+  fi
+
   load_mem_stats "$DETECTED_MASTER_IP"
   check_xostor_in_use_and_ram "$DETECTED_MASTER_IP" "$pass" || true
   MASTER_XOSTOR_IN_USE=$(( XOSTOR_IN_USE ))
@@ -1793,10 +1811,21 @@ main() {
   ensure_sshpass
   
   local pass=""
+  local rc
+
   if [[ $# -eq 2 ]]; then
     pass="$2"
   else
-    pass="$(get_password_from_xoa_db_simple "$seed_host" || true)"
+	  if pass="$(get_password_from_xoa_db_simple "$seed_host")"; then
+      rc=0
+    else
+		  rc=$?
+
+      if [[ $rc -eq 2 ]]; then
+        PW_NOTIFY=1
+      fi
+    fi
+
     if [[ -z "$pass" ]]; then
       echo "Host IP not found in xo-db, please manually provide a password, or check that the IP is the master host and not a slave"
       exit 1
