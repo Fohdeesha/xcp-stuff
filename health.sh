@@ -470,7 +470,13 @@ get_pool_missing_patches() {
   cmd="sudo yum check-update -q | awk '/^Loaded plugins:/||NF==0{next} /^Obsoleting Packages/{exit} NF==1&&!/^[[:space:]]/{pkg=\$0;next} pkg&&/^[[:space:]]+/{sub(/^[[:space:]]+/,\"\");print pkg,\$0;pkg=\"\";next} {print}' | wc -l"
   if out=$(run_remote "$DETECTED_MASTER_IP" "$pass" "$cmd"); then
     rc=0
-    POOL_MISSING_PATCHES=$out
+
+    if [[ -z "$out" || ! "$out" =~ ^[0-9]+$ ]]; then
+      POOL_MISSING_PATCHES=-1
+    else
+      POOL_MISSING_PATCHES=$out
+    fi
+
   else
     rc=$?
     POOL_MISSING_PATCHES=0
@@ -1558,7 +1564,7 @@ print_pool_status_section() {
   if (( POOL_MISSING_PATCHES == 0 )); then
     printf "Missing Patches: %s\n" "$(green_text "${POOL_MISSING_PATCHES}")"
   else
-    printf "Missing Patches: %s\n" "$(yellow_text "${POOL_MISSING_PATCHES}")"
+    printf "Missing Patches: %s\n" "$(yellow_text "${POOL_MISSING_PATCHES/-1/Unknown}")"
   fi
 
   if (( PW_NOTIFY == 1 )); then
