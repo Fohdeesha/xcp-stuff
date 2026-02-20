@@ -68,7 +68,7 @@ POOL_HOST_ACCESS_IPS=()
 declare -A POOL_HOST_UUIDS=()
 declare -A POOL_HOSTS_MEM=()
 declare -A POOL_HOSTS_NTP=()
-declare -A POOL_HOSTS_ENABLED=()
+declare -A POOL_HOSTS_STATUS=()
 SSH_PORT=22
 PARSED_HOST=""
 ORIGINAL_ARGS=()
@@ -378,13 +378,13 @@ get_pool_host_details() {
 
   # Ask for multiple fields; don't rely on ordering cuz it seems random ?
   local out rc
-  if out=$(run_remote "$host" "$pass" "xe host-list params=uuid,address,enabled 2>/dev/null"); then
+  if out=$(run_remote "$host" "$pass" "xe host-list params=uuid,address,enabled,multipathing 2>/dev/null"); then
     rc=0
     out=$(tr -d '\r' <<<"$out")
   
     POOL_HOST_IPS=()
     POOL_HOST_UUIDS=()
-    POOL_HOSTS_ENABLED=()
+    POOL_HOSTS_STATUS=()
 
     eval "$(
       printf '%s\n' "$out"  | awk '
@@ -408,11 +408,17 @@ get_pool_host_details() {
           en[idx] = a[2]
       }
 
+      /^[[:space:]]*multipathing[[:space:]]*\(/ {
+          split($0, a, /: /)
+          mp[idx] = a[2]
+      }
+
       END {
         for (i = 0; i <= idx; i++) {
           printf "POOL_HOST_UUIDS[\"%s\"]=\"%s\"\n", addr[i], uuid[i]
           printf "POOL_HOST_IPS+=(\"%s\")\n", addr[i]
-          printf "POOL_HOSTS_ENABLED[\"%s\"]=\"%s\"\n", addr[i], en[i]
+          printf "POOL_HOSTS_STATUS[\"%s_enabled\"]=\"%s\"\n", uuid[i], en[i]
+          printf "POOL_HOSTS_STATUS[\"%s_multipath\"]=\"%s\"\n", uuid[i], mp[i]
         }
       }
       '
@@ -722,13 +728,30 @@ check_uptime() {
 check_enabled() {
   local ip="$1"
 
-  local enabled 
-  enabled="${POOL_HOSTS_ENABLED[${ip}]:-Unknown}"
+  local uuid enabled
+  uuid="${POOL_HOST_UUIDS[$ip]}"
+  enabled="${POOL_HOSTS_STATUS[${uuid}_enabled]:-Unknown}"
 
   if [[ "$enabled" == "true" ]]; then
     printf "Host Enabled: %s\n" "$(green_text "$enabled")"
   else
     printf "Host Enabled: %s\n" "$(yellow_text "$enabled")"
+  fi
+
+  return 0
+}
+
+check_multipath() {
+  local ip="$1"
+
+  local uuid mp
+  uuid="${POOL_HOST_UUIDS[$ip]}"
+  mp="${POOL_HOSTS_STATUS[${uuid}_multipath]:-Unknown}"
+
+  if [[ "$mp" == "Unknown" ]]; then
+    printf "Multipathing: %s\n" "$(yellow_text "$mp")"
+  else
+    printf "Multipathing: %s\n" "$(green_text "$mp")"
   fi
 
   return 0
@@ -1671,6 +1694,7 @@ run_checks_for_host() {
   check_xcpng_version "$ip" "$pass" || true
   check_uptime "$ip" "$pass"
   check_enabled "$ip"
+  check_multipath "$ip"
   check_host_timesync "$ip"
 
   local dmesg_t smlog rc
