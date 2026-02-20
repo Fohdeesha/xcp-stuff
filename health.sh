@@ -719,6 +719,21 @@ check_uptime() {
   return 0
 }
 
+check_enabled() {
+  local ip="$1"
+
+  local enabled 
+  enabled="${POOL_HOSTS_ENABLED[${ip}]:-Unknown}"
+
+  if [[ "$enabled" == "true" ]]; then
+    printf "Host Enabled: %s\n" "$(green_text "$enabled")"
+  else
+    printf "Host Enabled: %s\n" "$(yellow_text "$enabled")"
+  fi
+
+  return 0
+}
+
 check_host_timesync() {
   local ip="$1"
   
@@ -1655,6 +1670,7 @@ run_checks_for_host() {
 
   check_xcpng_version "$ip" "$pass" || true
   check_uptime "$ip" "$pass"
+  check_enabled "$ip"
   check_host_timesync "$ip"
 
   local dmesg_t smlog rc
