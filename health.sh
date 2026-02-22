@@ -1821,6 +1821,13 @@ fi
 main() {
   ORIGINAL_ARGS=("$@")
 
+  local debver
+  debver=$(cat /etc/os-release | awk -F '=' '/VERSION_ID=/ {print $2}' | tr -d '"')
+  if  [[ "$debver" -lt 11 ]]; then
+    echo "This script requires Debian 11 or later. Detected version: $debver" >&2
+    exit 1
+  fi
+
   VALID_ARGS=$(getopt -o fhs --long filter,help,single -- "$@")
   if [[ $? -ne 0 ]]; then
       exit 1;
