@@ -33,7 +33,7 @@ pool_run_silly_mtus=1
 pool_run_dns_gw_non_mgmt_pifs=1
 pool_run_overlapping_subnets=1
 pool_run_smapi_exceptions=1
-pool_run_smapi_hidden_leaves=1
+pool_run_smapi_hidden_leaves=0
 pool_run_rebooted_after_updates=1
 pool_run_yum_patch_level=1
 pool_run_ha_enabled=0
@@ -51,7 +51,6 @@ ok()        { printf "%sOK%s"   "$GREEN" "$RESET"; }
 none()      { printf "%sNone%s" "$GREEN" "$RESET"; }
 fail()      { printf "%sFail%s" "$YELLOW" "$RESET"; }
 yes()       { printf "%sYes%s"  "$YELLOW" "$RESET"; }
-found()     { printf "%sFound:%s" "$YELLOW" "$RESET"; }
 green_text()  { printf "%s%s%s" "$GREEN" "$1" "$RESET"; }
 yellow_text() { printf "%s%s%s" "$YELLOW" "$1" "$RESET"; }
 cyan_text()   { printf "%s%s%s" "$CYAN" "$1" "$RESET"; }
@@ -1230,10 +1229,8 @@ check_smapi_hidden_leaves() {
     return 0
   fi
 
-  printf "SMAPI Hidden Leaves: %s\n" "$(found)"
-  while IFS= read -r line; do
-    [[ -n "$line" ]] && printf "  %s\n" "$line"
-  done <<< "$matches"
+  printf "SMAPI Hidden Leaves: %s\n" "$(yellow_text 'Yes, See Error Output')"
+  append_details "$hostlabel" "SMAPI Hidden Leaves" "$matches"
   return 1
 }
 
