@@ -208,6 +208,21 @@ print_xoa_status_section() {
     used_pct="$(awk -v t="$total_gb" -v u="$used_gb" 'BEGIN{ if (t<=0) printf "0.0"; else printf "%.1f", (u/t)*100 }')"
 
     printf "Memory Usage: %s GB used of %s GB (%s%%)\n" "$(green_text "$used_gb")" "$(green_text "$total_gb")" "$(green_text "$used_pct")"
+
+    local max_old_space
+    max_old_space=$(grep -oP '(?<=--max-old-space-size=)\d+' /etc/systemd/system/xo-server.service 2>/dev/null || true)
+
+    if [[ -z "$max_old_space" ]]; then
+      printf "XO-Server Memory Limit: %s\n" "$(yellow_text 'Not Set')"
+    else
+      local adjtotal_mb
+      adjtotal_mb="$(awk -v m="$XOA_TOTAL_MEM" 'BEGIN{printf "%.0f", m/1024-500}')"
+      if [[ "$max_old_space" -lt "$adjtotal_mb" ]]; then
+        printf "XO-Server Memory Limit: %s\n" "$(yellow_text "${max_old_space}")"
+      else
+        printf "XO-Server Memory Limit: %s\n" "$(green_text "$max_old_space")"
+      fi
+    fi
   fi
 
   local dmesg_t
