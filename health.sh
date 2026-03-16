@@ -228,7 +228,7 @@ print_xoa_status_section() {
   local dmesg_t
   dmesg_t="$(dmesg -T)"
 
-  if ! check_dmesg_content "$dmesg_t"; then 
+  if ! check_dmesg_content "$dmesg_t"; then
     if [[ -n "$DMESG_ISSUES_BLOCK" ]]; then
       append_details "XOA" "Dmesg Issues" "$DMESG_ISSUES_BLOCK"
     fi
@@ -245,21 +245,54 @@ get_password_from_xoa_db_simple() {
     return 1
   }
 
-  xo-server-db ls server "host=$host_only" 2>/dev/null | \
-    awk -F"'" '
-      tolower($0) ~ /password:/ {
-        pwd = $2
-        if (pwd ~ /\\\\/) {
-          gsub(/\\\\/, "PLACEHOLDER", pwd)
-          gsub(/\\/, "", pwd)
-          gsub(/PLACEHOLDER/, "\\\\", pwd)
-          print pwd
-          exit 2   # flag: password had backslashes
-        }
-        print pwd
-        exit 0
+  xo-server-db ls server "host=$host_only" 2>/dev/null |
+  awk '
+  BEGIN { IGNORECASE=1 }
+
+  /password:/ {
+
+      if (!match($0, /password:[[:space:]]*["\047]/))
+          next
+
+      q = substr($0, RSTART+RLENGTH-1, 1)
+      s = substr($0, RSTART+RLENGTH)
+
+      pwd=""
+      esc=0
+
+      for (i=1;i<=length(s);i++) {
+          c = substr(s,i,1)
+
+          if (esc) {
+              pwd = pwd c
+              esc=0
+              continue
+          }
+
+          if (c=="\\") {
+              pwd = pwd c
+              esc=1
+              continue
+          }
+
+          if (c==q)
+              break
+
+          pwd = pwd c
       }
-    '
+
+      if (pwd ~ /\\\\/) {
+          gsub(/\\\\/,"PLACEHOLDER",pwd)
+          gsub(/\\/,"",pwd)
+          gsub(/PLACEHOLDER/,"\\\\",pwd)
+          print pwd
+          exit 2
+      }
+
+      print pwd
+      exit 0
+  }
+  '
 }
 
 
@@ -333,7 +366,7 @@ get_remote_hostname() {
   else
     rc=$?
     echo "SSH failed when trying to get hostname from $host (exit code $rc)" >&2
-  fi    
+  fi
 
   return $rc
 }
@@ -395,7 +428,7 @@ get_pool_host_details() {
   if out=$(run_remote "$host" "$pass" "xe host-list params=uuid,address,enabled,multipathing 2>/dev/null"); then
     rc=0
     out=$(tr -d '\r' <<<"$out")
-  
+
     POOL_HOST_IPS=()
     POOL_HOST_UUIDS=()
     POOL_HOSTS_STATUS=()
@@ -459,7 +492,7 @@ get_pool_host_memory() {
         if (t==0) {print \"0 0\"; exit}
         printf \"%d %d\", int(t/1024), int(a/1024)
       }' /proc/meminfo"
-      
+
     if mi=$(run_remote "$ip" "$pass" "$cmd"); then
       rc=0
       mi=$(tr -d '\r' <<< "$mi")
@@ -485,13 +518,13 @@ get_pool_host_memory() {
     else
       total_mb=0; used_mb=0; avail_mb=0
     fi
-    
+
     local uuid="${POOL_HOST_UUIDS[$ip]}"
 
     POOL_HOSTS_MEM[${uuid}_total]=$total_mb
     POOL_HOSTS_MEM[${uuid}_used]=$used_mb
     POOL_HOSTS_MEM[${uuid}_avail]=$avail_mb
-  done 
+  done
 }
 
 get_pool_missing_patches() {
@@ -513,7 +546,7 @@ get_pool_missing_patches() {
     POOL_MISSING_PATCHES=0
   fi
 
-  return  
+  return
 }
 
 # Pool RAM match
@@ -773,7 +806,7 @@ check_multipath() {
 
 check_host_timesync() {
   local ip="$1"
-  
+
   local uuid ntp sync utc
   uuid="${POOL_HOST_UUIDS[$ip]}"
   ntp="${POOL_HOSTS_NTP[${uuid}_ntp]:-Unknown}"
@@ -838,7 +871,7 @@ get_pool_timesync() {
         POOL_NTP_MATCH=0
       fi
     fi
-  done 
+  done
 }
 
 check_dom0_disk_usage() {
@@ -853,7 +886,7 @@ check_dom0_disk_usage() {
     echo "SSH failed when trying to get disk usage from $host (exit code $rc)" >&2
     return "$rc"
   fi
-  
+
   local -a bad=()
   while read -r fs size used avail usep mnt; do
     [[ "$fs" == "Filesystem" ]] && continue
@@ -1093,8 +1126,8 @@ check_dns_gw_non_mgmt_pifs() {
     echo "SSH failed when trying to check DNS/GW on non-mgmt PIFs on $host (exit code $rc)" >&2
     return "$rc"
   fi
-  
-  # Check if ANY gateway or DNS line has a non-empty value 
+
+  # Check if ANY gateway or DNS line has a non-empty value
   local found
   found="$(
     awk '
@@ -1261,7 +1294,7 @@ check_ha_enabled() {
     echo "SSH failed when trying to check HA status on $host (exit code $rc)" >&2
     return "$rc"
   fi
-  
+
   # Match on "true" or "false" anywhere in the output
   if [[ "$out" =~ false ]]; then
     [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "HA Enabled: %s\n" "$(green_text 'No')"
@@ -1350,7 +1383,7 @@ check_xostor_in_use_and_ram() {
     echo "SSH failed when trying to check XOSTOR usage on $host (exit code $rc)" >&2
     return "$rc"
   fi
-  
+
   if [[ -z "${out//[[:space:]]/}" ]]; then
     [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "XOSTOR In Use: %s\n" "$(green_text 'No')"
     return 0
@@ -1388,7 +1421,7 @@ check_xostor_nodes() {
   local node_not_online
 
   node_not_online="$(
-      printf '%s\n' "$out" | 
+      printf '%s\n' "$out" |
       awk -F '\\|' '
       # Skip borders and separators
       /^[+]/ || /^\|=/ { next }
@@ -1441,7 +1474,7 @@ check_xostor_faulty_resources() {
     echo "SSH failed when trying to check XOSTOR faulty resources on $host (exit code $rc)" >&2
     return "$rc"
   fi
-  
+
   local has_rows
   has_rows="$(
     awk '
@@ -1609,7 +1642,7 @@ print_pool_status_section() {
   else
     printf "Dom0 RAM Allocations: %s\n" "$(yellow_text 'Mismatched')"
   fi
-  
+
   if (( POOL_NTP_MATCH == 1 )); then
     [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Pool Time Synchronization: %s\n" "$(green_text 'Matched')"
   else
@@ -1663,7 +1696,7 @@ get_host_uuid_by_address() {
     echo "SSH failed when trying to get host UUIDs on $host (exit code $rc)" >&2
     return "$rc"
   fi
-  
+
   echo "$out" |
     awk -v want="$ip" -F': ' '
         function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); return s }
@@ -1684,7 +1717,7 @@ get_host_uuid_by_address() {
 run_checks_for_host() {
   local ip="$1"
   local pass="$2"
-  local is_master="$3"             
+  local is_master="$3"
   local controllers_csv="$4"       # optional: for XOSTOR checks
 
   local hn
@@ -1863,8 +1896,8 @@ main() {
           POOL_MODE=0
           shift
           ;;
-      --) shift; 
-          break 
+      --) shift;
+          break
           ;;
     esac
   done
@@ -1878,14 +1911,14 @@ main() {
         echo "No host IP provided and no hosts found in xo-db, please provide a host IP as an argument"
         exit 1
       fi
-      set -- "$first_host"    
+      set -- "$first_host"
   fi
 
   parse_target_host_and_port "$1"
   local seed_host="$PARSED_HOST"
 
   ensure_sshpass
-  
+
   local pass=""
   local rc
 
@@ -1920,7 +1953,7 @@ main() {
   local overall_rc=0
   get_pool_timesync "$pass"
   get_pool_host_memory "$pass"
-  
+
   print_xoa_status_section
 
   if (( POOL_MODE == 0 )); then
