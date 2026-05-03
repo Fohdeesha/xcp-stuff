@@ -1153,10 +1153,31 @@ check_dns_gw_non_mgmt_pifs() {
   return 0
 }
 
+check_vlan0_exist() {
+  local host="$1"
+  local pass="$2"
+  local host_uuid="$3"
 
+  local out rc
+  if out=$(run_remote "$host" "$pass" "xe pif-list params=VLAN host-uuid=$host_uuid 2>/dev/null || true" | tr -d '\r'); then
+    rc=0
+  else
+    rc=$?
+    echo "SSH failed when trying to check for VLAN PIFs on $host (exit code $rc)" >&2
+    return "$rc"
+  fi
 
+  local found
+  found=$(awk -F': ' '/VLAN/{ if ($2 == "0") { print "found"; exit } }' <<< "$out")
 
+  if [[ -n "$found" ]]; then
+    printf "VLAN 0 Check: %s\n" "$(yellow_text 'Yes')"
+    return 1
+  fi
 
+  [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "VLAN 0 Check: %s\n" "$(green_text 'No')"
+  return 0
+}
 
 # this is ipv4 only currently and will probably explode if fed v6
 check_overlapping_subnets() {
@@ -1669,7 +1690,6 @@ print_pool_status_section() {
   check_xostor_in_use_and_ram "$DETECTED_MASTER_IP" "$pass" || true
   MASTER_XOSTOR_IN_USE=$(( XOSTOR_IN_USE ))
 
-
   if (( MASTER_XOSTOR_IN_USE == 1 )); then
     # Build comma-separated list of controllers for LINSTOR cmds
     local IFS=,
@@ -1679,6 +1699,9 @@ print_pool_status_section() {
     check_xostor_nodes "$DETECTED_MASTER_IP" "$pass" "$controllers_csv" || true
     check_xostor_controller "$DETECTED_MASTER_IP" "$pass" "$controllers_csv" || true
   fi
+
+  local host_uuid="${POOL_HOST_UUIDS[$DETECTED_MASTER_IP]}"
+  check_vlan0_exist "$DETECTED_MASTER_IP" "$pass" "$host_uuid" || true
 
   echo
 }
@@ -1711,8 +1734,6 @@ get_host_uuid_by_address() {
         }
       ' | tr -d '\r' | head -n 1
 }
-
-
 
 run_checks_for_host() {
   local ip="$1"
