@@ -1179,6 +1179,60 @@ check_vlan0_exist() {
   return 0
 }
 
+check_migration_network() {
+  local host="$1"
+  local pass="$2"
+
+  local out rc
+  if out=$(run_remote "$host" "$pass" "xe pool-param-get uuid=${MASTER_POOL_UUID} param-name=other-config param-key=xo:migrationNetwork 2>/dev/null || true"); then
+    rc=0
+  else
+    rc=$?
+    echo "SSH failed when trying to check migration network on $host (exit code $rc)" >&2
+    return "$rc"
+  fi
+
+ if [[ -z "${out//[[:space:]]/}" ]]; then
+    printf "Migration Network: %s\n" "$(green_text 'Not configured')"
+  else
+    local network_uuid=$out
+
+    if check_is_bond_member "$host" "$pass" "$network_uuid"; then
+      # if this network is set to be a bond member, that's a problem for migration traffic
+      printf "Migration Network: %s\n" "$(yellow_text 'Set to bond member')"
+      rc=1
+    else
+      printf "Migration Network: %s\n" "$(green_text 'Configured')"
+      rc=0
+    fi
+  fi
+
+  return 0
+}
+
+
+check_is_bond_member() {
+  local host="$1"
+  local pass="$2"
+  local network_uuid="$3"
+
+  local out
+  if ! out=$(run_remote "$host" "$pass" "xe pif-list network-uuid=${network_uuid} params=uuid,device,bond-master-of,bond-slave-of 2>/dev/null || true"); then
+    echo "SSH failed when trying to check for bond members on $host" >&2
+    return 1
+  fi
+
+  # Check if any bond-master-of or bond-slave-of has a non-empty, non-database value
+  awk -F': ' '
+    /bond-master-of|bond-slave-of/ {
+      val=$2
+      gsub(/^[ \t]+|[ \t]+$/, "", val)
+      if (val != "" && val != "<not in database>") { found=1 }
+    }
+    END { exit !found }
+  ' <<< "$out"
+}
+
 # this is ipv4 only currently and will probably explode if fed v6
 check_overlapping_subnets() {
   local host="$1"
@@ -1702,7 +1756,7 @@ print_pool_status_section() {
 
   local host_uuid="${POOL_HOST_UUIDS[$DETECTED_MASTER_IP]}"
   check_vlan0_exist "$DETECTED_MASTER_IP" "$pass" "$host_uuid" || true
-
+  check_migration_network "$DETECTED_MASTER_IP" "$pass" || true
   echo
 }
 
