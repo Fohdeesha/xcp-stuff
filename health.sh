@@ -1210,6 +1210,36 @@ check_migration_network() {
   return 0
 }
 
+check_backup_network() {
+  local host="$1"
+  local pass="$2"
+
+  local out rc
+  if out=$(run_remote "$host" "$pass" "xe pool-param-get uuid=${MASTER_POOL_UUID} param-name=other-config param-key=xo:backupNetwork 2>/dev/null || true"); then
+    rc=0
+  else
+    rc=$?
+    echo "SSH failed when trying to check backup network on $host (exit code $rc)" >&2
+    return "$rc"
+  fi
+
+ if [[ -z "${out//[[:space:]]/}" ]]; then
+    printf "Backup Network: %s\n" "$(green_text 'Not configured')"
+  else
+    local network_uuid=$out
+
+    if check_is_bond_member "$host" "$pass" "$network_uuid"; then
+      # if this network is set to be a bond member, that's a problem for backup traffic
+      printf "Backup Network: %s\n" "$(yellow_text 'Set to bond member')"
+      rc=1
+    else
+      printf "Backup Network: %s\n" "$(green_text 'Configured')"
+      rc=0
+    fi
+  fi
+
+  return 0
+}
 
 check_is_bond_member() {
   local host="$1"
@@ -1757,6 +1787,7 @@ print_pool_status_section() {
   local host_uuid="${POOL_HOST_UUIDS[$DETECTED_MASTER_IP]}"
   check_vlan0_exist "$DETECTED_MASTER_IP" "$pass" "$host_uuid" || true
   check_migration_network "$DETECTED_MASTER_IP" "$pass" || true
+  check_backup_network "$DETECTED_MASTER_IP" "$pass" || true
   echo
 }
 
