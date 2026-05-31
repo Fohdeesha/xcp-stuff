@@ -1252,9 +1252,9 @@ check_is_bond_member() {
     return 1
   fi
 
-  # Check if any bond-master-of or bond-slave-of has a non-empty, non-database value
+  # Check if bond-slave-of has a non-empty, non-database value
   awk -F': ' '
-    /bond-master-of|bond-slave-of/ {
+    /bond-slave-of/ {
       val=$2
       gsub(/^[ \t]+|[ \t]+$/, "", val)
       if (val != "" && val != "<not in database>") { found=1 }
