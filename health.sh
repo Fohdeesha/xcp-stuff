@@ -136,7 +136,7 @@ ensure_sshpass() {
 
 print_xoa_status_section() {
   local out DMESG_ISSUES_BLOCK XOA_CHANNEL XOA_CURRENT XOA_DEBIAN
-  local XOA_PLAN XOA_REGIST
+  local XOA_PLAN XOA_REGIST XOA_VERSION
 
   out=$(xoa-updater raw-api-call isRegistered || true)
   XOA_REGIST=$(echo "$out" | awk -F"email: '" '{ if(NF>1){split($2,a,"'\'',"); print a[1]} }')
@@ -149,6 +149,8 @@ print_xoa_status_section() {
   /All up to date/   {print "XOA_CURRENT=1"}
   ' <<< "$out"
   )"
+
+  XOA_VERSION=$(xoa-updater raw-api-call getLocalManifest 2>&1 | awk -F"'" '$2=="xen-orchestra" {print $4}')
 
   XOA_DEBIAN=$(lsb_release -a 2>&1 | awk '/Description:/ { sub(/^Description:[[:space:]]*/, ""); print }')
 
@@ -164,6 +166,12 @@ print_xoa_status_section() {
     printf "XOA Channel: %s\n" "$(yellow_text '(Unknown)')"
   else
     printf "XOA Channel: %s\n" "$(green_text "${XOA_CHANNEL}")"
+  fi
+
+  if [[ -z "${XOA_VERSION:-}" ]]; then
+    printf "XOA Version: %s\n" "$(yellow_text 'Unknown')"
+  else
+    printf "XOA Version: %s\n" "$(green_text "${XOA_VERSION}")"
   fi
 
   XOA_PLAN=$(xoa-updater raw-api-call getXoaPlan | awk 'NF>0 { gsub(/[^\x00-\x7F]/, ""); print $1 }')
