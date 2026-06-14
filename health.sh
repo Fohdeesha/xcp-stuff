@@ -768,7 +768,7 @@ check_uptime() {
   local pass="$2"
 
   local up rc
-  if up=$(run_remote "$host" "$pass" "uptime -p 2>/dev/null || true" | tr -d '\r' | head -n 1); then
+  if up=$(run_remote "$host" "$pass" "uptime -s 2>/dev/null || true" | tr -d '\r' | head -n 1); then
     rc=0
   else
     rc=$?
@@ -776,7 +776,24 @@ check_uptime() {
   fi
 
   up="${up:-Unknown}"
-  printf "Uptime: %s\n" "$up"
+  printf "Last Booted:  %s\n" "$up"
+  return 0
+}
+
+check_lastpatched() {
+  local host="$1"
+  local pass="$2"
+
+  local last rc
+  if last=$(run_remote "$host" "$pass" "rpm -qa --last | head -n 1 2>/dev/null || true" | awk '{$1=""; sub(/^ /,""); print}' | xargs -I{} date -d "{}" '+%Y-%m-%d %H:%M:%S'); then
+    rc=0
+  else
+    rc=$?
+    echo "SSH failed when trying to get last patched info from $host (exit code $rc)" >&2
+  fi
+
+  last="${last:-Unknown}"
+  printf "Last Patched: %s\n" "$last"
   return 0
 }
 
@@ -1852,6 +1869,7 @@ run_checks_for_host() {
 
   check_xcpng_version "$ip" "$pass" || true
   check_uptime "$ip" "$pass"
+  check_lastpatched "$ip" "$pass"
   check_enabled "$ip"
   check_multipath "$ip"
   check_host_timesync "$ip"
