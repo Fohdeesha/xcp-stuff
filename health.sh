@@ -728,23 +728,34 @@ build_context_block() {
 }
 
 # the actual tests
-check_xcpng_version() {
+check_hyper_version() {
   local host="$1"
   local pass="$2"
 
-  local version rc
-  if version=$(run_remote "$host" "$pass" "grep '^VERSION=' /etc/os-release 2>/dev/null | cut -d'\"' -f2 || echo 'unknown'" | tr -d '\r' | head -n 1); then
+  local cmd out hyper version rc
+
+  cmd="awk -F= '
+    /^NAME=/ {gsub(/\"/, \"\", \$2); n=\$2}
+    /^VERSION=/ {gsub(/\"/, \"\", \$2); v=\$2}
+    END {
+      printf \"%s %s\", n, v
+    }' /etc/os-release"
+
+  if out=$(run_remote "$host" "$pass" "$cmd"); then
     rc=0
   else
     rc=$?
-    echo "SSH failed when trying to get XCP-ng version from $host (exit code $rc)" >&2
+    echo "SSH failed when trying to get hypervisor version from $host (exit code $rc)" >&2
     return
   fi
 
-  if [[ "$version" == "unknown" ]]; then
-    printf "XCP-ng Version: %s\n" "$(yellow_text 'Unknown')"
+  if [[ "$out" == "unknown" ]]; then
+    printf "Hypervisor Version: %s\n" "$(yellow_text 'Unknown')"
     return 1
   fi
+
+  hyper="$(awk '{print $1}' <<< "$out")"
+  version="$(awk '{print $2}' <<< "$out")"
 
   # Compare version: extract major.minor (eg 8.3 from 8.3.0)
   local major minor
@@ -754,12 +765,12 @@ check_xcpng_version() {
   # Check if version >= 8.3 (8.2 is no longer supported)
   if [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]]; then
     if (( major > 8 )) || (( major == 8 && minor >= 3 )); then
-      printf "XCP-ng Version: %s\n" "$(green_text "$version")"
+      printf "$hyper Version: %s\n" "$(green_text "$version")"
       return 0
     fi
   fi
 
-  printf "XCP-ng Version: %s\n" "$(yellow_text "$version")"
+  printf "$hyper Version: %s\n" "$(yellow_text "$version")"
   return 1
 }
 
@@ -909,13 +920,13 @@ check_dom0_disk_usage() {
   done <<< "$df_out"
 
   if (( ${#bad[@]} == 0 )); then
-    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "XCP-ng Dom0 Disk Usage: %s\n" "$(ok)"
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Dom0 Disk Usage: %s\n" "$(ok)"
     return 0
   else
     local msg
     msg="$(printf "%s, " "${bad[@]}")"
     msg="${msg%, }"
-    printf "XCP-ng Dom0 Disk Usage: %s - %s\n" "$(fail)" "$msg"
+    printf "Dom0 Disk Usage: %s - %s\n" "$(fail)" "$msg"
     return 1
   fi
 }
@@ -1847,10 +1858,10 @@ run_checks_for_host() {
       echo "$(cyan_text "$hn ($ip) Results:")"
     fi
   else
-    echo "$(cyan_text "== XCP-ng health check on: $hn ==")"
+    echo "$(cyan_text "== Health check on: $hn ==")"
   fi
 
-  check_xcpng_version "$ip" "$pass" || true
+  check_hyper_version "$ip" "$pass" || true
   check_uptime "$ip" "$pass"
   check_enabled "$ip"
   check_multipath "$ip"
