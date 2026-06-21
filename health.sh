@@ -795,8 +795,9 @@ check_lastpatched() {
   local host="$1"
   local pass="$2"
 
-  local last rc
-  if last=$(run_remote "$host" "$pass" "rpm -qa --last | head -n 1 2>/dev/null || true" | awk '{$1=""; sub(/^ /,""); print}' | xargs -I{} date -d "{}" '+%Y-%m-%d %H:%M:%S'); then
+  local out last rc
+  if out=$(run_remote "$host" "$pass" "rpm -qa --last | head -n 1 2>/dev/null || true"); then
+    last=$(echo "$out" | awk '{$1=""; sub(/^ /,""); print}' | sed -E '/ UTC[+-]/! s/ ([+-][0-9]{2}(:?[0-9]{2})?)$/ UTC\1/' | xargs -I{} date -d "{}" '+%Y-%m-%d %H:%M:%S')
     rc=0
   else
     rc=$?
