@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # J-Sands / Vates
-# V1.2
+# V2.0
 set -euo pipefail
 set +H 2>/dev/null || true   # make ! in args no explode
 
 # =========================
 # config
 # =========================
-ssh_timeout=45                                  # SSH timeout in secs
+ssh_timeout=45                                  # SSH connect timeout in secs
+remote_cmd_timeout=180                          # max secs a single remote command may run before being killed (hung xe etc)
 dom0_max_used=75                                # dom0 percent disk / storage use allowed before flagging as failed
 dom0_mem_used_max_pct=65                        # dom0 percent memory allowed in use before flagging as failed
-xostor_min_avail_gb=15                          # Minimum RAM dom0 should have if xostor is in use
+xostor_min_ram_gb=15                            # Minimum total RAM (GB) dom0 should have if xostor is in use
 mtu_dmesg_keywords="mtu large fragment"         # keywords in dom0 to flag MTU issues
 dmesg_issue_words="panic crash rip kill"        # words that trigger dmesg contents issues
 dmesg_issue_phrases="call trace|timed out"      # matches that trigger dmesg contents issues (whole phrase matched, pipe seperated)
@@ -36,15 +37,22 @@ pool_run_smapi_exceptions=1
 pool_run_smapi_hidden_leaves=0
 pool_run_rebooted_after_updates=1
 pool_run_yum_patch_level=1
-pool_run_ha_enabled=0
-pool_run_xostor_in_use=0
-pool_run_xostor_faulty=0
 
 # petula clark - color my world
-GREEN=$'\033[32m'
-YELLOW=$'\033[33m'
-CYAN=$'\033[36m'
-RESET=$'\033[0m'
+# only colorize when stdout is a terminal (or HEALTH_FORCE_COLOR=1), so piped/logged output
+# stays clean (deliberately NOT named FORCE_COLOR - node tools like xoa-updater honor that
+# one and would start colorizing the output we parse)
+if [[ -t 1 || "${HEALTH_FORCE_COLOR:-0}" == "1" ]]; then
+  GREEN=$'\033[32m'
+  YELLOW=$'\033[33m'
+  CYAN=$'\033[36m'
+  RESET=$'\033[0m'
+else
+  GREEN=""
+  YELLOW=""
+  CYAN=""
+  RESET=""
+fi
 
 # flag passes / fails with color
 ok()        { printf "%sOK%s"   "$GREEN" "$RESET"; }
@@ -84,6 +92,7 @@ MEM_TOTAL_GB="0.0"
 MEM_USED_PCT="0.0"
 MEM_AVAIL_GB="0.0"
 PW_NOTIFY=0                         # flag to indicate we should print a warning about backslash in password
+WORK_DIR=""                         # temp dir for ssh control sockets / stderr capture (set in main)
 
 usage() {
   echo "Usage:"
@@ -100,7 +109,7 @@ usage() {
   echo "  $0 192.168.1.5"
   echo "  $0 192.168.1.6 'mypass'"
   echo "  $0 -s 192.168.1.7 'mypass'"
-  exit 2
+  exit "${1:-2}"
 }
 
 parse_target_host_and_port() {
@@ -143,16 +152,15 @@ print_xoa_status_section() {
 
   out="$(xoa-updater || true)"
 
-  eval "$(
-  awk '
-  /channel selected/ {print "XOA_CHANNEL=\"" $1 "\""}
-  /All up to date/   {print "XOA_CURRENT=1"}
-  ' <<< "$out"
-  )"
+  XOA_CHANNEL="$(awk '/channel selected/ {print $1; exit}' <<< "$out" || true)"
+  XOA_CURRENT=""
+  if grep -q 'All up to date' <<< "$out"; then
+    XOA_CURRENT=1
+  fi
 
-  XOA_VERSION=$(xoa-updater raw-api-call getLocalManifest 2>&1 | awk -F"'" '$2=="xen-orchestra" {print $4}')
+  XOA_VERSION=$(xoa-updater raw-api-call getLocalManifest 2>/dev/null | awk -F"'" '$2=="xen-orchestra" {print $4}' || true)
 
-  XOA_DEBIAN=$(lsb_release -a 2>&1 | awk '/Description:/ { sub(/^Description:[[:space:]]*/, ""); print }')
+  XOA_DEBIAN=$(lsb_release -a 2>/dev/null | awk '/Description:/ { sub(/^Description:[[:space:]]*/, ""); print }' || true)
 
   echo "$(cyan_text "== XOA Status ==")"
 
@@ -174,11 +182,17 @@ print_xoa_status_section() {
     printf "XOA Version: %s\n" "$(green_text "${XOA_VERSION}")"
   fi
 
-  XOA_PLAN=$(xoa-updater raw-api-call getXoaPlan | awk 'NF>0 { gsub(/[^\x00-\x7F]/, ""); print $1 }')
-  printf "XOA Plan: %s" "$(green_text "${XOA_PLAN}")"
+  XOA_PLAN=$(xoa-updater raw-api-call getXoaPlan 2>/dev/null | awk '{ gsub(/\x1B\[[0-9;]*[A-Za-z]/, "") } NF>0 { gsub(/[^\x00-\x7F]/, ""); print $1 }' || true)
+  if [[ -z "${XOA_PLAN:-}" ]]; then
+    printf "XOA Plan: %s" "$(yellow_text 'Unknown')"
+  else
+    printf "XOA Plan: %s" "$(green_text "${XOA_PLAN}")"
+  fi
 
-  out=$(xoa-updater raw-api-call getSelfLicenses | awk 'NF>0 { gsub(/[^\x00-\x7F]/, ""); print $1 }')
-  if [[ "$out" == "[]" ]]; then
+  out=$(xoa-updater raw-api-call getSelfLicenses 2>/dev/null | awk '{ gsub(/\x1B\[[0-9;]*[A-Za-z]/, "") } NF>0 { gsub(/[^\x00-\x7F]/, ""); print $1 }' || true)
+  if [[ -z "${out//[[:space:]]/}" ]]; then
+      printf " (%s)\n" "$(yellow_text "Unknown")"
+  elif [[ "$out" == "[]" ]]; then
       printf " (%s)\n" "$(yellow_text "Unbound")"
   else
     printf " (%s)\n" "$(green_text "Bound")"
@@ -198,15 +212,15 @@ print_xoa_status_section() {
     append_details "XOA" "XOA Check Issues" "$out"
   fi
 
-  printf "OS Version: %s\n" "$(green_text "${XOA_DEBIAN}")"
+  if [[ -z "${XOA_DEBIAN:-}" ]]; then
+    printf "OS Version: %s\n" "$(yellow_text 'Unknown')"
+  else
+    printf "OS Version: %s\n" "$(green_text "${XOA_DEBIAN}")"
+  fi
 
  local XOA_TOTAL_MEM XOA_AVAIL_MEM
-  eval "$(
-  awk '
-  /^MemTotal:/ {print "XOA_TOTAL_MEM=\"" $2 "\""}
-  /^MemAvailable:/ {print "XOA_AVAIL_MEM=\"" $2 "\""}
-  ' /proc/meminfo
-  )"
+  XOA_TOTAL_MEM="$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || true)"
+  XOA_AVAIL_MEM="$(awk '/^MemAvailable:/ {print $2; exit}' /proc/meminfo 2>/dev/null || true)"
 
   if [[ -n "$XOA_TOTAL_MEM" && -n "$XOA_AVAIL_MEM" ]]; then
     local total_gb avail_gb used_gb used_pct
@@ -234,7 +248,7 @@ print_xoa_status_section() {
   fi
 
   local dmesg_t
-  dmesg_t="$(dmesg -T)"
+  dmesg_t="$(dmesg -T 2>/dev/null || true)"
 
   if ! check_dmesg_content "$dmesg_t"; then
     if [[ -n "$DMESG_ISSUES_BLOCK" ]]; then
@@ -321,10 +335,11 @@ get_first_host_from_xoa_db() {
     const blocks = input.match(/\{[\s\S]*?\}/g) || [];
 
     for (const block of blocks) {
-      // turn JS object literal into a real object
-      const obj = Function('\"use strict\"; return (' + block + ')')();
-      if (obj.enabled === \"true\" && obj.host) {
-        console.log(obj.host);
+      // pick fields out with regexes instead of eval'ing DB content as code (\x27 = single quote)
+      if (!/[\s{,]enabled:\s*\x27?true\x27?/.test(block)) continue;
+      const m = block.match(/[\s{,]host:\s*\x27([^\x27]*)\x27/);
+      if (m && m[1]) {
+        console.log(m[1]);
         break;
       }
     }
@@ -337,26 +352,41 @@ run_remote() {
   local pass="$2"
   local cmd="$3"
 
-  local output
-  local rc
+  local output rc
+  local errfile="${WORK_DIR:-/tmp}/health-ssh-err.$$"
 
+  # - stderr goes to a file instead of being merged into stdout, so remote warnings
+  #   and noise can never contaminate the output our parsers read
+  # - timeout guards against remote commands that hang forever (eg xe when xapi is wedged);
+  #   it signals the whole process group so ssh dies with sshpass
+  # - ControlMaster reuses one ssh connection per host instead of opening a new one per check
+  # - sshpass -e (password via env) keeps the password out of the process list
   output=$(
-    sshpass -p "$pass" ssh \
+    SSHPASS="$pass" timeout -k 5 "$remote_cmd_timeout" \
+    sshpass -e ssh \
       -p "$SSH_PORT" \
       -o StrictHostKeyChecking=no \
       -o UserKnownHostsFile=/dev/null \
       -o LogLevel=ERROR \
       -o ConnectTimeout="$ssh_timeout" \
+      -o ControlMaster=auto \
+      -o ControlPath="${WORK_DIR:-/tmp}/health-cm-%r@%h:%p" \
+      -o ControlPersist=60 \
       -o BatchMode=no \
       root@"$host" \
       "$cmd" \
-      2>&1
+      2>"$errfile"
   )
   rc=$?
 
   if (( rc != 0 )); then
-    echo "SSH failed on host $host (exit code $rc)" >&2
-    echo "$output" >&2
+    if (( rc == 124 )); then
+      echo "SSH command on host $host timed out after ${remote_cmd_timeout}s" >&2
+    else
+      echo "SSH failed on host $host (exit code $rc)" >&2
+    fi
+    [[ -s "$errfile" ]] && cat "$errfile" >&2
+    [[ -n "$output" ]] && echo "$output" >&2
     return "$rc"
   fi
 
@@ -384,7 +414,7 @@ get_pool_uuid() {
   local pass="$2"
 
   local out rc
-  if out=$(run_remote "$host" "$pass" "xe pool-list params=uuid"); then
+  if out=$(run_remote "$host" "$pass" "xe pool-list params=uuid --minimal"); then
     rc=0
     out=$(tr -d '\r' <<< "$out")
 
@@ -410,7 +440,7 @@ check_pool_hosts_access() {
 
   local ip
   for ip in "${POOL_HOST_IPS[@]}"; do
-    if ! run_remote "$ip" "$pass" "echo SSH_OK 2>/dev/null || true" | grep -q "SSH_OK"; then
+    if ! run_remote "$ip" "$pass" "echo SSH_OK" | grep -q "SSH_OK"; then
       POOL_HOST_NOACCESS_IPS+=("$ip")
     else
       POOL_HOST_ACCESS_IPS+=("$ip")
@@ -431,9 +461,17 @@ get_pool_host_details() {
   local host="$1"
   local pass="$2"
 
-  # Ask for multiple fields; don't rely on ordering cuz it seems random ?
-  local out rc
-  if out=$(run_remote "$host" "$pass" "xe host-list params=uuid,address,enabled,multipathing 2>/dev/null"); then
+  # one pipe-separated line per host via xe param-get, instead of scraping the
+  # human-readable host-list output (no label parsing, no field-order assumptions)
+  local out rc cmd
+  cmd='for u in $(xe host-list --minimal | tr , " "); do
+    a=$(xe host-param-get uuid=$u param-name=address 2>/dev/null)
+    e=$(xe host-param-get uuid=$u param-name=enabled 2>/dev/null)
+    m=$(xe host-param-get uuid=$u param-name=multipathing 2>/dev/null)
+    printf "%s|%s|%s|%s\n" "$u" "$a" "$e" "$m"
+  done'
+
+  if out=$(run_remote "$host" "$pass" "$cmd"); then
     rc=0
     out=$(tr -d '\r' <<<"$out")
 
@@ -441,43 +479,20 @@ get_pool_host_details() {
     POOL_HOST_UUIDS=()
     POOL_HOSTS_STATUS=()
 
-    eval "$(
-      printf '%s\n' "$out"  | awk '
-      function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); return s }
-
-      BEGIN { idx = -1 }
-
-      /^[[:space:]]*uuid[[:space:]]*\(/   {
-          idx++
-          split($0, a, /: /)
-          uuid[idx] = a[2]
-      }
-
-      /^[[:space:]]*address[[:space:]]*\(/ {
-          split($0, a, /: /)
-          addr[idx] = a[2]
-      }
-
-      /^[[:space:]]*enabled[[:space:]]*\(/ {
-          split($0, a, /: /)
-          en[idx] = a[2]
-      }
-
-      /^[[:space:]]*multipathing[[:space:]]*\(/ {
-          split($0, a, /: /)
-          mp[idx] = a[2]
-      }
-
-      END {
-        for (i = 0; i <= idx; i++) {
-          printf "POOL_HOST_UUIDS[\"%s\"]=\"%s\"\n", addr[i], uuid[i]
-          printf "POOL_HOST_IPS+=(\"%s\")\n", addr[i]
-          printf "POOL_HOSTS_STATUS[\"%s_enabled\"]=\"%s\"\n", uuid[i], en[i]
-          printf "POOL_HOSTS_STATUS[\"%s_multipath\"]=\"%s\"\n", uuid[i], mp[i]
-        }
-      }
-      '
-    )"
+    local uuid addr en mp
+    while IFS='|' read -r uuid addr en mp; do
+      if [[ -z "$uuid" ]]; then
+        continue
+      fi
+      if [[ -z "$addr" ]]; then
+        echo "Warning: pool host $uuid has no address in xapi; skipping it" >&2
+        continue
+      fi
+      POOL_HOST_UUIDS["$addr"]="$uuid"
+      POOL_HOST_IPS+=("$addr")
+      POOL_HOSTS_STATUS["${uuid}_enabled"]="${en:-Unknown}"
+      POOL_HOSTS_STATUS["${uuid}_multipath"]="${mp:-Unknown}"
+    done <<< "$out"
   else
     rc=$?
     echo "SSH failed when trying to get pool host list from $host (exit code $rc)" >&2
@@ -527,7 +542,10 @@ get_pool_host_memory() {
       total_mb=0; used_mb=0; avail_mb=0
     fi
 
-    local uuid="${POOL_HOST_UUIDS[$ip]}"
+    local uuid="${POOL_HOST_UUIDS[$ip]:-}"
+    if [[ -z "$uuid" ]]; then
+      continue
+    fi
 
     POOL_HOSTS_MEM[${uuid}_total]=$total_mb
     POOL_HOSTS_MEM[${uuid}_used]=$used_mb
@@ -551,7 +569,7 @@ get_pool_missing_patches() {
 
   else
     rc=$?
-    POOL_MISSING_PATCHES=0
+    POOL_MISSING_PATCHES=-1
   fi
 
   return
@@ -576,8 +594,14 @@ compute_pool_ram_match() {
 
   for ip in "${all_ips[@]}"; do
     local gb total_mb uuid
-    uuid="${POOL_HOST_UUIDS[$ip]}"
+    uuid="${POOL_HOST_UUIDS[$ip]:-}"
     total_mb="${POOL_HOSTS_MEM[${uuid}_total]:-0}"
+
+    # skip hosts we couldn't read memory from - unknown is not a mismatch
+    if [[ -z "$uuid" || "$total_mb" == "0" ]]; then
+      continue
+    fi
+
     gb="$(awk -v m="$total_mb" 'BEGIN{printf "%d", m/1024+.5}')"
 
     if [[ -z "$gb" || ! "$gb" =~ ^[0-9]+$ ]]; then
@@ -615,7 +639,7 @@ detect_pool_master_by_poolconf() {
 
       if [[ "${pc,,}" == "master" ]]; then
         DETECTED_MASTER_IP="$ip"
-        DETECTED_MASTER_HOSTNAME="$(get_remote_hostname "$ip" "$pass" | tr -d '\r')"
+        DETECTED_MASTER_HOSTNAME="$(get_remote_hostname "$ip" "$pass" | tr -d '\r' || true)"
         [[ -z "$DETECTED_MASTER_HOSTNAME" ]] && DETECTED_MASTER_HOSTNAME="$ip"
         return 0
       fi
@@ -629,7 +653,7 @@ detect_pool_master_by_poolconf() {
 load_mem_stats() {
   local host="$1"
 
-  local uuid="${POOL_HOST_UUIDS[$host]}"
+  local uuid="${POOL_HOST_UUIDS[$host]:-}"
 
   local total_mb used_mb avail_mb
   total_mb="${POOL_HOSTS_MEM[${uuid}_total]:-0}"
@@ -651,7 +675,7 @@ get_rpm_manifest_remote() {
   local pass="$2"
 
   local out rc
-  if out=$(run_remote "$host" "$pass" "bash -lc \"$(rpm_manifest_cmd)\""); then
+  if out=$(run_remote "$host" "$pass" "$(rpm_manifest_cmd)"); then
     echo "$out"
     rc=0
   else
@@ -666,8 +690,8 @@ get_rpm_manifest_hash_remote() {
   local pass="$2"
 
   local out rc
-  if out=$(run_remote "$host" "$pass" "bash -lc \"$(rpm_manifest_cmd) | (command -v sha256sum >/dev/null 2>&1 && sha256sum || md5sum) | cut -d' ' -f1\""); then
-    echo $out
+  if out=$(run_remote "$host" "$pass" "$(rpm_manifest_cmd) | (command -v sha256sum >/dev/null 2>&1 && sha256sum || md5sum) | cut -d' ' -f1"); then
+    echo "$out"
     rc=0
   else
     rc=$?
@@ -738,7 +762,7 @@ check_hyper_version() {
     /^NAME=/ {gsub(/\"/, \"\", \$2); n=\$2}
     /^VERSION=/ {gsub(/\"/, \"\", \$2); v=\$2}
     END {
-      printf \"%s %s\", n, v
+      printf \"%s|%s\", n, v
     }' /etc/os-release"
 
   if out=$(run_remote "$host" "$pass" "$cmd"); then
@@ -749,13 +773,14 @@ check_hyper_version() {
     return
   fi
 
-  if [[ "$out" == "unknown" ]]; then
+  out="$(tr -d '\r' <<< "$out")"
+  hyper="${out%%|*}"
+  version="${out##*|}"
+
+  if [[ -z "$hyper" || -z "$version" ]]; then
     printf "Hypervisor Version: %s\n" "$(yellow_text 'Unknown')"
     return 1
   fi
-
-  hyper="$(awk '{print $1}' <<< "$out")"
-  version="$(awk '{print $2}' <<< "$out")"
 
   # Compare version: extract major.minor (eg 8.3 from 8.3.0)
   local major minor
@@ -765,12 +790,12 @@ check_hyper_version() {
   # Check if version >= 8.3 (8.2 is no longer supported)
   if [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]]; then
     if (( major > 8 )) || (( major == 8 && minor >= 3 )); then
-      printf "$hyper Version: %s\n" "$(green_text "$version")"
+      printf "%s Version: %s\n" "$hyper" "$(green_text "$version")"
       return 0
     fi
   fi
 
-  printf "$hyper Version: %s\n" "$(yellow_text "$version")"
+  printf "%s Version: %s\n" "$hyper" "$(yellow_text "$version")"
   return 1
 }
 
@@ -797,7 +822,7 @@ check_lastpatched() {
 
   local out last rc
   if out=$(run_remote "$host" "$pass" "rpm -qa --last | head -n 1 2>/dev/null || true"); then
-    last=$(echo "$out" | awk '{$1=""; sub(/^ /,""); print}' | sed -E '/ UTC[+-]/! s/ ([+-][0-9]{2}(:?[0-9]{2})?)$/ UTC\1/' | xargs -I{} date -d "{}" '+%Y-%m-%d %H:%M:%S')
+    last=$(echo "$out" | awk 'NF>1 {$1=""; sub(/^ /,""); print}' | sed -E '/ UTC[+-]/! s/ ([+-][0-9]{2}(:?[0-9]{2})?)$/ UTC\1/' | xargs -I{} date -d "{}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)
     rc=0
   else
     rc=$?
@@ -813,7 +838,7 @@ check_enabled() {
   local ip="$1"
 
   local uuid enabled
-  uuid="${POOL_HOST_UUIDS[$ip]}"
+  uuid="${POOL_HOST_UUIDS[$ip]:-}"
   enabled="${POOL_HOSTS_STATUS[${uuid}_enabled]:-Unknown}"
 
   if [[ "$enabled" == "true" ]]; then
@@ -829,7 +854,7 @@ check_multipath() {
   local ip="$1"
 
   local uuid mp
-  uuid="${POOL_HOST_UUIDS[$ip]}"
+  uuid="${POOL_HOST_UUIDS[$ip]:-}"
   mp="${POOL_HOSTS_STATUS[${uuid}_multipath]:-Unknown}"
 
   if [[ "$mp" == "Unknown" ]]; then
@@ -845,7 +870,7 @@ check_host_timesync() {
   local ip="$1"
 
   local uuid ntp sync utc
-  uuid="${POOL_HOST_UUIDS[$ip]}"
+  uuid="${POOL_HOST_UUIDS[$ip]:-}"
   ntp="${POOL_HOSTS_NTP[${uuid}_ntp]:-Unknown}"
   sync="${POOL_HOSTS_NTP[${uuid}_sync]:-Unknown}"
 
@@ -867,11 +892,8 @@ check_host_timesync() {
 get_pool_timesync() {
   local pass="$1"
 
-  # save time from XOA to compare against later
-  local xo_time=$(date +%s)
-
   # check each host's time sync status
-  local ip out utc ntp sync uuid unix_time time_diff rc
+  local ip out utc ntp sync uuid unix_time time_diff xo_time rc
   for ip in "${POOL_HOST_ACCESS_IPS[@]}"; do
     if out=$(run_remote "$ip" "$pass" "timedatectl"); then
       rc=0
@@ -879,34 +901,49 @@ get_pool_timesync() {
       rc=$?
       echo "SSH failed when trying to get time sync info from $ip (exit code $rc)" >&2
       POOL_NTP_MATCH=0
-      return 0
+      continue
     fi
 
-    eval "$(
-    awk -F': ' '
-    / Universal time:/ {print "utc=\"" $2 "\""}
-    /NTP enabled:/ {print "ntp=\"" $2 "\""}
-    /NTP synchronized:/ {print "sync=\"" $2 "\""}
-    ' <<< "$out"
-    )"
+    out="$(tr -d '\r' <<< "$out")"
 
-    uuid="${POOL_HOST_UUIDS[$ip]}"
+    # older systemd (xcp-ng 8.x dom0) says "NTP enabled" / "NTP synchronized",
+    # newer systemd says "NTP service" / "System clock synchronized" - accept both
+    utc="$(awk -F': ' '/Universal time:/ {print $2; exit}' <<< "$out" || true)"
+    ntp="$(awk -F': ' '/NTP enabled:|NTP service:/ {print $2; exit}' <<< "$out" || true)"
+    sync="$(awk -F': ' '/NTP synchronized:|System clock synchronized:/ {print $2; exit}' <<< "$out" || true)"
 
-    POOL_HOSTS_NTP[$uuid"_ntp"]=$ntp
-    POOL_HOSTS_NTP[$uuid"_sync"]=$sync
-    POOL_HOSTS_NTP[$uuid"_utc"]=$utc
+    case "$ntp" in
+      active) ntp="yes" ;;
+      inactive) ntp="no" ;;
+    esac
+
+    uuid="${POOL_HOST_UUIDS[$ip]:-}"
+    if [[ -n "$uuid" ]]; then
+      POOL_HOSTS_NTP[${uuid}_ntp]="$ntp"
+      POOL_HOSTS_NTP[${uuid}_sync]="$sync"
+      POOL_HOSTS_NTP[${uuid}_utc]="$utc"
+    fi
 
     if [[ "$ntp" != "yes" || "$sync" != "yes" ]]; then
       POOL_NTP_MATCH=0
-    else
-      unix_time=$(date -d "$utc" +%s)
-      time_diff=$((xo_time - unix_time))
-      if [[ $time_diff -lt 0 ]]; then
-        time_diff=$(( -time_diff ))
-      fi
-      if (( time_diff > time_sync_allowance_secs )); then
-        POOL_NTP_MATCH=0
-      fi
+      continue
+    fi
+
+    # compare against local time taken right now (not at loop start), so ssh
+    # latency from earlier hosts doesn't accumulate into fake clock drift
+    xo_time=$(date +%s)
+    unix_time="$(date -d "$utc" +%s 2>/dev/null || true)"
+    if [[ ! "$unix_time" =~ ^[0-9]+$ ]]; then
+      POOL_NTP_MATCH=0
+      continue
+    fi
+
+    time_diff=$(( xo_time - unix_time ))
+    if (( time_diff < 0 )); then
+      time_diff=$(( -time_diff ))
+    fi
+    if (( time_diff > time_sync_allowance_secs )); then
+      POOL_NTP_MATCH=0
     fi
   done
 }
@@ -959,7 +996,7 @@ check_dom0_memory_lines() {
     printf "Dom0 Memory Usage: %s\n" "$(yellow_text "${MEM_USED_PCT}%")"
     return 1
   else
-    printf "Dom0 Memory Usage: %s\n" "$(green_text "${MEM_USED_PCT}%")"
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Dom0 Memory Usage: %s\n" "$(green_text "${MEM_USED_PCT}%")"
     return 0
   fi
 }
@@ -1120,10 +1157,15 @@ check_silly_mtus() {
   local pass="$2"
 
   local ip_out rc
-  ip_out=$(run_remote "$host" "$pass" "ip link show")
-  rc=$?
+  if ip_out=$(run_remote "$host" "$pass" "ip link show" | tr -d '\r'); then
+    rc=0
+  else
+    rc=$?
+    echo "SSH failed when trying to get link MTUs on $host (exit code $rc)" >&2
+    return "$rc"
+  fi
 
-  local found_nonstandard=0
+  local -a nonstandard=()
   while IFS= read -r line; do
     [[ "$line" =~ ^[0-9]+:\  ]] || continue
 
@@ -1136,13 +1178,15 @@ check_silly_mtus() {
     [[ -n "$mtu" ]] || continue
 
     if [[ "$mtu" != "1500" ]]; then
-      found_nonstandard=1
-      break
+      nonstandard+=("${ifname}=${mtu}")
     fi
   done <<< "$ip_out"
 
-  if (( found_nonstandard == 1 )); then
-    printf "Silly MTUs: %s - Non-standard MTUs found, check \"ip a\" output\n" "$(yes)"
+  if (( ${#nonstandard[@]} > 0 )); then
+    local msg
+    msg="$(printf "%s, " "${nonstandard[@]}")"
+    msg="${msg%, }"
+    printf "Silly MTUs: %s - Non-standard MTUs found: %s\n" "$(yes)" "$msg"
     return 1
   else
     [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Silly MTUs: %s\n" "$(green_text 'OK - All 1500')"
@@ -1156,7 +1200,7 @@ check_dns_gw_non_mgmt_pifs() {
   local host_uuid="$3"
 
   local out rc
-  if out=$(run_remote "$host" "$pass" "xe pif-list params=gateway,DNS management=false host-uuid=$host_uuid 2>/dev/null || true" | tr -d '\r'); then
+  if out=$(run_remote "$host" "$pass" "xe pif-list params=gateway,DNS management=false host-uuid=$host_uuid" | tr -d '\r'); then
     rc=0
   else
     rc=$?
@@ -1196,7 +1240,7 @@ check_vlan0_exist() {
   local host_uuid="$3"
 
   local out rc
-  if out=$(run_remote "$host" "$pass" "xe pif-list params=VLAN host-uuid=$host_uuid 2>/dev/null || true" | tr -d '\r'); then
+  if out=$(run_remote "$host" "$pass" "xe pif-list VLAN=0 host-uuid=$host_uuid --minimal" | tr -d '\r'); then
     rc=0
   else
     rc=$?
@@ -1204,10 +1248,7 @@ check_vlan0_exist() {
     return "$rc"
   fi
 
-  local found
-  found=$(awk -F': ' '/VLAN/{ if ($2 == "0") { print "found"; exit } }' <<< "$out")
-
-  if [[ -n "$found" ]]; then
+  if [[ -n "${out//[[:space:]]/}" ]]; then
     printf "VLAN 0 Check: %s\n" "$(yellow_text 'Yes')"
     return 1
   fi
@@ -1229,22 +1270,30 @@ check_migration_network() {
     return "$rc"
   fi
 
- if [[ -z "${out//[[:space:]]/}" ]]; then
-    printf "Migration Network: %s\n" "$(green_text 'Not configured')"
-  else
-    local network_uuid=$out
-
-    if check_is_bond_member "$host" "$pass" "$network_uuid"; then
-      # if this network is set to be a bond member, that's a problem for migration traffic
-      printf "Migration Network: %s\n" "$(yellow_text 'Set to bond member')"
-      rc=1
-    else
-      printf "Migration Network: %s\n" "$(green_text 'Configured')"
-      rc=0
-    fi
+  if [[ -z "${out//[[:space:]]/}" ]]; then
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Migration Network: %s\n" "$(green_text 'Not configured')"
+    return 0
   fi
 
-  return 0
+  local network_uuid="${out//[[:space:]]/}"
+  local member_rc=0
+  check_is_bond_member "$host" "$pass" "$network_uuid" || member_rc=$?
+
+  case "$member_rc" in
+    0)
+      # if this network is set to be a bond member, that's a problem for migration traffic
+      printf "Migration Network: %s\n" "$(yellow_text 'Set to bond member')"
+      return 1
+      ;;
+    2)
+      printf "Migration Network: %s\n" "$(yellow_text 'Unknown (could not check bond membership)')"
+      return 1
+      ;;
+    *)
+      [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Migration Network: %s\n" "$(green_text 'Configured')"
+      return 0
+      ;;
+  esac
 }
 
 check_backup_network() {
@@ -1260,33 +1309,42 @@ check_backup_network() {
     return "$rc"
   fi
 
- if [[ -z "${out//[[:space:]]/}" ]]; then
-    printf "Backup Network: %s\n" "$(green_text 'Not configured')"
-  else
-    local network_uuid=$out
-
-    if check_is_bond_member "$host" "$pass" "$network_uuid"; then
-      # if this network is set to be a bond member, that's a problem for backup traffic
-      printf "Backup Network: %s\n" "$(yellow_text 'Set to bond member')"
-      rc=1
-    else
-      printf "Backup Network: %s\n" "$(green_text 'Configured')"
-      rc=0
-    fi
+  if [[ -z "${out//[[:space:]]/}" ]]; then
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Backup Network: %s\n" "$(green_text 'Not configured')"
+    return 0
   fi
 
-  return 0
+  local network_uuid="${out//[[:space:]]/}"
+  local member_rc=0
+  check_is_bond_member "$host" "$pass" "$network_uuid" || member_rc=$?
+
+  case "$member_rc" in
+    0)
+      # if this network is set to be a bond member, that's a problem for backup traffic
+      printf "Backup Network: %s\n" "$(yellow_text 'Set to bond member')"
+      return 1
+      ;;
+    2)
+      printf "Backup Network: %s\n" "$(yellow_text 'Unknown (could not check bond membership)')"
+      return 1
+      ;;
+    *)
+      [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Backup Network: %s\n" "$(green_text 'Configured')"
+      return 0
+      ;;
+  esac
 }
 
+# returns 0 = network sits on a bond member, 1 = it doesn't, 2 = could not check
 check_is_bond_member() {
   local host="$1"
   local pass="$2"
   local network_uuid="$3"
 
   local out
-  if ! out=$(run_remote "$host" "$pass" "xe pif-list network-uuid=${network_uuid} params=uuid,device,bond-master-of,bond-slave-of 2>/dev/null || true"); then
+  if ! out=$(run_remote "$host" "$pass" "xe pif-list network-uuid=${network_uuid} params=bond-slave-of"); then
     echo "SSH failed when trying to check for bond members on $host" >&2
-    return 1
+    return 2
   fi
 
   # Check if bond-slave-of has a non-empty, non-database value
@@ -1306,8 +1364,13 @@ check_overlapping_subnets() {
   local pass="$2"
 
   local ip_out rc
-  ip_out=$(run_remote "$host" "$pass" "ip -o -4 addr show 2>/dev/null || ip -o -4 address show 2>/dev/null || true" | tr -d '\r')
-  rc=$?
+  if ip_out=$(run_remote "$host" "$pass" "ip -o -4 addr show 2>/dev/null || ip -o -4 address show 2>/dev/null" | tr -d '\r'); then
+    rc=0
+  else
+    rc=$?
+    echo "SSH failed when trying to get addresses on $host (exit code $rc)" >&2
+    return "$rc"
+  fi
 
   local lst
   lst="$(
@@ -1372,55 +1435,59 @@ check_overlapping_subnets() {
 }
 
 check_smapi_exceptions() {
-  local smlog_out="$1"
+  local host="$1"
+  local pass="$2"
+
   SMLOG_EXCEPTIONS_BLOCK=""
 
-  local last_line
-  last_line="$(
-    awk '
-      { l=tolower($0) }
-      index(l,"except") { n=NR }
-      END { if (n>0) print n }
-    ' <<< "$smlog_out"
-  )"
+  # find the last line containing "except" and pull +/- 3 lines of context around it,
+  # remotely, so we don't drag the whole SMlog over the wire
+  local cmd='test -r /var/log/SMlog || exit 0; n=$(grep -in except /var/log/SMlog 2>/dev/null | tail -n 1 | cut -d: -f1); if [ -n "$n" ]; then s=$((n-3)); [ "$s" -lt 1 ] && s=1; sed -n "${s},$((n+3))p" /var/log/SMlog; fi'
 
-  if [[ -z "${last_line:-}" ]]; then
+  local out rc
+  if out=$(run_remote "$host" "$pass" "$cmd"); then
+    rc=0
+  else
+    rc=$?
+    echo "SSH failed when trying to check SMlog exceptions on $host (exit code $rc)" >&2
+    return "$rc"
+  fi
+
+  if [[ -z "${out//[[:space:]]/}" ]]; then
     [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "SMAPI Exceptions: %s\n" "$(none)"
     return 0
   fi
 
-  local start end
-  start=$(( last_line - 3 )); (( start < 1 )) && start=1
-  end=$(( last_line + 3 ))
-
-  SMLOG_EXCEPTIONS_BLOCK="$(
-    awk -v s="$start" -v e="$end" 'NR>=s && NR<=e { print "  " $0 }' <<< "$smlog_out"
-  )"
+  SMLOG_EXCEPTIONS_BLOCK="$(sed 's/^/  /' <<< "$out")"
 
   printf "SMAPI Exceptions: %s\n" "$(yellow_text 'Yes, See Error Output')"
   return 1
 }
 
 check_smapi_hidden_leaves() {
-  local smlog_out="$1"
+  local host="$1"
+  local pass="$2"
+  local hostlabel="$3"
 
-  local matches
-  matches="$(
-    awk '
-      { l=tolower($0) }
-      index(l,"hidden leaf") {
-        if (!seen[$0]++) print $0
-      }
-    ' <<< "$smlog_out"
-  )"
+  # dedupe remotely, first-seen order preserved (pipeline rc is awk's, so no-match grep is fine)
+  local cmd="grep -i 'hidden leaf' /var/log/SMlog 2>/dev/null | awk '!seen[\$0]++'"
 
-  if [[ -z "${matches:-}" ]]; then
+  local out rc
+  if out=$(run_remote "$host" "$pass" "$cmd"); then
+    rc=0
+  else
+    rc=$?
+    echo "SSH failed when trying to check SMlog hidden leaves on $host (exit code $rc)" >&2
+    return "$rc"
+  fi
+
+  if [[ -z "${out//[[:space:]]/}" ]]; then
     [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "SMAPI Hidden Leaves: %s\n" "$(none)"
     return 0
   fi
 
   printf "SMAPI Hidden Leaves: %s\n" "$(yellow_text 'Yes, See Error Output')"
-  append_details "$hostlabel" "SMAPI Hidden Leaves" "$matches"
+  append_details "$hostlabel" "SMAPI Hidden Leaves" "$out"
   return 1
 }
 
@@ -1430,9 +1497,10 @@ check_ha_enabled() {
   local pool_uuid="$3"
 
   local out rc
-  if out=$(run_remote "$host" "$pass" "xe pool-list uuid=$pool_uuid params=ha-enabled" | tr -d '\r'); then
+  if out=$(run_remote "$host" "$pass" "xe pool-param-get uuid=$pool_uuid param-name=ha-enabled" | tr -d '\r'); then
     rc=0
   else
+    rc=$?
     echo "SSH failed when trying to check HA status on $host (exit code $rc)" >&2
     return "$rc"
   fi
@@ -1456,7 +1524,7 @@ check_rebooted_after_updates() {
 
   local out rc cmd
   cmd="bash -lc '
-    line=\$(awk '\''\$4==\"Updated:\"{l=\$0} END{print l}'\'' /var/log/yum.log 2>/dev/null || true)
+    line=\$(awk '\''\$4==\"Updated:\" || (\$4==\"Installed:\" && \$5 ~ /^(kernel|xen)/) {l=\$0} END{print l}'\'' /var/log/yum.log 2>/dev/null || true)
     if [ -z \"\$line\" ]; then
       echo \"NOUPDATES\"
       exit 0
@@ -1518,7 +1586,7 @@ check_xostor_in_use_and_ram() {
   XOSTOR_IN_USE=0
 
   local out rc
-  if out=$(run_remote "$host" "$pass" "xe sr-list type=linstor 2>/dev/null || true"); then
+  if out=$(run_remote "$host" "$pass" "xe sr-list type=linstor --minimal"); then
     rc=0
   else
     rc=$?
@@ -1537,8 +1605,8 @@ check_xostor_in_use_and_ram() {
   local total_gb_int
   total_gb_int="$(awk -v g="$MEM_TOTAL_GB" 'BEGIN{printf "%d", g+0.00001}')"
 
-  if (( total_gb_int < xostor_min_avail_gb )); then
-    printf "XOSTOR RAM: %s\n" "$(yellow_text "Not Enough: ${MEM_TOTAL_GB}G (Need >${xostor_min_avail_gb}G)")"
+  if (( total_gb_int < xostor_min_ram_gb )); then
+    printf "XOSTOR RAM: %s\n" "$(yellow_text "Not Enough: ${MEM_TOTAL_GB}G (Need >${xostor_min_ram_gb}G)")"
     return 1
   else
     printf "XOSTOR RAM: %s\n" "$(green_text "${MEM_TOTAL_GB}G")"
@@ -1552,12 +1620,17 @@ check_xostor_nodes() {
   local controllers_csv="$3"
 
   local out rc
-  if out=$(run_remote "$host" "$pass" "linstor --controllers=${controllers_csv} n l 2>/dev/null || true"); then
+  if out=$(run_remote "$host" "$pass" "command -v linstor >/dev/null 2>&1 || { echo NOLINSTOR; exit 0; }; linstor --controllers=${controllers_csv} n l"); then
     rc=0
   else
     rc=$?
     echo "SSH failed when trying to check XOSTOR nodes on $host (exit code $rc)" >&2
     return "$rc"
+  fi
+
+  if [[ "$out" == *NOLINSTOR* ]]; then
+    printf "XOSTOR Faulty Nodes: %s\n" "$(yellow_text 'Unknown (linstor CLI not found)')"
+    return 1
   fi
 
   local node_not_online
@@ -1609,12 +1682,17 @@ check_xostor_faulty_resources() {
   local controllers_csv="$3"
 
   local out rc
-  if out=$(run_remote "$host" "$pass" "linstor --controllers=${controllers_csv} r l --faulty 2>/dev/null || true"); then
+  if out=$(run_remote "$host" "$pass" "command -v linstor >/dev/null 2>&1 || { echo NOLINSTOR; exit 0; }; linstor --controllers=${controllers_csv} r l --faulty"); then
     rc=0
   else
     rc=$?
     echo "SSH failed when trying to check XOSTOR faulty resources on $host (exit code $rc)" >&2
     return "$rc"
+  fi
+
+  if [[ "$out" == *NOLINSTOR* ]]; then
+    printf "XOSTOR Faulty Resources: %s\n" "$(yellow_text 'Unknown (linstor CLI not found)')"
+    return 1
   fi
 
   local has_rows
@@ -1640,12 +1718,17 @@ check_xostor_controller() {
   local controllers_csv="$3"
 
   local out ip rc
-  if out=$(run_remote "$host" "$pass" "linstor --controllers=${controllers_csv} c which 2>/dev/null || true"); then
+  if out=$(run_remote "$host" "$pass" "command -v linstor >/dev/null 2>&1 || { echo NOLINSTOR; exit 0; }; linstor --controllers=${controllers_csv} c which"); then
     rc=0
   else
     rc=$?
     echo "SSH failed when trying to check XOSTOR controller on $host (exit code $rc)" >&2
     return "$rc"
+  fi
+
+  if [[ "$out" == *NOLINSTOR* ]]; then
+    printf "XOSTOR Controller IP: %s\n" "$(yellow_text 'Unknown (linstor CLI not found)')"
+    return 1
   fi
   ip="$(echo "$out" | awk '!/^Error:/ {
     if ($0 ~ /^linstor:\/\//) {
@@ -1656,10 +1739,10 @@ check_xostor_controller() {
 
   if [[ -z "${ip//[[:space:]]/}" ]]; then
     printf "XOSTOR Controller IP: %s\n" "$(yellow_text "None")"
-  else
-    printf "XOSTOR Controller IP: %s\n" "$(green_text "$ip")"
+    return 1
   fi
 
+  printf "XOSTOR Controller IP: %s\n" "$(green_text "$ip")"
   return 0
 }
 
@@ -1684,9 +1767,15 @@ check_yum_patch_level() {
   fi
 
   local h
-  h="$(get_rpm_manifest_hash_remote "$host" "$pass" | tr -d '\r' | head -n 1)"
+  h="$(get_rpm_manifest_hash_remote "$host" "$pass" | tr -d '\r' | head -n 1 || true)"
 
-  if [[ -n "$h" && "$h" == "$MASTER_RPMHASH" ]]; then
+  if [[ -z "$h" ]]; then
+    # couldn't fetch the hash (transient ssh failure etc) - don't call that a mismatch
+    printf "Yum Patch Level: %s\n" "$(yellow_text 'Unknown (could not retrieve)')"
+    return 1
+  fi
+
+  if [[ "$h" == "$MASTER_RPMHASH" ]]; then
     [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Yum Patch Level: %s\n" "$(green_text 'Match')"
     return 0
   fi
@@ -1694,7 +1783,12 @@ check_yum_patch_level() {
   printf "Yum Patch Level: %s\n" "$(yellow_text 'Mismatch, See Below')"
 
   local slave_list
-  slave_list="$(get_rpm_manifest_remote "$host" "$pass")"
+  slave_list="$(get_rpm_manifest_remote "$host" "$pass" || true)"
+
+  if [[ -z "${slave_list//[[:space:]]/}" ]]; then
+    append_details "$hostlabel" "Yum Patch Level Differences" "(could not retrieve package list from host)"
+    return 1
+  fi
 
   local diff_all
   diff_all="$(
@@ -1770,6 +1864,7 @@ append_poolconf_summary() {
 # pool status stuff
 print_pool_status_section() {
   local pass="$1"
+  local rc_any=0
 
   echo "$(cyan_text "== Pool Status ==")"
 
@@ -1783,24 +1878,28 @@ print_pool_status_section() {
     [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Dom0 RAM Allocations: %s\n" "$(green_text 'Matched')"
   else
     printf "Dom0 RAM Allocations: %s\n" "$(yellow_text 'Mismatched')"
+    rc_any=1
   fi
 
   if (( POOL_NTP_MATCH == 1 )); then
     [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Pool Time Synchronization: %s\n" "$(green_text 'Matched')"
   else
     printf "Pool Time Synchronization: %s\n" "$(yellow_text 'Mismatched')"
+    rc_any=1
   fi
 
   if [[ -n "$MASTER_POOL_UUID" ]]; then
-    check_ha_enabled "$DETECTED_MASTER_IP" "$pass" "$MASTER_POOL_UUID" || true
+    if ! check_ha_enabled "$DETECTED_MASTER_IP" "$pass" "$MASTER_POOL_UUID"; then rc_any=1; fi
   else
     printf "HA Enabled: %s\n" "$(yellow_text 'Unknown')"
+    rc_any=1
   fi
 
   if (( POOL_MISSING_PATCHES == 0 )); then
-    printf "Missing Patches: %s\n" "$(green_text "${POOL_MISSING_PATCHES}")"
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Missing Patches: %s\n" "$(green_text "${POOL_MISSING_PATCHES}")"
   else
     printf "Missing Patches: %s\n" "$(yellow_text "${POOL_MISSING_PATCHES/-1/Unknown}")"
+    rc_any=1
   fi
 
   if (( PW_NOTIFY == 1 )); then
@@ -1808,7 +1907,7 @@ print_pool_status_section() {
   fi
 
   load_mem_stats "$DETECTED_MASTER_IP"
-  check_xostor_in_use_and_ram "$DETECTED_MASTER_IP" "$pass" || true
+  if ! check_xostor_in_use_and_ram "$DETECTED_MASTER_IP" "$pass"; then rc_any=1; fi
   MASTER_XOSTOR_IN_USE=$(( XOSTOR_IN_USE ))
 
   if (( MASTER_XOSTOR_IN_USE == 1 )); then
@@ -1816,16 +1915,19 @@ print_pool_status_section() {
     local IFS=,
     local controllers_csv="${POOL_HOST_ACCESS_IPS[*]}"
     unset IFS
-    check_xostor_faulty_resources "$DETECTED_MASTER_IP" "$pass" "$controllers_csv" || true
-    check_xostor_nodes "$DETECTED_MASTER_IP" "$pass" "$controllers_csv" || true
-    check_xostor_controller "$DETECTED_MASTER_IP" "$pass" "$controllers_csv" || true
+    if ! check_xostor_faulty_resources "$DETECTED_MASTER_IP" "$pass" "$controllers_csv"; then rc_any=1; fi
+    if ! check_xostor_nodes "$DETECTED_MASTER_IP" "$pass" "$controllers_csv"; then rc_any=1; fi
+    if ! check_xostor_controller "$DETECTED_MASTER_IP" "$pass" "$controllers_csv"; then rc_any=1; fi
   fi
 
-  local host_uuid="${POOL_HOST_UUIDS[$DETECTED_MASTER_IP]}"
-  check_vlan0_exist "$DETECTED_MASTER_IP" "$pass" "$host_uuid" || true
-  check_migration_network "$DETECTED_MASTER_IP" "$pass" || true
-  check_backup_network "$DETECTED_MASTER_IP" "$pass" || true
+  local host_uuid="${POOL_HOST_UUIDS[$DETECTED_MASTER_IP]:-}"
+  if [[ -n "$host_uuid" ]]; then
+    if ! check_vlan0_exist "$DETECTED_MASTER_IP" "$pass" "$host_uuid"; then rc_any=1; fi
+  fi
+  if ! check_migration_network "$DETECTED_MASTER_IP" "$pass"; then rc_any=1; fi
+  if ! check_backup_network "$DETECTED_MASTER_IP" "$pass"; then rc_any=1; fi
   echo
+  return "$rc_any"
 }
 
 get_host_uuid_by_address() {
@@ -1834,7 +1936,7 @@ get_host_uuid_by_address() {
   local ip="$3"     # the address we matching
 
   local out rc
-  if out=$(run_remote "$host" "$pass" "xe host-list params=uuid,address 2>/dev/null || true"); then
+  if out=$(run_remote "$host" "$pass" "xe host-list address=$ip params=uuid --minimal 2>/dev/null || true"); then
     rc=0
   else
     rc=$?
@@ -1842,19 +1944,7 @@ get_host_uuid_by_address() {
     return "$rc"
   fi
 
-  echo "$out" |
-    awk -v want="$ip" -F': ' '
-        function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); return s }
-
-        /^[[:space:]]*uuid[[:space:]]*\(/    { u=trim($2) }
-        /^[[:space:]]*address[[:space:]]*\(/ { a=trim($2) }
-
-        # when we have a full record, evaluate + reset
-        (u != "" && a != "") {
-          if (a == want) { print u; exit }
-          u=""; a=""
-        }
-      ' | tr -d '\r' | head -n 1
+  tr -d '\r' <<< "$out" | head -n 1
 }
 
 run_checks_for_host() {
@@ -1864,7 +1954,7 @@ run_checks_for_host() {
   local controllers_csv="$4"       # optional: for XOSTOR checks
 
   local hn
-  hn="$(get_remote_hostname "$ip" "$pass" | tr -d '\r')"
+  hn="$(get_remote_hostname "$ip" "$pass" | tr -d '\r' || true)"
   [[ -z "$hn" ]] && hn="$ip"
 
   if (( POOL_MODE == 1 )); then
@@ -1886,21 +1976,13 @@ run_checks_for_host() {
   check_multipath "$ip"
   check_host_timesync "$ip"
 
-  local dmesg_t smlog rc
+  local dmesg_t rc
   if dmesg_t=$(run_remote "$ip" "$pass" "dmesg -T"); then
     rc=0
   else
     rc=$?
     echo "SSH failed when trying to get dmesg on $ip (exit code $rc)" >&2
     dmesg_t=""
-  fi
-
-  if smlog=$(run_remote "$ip" "$pass" "test -r /var/log/SMlog && cat /var/log/SMlog || true"); then
-    rc=0
-  else
-    rc=$?
-    echo "SSH failed when trying to get SMlog on $ip (exit code $rc)" >&2
-    smlog=""
   fi
 
   if (( POOL_MODE == 1 )); then
@@ -1910,7 +1992,7 @@ run_checks_for_host() {
     else
       rc=$?
       echo "SSH failed when trying to get pool.conf on $ip (exit code $rc)" >&2
-      return "$rc"
+      poolconf_line="(unavailable)"
     fi
 
     append_poolconf_summary "$hn" "$ip" "$poolconf_line"
@@ -1918,7 +2000,7 @@ run_checks_for_host() {
 
   load_mem_stats "$ip"
 
-  local DMESG_ISSUES_BLOCK OOM_EVENTS_BLOCK LACP_OUTPUT_BLOCK SMLOG_EXCEPTIONS_BLOCK XOSTOR_FAULTY_RESOURCES_BLOCK
+  local DMESG_ISSUES_BLOCK OOM_EVENTS_BLOCK LACP_OUTPUT_BLOCK SMLOG_EXCEPTIONS_BLOCK
 
   local hostlabel="${hn} (${ip})"
   local rc_any=0
@@ -1981,20 +2063,19 @@ if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave 
 fi
 
 
-  # NEW TEST call
   if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_overlapping_subnets; then
     if ! check_overlapping_subnets "$ip" "$pass"; then rc_any=1; fi
   fi
 
   if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_smapi_exceptions; then
-    if ! check_smapi_exceptions "$smlog"; then rc_any=1; fi
+    if ! check_smapi_exceptions "$ip" "$pass"; then rc_any=1; fi
     if [[ -n "$SMLOG_EXCEPTIONS_BLOCK" ]]; then
       append_details "$hostlabel" "SMlog Exceptions" "$SMLOG_EXCEPTIONS_BLOCK"
     fi
   fi
 
   if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_smapi_hidden_leaves; then
-    if ! check_smapi_hidden_leaves "$smlog"; then rc_any=1; fi
+    if ! check_smapi_hidden_leaves "$ip" "$pass" "$hostlabel"; then rc_any=1; fi
   fi
 
   if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_rebooted_after_updates; then
@@ -2013,28 +2094,33 @@ fi
 main() {
   ORIGINAL_ARGS=("$@")
 
-  local debver
-  debver=$(cat /etc/os-release | awk -F '=' '/VERSION_ID=/ {print $2}' | tr -d '"')
-  if  [[ "$debver" -lt 11 ]]; then
-    echo "This script requires Debian 11 or later. Detected version: $debver" >&2
+  local debver debver_major
+  debver=$(awk -F '=' '/^VERSION_ID=/ {gsub(/"/,"",$2); print $2}' /etc/os-release 2>/dev/null || true)
+  debver_major="${debver%%.*}"
+  if [[ ! "$debver_major" =~ ^[0-9]+$ ]] || (( debver_major < 11 )); then
+    echo "This script requires Debian 11 or later. Detected version: ${debver:-unknown}" >&2
     exit 1
   fi
 
-  VALID_ARGS=$(getopt -o fhs --long filter,help,single -- "$@")
-  if [[ $? -ne 0 ]]; then
-      exit 1;
+  # temp dir for ssh control sockets + stderr capture
+  WORK_DIR="$(mktemp -d)"
+  trap 'rm -rf "$WORK_DIR"' EXIT
+
+  local VALID_ARGS
+  if ! VALID_ARGS=$(getopt -o fhs --long filter,help,single -- "$@"); then
+      exit 1
   fi
 
   eval set -- "$VALID_ARGS"
 
-  while [ true ]; do
+  while true; do
     case "$1" in
       -f | --filter)
           FILTER_OUTPUT=1
           shift
           ;;
       -h | --help)
-          usage
+          usage 0
       ;;
       -s | --single)
           POOL_MODE=0
@@ -2085,11 +2171,16 @@ main() {
     fi
   fi
 
-  get_pool_host_details "$seed_host" "$pass"
+  get_pool_host_details "$seed_host" "$pass" || true
 
   if (( ${#POOL_HOST_IPS[@]} == 0 )); then
     echo "ERROR: Could not retrieve pool host addresses from '$seed_host'." >&2
     exit 1
+  fi
+
+  # in single mode only the seed host gets checked - don't probe the rest of the pool
+  if (( POOL_MODE == 0 )); then
+    POOL_HOST_IPS=("$seed_host")
   fi
 
   check_pool_hosts_access "$pass"
@@ -2108,14 +2199,14 @@ main() {
       exit 1
     fi
 
-    MASTER_POOL_UUID="$(get_pool_uuid "$DETECTED_MASTER_IP" "$pass")"
+    MASTER_POOL_UUID="$(get_pool_uuid "$DETECTED_MASTER_IP" "$pass" || true)"
     compute_pool_ram_match "$DETECTED_MASTER_IP" "$pass"
     get_pool_missing_patches "$pass"
 
-    MASTER_RPMLIST="$(get_rpm_manifest_remote "$DETECTED_MASTER_IP" "$pass")"
-    MASTER_RPMHASH="$(get_rpm_manifest_hash_remote "$DETECTED_MASTER_IP" "$pass" | tr -d '\r' | head -n 1)"
+    MASTER_RPMLIST="$(get_rpm_manifest_remote "$DETECTED_MASTER_IP" "$pass" || true)"
+    MASTER_RPMHASH="$(get_rpm_manifest_hash_remote "$DETECTED_MASTER_IP" "$pass" | tr -d '\r' | head -n 1 || true)"
 
-    print_pool_status_section "$pass"
+    if ! print_pool_status_section "$pass"; then overall_rc=1; fi
 
     if ! run_checks_for_host "$DETECTED_MASTER_IP" "$pass" 1 ""; then overall_rc=1; fi
 
