@@ -15,6 +15,12 @@ xostor_min_ram_gb=15                            # Minimum total RAM (GB) dom0 sh
 mtu_dmesg_keywords="mtu large fragment"         # keywords in dom0 to flag MTU issues
 dmesg_issue_words="panic crash rip kill"        # words that trigger dmesg contents issues
 dmesg_issue_phrases="call trace|timed out"      # matches that trigger dmesg contents issues (whole phrase matched, pipe seperated)
+# dmesg lines that match an issue word/phrase above but are known-benign false positives.
+# Each array entry is one ignore rule: a matching line is exempted only if it contains ALL of
+# the rule's "&&"-separated substrings (case-insensitive). Add new rules as new entries.
+dmesg_ignore_rules=(
+  "megaraid && firmware crash dump"             # megaraid driver load prints "firmware crash dump : no"
+)
 oom_phrase="out of memory"                      # phrase that flags OOM runs
 crash_ignore_file=".sacrificial-space-for-logs" # file in /var/crash to ignore (don't flag on crash logs cuz of this)
 pkg_diff_max_lines=100                          # max amt of mismatched yum packages to list
@@ -1020,24 +1026,59 @@ check_dmesg_content() {
   local dmesg_out="$1"
   DMESG_ISSUES_BLOCK=""
 
+  # Flatten the ignore-rule array (one rule per line) for awk; safe when the array is empty.
+  local ignore_rules_joined
+  ignore_rules_joined="$(printf '%s\n' "${dmesg_ignore_rules[@]:-}")"
+
   local matches
   matches="$(
-    awk -v words="$dmesg_issue_words" -v phrases="$dmesg_issue_phrases" '
+    awk -v words="$dmesg_issue_words" -v phrases="$dmesg_issue_phrases" -v ignores="$ignore_rules_joined" '
       function esc_re(s,    t) { t=s; gsub(/[][(){}.*+?^$\\|]/,"\\\\&",t); return t }
       function has_word(line, w,    ww, pat) {
         ww=esc_re(w)
         pat="(^|[^[:alnum:]_])" ww "([^[:alnum:]_]|$)"
         return line ~ pat
       }
+      # A line is exempted if it contains ALL substrings of any single ignore rule.
+      function line_ignored(line,    i, j, ok) {
+        for (i=1;i<=nir;i++) {
+          ok=1
+          for (j=1;j<=IRC[i];j++) {
+            if (!index(line, IR[i,j])) { ok=0; break }
+          }
+          if (ok) return 1
+        }
+        return 0
+      }
       BEGIN{
         nw=split(words, W, /[[:space:]]+/)
         np=split(phrases, P, /\|/)
         for (i=1;i<=nw;i++) W[i]=tolower(W[i])
         for (i=1;i<=np;i++) { P[i]=tolower(P[i]); gsub(/^[[:space:]]+|[[:space:]]+$/,"",P[i]) }
+
+        # Parse ignore rules: rules split on newline, substrings within a rule split on "&&".
+        nir=0
+        nlines=split(ignores, IRLINES, /\n/)
+        for (i=1;i<=nlines;i++) {
+          if (IRLINES[i] ~ /^[[:space:]]*$/) continue
+          rc=0
+          nc=split(IRLINES[i], SUBS, /&&/)
+          for (j=1;j<=nc;j++) {
+            s=tolower(SUBS[j])
+            gsub(/^[[:space:]]+|[[:space:]]+$/,"",s)
+            gsub(/[[:space:]]+/," ",s)
+            if (s=="") continue
+            rc++
+            IR[nir+1, rc]=s
+          }
+          if (rc>0) { nir++; IRC[nir]=rc }
+        }
       }
       {
         l=tolower($0)
         gsub(/[[:space:]]+/, " ", l)
+
+        if (line_ignored(l)) next
 
         hit=0
         for (i=1;i<=np;i++) {
