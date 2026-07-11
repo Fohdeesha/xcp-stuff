@@ -9,6 +9,7 @@ set +H 2>/dev/null || true   # make ! in args no explode
 # =========================
 ssh_timeout=45                                  # SSH connect timeout in secs
 remote_cmd_timeout=180                          # max secs a single remote command may run before being killed (hung xe etc)
+local_cmd_timeout=10                            # max secs a single local command may run before being killed (hung xoa-updater etc)
 dom0_max_used=75                                # dom0 percent disk / storage use allowed before flagging as failed
 dom0_mem_used_max_pct=65                        # dom0 percent memory allowed in use before flagging as failed
 xostor_min_ram_gb=15                            # Minimum total RAM (GB) dom0 should have if xostor is in use
@@ -151,71 +152,80 @@ ensure_sshpass() {
 
 print_xoa_status_section() {
   local out DMESG_ISSUES_BLOCK XOA_CHANNEL XOA_CURRENT XOA_DEBIAN
-  local XOA_PLAN XOA_REGIST XOA_VERSION
+  local XOA_PLAN XOA_REGIST XOA_VERSION XOA_UPDATER XOA_LICENSES
 
-  out=$(xoa-updater raw-api-call isRegistered || true)
-  XOA_REGIST=$(echo "$out" | awk -F"email: '" '{ if(NF>1){split($2,a,"'\'',"); print a[1]} }')
+  out=$(timeout $local_cmd_timeout xoa-updater || true)
+  if [ $? -eq 124 ]; then
+    XOA_UPDATER=0
+  else
+    XOA_UPDATER=1
+    XOA_CHANNEL="$(awk '/channel selected/ {print $1; exit}' <<< "$out" || true)"
+    XOA_CURRENT=""
+    if grep -q 'All up to date' <<< "$out"; then
+      XOA_CURRENT=1
+    fi
 
-  out="$(xoa-updater || true)"
+    out=$(xoa-updater raw-api-call isRegistered || true)
+    XOA_REGIST=$(echo "$out" | awk -F"email: '" '{ if(NF>1){split($2,a,"'\'',"); print a[1]} }')
 
-  XOA_CHANNEL="$(awk '/channel selected/ {print $1; exit}' <<< "$out" || true)"
-  XOA_CURRENT=""
-  if grep -q 'All up to date' <<< "$out"; then
-    XOA_CURRENT=1
+    XOA_VERSION=$(xoa-updater raw-api-call getLocalManifest 2>/dev/null | awk -F"'" '$2=="xen-orchestra" {print $4}' || true)
+    XOA_PLAN=$(xoa-updater raw-api-call getXoaPlan 2>/dev/null | awk '{ gsub(/\x1B\[[0-9;]*[A-Za-z]/, "") } NF>0 { gsub(/[^\x00-\x7F]/, ""); print $1 }' || true)
+    XOA_LICENSES=$(xoa-updater raw-api-call getSelfLicenses 2>/dev/null | awk '{ gsub(/\x1B\[[0-9;]*[A-Za-z]/, "") } NF>0 { gsub(/[^\x00-\x7F]/, ""); print $1 }' || true)
   fi
-
-  XOA_VERSION=$(xoa-updater raw-api-call getLocalManifest 2>/dev/null | awk -F"'" '$2=="xen-orchestra" {print $4}' || true)
 
   XOA_DEBIAN=$(lsb_release -a 2>/dev/null | awk '/Description:/ { sub(/^Description:[[:space:]]*/, ""); print }' || true)
 
   echo "$(cyan_text "== XOA Status ==")"
 
-  if [[ -z "${XOA_REGIST:-}" ]]; then
-    printf "Registration: %s\n" "$(yellow_text 'Unregistered')"
+  if [ "$XOA_UPDATER" -eq 0 ]; then
+    printf "XOA-Updater: %s\n" "$(yellow_text 'Timeout issues, unable to determine XOA status')"
   else
-    printf "Registration: %s\n" "$(green_text "${XOA_REGIST}")"
-  fi
 
-  if [[ -z "${XOA_CHANNEL:-}" ]]; then
-    printf "XOA Channel: %s\n" "$(yellow_text '(Unknown)')"
-  else
-    printf "XOA Channel: %s\n" "$(green_text "${XOA_CHANNEL}")"
-  fi
+    if [[ -z "${XOA_REGIST:-}" ]]; then
+      printf "Registration: %s\n" "$(yellow_text 'Unregistered')"
+    else
+      printf "Registration: %s\n" "$(green_text "${XOA_REGIST}")"
+    fi
 
-  if [[ -z "${XOA_VERSION:-}" ]]; then
-    printf "XOA Version: %s\n" "$(yellow_text 'Unknown')"
-  else
-    printf "XOA Version: %s\n" "$(green_text "${XOA_VERSION}")"
-  fi
+    if [[ -z "${XOA_CHANNEL:-}" ]]; then
+      printf "XOA Channel: %s\n" "$(yellow_text '(Unknown)')"
+    else
+      printf "XOA Channel: %s\n" "$(green_text "${XOA_CHANNEL}")"
+    fi
 
-  XOA_PLAN=$(xoa-updater raw-api-call getXoaPlan 2>/dev/null | awk '{ gsub(/\x1B\[[0-9;]*[A-Za-z]/, "") } NF>0 { gsub(/[^\x00-\x7F]/, ""); print $1 }' || true)
-  if [[ -z "${XOA_PLAN:-}" ]]; then
-    printf "XOA Plan: %s" "$(yellow_text 'Unknown')"
-  else
-    printf "XOA Plan: %s" "$(green_text "${XOA_PLAN}")"
-  fi
+    if [[ -z "${XOA_VERSION:-}" ]]; then
+      printf "XOA Version: %s\n" "$(yellow_text 'Unknown')"
+    else
+      printf "XOA Version: %s\n" "$(green_text "${XOA_VERSION}")"
+    fi
 
-  out=$(xoa-updater raw-api-call getSelfLicenses 2>/dev/null | awk '{ gsub(/\x1B\[[0-9;]*[A-Za-z]/, "") } NF>0 { gsub(/[^\x00-\x7F]/, ""); print $1 }' || true)
-  if [[ -z "${out//[[:space:]]/}" ]]; then
-      printf " (%s)\n" "$(yellow_text "Unknown")"
-  elif [[ "$out" == "[]" ]]; then
-      printf " (%s)\n" "$(yellow_text "Unbound")"
-  else
-    printf " (%s)\n" "$(green_text "Bound")"
-  fi
+    if [[ -z "${XOA_PLAN:-}" ]]; then
+      printf "XOA Plan: %s" "$(yellow_text 'Unknown')"
+    else
+      printf "XOA Plan: %s" "$(green_text "${XOA_PLAN}")"
+    fi
 
-  if [[ -z "${XOA_CURRENT:-}" ]]; then
-    printf "XOA Status: %s\n" "$(yellow_text 'Updates available')"
-  else
-    printf "XOA Status: %s\n" "$(green_text 'Up to date')"
-  fi
+    if [[ -z "${XOA_LICENSES:-}" ]]; then
+        printf " (%s)\n" "$(yellow_text "Unknown")"
+    elif [[ "$XOA_LICENSES" == "[]" ]]; then
+        printf " (%s)\n" "$(yellow_text "Unbound")"
+    else
+      printf " (%s)\n" "$(green_text "Bound")"
+    fi
 
-  out=$(xoa check 2>&1 >/dev/null || true)
-  if [[ -z "${out//[[:space:]]/}" ]]; then
-    printf "XOA Check: %s\n" "$(green_text 'All OK')"
-  else
-    printf "XOA Check: %s\n" "$(yellow_text 'Issues Found, See Output Below')"
-    append_details "XOA" "XOA Check Issues" "$out"
+    if [[ -z "${XOA_CURRENT:-}" ]]; then
+      printf "XOA Status: %s\n" "$(yellow_text 'Updates available')"
+    else
+      printf "XOA Status: %s\n" "$(green_text 'Up to date')"
+    fi
+
+    out=$(xoa check 2>&1 >/dev/null || true)
+    if [[ -z "${out//[[:space:]]/}" ]]; then
+      printf "XOA Check: %s\n" "$(green_text 'All OK')"
+    else
+      printf "XOA Check: %s\n" "$(yellow_text 'Issues Found, See Output Below')"
+      append_details "XOA" "XOA Check Issues" "$out"
+    fi
   fi
 
   if [[ -z "${XOA_DEBIAN:-}" ]]; then
