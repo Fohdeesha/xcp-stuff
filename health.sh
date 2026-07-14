@@ -154,8 +154,9 @@ print_xoa_status_section() {
   local out DMESG_ISSUES_BLOCK XOA_CHANNEL XOA_CURRENT XOA_DEBIAN
   local XOA_PLAN XOA_REGIST XOA_VERSION XOA_UPDATER XOA_LICENSES
 
-  out=$(timeout $local_cmd_timeout xoa-updater || true)
-  if [ $? -eq 124 ]; then
+  local rc=0
+  out=$(timeout "$local_cmd_timeout" xoa-updater) || rc=$?
+  if [ "$rc" -eq 124 ]; then
     XOA_UPDATER=0
   else
     XOA_UPDATER=1
