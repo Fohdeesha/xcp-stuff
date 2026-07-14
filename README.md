@@ -22,3 +22,7 @@ Usage:
   ./health_test.sh 192.168.1.6 'mypass'
   ./health_test.sh -s 192.168.1.7 'mypass'
   ```
+
+  ## Example Output
+
+![Alt text](example-output.png)
