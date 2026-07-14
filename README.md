@@ -4,7 +4,10 @@ Home of the XCP-ng infra health check script & misc xcp tooling
 ## how to use
 Run the health.sh script on an XOA appliance with no arguments, it will pull pool/host information from XOA's database.  
 
-If XOA is connected to more than one pool, specify the IP of the pool master you wish to check, otherwise it only checks the first pool listed in XOA. Providing the password is not necessary, it will be pulled from XOA. If the host/pool is not in XOA, you can manually specify the pool master IP and password:
+- If XOA is connected to more than one pool, specify the IP of the pool master you wish to check, otherwise it only checks the first pool listed in XOA
+- Providing the password is not necessary, it will be pulled from XOA.
+- If the host/pool is not in XOA, you can manually specify the pool master IP and password
+- If the host it's checking is part of a pool, it will health check every pool member, unless you provide "-s" for single host check only
 ```
 [03:34 14] xoa:~$ ./health.sh --help
 Usage:
