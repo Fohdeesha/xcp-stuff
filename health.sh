@@ -110,7 +110,7 @@ usage() {
   echo "  - If a password is not supplied, it will be looked up locally in xo-server-db"
   echo "  - By default, the script runs in pool mode (checks all hosts in the pool)"
   echo "  - Use '-f' flag to filter output to only show issues found"
-  echo "  - Use '-s' flag to only check the specified host"
+  echo "  - Use '-s' flag to only check the specified host (do not check other pool members if present)"
   echo ""
   echo "  Examples:"
   echo "  $0 192.168.1.5"
