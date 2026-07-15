@@ -2,11 +2,18 @@
 Home of the XCP-ng infra health check script & misc xcp tooling
 
 ## how to use
+```
+# from XOA as root (no args = interactive menu to choose pool):
+bash <(curl -fsSL https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/health.sh)
+
+# With args:
+bash <(curl -fsSL https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/health.sh) -n mainpool
+```
 Run the health.sh script on an XOA appliance with no arguments, it will pull pool/host information from XOA's database.  
 
 - If XOA is connected to more than one pool, it lists the enabled pools and asks which one to check
 - You can also provide a pool's name or part of a name with "-n", (for example, "-n pri" would match XEN-PRIMARY) or by giving the IP of the pool master directly
-- Providing the password is not necessary, it will be pulled from XOA.
+- Providing the password is not necessary, it will be pulled from XOA
 - If the host/pool is not in XOA, you can manually specify the pool master IP and password
 - If the host it's checking is part of a pool, it will health check every pool member, unless you provide "-s" for single host check only
 ```
