@@ -73,6 +73,7 @@ cyan_text()   { printf "%s%s%s" "$CYAN" "$1" "$RESET"; }
 # globals
 POOL_MODE=1
 FILTER_OUTPUT=0
+POOL_NAME_FILTER=""                 # -n: substring to match a pool by name in xo-db (case insensitive)
 DETAILS_OUTPUT=""
 POOLDETAILS_OUTPUT=""
 POOLCONF_SUMMARY=""
@@ -85,6 +86,7 @@ declare -A POOL_HOSTS_NTP=()
 declare -A POOL_HOSTS_STATUS=()
 SSH_PORT=22
 PARSED_HOST=""
+SELECTED_HOST=""                    # host chosen from the xo-db pool picker (set by select_host_from_xoa_db)
 ORIGINAL_ARGS=()
 MASTER_RPMLIST=""
 MASTER_RPMHASH=""
@@ -103,19 +105,25 @@ WORK_DIR=""                         # temp dir for ssh control sockets / stderr 
 
 usage() {
   echo "Usage:"
-  echo "  $0 [-f] [-s] [pool_master_or_host[:ssh_port] [root_password]]"
+  echo "  $0 [-f] [-s] [-n name] [pool_master_or_host[:ssh_port] [root_password]]"
   echo ""
   echo "  - All parameters are optional"
-  echo "  - If a host is not supplied, the first one from xo-server-db will be used"
+  echo "  - If a host is not supplied, the enabled pools in xo-server-db are listed to pick from"
+  echo "    (a single enabled pool, or non-interactive use, just takes the first one)"
   echo "  - If a password is not supplied, it will be looked up locally in xo-server-db"
   echo "  - By default, the script runs in pool mode (checks all hosts in the pool)"
   echo "  - Use '-f' flag to filter output to only show issues found"
   echo "  - Use '-s' flag to only check the specified host (do not check other pool members if present)"
+  echo "  - Use '-n' to pick a pool from xo-server-db by name instead of being prompted:"
+  echo "    the first pool whose name contains the text is used, matched anywhere in the"
+  echo "    name and ignoring case, so '-n sec' matches 'XEN-SECONDARY'"
   echo ""
   echo "  Examples:"
   echo "  $0 192.168.1.5"
   echo "  $0 192.168.1.6 'mypass'"
   echo "  $0 -s 192.168.1.7 'mypass'"
+  echo "  $0 -n sec"
+  echo "  $0 -f -n 'xen-main'"
   exit "${1:-2}"
 }
 
@@ -335,33 +343,190 @@ get_password_from_xoa_db_simple() {
 }
 
 
-get_first_host_from_xoa_db() {
+# Emit one "host|poolname" line per *enabled* server in xo-server-db, sorted by pool name.
+#
+# Deliberately goes through xo-server-db rather than talking to redis directly: when
+# xo-server config has redis.encryptCredentialDatabase set, the whole record is stored
+# AES-encrypted under xo:server:<id> (and the indexes are HMACed), so a raw redis-cli
+# GET returns ciphertext. xo-server-db decrypts transparently and also honors whatever
+# redis connection the config points at. 'enabled' is not an indexed field either, so
+# the filtering can't be pushed into the db - we do it here.
+get_enabled_servers_from_xoa_db() {
 
   command -v xo-server-db >/dev/null 2>&1 || {
     echo "ERROR: xo-server-db not found in PATH (are you running this on XOA?)." >&2
     return 1
   }
 
-  xo-server-db ls server 2>/dev/null | node -e "
-    const fs = require(\"fs\");
+  # 'ls' prints each record with node's util.inspect, which is structured but NOT JSON:
+  # it picks the quote character per value, so a pool named  Bob's Pool  comes out as
+  # "Bob's Pool" and one with both quote kinds comes out `like this`. Values may also
+  # contain braces (the error field holds raw JSON). So we scan the text string-aware
+  # rather than regexing out {...} blocks - a quote or brace inside a value is otherwise
+  # indistinguishable from structure. Values are still only ever read as data, never eval'd.
+  xo-server-db ls server 2>/dev/null | node -e '
+    const text = require("fs").readFileSync(0, "utf8");
+    // apostrophe(39), double quote(34), backtick(96) - built from char codes because
+    // this whole script sits inside bash single quotes: a literal apostrophe here
+    // would end the shell string, and a literal backtick would start a subshell
+    const QUOTES = String.fromCharCode(39, 34, 96);
+    let i = 0;
 
-    const input = fs.readFileSync(0, \"utf8\")
-      .replace(/^\s*error:\s*'.*',?\s*$/gm, \"\");
+    const unescape = (s) => s.replace(/\\(u\{([0-9a-fA-F]+)\}|u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2})|.)/g,
+      (m, all, ub, u, x) => {
+        if (ub !== undefined) return String.fromCodePoint(parseInt(ub, 16));
+        if (u !== undefined) return String.fromCharCode(parseInt(u, 16));
+        if (x !== undefined) return String.fromCharCode(parseInt(x, 16));
+        return { n: "\n", t: "\t", r: "\r", b: "\b", f: "\f", v: "\v", "0": "\0" }[all] ?? all;
+      });
 
-    // split into object blocks
-    const blocks = input.match(/\{[\s\S]*?\}/g) || [];
-
-    for (const block of blocks) {
-      // pick fields out with regexes instead of eval'ing DB content as code (\x27 = single quote)
-      if (!/[\s{,]enabled:\s*\x27?true\x27?/.test(block)) continue;
-      const m = block.match(/[\s{,]host:\s*\x27([^\x27]*)\x27/);
-      if (m && m[1]) {
-        console.log(m[1]);
-        break;
+    // text[i] is an opening quote; consume through the matching close and return the value
+    const readQuoted = () => {
+      const q = text[i++];
+      let raw = "";
+      while (i < text.length && text[i] !== q) {
+        if (text[i] === "\\") raw += text[i++];   // keep escape, take next char verbatim
+        raw += text[i++];
       }
-    }
-    "
+      i++;
+      return unescape(raw);
+    };
 
+    const KEY = /([A-Za-z_$][\w$]*)\s*:\s*/y;
+    const records = [];
+
+    while (i < text.length) {
+      if (QUOTES.includes(text[i])) { readQuoted(); continue; }
+      if (text[i] !== "{") { i++; continue; }
+
+      i++;
+      const rec = {};
+      let depth = 1;
+      while (i < text.length && depth > 0) {
+        const c = text[i];
+        if (QUOTES.includes(c)) { readQuoted(); continue; }
+        if (c === "{" || c === "[") { depth++; i++; continue; }
+        if (c === "}" || c === "]") { depth--; i++; continue; }
+        if (depth === 1) {
+          KEY.lastIndex = i;
+          const m = KEY.exec(text);
+          if (m) {
+            i = KEY.lastIndex;
+            const v = text[i];
+            if (QUOTES.includes(v)) rec[m[1]] = readQuoted();
+            else if (v !== "{" && v !== "[") {     // bare value: true, 42, null ...
+              let bare = "";
+              while (i < text.length && !",}\n".includes(text[i])) bare += text[i++];
+              rec[m[1]] = bare.trim();
+            }
+            continue;                             // nested {/[ falls through to depth tracking
+          }
+        }
+        i++;
+      }
+      records.push(rec);
+    }
+
+    const clean = (s) => String(s ?? "").replace(/\s+/g, " ").trim();
+
+    const rows = records
+      .filter((r) => String(r.enabled) === "true" && r.host)
+      // poolNameLabel only exists once XO has connected to the pool at least once;
+      // fall back to the user-set server label, then to a placeholder
+      .map((r) => ({
+        host: r.host,
+        name: clean(r.poolNameLabel) || clean(r.label) || "(unnamed)",
+        // -n matches either name, not just the displayed one: a pool can show as
+        // XEN-PRIMARY while the server label a user remembers it by is XEN-MAIN-01
+        search: (clean(r.poolNameLabel) + " " + clean(r.label)).toLowerCase(),
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
+
+    // tab separated: clean() collapsed all whitespace, so no field can contain a tab
+    for (const r of rows) console.log([r.host, r.name, r.search].join("\t"));
+  '
+
+}
+
+# With no host argument: choose which pool to check from the enabled servers in xo-db.
+# -n <str> picks the first name match outright; otherwise a single enabled server is
+# used silently and several get a numbered menu.
+# Sets SELECTED_HOST. Returns 0 = chosen, 1 = nothing usable found, 2 = user aborted,
+# 3 = -n matched nothing.
+select_host_from_xoa_db() {
+  SELECTED_HOST=""
+
+  local -a names=() hosts=() searches=()
+  local name host search
+  while IFS=$'\t' read -r host name search; do
+    [[ -n "$host" ]] || continue
+    hosts+=("$host")
+    names+=("$name")
+    searches+=("$search")
+  done < <(get_enabled_servers_from_xoa_db || true)
+
+  local n="${#hosts[@]}"
+  (( n > 0 )) || return 1
+
+  local i
+
+  # -n: first case-insensitive substring match, anywhere in either name. Applied
+  # before the menu so it works non-interactively too. Order is the sorted display
+  # order, so "first match" is deterministic rather than however redis listed things.
+  if [[ -n "$POOL_NAME_FILTER" ]]; then
+    local needle="${POOL_NAME_FILTER,,}"
+    for (( i = 0; i < n; i++ )); do
+      if [[ "${searches[i]}" == *"$needle"* ]]; then
+        SELECTED_HOST="${hosts[i]}"
+        printf "Matched pool: %s\n" "$(green_text "${names[i]} (${hosts[i]})")" >&2
+        return 0
+      fi
+    done
+    {
+      printf "ERROR: no enabled pool in xo-server-db matches '%s'.\n" "$POOL_NAME_FILTER"
+      echo "Enabled pools:"
+      for (( i = 0; i < n; i++ )); do
+        printf "  %s (%s)\n" "${names[i]}" "${hosts[i]}"
+      done
+    } >&2
+    return 3
+  fi
+
+  # nothing to choose from, or nobody at the keyboard (piped/cron) - keep the old
+  # behaviour of just taking the first enabled server
+  if (( n == 1 )) || [[ ! -t 0 ]]; then
+    SELECTED_HOST="${hosts[0]}"
+    return 0
+  fi
+
+  {
+    echo ""
+    echo "$(cyan_text "== Multiple pools found in XOA ==")"
+    for (( i = 0; i < n; i++ )); do
+      printf "%d - %s (%s)\n" "$((i + 1))" "${names[i]}" "${hosts[i]}"
+    done
+    echo ""
+  } >&2
+
+  local choice
+  while true; do
+    printf "Select a pool [1-%d], or q to quit: " "$n" >&2
+
+    # default IFS so surrounding whitespace is trimmed; EOF (ctrl-d) reads as a quit
+    read -r choice || choice="q"
+
+    case "$choice" in
+      q|Q) return 2 ;;
+    esac
+
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= n )); then
+      SELECTED_HOST="${hosts[choice - 1]}"
+      echo "" >&2
+      return 0
+    fi
+
+    printf "%s\n" "$(yellow_text 'Invalid selection.')" >&2
+  done
 }
 
 run_remote() {
@@ -821,15 +986,18 @@ check_uptime() {
   local pass="$2"
 
   local up rc
-  if up=$(run_remote "$host" "$pass" "uptime -s 2>/dev/null || true" | tr -d '\r' | head -n 1); then
-    rc=0
-  else
+  if ! up=$(run_remote "$host" "$pass" "uptime -s 2>/dev/null || true"); then
     rc=$?
     echo "SSH failed when trying to get uptime from $host (exit code $rc)" >&2
+    up=""
   fi
 
-  up="${up:-Unknown}"
-  printf "Last Booted:  %s\n" "$up"
+  # strip CRs / keep the first line with builtins: piping into 'head -n 1' can SIGPIPE
+  # the upstream command, which pipefail would then report as a failure of the ssh call
+  up="${up//$'\r'/}"
+  up="${up%%$'\n'*}"
+
+  printf "Last Booted:  %s\n" "${up:-Unknown}"
   return 0
 }
 
@@ -2159,7 +2327,7 @@ main() {
   trap 'rm -rf "$WORK_DIR"' EXIT
 
   local VALID_ARGS
-  if ! VALID_ARGS=$(getopt -o fhs --long filter,help,single -- "$@"); then
+  if ! VALID_ARGS=$(getopt -o fhsn: --long filter,help,single,name: -- "$@"); then
       exit 1
   fi
 
@@ -2178,6 +2346,10 @@ main() {
           POOL_MODE=0
           shift
           ;;
+      -n | --name)
+          POOL_NAME_FILTER="$2"
+          shift 2
+          ;;
       --) shift;
           break
           ;;
@@ -2186,14 +2358,28 @@ main() {
 
    [[ $# -le 2 ]] || usage
 
-  # no args = use first host from xo-db
-  if [ "$#" -eq 0 ]; then
-      local first_host="$(get_first_host_from_xoa_db || true)"
-      if [[ -z "$first_host" ]]; then
-        echo "No host IP provided and no hosts found in xo-db, please provide a host IP as an argument"
-        exit 1
-      fi
-      set -- "$first_host"
+  # -n names a pool instead of giving a host, so only an optional password may follow it
+  if [[ -n "$POOL_NAME_FILTER" && $# -gt 1 ]]; then
+    echo "ERROR: -n/--name looks the host up in xo-server-db, so it takes at most a password after it." >&2
+    usage
+  fi
+
+  # -n, or no args at all = resolve a pool from xo-db (which prompts when more than
+  # one is enabled and no -n narrowed it down)
+  if [[ -n "$POOL_NAME_FILTER" ]] || [ "$#" -eq 0 ]; then
+      local sel_rc=0
+      select_host_from_xoa_db || sel_rc=$?
+      case "$sel_rc" in
+        0) ;;
+        2) echo "Aborted." >&2; exit 0 ;;
+        3) exit 1 ;;   # -n matched nothing; the pools it did find were already listed
+        *)
+          echo "No host IP provided and no enabled hosts found in xo-db, please provide a host IP as an argument"
+          exit 1
+          ;;
+      esac
+      # keep any password the user passed after -n as the second positional
+      set -- "$SELECTED_HOST" "$@"
   fi
 
   parse_target_host_and_port "$1"
