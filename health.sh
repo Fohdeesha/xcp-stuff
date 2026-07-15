@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # J-Sands / Vates
-# V2.0
+# V2.1
 set -euo pipefail
 set +H 2>/dev/null || true   # make ! in args no explode
 
@@ -23,6 +23,34 @@ dmesg_ignore_rules=(
   "megaraid && firmware crash dump"             # megaraid driver load prints "firmware crash dump : no"
 )
 oom_phrase="out of memory"                      # phrase that flags OOM runs
+
+# --- "Log Errors" check ---
+# Phrases that flag a problem when found in the logs listed below. Matched as plain
+# case-insensitive substrings (not regex), so no escaping needed - add new ones freely.
+# Each phrase is reported separately, so a noisy phrase can't hide a rare one.
+log_error_phrases=(
+  "except"                                      # python tracebacks / SMAPI exceptions
+  "Input/output error"
+  "XENAPI_PLUGIN_FAILURE"
+)
+# Logs scanned for the phrases above. Each is searched together with its rotated ".1"
+# copy, because these rotate daily (~04:00) - right after a rotation the live file is
+# nearly empty and this morning's errors are already in .1.
+log_error_files=(
+  "/var/log/SMlog"
+  "/var/log/xensource.log"
+)
+log_error_context=3                             # lines of context shown either side of a match
+
+# --- "LUN Assignments" check ---
+# Same scan machinery as above, pointed at the kernel log (also read with its .1 copy)
+lun_change_phrases=(
+  "Warning! Received an indication that the LUN assignments on this target have changed"
+)
+lun_change_files=(
+  "/var/log/kern.log"
+)
+
 crash_ignore_file=".sacrificial-space-for-logs" # file in /var/crash to ignore (don't flag on crash logs cuz of this)
 pkg_diff_max_lines=100                          # max amt of mismatched yum packages to list
 time_sync_allowance_secs=300                    # max allowed time difference between hosts in seconds
@@ -40,7 +68,8 @@ pool_run_lacp_negotiation=1
 pool_run_silly_mtus=1
 pool_run_dns_gw_non_mgmt_pifs=1
 pool_run_overlapping_subnets=1
-pool_run_smapi_exceptions=1
+pool_run_log_errors=1
+pool_run_lun_assignments=1
 pool_run_smapi_hidden_leaves=0
 pool_run_rebooted_after_updates=1
 pool_run_yum_patch_level=1
@@ -1477,23 +1506,72 @@ check_vlan0_exist() {
   return 0
 }
 
+# Read one key out of the pool's other-config map.
+# prints the value; returns 0 = key set, 1 = key not set, 2 = could not read the map
+#
+# Deliberately fetches the whole map rather than asking for the key with 'param-key=':
+# when the key isn't set, xapi answers a param-key request with a Cli_failure AND logs
+# an exception into xensource.log, so probing key by key made every run of this script
+# leave two fresh "except" hits on the master - which check_log_errors would then dutifully
+# report as a problem we caused ourselves. Fetching the whole map is quiet.
+#
+# It also lets us tell "key not set" apart from "xapi isn't answering": a map we read
+# successfully that lacks the key is genuinely unconfigured, a map we couldn't read is
+# unknown. The old param-key form swallowed both into an empty string.
+get_pool_other_config_key() {
+  local host="$1"
+  local pass="$2"
+  local key="$3"
+
+  local out
+  if ! out=$(run_remote "$host" "$pass" "xe pool-param-get uuid=${MASTER_POOL_UUID} param-name=other-config"); then
+    return 2
+  fi
+
+  # the map prints as "key: value; key: value"; the values we look up are network
+  # UUIDs, so splitting records on ';' can't cut one of them in half
+  local val
+  val="$(awk -v k="$key" '
+    BEGIN { RS=";" }
+    {
+      entry=$0
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", entry)
+      i=index(entry, ": ")
+      if (i==0) next
+      name=substr(entry, 1, i-1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+      if (name==k) {
+        v=substr(entry, i+2)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+        print v
+        exit
+      }
+    }
+  ' <<< "$out" || true)"
+
+  [[ -n "${val//[[:space:]]/}" ]] || return 1
+
+  printf '%s' "$val"
+  return 0
+}
+
 check_migration_network() {
   local host="$1"
   local pass="$2"
 
-  local out rc
-  if out=$(run_remote "$host" "$pass" "xe pool-param-get uuid=${MASTER_POOL_UUID} param-name=other-config param-key=xo:migrationNetwork 2>/dev/null || true"); then
-    rc=0
-  else
-    rc=$?
-    echo "SSH failed when trying to check migration network on $host (exit code $rc)" >&2
-    return "$rc"
-  fi
+  local out krc=0
+  out="$(get_pool_other_config_key "$host" "$pass" "xo:migrationNetwork")" || krc=$?
 
-  if [[ -z "${out//[[:space:]]/}" ]]; then
-    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Migration Network: %s\n" "$(green_text 'Not configured')"
-    return 0
-  fi
+  case "$krc" in
+    1)
+      [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Migration Network: %s\n" "$(green_text 'Not configured')"
+      return 0
+      ;;
+    2)
+      printf "Migration Network: %s\n" "$(yellow_text 'Unknown (could not read pool other-config)')"
+      return 1
+      ;;
+  esac
 
   local network_uuid="${out//[[:space:]]/}"
   local member_rc=0
@@ -1520,19 +1598,19 @@ check_backup_network() {
   local host="$1"
   local pass="$2"
 
-  local out rc
-  if out=$(run_remote "$host" "$pass" "xe pool-param-get uuid=${MASTER_POOL_UUID} param-name=other-config param-key=xo:backupNetwork 2>/dev/null || true"); then
-    rc=0
-  else
-    rc=$?
-    echo "SSH failed when trying to check backup network on $host (exit code $rc)" >&2
-    return "$rc"
-  fi
+  local out krc=0
+  out="$(get_pool_other_config_key "$host" "$pass" "xo:backupNetwork")" || krc=$?
 
-  if [[ -z "${out//[[:space:]]/}" ]]; then
-    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Backup Network: %s\n" "$(green_text 'Not configured')"
-    return 0
-  fi
+  case "$krc" in
+    1)
+      [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Backup Network: %s\n" "$(green_text 'Not configured')"
+      return 0
+      ;;
+    2)
+      printf "Backup Network: %s\n" "$(yellow_text 'Unknown (could not read pool other-config)')"
+      return 1
+      ;;
+  esac
 
   local network_uuid="${out//[[:space:]]/}"
   local member_rc=0
@@ -1654,33 +1732,116 @@ check_overlapping_subnets() {
   fi
 }
 
-check_smapi_exceptions() {
+# Build the remote script that scans logs for phrases. For every (log, phrase) pair it
+# reports the most recent hit with a few lines of context either side.
+#
+#   $1 = newline separated base log paths   $2 = newline separated phrases   $3 = context lines
+#
+# All the work happens on the host - these logs run to tens of MB (xensource.log.1 is
+# routinely 50MB+), so we never drag them over the wire, only the few matched lines.
+# Each base log is tried first, then its rotated .1, and we stop at the first of the two
+# that has the phrase: the live file holds the newest hit, and falling back to .1 only
+# when the live file has none covers the daily rotation without reporting a stale hit
+# alongside a current one. Phrases are searched one at a time (grep -F, fixed string) so
+# a phrase that matches constantly can never crowd out a rare, more serious one.
+build_log_scan_cmd() {
+  local files_nl="$1"
+  local phrases_nl="$2"
+  local ctx="${3:-3}"
+
+  local q_files="" q_phrases="" x
+  while IFS= read -r x; do
+    [[ -n "$x" ]] || continue
+    q_files+=" $(printf '%q' "$x")"
+  done <<< "$files_nl"
+  while IFS= read -r x; do
+    [[ -n "$x" ]] || continue
+    q_phrases+=" $(printf '%q' "$x")"
+  done <<< "$phrases_nl"
+
+  # exits 0 no matter what: no match, an unreadable log and a missing log are all
+  # "nothing to report" here, and a nonzero rc would be read as an SSH failure
+  cat <<EOF
+CTX=$(printf '%q' "$ctx")
+for base in$q_files; do
+  for ph in$q_phrases; do
+    for cand in "\$base" "\$base.1"; do
+      [ -r "\$cand" ] || continue
+      n=\$(grep -inF -- "\$ph" "\$cand" 2>/dev/null | tail -n 1 | cut -d: -f1)
+      [ -n "\$n" ] || continue
+      s=\$((n - CTX)); [ "\$s" -lt 1 ] && s=1
+      printf '%s\n' "--- \$ph (\$cand) ---"
+      sed -n "\${s},\$((n + CTX))p" "\$cand" 2>/dev/null | sed 's/^/  /'
+      printf '\n'
+      break
+    done
+  done
+done
+exit 0
+EOF
+}
+
+check_log_errors() {
   local host="$1"
   local pass="$2"
 
-  SMLOG_EXCEPTIONS_BLOCK=""
+  LOG_ERRORS_BLOCK=""
 
-  # find the last line containing "except" and pull +/- 3 lines of context around it,
-  # remotely, so we don't drag the whole SMlog over the wire
-  local cmd='test -r /var/log/SMlog || exit 0; n=$(grep -in except /var/log/SMlog 2>/dev/null | tail -n 1 | cut -d: -f1); if [ -n "$n" ]; then s=$((n-3)); [ "$s" -lt 1 ] && s=1; sed -n "${s},$((n+3))p" /var/log/SMlog; fi'
+  local cmd
+  cmd="$(build_log_scan_cmd \
+    "$(printf '%s\n' "${log_error_files[@]}")" \
+    "$(printf '%s\n' "${log_error_phrases[@]}")" \
+    "$log_error_context")"
 
   local out rc
   if out=$(run_remote "$host" "$pass" "$cmd"); then
     rc=0
   else
     rc=$?
-    echo "SSH failed when trying to check SMlog exceptions on $host (exit code $rc)" >&2
+    echo "SSH failed when trying to check logs for errors on $host (exit code $rc)" >&2
     return "$rc"
   fi
 
   if [[ -z "${out//[[:space:]]/}" ]]; then
-    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "SMAPI Exceptions: %s\n" "$(none)"
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Log Errors: %s\n" "$(none)"
     return 0
   fi
 
-  SMLOG_EXCEPTIONS_BLOCK="$(sed 's/^/  /' <<< "$out")"
+  LOG_ERRORS_BLOCK="$out"
 
-  printf "SMAPI Exceptions: %s\n" "$(yellow_text 'Yes, See Error Output')"
+  printf "Log Errors: %s\n" "$(yellow_text 'Yes, See Error Output')"
+  return 1
+}
+
+check_lun_assignments() {
+  local host="$1"
+  local pass="$2"
+
+  LUN_CHANGES_BLOCK=""
+
+  local cmd
+  cmd="$(build_log_scan_cmd \
+    "$(printf '%s\n' "${lun_change_files[@]}")" \
+    "$(printf '%s\n' "${lun_change_phrases[@]}")" \
+    "$log_error_context")"
+
+  local out rc
+  if out=$(run_remote "$host" "$pass" "$cmd"); then
+    rc=0
+  else
+    rc=$?
+    echo "SSH failed when trying to check LUN assignments on $host (exit code $rc)" >&2
+    return "$rc"
+  fi
+
+  if [[ -z "${out//[[:space:]]/}" ]]; then
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "LUN Assignments: %s\n" "$(green_text 'Unchanged')"
+    return 0
+  fi
+
+  LUN_CHANGES_BLOCK="$out"
+
+  printf "LUN Assignments: %s\n" "$(yellow_text 'Changed - see below')"
   return 1
 }
 
@@ -2220,7 +2381,7 @@ run_checks_for_host() {
 
   load_mem_stats "$ip"
 
-  local DMESG_ISSUES_BLOCK OOM_EVENTS_BLOCK LACP_OUTPUT_BLOCK SMLOG_EXCEPTIONS_BLOCK
+  local DMESG_ISSUES_BLOCK OOM_EVENTS_BLOCK LACP_OUTPUT_BLOCK LOG_ERRORS_BLOCK LUN_CHANGES_BLOCK
 
   local hostlabel="${hn} (${ip})"
   local rc_any=0
@@ -2287,10 +2448,17 @@ fi
     if ! check_overlapping_subnets "$ip" "$pass"; then rc_any=1; fi
   fi
 
-  if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_smapi_exceptions; then
-    if ! check_smapi_exceptions "$ip" "$pass"; then rc_any=1; fi
-    if [[ -n "$SMLOG_EXCEPTIONS_BLOCK" ]]; then
-      append_details "$hostlabel" "SMlog Exceptions" "$SMLOG_EXCEPTIONS_BLOCK"
+  if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_log_errors; then
+    if ! check_log_errors "$ip" "$pass"; then rc_any=1; fi
+    if [[ -n "$LOG_ERRORS_BLOCK" ]]; then
+      append_details "$hostlabel" "Log Errors" "$LOG_ERRORS_BLOCK"
+    fi
+  fi
+
+  if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_lun_assignments; then
+    if ! check_lun_assignments "$ip" "$pass"; then rc_any=1; fi
+    if [[ -n "$LUN_CHANGES_BLOCK" ]]; then
+      append_details "$hostlabel" "LUN Assignment Changes" "$LUN_CHANGES_BLOCK"
     fi
   fi
 
