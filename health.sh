@@ -116,6 +116,7 @@ declare -A POOL_HOSTS_STATUS=()
 SSH_PORT=22
 PARSED_HOST=""
 SELECTED_HOST=""                    # host chosen from the xo-db pool picker (set by select_host_from_xoa_db)
+SELECTED_POOL_NAME=""               # xo-db name of that pool, as the picker menu would show it ("" if unknown)
 ORIGINAL_ARGS=()
 MASTER_RPMLIST=""
 MASTER_RPMHASH=""
@@ -480,10 +481,12 @@ get_enabled_servers_from_xoa_db() {
 # With no host argument: choose which pool to check from the enabled servers in xo-db.
 # -n <str> picks the first name match outright; otherwise a single enabled server is
 # used silently and several get a numbered menu.
-# Sets SELECTED_HOST. Returns 0 = chosen, 1 = nothing usable found, 2 = user aborted,
+# Sets SELECTED_HOST and SELECTED_POOL_NAME (main announces the choice - this function
+# only resolves it). Returns 0 = chosen, 1 = nothing usable found, 2 = user aborted,
 # 3 = -n matched nothing.
 select_host_from_xoa_db() {
   SELECTED_HOST=""
+  SELECTED_POOL_NAME=""
 
   local -a names=() hosts=() searches=()
   local name host search
@@ -507,7 +510,7 @@ select_host_from_xoa_db() {
     for (( i = 0; i < n; i++ )); do
       if [[ "${searches[i]}" == *"$needle"* ]]; then
         SELECTED_HOST="${hosts[i]}"
-        printf "Matched pool: %s\n" "$(green_text "${names[i]} (${hosts[i]})")" >&2
+        SELECTED_POOL_NAME="${names[i]}"
         return 0
       fi
     done
@@ -525,6 +528,7 @@ select_host_from_xoa_db() {
   # behaviour of just taking the first enabled server
   if (( n == 1 )) || [[ ! -t 0 ]]; then
     SELECTED_HOST="${hosts[0]}"
+    SELECTED_POOL_NAME="${names[0]}"
     return 0
   fi
 
@@ -550,12 +554,55 @@ select_host_from_xoa_db() {
 
     if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= n )); then
       SELECTED_HOST="${hosts[choice - 1]}"
+      SELECTED_POOL_NAME="${names[choice - 1]}"
       echo "" >&2
       return 0
     fi
 
     printf "%s\n" "$(yellow_text 'Invalid selection.')" >&2
   done
+}
+
+# Pool name for a host that was given as an argument rather than picked from the menu,
+# so every invocation can name what it is about to check. Reuses the picker's listing so
+# the name printed is byte-for-byte the one the menu would have shown; that costs one
+# extra 'xo-server-db ls' next to a run that is otherwise minutes of ssh.
+#
+# Quiet and always successful on purpose: a host xo-db has no enabled record for (a
+# slave via -s, a pool XO does not manage, or no xo-server-db at all when a host and
+# password were both passed) is a normal case, not an error - it just means the banner
+# prints the address on its own.
+get_pool_name_for_host() {
+  local want="$1"
+
+  command -v xo-server-db >/dev/null 2>&1 || return 0
+
+  local host name search
+  while IFS=$'\t' read -r host name search; do
+    if [[ "$host" == "$want" ]]; then
+      printf "%s\n" "$name"
+      return 0
+    fi
+  done < <(get_enabled_servers_from_xoa_db 2>/dev/null || true)
+
+  return 0
+}
+
+# Announce the target before any of the slow remote work starts, however it was arrived
+# at: menu choice, the sole enabled pool, -n match, or a host argument. Naming the pool
+# where we can is what makes the auto-picked and non-interactive (cron/pipe) runs
+# auditable - those take entry #1 silently, and the printed name is the only record of
+# which one that was.
+print_target_banner() {
+  local host="$1"
+  local name="$2"
+
+  if [[ -n "$name" ]]; then
+    printf "Checking pool: %s\n" "$(green_text "$name ($host)")"
+  else
+    printf "Checking host: %s\n" "$(green_text "$host")"
+  fi
+  echo ""
 }
 
 run_remote() {
@@ -2552,6 +2599,13 @@ main() {
 
   parse_target_host_and_port "$1"
   local seed_host="$PARSED_HOST"
+
+  # the picker already knows the name when it resolved the host; a host argument didn't
+  # go through it, so look that one up (this is the only path that can leave it empty)
+  if [[ -z "$SELECTED_POOL_NAME" ]]; then
+    SELECTED_POOL_NAME="$(get_pool_name_for_host "$seed_host" || true)"
+  fi
+  print_target_banner "$seed_host" "$SELECTED_POOL_NAME"
 
   ensure_sshpass
 
