@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # J-Sands / Vates
-# V2.1
+# V2.3
 set -euo pipefail
 set +H 2>/dev/null || true   # make ! in args no explode
 
@@ -10,6 +10,7 @@ set +H 2>/dev/null || true   # make ! in args no explode
 ssh_timeout=45                                  # SSH connect timeout in secs
 remote_cmd_timeout=180                          # max secs a single remote command may run before being killed (hung xe etc)
 local_cmd_timeout=10                            # max secs a single local command may run before being killed (hung xoa-updater etc)
+xoa_check_timeout=60                            # max secs 'xoa check' may run (it does real network probes, so it gets longer than local_cmd_timeout)
 dom0_max_used=75                                # dom0 percent disk / storage use allowed before flagging as failed
 dom0_mem_used_max_pct=65                        # dom0 percent memory allowed in use before flagging as failed
 xostor_min_ram_gb=15                            # Minimum total RAM (GB) dom0 should have if xostor is in use
@@ -134,6 +135,10 @@ PW_NOTIFY=0                         # flag to indicate we should print a warning
 WORK_DIR=""                         # temp dir for ssh control sockets / stderr capture (set in main)
 
 usage() {
+  # help asked for (-h, exit 0) goes to stdout; usage *errors* go to stderr
+  local rc="${1:-2}" fd=1
+  (( rc == 0 )) || fd=2
+  {
   echo "Usage:"
   echo "  $0 [-f] [-s] [-n name] [pool_master_or_host[:ssh_port] [root_password]]"
   echo ""
@@ -154,7 +159,8 @@ usage() {
   echo "  $0 -s 192.168.1.7 'mypass'"
   echo "  $0 -n sec"
   echo "  $0 -f -n 'xen-main'"
-  exit "${1:-2}"
+  } >&"$fd"
+  exit "$rc"
 }
 
 parse_target_host_and_port() {
@@ -192,6 +198,12 @@ print_xoa_status_section() {
   local out DMESG_ISSUES_BLOCK XOA_CHANNEL XOA_CURRENT XOA_DEBIAN
   local XOA_PLAN XOA_REGIST XOA_VERSION XOA_UPDATER XOA_LICENSES
 
+  # anything printed yellow in this section flips the return code, so XOA-side
+  # problems count toward the script exit code like every other check
+  local rc_any=0
+
+  # every updater/xoa invocation gets a timeout, not just the first one - a wedged
+  # updater daemon that answers one call and hangs on the next used to stall the run
   local rc=0
   out=$(timeout "$local_cmd_timeout" xoa-updater) || rc=$?
   if [ "$rc" -eq 124 ]; then
@@ -204,12 +216,12 @@ print_xoa_status_section() {
       XOA_CURRENT=1
     fi
 
-    out=$(xoa-updater raw-api-call isRegistered || true)
+    out=$(timeout "$local_cmd_timeout" xoa-updater raw-api-call isRegistered || true)
     XOA_REGIST=$(echo "$out" | awk -F"email: '" '{ if(NF>1){split($2,a,"'\'',"); print a[1]} }')
 
-    XOA_VERSION=$(xoa-updater raw-api-call getLocalManifest 2>/dev/null | awk -F"'" '$2=="xen-orchestra" {print $4}' || true)
-    XOA_PLAN=$(xoa-updater raw-api-call getXoaPlan 2>/dev/null | awk '{ gsub(/\x1B\[[0-9;]*[A-Za-z]/, "") } NF>0 { gsub(/[^\x00-\x7F]/, ""); print $1 }' || true)
-    XOA_LICENSES=$(xoa-updater raw-api-call getSelfLicenses 2>/dev/null | awk '{ gsub(/\x1B\[[0-9;]*[A-Za-z]/, "") } NF>0 { gsub(/[^\x00-\x7F]/, ""); print $1 }' || true)
+    XOA_VERSION=$(timeout "$local_cmd_timeout" xoa-updater raw-api-call getLocalManifest 2>/dev/null | awk -F"'" '$2=="xen-orchestra" {print $4}' || true)
+    XOA_PLAN=$(timeout "$local_cmd_timeout" xoa-updater raw-api-call getXoaPlan 2>/dev/null | awk '{ gsub(/\x1B\[[0-9;]*[A-Za-z]/, "") } NF>0 { gsub(/[^\x00-\x7F]/, ""); print $1 }' || true)
+    XOA_LICENSES=$(timeout "$local_cmd_timeout" xoa-updater raw-api-call getSelfLicenses 2>/dev/null | awk '{ gsub(/\x1B\[[0-9;]*[A-Za-z]/, "") } NF>0 { gsub(/[^\x00-\x7F]/, ""); print $1 }' || true)
   fi
 
   XOA_DEBIAN=$(lsb_release -a 2>/dev/null | awk '/Description:/ { sub(/^Description:[[:space:]]*/, ""); print }' || true)
@@ -218,57 +230,73 @@ print_xoa_status_section() {
 
   if [ "$XOA_UPDATER" -eq 0 ]; then
     printf "XOA-Updater: %s\n" "$(yellow_text 'Timeout issues, unable to determine XOA status')"
+    rc_any=1
   else
 
     if [[ -z "${XOA_REGIST:-}" ]]; then
       printf "Registration: %s\n" "$(yellow_text 'Unregistered')"
+      rc_any=1
     else
       printf "Registration: %s\n" "$(green_text "${XOA_REGIST}")"
     fi
 
     if [[ -z "${XOA_CHANNEL:-}" ]]; then
       printf "XOA Channel: %s\n" "$(yellow_text '(Unknown)')"
+      rc_any=1
     else
       printf "XOA Channel: %s\n" "$(green_text "${XOA_CHANNEL}")"
     fi
 
     if [[ -z "${XOA_VERSION:-}" ]]; then
       printf "XOA Version: %s\n" "$(yellow_text 'Unknown')"
+      rc_any=1
     else
       printf "XOA Version: %s\n" "$(green_text "${XOA_VERSION}")"
     fi
 
     if [[ -z "${XOA_PLAN:-}" ]]; then
       printf "XOA Plan: %s" "$(yellow_text 'Unknown')"
+      rc_any=1
     else
       printf "XOA Plan: %s" "$(green_text "${XOA_PLAN}")"
     fi
 
     if [[ -z "${XOA_LICENSES:-}" ]]; then
         printf " (%s)\n" "$(yellow_text "Unknown")"
+        rc_any=1
     elif [[ "$XOA_LICENSES" == "[]" ]]; then
         printf " (%s)\n" "$(yellow_text "Unbound")"
+        rc_any=1
     else
       printf " (%s)\n" "$(green_text "Bound")"
     fi
 
     if [[ -z "${XOA_CURRENT:-}" ]]; then
       printf "XOA Status: %s\n" "$(yellow_text 'Updates available')"
+      rc_any=1
     else
       printf "XOA Status: %s\n" "$(green_text 'Up to date')"
     fi
 
-    out=$(xoa check 2>&1 >/dev/null || true)
-    if [[ -z "${out//[[:space:]]/}" ]]; then
+    # a timed-out 'xoa check' produces no stderr, which used to read as a green
+    # "All OK" - tell the two apart via timeout's exit code 124
+    local xoa_check_rc=0
+    out=$(timeout "$xoa_check_timeout" xoa check 2>&1 >/dev/null) || xoa_check_rc=$?
+    if (( xoa_check_rc == 124 )); then
+      printf "XOA Check: %s\n" "$(yellow_text "Timed out after ${xoa_check_timeout}s")"
+      rc_any=1
+    elif [[ -z "${out//[[:space:]]/}" ]]; then
       printf "XOA Check: %s\n" "$(green_text 'All OK')"
     else
       printf "XOA Check: %s\n" "$(yellow_text 'Issues Found, See Output Below')"
       append_details "XOA" "XOA Check Issues" "$out"
+      rc_any=1
     fi
   fi
 
   if [[ -z "${XOA_DEBIAN:-}" ]]; then
     printf "OS Version: %s\n" "$(yellow_text 'Unknown')"
+    rc_any=1
   else
     printf "OS Version: %s\n" "$(green_text "${XOA_DEBIAN}")"
   fi
@@ -291,11 +319,13 @@ print_xoa_status_section() {
 
     if [[ -z "$max_old_space" ]]; then
       printf "XO-Server Memory Limit: %s\n" "$(yellow_text 'Not Set')"
+      rc_any=1
     else
       local adjtotal_mb
       adjtotal_mb="$(awk -v m="$XOA_TOTAL_MEM" 'BEGIN{printf "%.0f", m/1024-500}')"
       if [[ "$max_old_space" -lt "$adjtotal_mb" ]]; then
         printf "XO-Server Memory Limit: %s\n" "$(yellow_text "${max_old_space}")"
+        rc_any=1
       else
         printf "XO-Server Memory Limit: %s\n" "$(green_text "$max_old_space")"
       fi
@@ -306,99 +336,33 @@ print_xoa_status_section() {
   dmesg_t="$(dmesg -T 2>/dev/null || true)"
 
   if ! check_dmesg_content "$dmesg_t"; then
+    rc_any=1
     if [[ -n "$DMESG_ISSUES_BLOCK" ]]; then
       append_details "XOA" "Dmesg Issues" "$DMESG_ISSUES_BLOCK"
     fi
   fi
 
   echo ""
+  return "$rc_any"
 }
 
-get_password_from_xoa_db_simple() {
-  local host_only="$1"
-
-  command -v xo-server-db >/dev/null 2>&1 || {
-    echo "ERROR: xo-server-db not found in PATH (are you running this on XOA?)." >&2
-    return 1
-  }
-
-  xo-server-db ls server "host=$host_only" 2>/dev/null |
-  awk '
-  BEGIN { IGNORECASE=1 }
-
-  /password:/ {
-
-      if (!match($0, /password:[[:space:]]*["\047]/))
-          next
-
-      q = substr($0, RSTART+RLENGTH-1, 1)
-      s = substr($0, RSTART+RLENGTH)
-
-      pwd=""
-      esc=0
-
-      for (i=1;i<=length(s);i++) {
-          c = substr(s,i,1)
-
-          if (esc) {
-              pwd = pwd c
-              esc=0
-              continue
-          }
-
-          if (c=="\\") {
-              pwd = pwd c
-              esc=1
-              continue
-          }
-
-          if (c==q)
-              break
-
-          pwd = pwd c
-      }
-
-      if (pwd ~ /\\\\/) {
-          gsub(/\\\\/,"PLACEHOLDER",pwd)
-          gsub(/\\/,"",pwd)
-          gsub(/PLACEHOLDER/,"\\\\",pwd)
-          print pwd
-          exit 2
-      }
-
-      print pwd
-      exit 0
-  }
-  '
-}
-
-
-# Emit one "host|poolname" line per *enabled* server in xo-server-db, sorted by pool name.
+# Shared node parser for 'xo-server-db ls' output, used by both the pool picker and
+# the password lookup so they read records byte-identically.
 #
-# Deliberately goes through xo-server-db rather than talking to redis directly: when
-# xo-server config has redis.encryptCredentialDatabase set, the whole record is stored
-# AES-encrypted under xo:server:<id> (and the indexes are HMACed), so a raw redis-cli
-# GET returns ciphertext. xo-server-db decrypts transparently and also honors whatever
-# redis connection the config points at. 'enabled' is not an indexed field either, so
-# the filtering can't be pushed into the db - we do it here.
-get_enabled_servers_from_xoa_db() {
-
-  command -v xo-server-db >/dev/null 2>&1 || {
-    echo "ERROR: xo-server-db not found in PATH (are you running this on XOA?)." >&2
-    return 1
-  }
-
-  # 'ls' prints each record with node's util.inspect, which is structured but NOT JSON:
-  # it picks the quote character per value, so a pool named  Bob's Pool  comes out as
-  # "Bob's Pool" and one with both quote kinds comes out `like this`. Values may also
-  # contain braces (the error field holds raw JSON). So we scan the text string-aware
-  # rather than regexing out {...} blocks - a quote or brace inside a value is otherwise
-  # indistinguishable from structure. Values are still only ever read as data, never eval'd.
-  xo-server-db ls server 2>/dev/null | node -e '
+# 'ls' prints each record with node's util.inspect, which is structured but NOT JSON:
+# it picks the quote character per value, so a pool named  Bob's Pool  comes out as
+# "Bob's Pool" and one with both quote kinds comes out `like this`. Values may also
+# contain braces (the error field holds raw JSON). So we scan the text string-aware
+# rather than regexing out {...} blocks - a quote or brace inside a value is otherwise
+# indistinguishable from structure. Values are still only ever read as data, never eval'd.
+#
+# This fragment leaves the parsed records in a 'records' array; each caller appends its
+# own single-quoted tail to decide what to print. Both this string and the tails sit
+# inside bash single quotes, so they must contain no literal apostrophe or backtick -
+# hence String.fromCharCode(39, 34, 96) for the quote set.
+XO_DB_PARSER_JS='
     const text = require("fs").readFileSync(0, "utf8");
-    // apostrophe(39), double quote(34), backtick(96) - built from char codes because
-    // this whole script sits inside bash single quotes: a literal apostrophe here
-    // would end the shell string, and a literal backtick would start a subshell
+    // apostrophe(39), double quote(34), backtick(96)
     const QUOTES = String.fromCharCode(39, 34, 96);
     let i = 0;
 
@@ -458,7 +422,53 @@ get_enabled_servers_from_xoa_db() {
     }
 
     const clean = (s) => String(s ?? "").replace(/\s+/g, " ").trim();
+'
 
+# Look the root password for a host up in xo-server-db. Prints the password;
+# returns 0 = found, 2 = found but it contains a backslash (caller warns via
+# PW_NOTIFY - backslash passwords have tripped tooling before), nonzero/empty
+# output otherwise. Goes through the shared node parser so every escape form
+# util.inspect can emit (\n, \', \xHH, \uHHHH, \\ ...) is decoded correctly -
+# the old line-oriented awk kept some escapes verbatim and silently returned a
+# wrong password.
+get_password_from_xoa_db_simple() {
+  local host_only="$1"
+
+  command -v xo-server-db >/dev/null 2>&1 || {
+    echo "ERROR: xo-server-db not found in PATH (are you running this on XOA?)." >&2
+    return 1
+  }
+
+  xo-server-db ls server "host=$host_only" 2>/dev/null |
+  node -e "$XO_DB_PARSER_JS"'
+    // host= is an indexed lookup, so at most one record comes back
+    const pwd = records.length ? records[0].password : undefined;
+    if (typeof pwd === "string" && pwd !== "") {
+      process.stdout.write(pwd);
+      process.exit(pwd.includes(String.fromCharCode(92)) ? 2 : 0);
+    }
+  '
+}
+
+
+# Emit one "host|poolname" line per *enabled* server in xo-server-db, sorted by pool name.
+#
+# Deliberately goes through xo-server-db rather than talking to redis directly: when
+# xo-server config has redis.encryptCredentialDatabase set, the whole record is stored
+# AES-encrypted under xo:server:<id> (and the indexes are HMACed), so a raw redis-cli
+# GET returns ciphertext. xo-server-db decrypts transparently and also honors whatever
+# redis connection the config points at. 'enabled' is not an indexed field either, so
+# the filtering can't be pushed into the db - we do it here.
+get_enabled_servers_from_xoa_db() {
+
+  command -v xo-server-db >/dev/null 2>&1 || {
+    echo "ERROR: xo-server-db not found in PATH (are you running this on XOA?)." >&2
+    return 1
+  }
+
+  # parsing of the util.inspect output lives in XO_DB_PARSER_JS (shared with the
+  # password lookup) - see the comments on that variable for why it exists
+  xo-server-db ls server 2>/dev/null | node -e "$XO_DB_PARSER_JS"'
     const rows = records
       .filter((r) => String(r.enabled) === "true" && r.host)
       // poolNameLabel only exists once XO has connected to the pool at least once;
@@ -579,7 +589,9 @@ get_pool_name_for_host() {
 
   local host name search
   while IFS=$'\t' read -r host name search; do
-    if [[ "$host" == "$want" ]]; then
+    # a db host may carry the ':port' XO connects to xapi on; the caller passes a
+    # port-stripped address, so compare against the stripped form too
+    if [[ "$host" == "$want" || "${host%:*}" == "$want" ]]; then
       printf "%s\n" "$name"
       return 0
     fi
@@ -759,63 +771,22 @@ get_pool_host_details() {
   return $rc
 }
 
-get_pool_host_memory() {
-  local pass="$1"
-
-  local ip
-  for ip in "${POOL_HOST_ACCESS_IPS[@]}"; do
-
-    local mi rc cmd
-    cmd="awk '
-      /^MemTotal:/ {t=\$2}
-      /^MemAvailable:/ {a=\$2}
-      END {
-        if (t==0) {print \"0 0\"; exit}
-        printf \"%d %d\", int(t/1024), int(a/1024)
-      }' /proc/meminfo"
-
-    if mi=$(run_remote "$ip" "$pass" "$cmd"); then
-      rc=0
-      mi=$(tr -d '\r' <<< "$mi")
-
-    else
-      rc=$?
-      echo "SSH failed when trying to get memory info from $ip (exit code $rc)" >&2
-      mi="0 0"
-    fi
-
-    local tmb amb
-    tmb="$(awk '{print $1}' <<< "$mi")"
-    amb="$(awk '{print $2}' <<< "$mi")"
-
-    if [[ "$tmb" =~ ^[0-9]+$ ]] && [[ "$amb" =~ ^[0-9]+$ ]] && (( tmb > 0 )); then
-      total_mb="$tmb"
-      avail_mb="$amb"
-      if (( total_mb >= avail_mb )); then
-        used_mb=$(( total_mb - avail_mb ))
-      else
-        used_mb=0
-      fi
-    else
-      total_mb=0; used_mb=0; avail_mb=0
-    fi
-
-    local uuid="${POOL_HOST_UUIDS[$ip]:-}"
-    if [[ -z "$uuid" ]]; then
-      continue
-    fi
-
-    POOL_HOSTS_MEM[${uuid}_total]=$total_mb
-    POOL_HOSTS_MEM[${uuid}_used]=$used_mb
-    POOL_HOSTS_MEM[${uuid}_avail]=$avail_mb
-  done
-}
-
 get_pool_missing_patches() {
   local pass="$1"
 
+  # yum check-update exits 0 = no updates, 100 = updates available, anything else =
+  # yum itself failed (broken repo config, no network, ...). Piping straight into
+  # wc -l used to swallow that last case as a green "0 missing patches" - emit a
+  # non-numeric sentinel instead so it lands in the existing Unknown (-1) path.
   local out rc cmd
-  cmd="sudo yum check-update -q | awk '/^Loaded plugins:/||NF==0{next} /^Obsoleting Packages/{exit} NF==1&&!/^[[:space:]]/{pkg=\$0;next} pkg&&/^[[:space:]]+/{sub(/^[[:space:]]+/,\"\");print pkg,\$0;pkg=\"\";next} {print}' | wc -l"
+  cmd="out=\$(sudo yum check-update -q); rc=\$?
+if [ \"\$rc\" -eq 100 ]; then
+  printf '%s\n' \"\$out\" | awk '/^Loaded plugins:/||NF==0{next} /^Obsoleting Packages/{exit} NF==1&&!/^[[:space:]]/{pkg=\$0;next} pkg&&/^[[:space:]]+/{sub(/^[[:space:]]+/,\"\");print pkg,\$0;pkg=\"\";next} {print}' | wc -l
+elif [ \"\$rc\" -eq 0 ]; then
+  echo 0
+else
+  echo YUMERR
+fi"
   if out=$(run_remote "$DETECTED_MASTER_IP" "$pass" "$cmd"); then
     rc=0
 
@@ -947,8 +918,12 @@ get_rpm_manifest_hash_remote() {
   local host="$1"
   local pass="$2"
 
+  # sha256sum only (no md5 fallback): the master's hash is computed locally from the
+  # fetched manifest, so slave hashes must use the same algorithm to be comparable.
+  # A host somehow lacking sha256sum fails the call and lands in the Unknown path,
+  # which beats a fake mismatch.
   local out rc
-  if out=$(run_remote "$host" "$pass" "$(rpm_manifest_cmd) | (command -v sha256sum >/dev/null 2>&1 && sha256sum || md5sum) | cut -d' ' -f1"); then
+  if out=$(run_remote "$host" "$pass" "$(rpm_manifest_cmd) | sha256sum | cut -d' ' -f1"); then
     echo "$out"
     rc=0
   else
@@ -1028,7 +1003,7 @@ check_hyper_version() {
   else
     rc=$?
     echo "SSH failed when trying to get hypervisor version from $host (exit code $rc)" >&2
-    return
+    return "$rc"
   fi
 
   out="$(tr -d '\r' <<< "$out")"
@@ -1061,8 +1036,12 @@ check_uptime() {
   local host="$1"
   local pass="$2"
 
+  # NOT 'if ! up=$(...)': $? after a negated pipeline is the negation's status (always
+  # 0 here), so the failure message used to claim "exit code 0" for every failure
   local up rc
-  if ! up=$(run_remote "$host" "$pass" "uptime -s 2>/dev/null || true"); then
+  if up=$(run_remote "$host" "$pass" "uptime -s 2>/dev/null || true"); then
+    rc=0
+  else
     rc=$?
     echo "SSH failed when trying to get uptime from $host (exit code $rc)" >&2
     up=""
@@ -1082,7 +1061,7 @@ check_lastpatched() {
   local pass="$2"
 
   local out last rc
-  if out=$(run_remote "$host" "$pass" "rpm -qa --last | head -n 1 2>/dev/null || true"); then
+  if out=$(run_remote "$host" "$pass" "rpm -qa --last 2>/dev/null | head -n 1 || true"); then
     last=$(echo "$out" | awk 'NF>1 {$1=""; sub(/^ /,""); print}' | sed -E '/ UTC[+-]/! s/ ([+-][0-9]{2}(:?[0-9]{2})?)$/ UTC\1/' | xargs -I{} date -d "{}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)
     rc=0
   else
@@ -1104,10 +1083,16 @@ check_enabled() {
 
   if [[ "$enabled" == "true" ]]; then
     printf "Host Enabled: %s\n" "$(green_text "$enabled")"
-  else
-    printf "Host Enabled: %s\n" "$(yellow_text "$enabled")"
+    return 0
   fi
 
+  printf "Host Enabled: %s\n" "$(yellow_text "$enabled")"
+
+  # a host xapi reports as disabled is a real finding; "Unknown" just means the seed
+  # address wasn't in the xe host list (eg invoked by hostname) and stays informational
+  if [[ "$enabled" == "false" ]]; then
+    return 1
+  fi
   return 0
 }
 
@@ -1148,37 +1133,90 @@ check_host_timesync() {
       printf " Synced - %s\n" "$(green_text "$sync")"
     fi
   fi
+
+  # an explicit "no" is a real finding either way; in pool mode POOL_NTP_MATCH also
+  # catches it at pool level, but single mode used to exit 0 with NTP visibly broken.
+  # "Unknown" (address not in the xe maps) stays informational.
+  if [[ "$ntp" == "no" || "$sync" == "no" ]]; then
+    return 1
+  fi
+  return 0
 }
 
-get_pool_timesync() {
+# One remote call per accessible host fetches both timedatectl and /proc/meminfo -
+# these used to be two separate sweeps over the whole pool. Fills POOL_HOSTS_NTP /
+# POOL_NTP_MATCH (time sync) and POOL_HOSTS_MEM (memory, MB).
+get_pool_host_facts() {
   local pass="$1"
 
-  # check each host's time sync status
-  local ip out utc ntp sync uuid unix_time time_diff xo_time rc
+  # each half is || true-guarded so the only nonzero rc is transport failure;
+  # a half that failed just parses as empty -> Unknown / zeros
+  local cmd="timedatectl 2>/dev/null || true
+printf '%s\n' '__HEALTH_FACTS_SEP__'
+awk '
+  /^MemTotal:/ {t=\$2}
+  /^MemAvailable:/ {a=\$2}
+  END {
+    if (t==0) {print \"0 0\"; exit}
+    printf \"%d %d\", int(t/1024), int(a/1024)
+  }' /proc/meminfo 2>/dev/null || true"
+
+  local ip out rc ts_out mi uuid utc ntp sync unix_time time_diff xo_time
+  local tmb amb total_mb used_mb avail_mb
   for ip in "${POOL_HOST_ACCESS_IPS[@]}"; do
-    if out=$(run_remote "$ip" "$pass" "timedatectl"); then
+    if out=$(run_remote "$ip" "$pass" "$cmd"); then
       rc=0
     else
       rc=$?
-      echo "SSH failed when trying to get time sync info from $ip (exit code $rc)" >&2
+      echo "SSH failed when trying to get time/memory info from $ip (exit code $rc)" >&2
       POOL_NTP_MATCH=0
-      continue
+      out=""
     fi
 
     out="$(tr -d '\r' <<< "$out")"
+    ts_out="${out%%__HEALTH_FACTS_SEP__*}"
+    mi="${out##*__HEALTH_FACTS_SEP__}"
+
+    uuid="${POOL_HOST_UUIDS[$ip]:-}"
+
+    # --- memory half (was get_pool_host_memory) ---
+    tmb="$(awk 'NF {print $1; exit}' <<< "$mi")"
+    amb="$(awk 'NF {print $2; exit}' <<< "$mi")"
+
+    if [[ "$tmb" =~ ^[0-9]+$ ]] && [[ "$amb" =~ ^[0-9]+$ ]] && (( tmb > 0 )); then
+      total_mb="$tmb"
+      avail_mb="$amb"
+      if (( total_mb >= avail_mb )); then
+        used_mb=$(( total_mb - avail_mb ))
+      else
+        used_mb=0
+      fi
+    else
+      total_mb=0; used_mb=0; avail_mb=0
+    fi
+
+    if [[ -n "$uuid" ]]; then
+      POOL_HOSTS_MEM[${uuid}_total]=$total_mb
+      POOL_HOSTS_MEM[${uuid}_used]=$used_mb
+      POOL_HOSTS_MEM[${uuid}_avail]=$avail_mb
+    fi
+
+    # --- time sync half (was get_pool_timesync) ---
+    if (( rc != 0 )); then
+      continue   # transport failed; POOL_NTP_MATCH already cleared above
+    fi
 
     # older systemd (xcp-ng 8.x dom0) says "NTP enabled" / "NTP synchronized",
     # newer systemd says "NTP service" / "System clock synchronized" - accept both
-    utc="$(awk -F': ' '/Universal time:/ {print $2; exit}' <<< "$out" || true)"
-    ntp="$(awk -F': ' '/NTP enabled:|NTP service:/ {print $2; exit}' <<< "$out" || true)"
-    sync="$(awk -F': ' '/NTP synchronized:|System clock synchronized:/ {print $2; exit}' <<< "$out" || true)"
+    utc="$(awk -F': ' '/Universal time:/ {print $2; exit}' <<< "$ts_out" || true)"
+    ntp="$(awk -F': ' '/NTP enabled:|NTP service:/ {print $2; exit}' <<< "$ts_out" || true)"
+    sync="$(awk -F': ' '/NTP synchronized:|System clock synchronized:/ {print $2; exit}' <<< "$ts_out" || true)"
 
     case "$ntp" in
       active) ntp="yes" ;;
       inactive) ntp="no" ;;
     esac
 
-    uuid="${POOL_HOST_UUIDS[$ip]:-}"
     if [[ -n "$uuid" ]]; then
       POOL_HOSTS_NTP[${uuid}_ntp]="$ntp"
       POOL_HOSTS_NTP[${uuid}_sync]="$sync"
@@ -1226,6 +1264,9 @@ check_dom0_disk_usage() {
   while read -r fs size used avail usep mnt; do
     [[ "$fs" == "Filesystem" ]] && continue
     case "$fs" in tmpfs|devtmpfs|xenstore) continue ;; esac
+    # SR mounts (local EXT SRs, NFS/SMB shares) aren't dom0 disks - a filling shared
+    # SR would otherwise flag every host in the pool as a "dom0" disk problem
+    case "$mnt" in /run/sr-mount/*) continue ;; esac
 
     usep="${usep%\%}"
     [[ "$usep" =~ ^[0-9]+$ ]] || continue
@@ -1427,10 +1468,13 @@ check_lacp_negotiation_issues() {
     return 0
   fi
 
+  # per-port lines are "slave: eth0: current attached" on OVS <= 2.16 (XCP-ng 8.2)
+  # but OVS 2.17 (XCP-ng 8.3) renamed them to "member: ..." - match both, or every
+  # 8.3 host reads as a false green
   local bad
   bad="$(
     awk '
-      /^[[:space:]]*slave:/ {
+      /^[[:space:]]*(slave|member):/ {
         line=$0
         sub(/[[:space:]]+$/, "", line)
         if (line !~ /: current attached$/) { print "bad"; exit }
@@ -1786,43 +1830,88 @@ check_overlapping_subnets() {
 #
 # All the work happens on the host - these logs run to tens of MB (xensource.log.1 is
 # routinely 50MB+), so we never drag them over the wire, only the few matched lines.
-# Each base log is tried first, then its rotated .1, and we stop at the first of the two
-# that has the phrase: the live file holds the newest hit, and falling back to .1 only
-# when the live file has none covers the daily rotation without reporting a stale hit
-# alongside a current one. Phrases are searched one at a time (grep -F, fixed string) so
-# a phrase that matches constantly can never crowd out a rare, more serious one.
+# Each file is scanned ONCE for all phrases together (grep -iF -e p1 -e p2 ...), then a
+# small awk pass over just the matched lines attributes the last hit to each phrase -
+# scanning per phrase used to reread the same tens-of-MB file once per phrase. Fixed-
+# string matching throughout, and one block per phrase, so a phrase that matches
+# constantly can never crowd out a rare, more serious one.
+# Each base log is tried first, then its rotated .1, per phrase: the live file holds the
+# newest hit, and falling back to .1 only for phrases the live file lacks covers the
+# daily rotation without reporting a stale hit alongside a current one.
 build_log_scan_cmd() {
   local files_nl="$1"
   local phrases_nl="$2"
   local ctx="${3:-3}"
 
-  local q_files="" q_phrases="" x
+  local q_files="" q_ephrases="" x
   while IFS= read -r x; do
     [[ -n "$x" ]] || continue
     q_files+=" $(printf '%q' "$x")"
   done <<< "$files_nl"
   while IFS= read -r x; do
     [[ -n "$x" ]] || continue
-    q_phrases+=" $(printf '%q' "$x")"
+    q_ephrases+=" -e $(printf '%q' "$x")"
   done <<< "$phrases_nl"
 
+  # no phrases configured = nothing to scan for (and grep without -e would misread
+  # the filename as its pattern)
+  if [[ -z "$q_ephrases" ]]; then
+    echo "exit 0"
+    return
+  fi
+
   # exits 0 no matter what: no match, an unreadable log and a missing log are all
-  # "nothing to report" here, and a nonzero rc would be read as an SSH failure
+  # "nothing to report" here, and a nonzero rc would be read as an SSH failure.
+  # The phrase list travels to awk via the environment: -v would reprocess backslashes.
+  # scan_last_hits prints "phraseindex:lineno" for the LAST hit of each phrase in $1;
+  # the phrase loop below indexes phrases the same way the awk BEGIN block does (blank
+  # lines skipped), so the two stay aligned.
   cat <<EOF
 CTX=$(printf '%q' "$ctx")
+HEALTH_SCAN_PHRASES=$(printf '%q' "$phrases_nl")
+export HEALTH_SCAN_PHRASES
+scan_last_hits() {
+  grep -inF$q_ephrases -- "\$1" 2>/dev/null | awk '
+    BEGIN {
+      n = split(ENVIRON["HEALTH_SCAN_PHRASES"], A, "\n")
+      m = 0
+      for (i = 1; i <= n; i++) if (A[i] != "") { m++; P[m] = tolower(A[i]) }
+    }
+    {
+      num = \$0; sub(/:.*/, "", num)
+      line = tolower(\$0); sub(/^[0-9]*:/, "", line)
+      for (i = 1; i <= m; i++) if (index(line, P[i])) last[i] = num
+    }
+    END { for (i = 1; i <= m; i++) if (last[i]) print i ":" last[i] }
+  '
+}
 for base in$q_files; do
-  for ph in$q_phrases; do
-    for cand in "\$base" "\$base.1"; do
-      [ -r "\$cand" ] || continue
-      n=\$(grep -inF -- "\$ph" "\$cand" 2>/dev/null | tail -n 1 | cut -d: -f1)
-      [ -n "\$n" ] || continue
-      s=\$((n - CTX)); [ "\$s" -lt 1 ] && s=1
-      printf '%s\n' "--- \$ph (\$cand) ---"
-      sed -n "\${s},\$((n + CTX))p" "\$cand" 2>/dev/null | sed 's/^/  /'
-      printf '\n'
-      break
-    done
-  done
+  live_hits=""
+  rot_hits=""
+  rot_scanned=0
+  [ -r "\$base" ] && live_hits=\$(scan_last_hits "\$base")
+  i=0
+  while IFS= read -r ph; do
+    [ -n "\$ph" ] || continue
+    i=\$((i + 1))
+    cand="\$base"
+    n=\$(printf '%s\n' "\$live_hits" | sed -n "s/^\$i:\(.*\)/\1/p")
+    if [ -z "\$n" ]; then
+      if [ "\$rot_scanned" -eq 0 ]; then
+        rot_scanned=1
+        [ -r "\$base.1" ] && rot_hits=\$(scan_last_hits "\$base.1")
+      fi
+      cand="\$base.1"
+      n=\$(printf '%s\n' "\$rot_hits" | sed -n "s/^\$i:\(.*\)/\1/p")
+    fi
+    [ -n "\$n" ] || continue
+    s=\$((n - CTX)); [ "\$s" -lt 1 ] && s=1
+    printf '%s\n' "--- \$ph (\$cand) ---"
+    sed -n "\${s},\$((n + CTX))p" "\$cand" 2>/dev/null | sed 's/^/  /'
+    printf '\n'
+  done <<HEALTH_PHRASES_EOF
+\$HEALTH_SCAN_PHRASES
+HEALTH_PHRASES_EOF
 done
 exit 0
 EOF
@@ -2034,7 +2123,7 @@ check_xostor_in_use_and_ram() {
   total_gb_int="$(awk -v g="$MEM_TOTAL_GB" 'BEGIN{printf "%d", g+0.00001}')"
 
   if (( total_gb_int < xostor_min_ram_gb )); then
-    printf "XOSTOR RAM: %s\n" "$(yellow_text "Not Enough: ${MEM_TOTAL_GB}G (Need >${xostor_min_ram_gb}G)")"
+    printf "XOSTOR RAM: %s\n" "$(yellow_text "Not Enough: ${MEM_TOTAL_GB}G (Need >=${xostor_min_ram_gb}G)")"
     return 1
   else
     printf "XOSTOR RAM: %s\n" "$(green_text "${MEM_TOTAL_GB}G")"
@@ -2302,6 +2391,15 @@ print_pool_status_section() {
     printf "Pool Master: %s\n" "$(yellow_text '(unknown)')"
   fi
 
+  # a pool member we couldn't SSH into is excluded from every per-host check below,
+  # which used to leave only a stderr warning and a clean exit code - surface it here
+  if (( ${#POOL_HOST_NOACCESS_IPS[@]} > 0 )); then
+    printf "Unreachable Hosts: %s\n" "$(yellow_text "${POOL_HOST_NOACCESS_IPS[*]}")"
+    rc_any=1
+  else
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Unreachable Hosts: %s\n" "$(green_text 'None')"
+  fi
+
   if (( POOL_RAM_MATCH == 1 )); then
     [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Dom0 RAM Allocations: %s\n" "$(green_text 'Matched')"
   else
@@ -2351,6 +2449,11 @@ print_pool_status_section() {
   local host_uuid="${POOL_HOST_UUIDS[$DETECTED_MASTER_IP]:-}"
   if [[ -n "$host_uuid" ]]; then
     if ! check_vlan0_exist "$DETECTED_MASTER_IP" "$pass" "$host_uuid"; then rc_any=1; fi
+  else
+    # don't skip the check silently just because the master's address wasn't in the
+    # xe maps - say so, like the DNS/GW check does
+    printf "VLAN 0 Check: %s\n" "$(yellow_text 'Unknown (master address not in xe host list)')"
+    rc_any=1
   fi
   if ! check_migration_network "$DETECTED_MASTER_IP" "$pass"; then rc_any=1; fi
   if ! check_backup_network "$DETECTED_MASTER_IP" "$pass"; then rc_any=1; fi
@@ -2382,8 +2485,13 @@ run_checks_for_host() {
   local controllers_csv="$4"       # optional: for XOSTOR checks
 
   local hn
-  hn="$(get_remote_hostname "$ip" "$pass" | tr -d '\r' || true)"
-  [[ -z "$hn" ]] && hn="$ip"
+  if [[ -n "$DETECTED_MASTER_IP" && "$ip" == "$DETECTED_MASTER_IP" && -n "$DETECTED_MASTER_HOSTNAME" ]]; then
+    # detect_pool_master_by_poolconf already fetched the master's hostname
+    hn="$DETECTED_MASTER_HOSTNAME"
+  else
+    hn="$(get_remote_hostname "$ip" "$pass" | tr -d '\r' || true)"
+    [[ -z "$hn" ]] && hn="$ip"
+  fi
 
   if (( POOL_MODE == 1 )); then
     if (( is_master == 1 )); then
@@ -2397,20 +2505,40 @@ run_checks_for_host() {
     echo "$(cyan_text "== Health check on: $hn ==")"
   fi
 
-  check_hyper_version "$ip" "$pass" || true
+  local rc_any=0
+
+  # pool mode prints this in the pool status section; single mode has nowhere else to
+  if (( POOL_MODE == 0 && PW_NOTIFY == 1 )); then
+    printf "Root Password: %s\n" "$(yellow_text 'Contains Backslash')"
+  fi
+
+  # info block - but an unsupported version, a disabled host, or NTP explicitly off
+  # still count toward the exit code
+  if ! check_hyper_version "$ip" "$pass"; then rc_any=1; fi
   check_uptime "$ip" "$pass"
   check_lastpatched "$ip" "$pass"
-  check_enabled "$ip"
+  if ! check_enabled "$ip"; then rc_any=1; fi
   check_multipath "$ip"
-  check_host_timesync "$ip"
+  if ! check_host_timesync "$ip"; then rc_any=1; fi
 
-  local dmesg_t rc
-  if dmesg_t=$(run_remote "$ip" "$pass" "dmesg -T"); then
-    rc=0
-  else
-    rc=$?
-    echo "SSH failed when trying to get dmesg on $ip (exit code $rc)" >&2
-    dmesg_t=""
+  # dmesg feeds the MTU/content/OOM checks - skip the fetch when none of them will run
+  local dmesg_t="" rc
+  local need_dmesg=0
+  if (( POOL_MODE == 0 )) || (( is_master == 1 )) \
+     || should_run_in_pool_for_slave pool_run_mtu_issues \
+     || should_run_in_pool_for_slave pool_run_dmesg_content \
+     || should_run_in_pool_for_slave pool_run_oom_events; then
+    need_dmesg=1
+  fi
+
+  if (( need_dmesg == 1 )); then
+    if dmesg_t=$(run_remote "$ip" "$pass" "dmesg -T"); then
+      rc=0
+    else
+      rc=$?
+      echo "SSH failed when trying to get dmesg on $ip (exit code $rc)" >&2
+      dmesg_t=""
+    fi
   fi
 
   if (( POOL_MODE == 1 )); then
@@ -2431,7 +2559,6 @@ run_checks_for_host() {
   local DMESG_ISSUES_BLOCK OOM_EVENTS_BLOCK LACP_OUTPUT_BLOCK LOG_ERRORS_BLOCK LUN_CHANGES_BLOCK
 
   local hostlabel="${hn} (${ip})"
-  local rc_any=0
 
   if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_dom0_disk_usage; then
     if ! check_dom0_disk_usage "$ip" "$pass"; then rc_any=1; fi
@@ -2589,7 +2716,7 @@ main() {
         2) echo "Aborted." >&2; exit 0 ;;
         3) exit 1 ;;   # -n matched nothing; the pools it did find were already listed
         *)
-          echo "No host IP provided and no enabled hosts found in xo-db, please provide a host IP as an argument"
+          echo "No host IP provided and no enabled hosts found in xo-db, please provide a host IP as an argument" >&2
           exit 1
           ;;
       esac
@@ -2599,6 +2726,12 @@ main() {
 
   parse_target_host_and_port "$1"
   local seed_host="$PARSED_HOST"
+
+  # a host that came from the xo-db picker may carry ':port' - that's the XAPI HTTPS
+  # port XO connects on, not an SSH port, so strip it for SSH but stay on 22
+  if [[ -n "$SELECTED_HOST" ]]; then
+    SSH_PORT=22
+  fi
 
   # the picker already knows the name when it resolved the host; a host argument didn't
   # go through it, so look that one up (this is the only path that can leave it empty)
@@ -2615,7 +2748,12 @@ main() {
   if [[ $# -eq 2 ]]; then
     pass="$2"
   else
-	  if pass="$(get_password_from_xoa_db_simple "$seed_host")"; then
+    # look the password up under the exact string xo-db keys the record by: for a
+    # picker-chosen host that's SELECTED_HOST verbatim (which may carry ':port' -
+    # the port-stripped seed_host would miss such a record entirely)
+    local db_host="$seed_host"
+    [[ -n "$SELECTED_HOST" ]] && db_host="$SELECTED_HOST"
+	  if pass="$(get_password_from_xoa_db_simple "$db_host")"; then
       rc=0
     else
 		  rc=$?
@@ -2646,10 +2784,9 @@ main() {
   check_pool_hosts_access "$pass"
 
   local overall_rc=0
-  get_pool_timesync "$pass"
-  get_pool_host_memory "$pass"
+  get_pool_host_facts "$pass"
 
-  print_xoa_status_section
+  if ! print_xoa_status_section; then overall_rc=1; fi
 
   if (( POOL_MODE == 0 )); then
     if ! run_checks_for_host "$seed_host" "$pass" 1 ""; then overall_rc=1; fi
@@ -2664,7 +2801,12 @@ main() {
     get_pool_missing_patches "$pass"
 
     MASTER_RPMLIST="$(get_rpm_manifest_remote "$DETECTED_MASTER_IP" "$pass" || true)"
-    MASTER_RPMHASH="$(get_rpm_manifest_hash_remote "$DETECTED_MASTER_IP" "$pass" | tr -d '\r' | head -n 1 || true)"
+    # hash the manifest we just fetched instead of running rpm -qa on the master a
+    # second time; slaves hash remotely with the same sha256sum, so they compare
+    MASTER_RPMHASH=""
+    if [[ -n "${MASTER_RPMLIST//[[:space:]]/}" ]]; then
+      MASTER_RPMHASH="$(printf '%s\n' "$MASTER_RPMLIST" | sha256sum | cut -d' ' -f1)"
+    fi
 
     if ! print_pool_status_section "$pass"; then overall_rc=1; fi
 
