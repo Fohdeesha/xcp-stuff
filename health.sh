@@ -1685,6 +1685,47 @@ check_migration_network() {
   esac
 }
 
+check_backup_network_reachability_from_xoa() {
+  local host="$1"
+  local pass="$2"
+  local network_uuid="$3"
+
+  local pif_out
+  local cmd="xe pif-list network-uuid=${network_uuid} params=IP"
+
+  if ! pif_out=$(run_remote "$host" "$pass" "$cmd" | tr -d '\r'); then
+    echo "SSH failed when trying to inspect backup network PIFs on $host" >&2
+    return 2
+  fi
+
+  local -a ips=()
+  local ip
+  while IFS= read -r ip; do
+    [[ -n "$ip" ]] || continue
+    [[ "$ip" == "0.0.0.0" ]] && continue
+    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+    ips+=("$ip")
+  done < <(awk '
+    /IP[[:space:]]*\(/ {
+      sub(/^[^:]*:[[:space:]]*/, "", $0)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+      if ($0 != "" && $0 != "<not in database>" && $0 != "[]") print $0
+    }
+  ' <<< "$pif_out")
+
+  if (( ${#ips[@]} == 0 )); then
+    return 2
+  fi
+
+  for ip in "${ips[@]}"; do
+    if timeout "$local_cmd_timeout" ping -c 1 -W 2 -n "$ip" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 check_backup_network() {
   local host="$1"
   local pass="$2"
@@ -1717,9 +1758,23 @@ check_backup_network() {
       printf "Backup Network: %s\n" "$(yellow_text 'Unknown (could not check bond membership)')"
       return 1
       ;;
-    *)
-      [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Backup Network: %s\n" "$(green_text 'Configured')"
+  esac
+
+  local reach_rc=0
+  check_backup_network_reachability_from_xoa "$host" "$pass" "$network_uuid" || reach_rc=$?
+
+  case "$reach_rc" in
+    0)
+      [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Backup Network: %s\n" "$(green_text 'Configured and reachable from XOA')"
       return 0
+      ;;
+    1)
+      printf "Backup Network: %s\n" "$(yellow_text 'Configured but not reachable from XOA')"
+      return 1
+      ;;
+    2)
+      printf "Backup Network: %s\n" "$(yellow_text 'Configured but no usable IP was found on the network')"
+      return 1
       ;;
   esac
 }
