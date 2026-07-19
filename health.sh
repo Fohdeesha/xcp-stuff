@@ -1724,6 +1724,8 @@ check_backup_network_reachability_from_xoa() {
   done
 
   return 1
+}
+
 check_migration_compression() {
   local host="$1"
   local pass="$2"
