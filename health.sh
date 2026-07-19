@@ -1724,6 +1724,30 @@ check_backup_network_reachability_from_xoa() {
   done
 
   return 1
+check_migration_compression() {
+  local host="$1"
+  local pass="$2"
+
+  local out rc
+  if out=$(run_remote "$host" "$pass" "xe pool-param-get uuid=${MASTER_POOL_UUID} param-name=migration-compression" | tr -d '\r'); then
+    rc=0
+  else
+    rc=$?
+    echo "SSH failed when trying to check migration compression on $host (exit code $rc)" >&2
+    return "$rc"
+  fi
+
+  # Match on "true" or "false" anywhere in the output
+  if [[ "$out" =~ false ]]; then
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Migration Compression: %s\n" "$(green_text 'Disabled')"
+    return 0
+  elif [[ "$out" =~ true ]]; then
+    printf "Migration Compression: %s\n" "$(yellow_text 'Enabled')"
+    return 1
+  else
+    printf "Migration Compression: %s\n" "$(yellow_text 'Unknown')"
+    return 1
+  fi
 }
 
 check_backup_network() {
@@ -2475,6 +2499,8 @@ print_pool_status_section() {
     printf "HA Enabled: %s\n" "$(yellow_text 'Unknown')"
     rc_any=1
   fi
+
+  if ! check_migration_compression "$DETECTED_MASTER_IP" "$pass"; then rc_any=1; fi
 
   if (( POOL_MISSING_PATCHES == 0 )); then
     [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Missing Patches: %s\n" "$(green_text "${POOL_MISSING_PATCHES}")"
