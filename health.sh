@@ -1685,45 +1685,54 @@ check_migration_network() {
   esac
 }
 
+# Ping every IPv4 address on the given network's PIFs (one per pool host) from the
+# XOA itself: XO moves backup traffic over this network, so the XOA has to reach
+# every host on it - "somebody answered" is not enough, one dead slave PIF still
+# breaks that host's backups even while the rest of the pool responds. The probe is
+# a single ICMP echo per IP, so a network that filters ping reads as unreachable -
+# which is why the status line claims "answer ping", not "network down".
+# prints the comma separated list of IPs that did not answer when returning 1
+# returns 0 = every IP answered, 1 = one or more did not (list printed),
+#         2 = could not check (SSH failed), 3 = no usable IPv4 on the network
 check_backup_network_reachability_from_xoa() {
   local host="$1"
   local pass="$2"
   local network_uuid="$3"
 
   local pif_out
-  local cmd="xe pif-list network-uuid=${network_uuid} params=IP"
-
-  if ! pif_out=$(run_remote "$host" "$pass" "$cmd" | tr -d '\r'); then
-    echo "SSH failed when trying to inspect backup network PIFs on $host" >&2
+  if ! pif_out=$(run_remote "$host" "$pass" "xe pif-list network-uuid=${network_uuid} params=IP --minimal" | tr -d '\r'); then
+    echo "SSH failed when trying to list backup network PIFs on $host" >&2
     return 2
   fi
 
-  local -a ips=()
+  # --minimal prints one comma-separated line with an empty field for every PIF
+  # that has no IP; keep only well-formed, non-placeholder IPv4 addresses
+  local -a fields=() ips=()
+  IFS=',' read -r -a fields <<< "$pif_out" || true
   local ip
-  while IFS= read -r ip; do
+  for ip in "${fields[@]}"; do
+    ip="${ip//[[:space:]]/}"
     [[ -n "$ip" ]] || continue
     [[ "$ip" == "0.0.0.0" ]] && continue
     [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
     ips+=("$ip")
-  done < <(awk '
-    /IP[[:space:]]*\(/ {
-      sub(/^[^:]*:[[:space:]]*/, "", $0)
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
-      if ($0 != "" && $0 != "<not in database>" && $0 != "[]") print $0
-    }
-  ' <<< "$pif_out")
-
-  if (( ${#ips[@]} == 0 )); then
-    return 2
-  fi
-
-  for ip in "${ips[@]}"; do
-    if timeout "$local_cmd_timeout" ping -c 1 -W 2 -n "$ip" >/dev/null 2>&1; then
-      return 0
-    fi
   done
 
-  return 1
+  (( ${#ips[@]} > 0 )) || return 3
+
+  local -a unreachable=()
+  for ip in "${ips[@]}"; do
+    timeout "$local_cmd_timeout" ping -c 1 -W 2 -n "$ip" >/dev/null 2>&1 || unreachable+=("$ip")
+  done
+
+  if (( ${#unreachable[@]} > 0 )); then
+    local msg
+    msg="$(printf "%s, " "${unreachable[@]}")"
+    printf '%s' "${msg%, }"
+    return 1
+  fi
+
+  return 0
 }
 
 check_migration_compression() {
@@ -1786,8 +1795,8 @@ check_backup_network() {
       ;;
   esac
 
-  local reach_rc=0
-  check_backup_network_reachability_from_xoa "$host" "$pass" "$network_uuid" || reach_rc=$?
+  local reach_out reach_rc=0
+  reach_out="$(check_backup_network_reachability_from_xoa "$host" "$pass" "$network_uuid")" || reach_rc=$?
 
   case "$reach_rc" in
     0)
@@ -1795,11 +1804,17 @@ check_backup_network() {
       return 0
       ;;
     1)
-      printf "Backup Network: %s\n" "$(yellow_text 'Configured but not reachable from XOA')"
+      printf "Backup Network: %s - No ping answer from XOA for: %s\n" "$(yellow_text 'Configured but not fully reachable')" "$reach_out"
       return 1
       ;;
-    2)
+    3)
       printf "Backup Network: %s\n" "$(yellow_text 'Configured but no usable IP was found on the network')"
+      return 1
+      ;;
+    *)
+      # 2 = transport trouble: we could not look, which is not the same thing as
+      # looking and finding nothing - never claim a fact we did not establish
+      printf "Backup Network: %s\n" "$(yellow_text 'Unknown (could not read backup network PIFs)')"
       return 1
       ;;
   esac
