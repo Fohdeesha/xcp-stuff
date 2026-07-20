@@ -1735,12 +1735,20 @@ check_backup_network_reachability_from_xoa() {
   return 0
 }
 
+# Deliberately reads the field with 'pool-list params=... --minimal' instead of
+# 'pool-param-get param-name=...': the param does not exist before 8.3, and asking
+# param-get for a missing param makes xapi log a CLI_failed_to_find_param exception
+# into xensource.log on every run - which check_log_errors then flags as a problem
+# this script caused itself (same trap get_pool_other_config_key documents for
+# param-key). The list form answers an unknown field with empty output and rc 0,
+# verified quiet on 8.2.1 - so empty cleanly means "feature not there", a real
+# answer rather than an error we have to swallow.
 check_migration_compression() {
   local host="$1"
   local pass="$2"
 
   local out rc
-  if out=$(run_remote "$host" "$pass" "xe pool-param-get uuid=${MASTER_POOL_UUID} param-name=migration-compression" | tr -d '\r'); then
+  if out=$(run_remote "$host" "$pass" "xe pool-list uuid=${MASTER_POOL_UUID} params=migration-compression --minimal" | tr -d '\r'); then
     rc=0
   else
     rc=$?
@@ -1748,17 +1756,25 @@ check_migration_compression() {
     return "$rc"
   fi
 
-  # Match on "true" or "false" anywhere in the output
-  if [[ "$out" =~ false ]]; then
-    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Migration Compression: %s\n" "$(green_text 'Disabled')"
-    return 0
-  elif [[ "$out" =~ true ]]; then
-    printf "Migration Compression: %s\n" "$(yellow_text 'Enabled')"
-    return 1
-  else
-    printf "Migration Compression: %s\n" "$(yellow_text 'Unknown')"
-    return 1
-  fi
+  case "${out//[[:space:]]/}" in
+    false)
+      [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Migration Compression: %s\n" "$(green_text 'Disabled')"
+      return 0
+      ;;
+    true)
+      printf "Migration Compression: %s\n" "$(yellow_text 'Enabled')"
+      return 1
+      ;;
+    "")
+      # pre-8.3 pool: the field is absent, so the feature cannot be on
+      [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Migration Compression: %s\n" "$(green_text 'Not supported (pre-8.3)')"
+      return 0
+      ;;
+    *)
+      printf "Migration Compression: %s\n" "$(yellow_text 'Unknown')"
+      return 1
+      ;;
+  esac
 }
 
 check_backup_network() {
