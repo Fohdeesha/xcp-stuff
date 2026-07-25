@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # J-Sands / Vates
-# V2.3
+# V2.4
 set -euo pipefail
 set +H 2>/dev/null || true   # make ! in args no explode
 
@@ -16,7 +16,7 @@ dom0_mem_used_max_pct=65                        # dom0 percent memory allowed in
 xostor_min_ram_gb=15                            # Minimum total RAM (GB) dom0 should have if xostor is in use
 mtu_dmesg_keywords="mtu large fragment"         # keywords in dom0 to flag MTU issues
 dmesg_issue_words="panic crash rip kill"        # words that trigger dmesg contents issues
-dmesg_issue_phrases="call trace|timed out"      # matches that trigger dmesg contents issues (whole phrase matched, pipe seperated)
+dmesg_issue_phrases="call trace|timed out"      # matches that trigger dmesg contents issues (whole phrase matched, pipe separated)
 # dmesg lines that match an issue word/phrase above but are known-benign false positives.
 # Each array entry is one ignore rule: a matching line is exempted only if it contains ALL of
 # the rule's "&&"-separated substrings (case-insensitive). Add new rules as new entries.
@@ -33,6 +33,7 @@ log_error_phrases=(
   "except"                                      # python tracebacks / SMAPI exceptions
   "Input/output error"
   "XENAPI_PLUGIN_FAILURE"
+  "TapdiskNotRunning"                           # tapdisk died under it - pairs with a core.tapdisk.* in $coredump_dir
 )
 # Logs scanned for the phrases above. Each is searched together with its rotated ".1"
 # copy, because these rotate daily (~04:00) - right after a rotation the live file is
@@ -53,6 +54,8 @@ lun_change_files=(
 )
 
 crash_ignore_file=".sacrificial-space-for-logs" # file in /var/crash to ignore (don't flag on crash logs cuz of this)
+coredump_dir="/var/lib/systemd/coredump"        # systemd-coredump drop dir - anything in here means a dom0 process died (tapdisk etc)
+coredump_max_lines=50                           # max amt of coredumps to list in the detail block (newest first)
 pkg_diff_max_lines=100                          # max amt of mismatched yum packages to list
 time_sync_allowance_secs=300                    # max allowed time difference between hosts in seconds
 
@@ -65,6 +68,7 @@ pool_run_mtu_issues=1
 pool_run_dmesg_content=1
 pool_run_oom_events=1
 pool_run_crash_logs_present=1
+pool_run_coredumps_present=1
 pool_run_lacp_negotiation=1
 pool_run_silly_mtus=1
 pool_run_dns_gw_non_mgmt_pifs=1
@@ -1448,6 +1452,46 @@ check_crash_logs_present() {
   fi
 }
 
+check_coredumps_present() {
+  local host="$1"
+  local pass="$2"
+
+  COREDUMPS_BLOCK=""
+
+  # one line per dump - date, size, filename, newest first. systemd names these
+  # core.<comm>.<uid>.<bootid>.<pid>.<usec>.xz, so the filename names the process that
+  # died (core.tapdisk.* being the interesting one), which is why the list is worth printing
+  local out rc
+  if out=$(run_remote "$host" "$pass" "test -d '$coredump_dir' || exit 0; find '$coredump_dir' -maxdepth 1 -type f -printf '%TY-%Tm-%Td %TH:%TM %12s  %f\n' 2>/dev/null | sort -r"); then
+    rc=0
+  else
+    rc=$?
+    echo "SSH failed when trying to check for coredumps on $host (exit code $rc)" >&2
+    return "$rc"
+  fi
+
+  local dumps=() line
+  while IFS= read -r line; do
+    line="${line//$'\r'/}"
+    [[ -z "${line//[[:space:]]/}" ]] && continue
+    dumps+=("$line")
+  done <<< "$out"
+
+  local cnt="${#dumps[@]}"
+  if (( cnt == 0 )); then
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Coredumps Present: %s\n" "$(green_text 'No')"
+    return 0
+  fi
+
+  local shown="$cnt"
+  (( shown > coredump_max_lines )) && shown="$coredump_max_lines"
+  COREDUMPS_BLOCK="$(printf '%s\n' "${dumps[@]:0:shown}")"
+  (( cnt > shown )) && COREDUMPS_BLOCK+=$'\n'"(plus $((cnt - shown)) older coredump(s) not listed)"
+
+  printf "Coredumps Present: %s\n" "$(yellow_text "Yes - $cnt file(s), see below")"
+  return 1
+}
+
 check_lacp_negotiation_issues() {
   local host="$1"
   local pass="$2"
@@ -2670,7 +2714,7 @@ run_checks_for_host() {
 
   load_mem_stats "$ip"
 
-  local DMESG_ISSUES_BLOCK OOM_EVENTS_BLOCK LACP_OUTPUT_BLOCK LOG_ERRORS_BLOCK LUN_CHANGES_BLOCK
+  local DMESG_ISSUES_BLOCK OOM_EVENTS_BLOCK LACP_OUTPUT_BLOCK LOG_ERRORS_BLOCK LUN_CHANGES_BLOCK COREDUMPS_BLOCK
 
   local hostlabel="${hn} (${ip})"
 
@@ -2702,6 +2746,13 @@ run_checks_for_host() {
 
   if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_crash_logs_present; then
     if ! check_crash_logs_present "$ip" "$pass"; then rc_any=1; fi
+  fi
+
+  if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_coredumps_present; then
+    if ! check_coredumps_present "$ip" "$pass"; then rc_any=1; fi
+    if [[ -n "$COREDUMPS_BLOCK" ]]; then
+      append_details "$hostlabel" "Coredumps ($coredump_dir)" "$COREDUMPS_BLOCK"
+    fi
   fi
 
   if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_lacp_negotiation; then
