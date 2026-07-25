@@ -122,7 +122,6 @@ SSH_PORT=22
 PARSED_HOST=""
 SELECTED_HOST=""                    # host chosen from the xo-db pool picker (set by select_host_from_xoa_db)
 SELECTED_POOL_NAME=""               # xo-db name of that pool, as the picker menu would show it ("" if unknown)
-ORIGINAL_ARGS=()
 MASTER_RPMLIST=""
 MASTER_RPMHASH=""
 POOL_RAM_MATCH=1
@@ -130,11 +129,13 @@ POOL_NTP_MATCH=1
 POOL_MISSING_PATCHES=0
 DETECTED_MASTER_IP=""
 DETECTED_MASTER_HOSTNAME=""
+XOSTOR_IN_USE=0                     # set by check_xostor_in_use_and_ram, read right after it
 MASTER_XOSTOR_IN_USE=0
 MASTER_POOL_UUID=""
 MEM_TOTAL_GB="0.0"
 MEM_USED_PCT="0.0"
-MEM_AVAIL_GB="0.0"
+MEM_KNOWN=0                         # 0 = memory for the current host could not be read, so
+                                    # the dom0 memory lines must say Unknown, not a green 0.0%
 PW_NOTIFY=0                         # flag to indicate we should print a warning about backslash in password
 WORK_DIR=""                         # temp dir for ssh control sockets / stderr capture (set in main)
 
@@ -241,45 +242,55 @@ print_xoa_status_section() {
       printf "Registration: %s\n" "$(yellow_text 'Unregistered')"
       rc_any=1
     else
-      printf "Registration: %s\n" "$(green_text "${XOA_REGIST}")"
+      [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Registration: %s\n" "$(green_text "${XOA_REGIST}")"
     fi
 
     if [[ -z "${XOA_CHANNEL:-}" ]]; then
       printf "XOA Channel: %s\n" "$(yellow_text '(Unknown)')"
       rc_any=1
     else
-      printf "XOA Channel: %s\n" "$(green_text "${XOA_CHANNEL}")"
+      [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "XOA Channel: %s\n" "$(green_text "${XOA_CHANNEL}")"
     fi
 
     if [[ -z "${XOA_VERSION:-}" ]]; then
       printf "XOA Version: %s\n" "$(yellow_text 'Unknown')"
       rc_any=1
     else
-      printf "XOA Version: %s\n" "$(green_text "${XOA_VERSION}")"
+      [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "XOA Version: %s\n" "$(green_text "${XOA_VERSION}")"
     fi
 
+    # plan and license binding share one printed line, so -f has to weigh them together -
+    # deciding per half would drop a flagged license along with a healthy plan
+    local plan_txt lic_txt plan_flagged=0
     if [[ -z "${XOA_PLAN:-}" ]]; then
-      printf "XOA Plan: %s" "$(yellow_text 'Unknown')"
-      rc_any=1
+      plan_txt="$(yellow_text 'Unknown')"
+      plan_flagged=1
     else
-      printf "XOA Plan: %s" "$(green_text "${XOA_PLAN}")"
+      plan_txt="$(green_text "${XOA_PLAN}")"
     fi
 
     if [[ -z "${XOA_LICENSES:-}" ]]; then
-        printf " (%s)\n" "$(yellow_text "Unknown")"
-        rc_any=1
+      lic_txt="$(yellow_text 'Unknown')"
+      plan_flagged=1
     elif [[ "$XOA_LICENSES" == "[]" ]]; then
-        printf " (%s)\n" "$(yellow_text "Unbound")"
-        rc_any=1
+      lic_txt="$(yellow_text 'Unbound')"
+      plan_flagged=1
     else
-      printf " (%s)\n" "$(green_text "Bound")"
+      lic_txt="$(green_text 'Bound')"
+    fi
+
+    if (( plan_flagged == 1 )); then
+      printf "XOA Plan: %s (%s)\n" "$plan_txt" "$lic_txt"
+      rc_any=1
+    else
+      [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "XOA Plan: %s (%s)\n" "$plan_txt" "$lic_txt"
     fi
 
     if [[ -z "${XOA_CURRENT:-}" ]]; then
       printf "XOA Status: %s\n" "$(yellow_text 'Updates available')"
       rc_any=1
     else
-      printf "XOA Status: %s\n" "$(green_text 'Up to date')"
+      [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "XOA Status: %s\n" "$(green_text 'Up to date')"
     fi
 
     # a timed-out 'xoa check' produces no stderr, which used to read as a green
@@ -290,7 +301,7 @@ print_xoa_status_section() {
       printf "XOA Check: %s\n" "$(yellow_text "Timed out after ${xoa_check_timeout}s")"
       rc_any=1
     elif [[ -z "${out//[[:space:]]/}" ]]; then
-      printf "XOA Check: %s\n" "$(green_text 'All OK')"
+      [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "XOA Check: %s\n" "$(green_text 'All OK')"
     else
       printf "XOA Check: %s\n" "$(yellow_text 'Issues Found, See Output Below')"
       append_details "XOA" "XOA Check Issues" "$out"
@@ -302,20 +313,26 @@ print_xoa_status_section() {
     printf "OS Version: %s\n" "$(yellow_text 'Unknown')"
     rc_any=1
   else
-    printf "OS Version: %s\n" "$(green_text "${XOA_DEBIAN}")"
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "OS Version: %s\n" "$(green_text "${XOA_DEBIAN}")"
   fi
 
- local XOA_TOTAL_MEM XOA_AVAIL_MEM
+  local XOA_TOTAL_MEM XOA_AVAIL_MEM
   XOA_TOTAL_MEM="$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || true)"
   XOA_AVAIL_MEM="$(awk '/^MemAvailable:/ {print $2; exit}' /proc/meminfo 2>/dev/null || true)"
 
-  if [[ -n "$XOA_TOTAL_MEM" && -n "$XOA_AVAIL_MEM" ]]; then
+  if [[ -z "$XOA_TOTAL_MEM" || -z "$XOA_AVAIL_MEM" ]]; then
+    # skipping the memory lines silently would hide that the XO-Server memory limit
+    # never got checked at all
+    printf "Memory Usage: %s\n" "$(yellow_text 'Unknown (could not read /proc/meminfo)')"
+    rc_any=1
+  else
     local total_gb avail_gb used_gb used_pct
     total_gb="$(awk -v m="$XOA_TOTAL_MEM" 'BEGIN{printf "%.1f", m/1024/1024}')"
     avail_gb="$(awk -v m="$XOA_AVAIL_MEM" 'BEGIN{printf "%.1f", m/1024/1024}')"
     used_gb="$(awk -v t="$total_gb" -v a="$avail_gb" 'BEGIN{printf "%.1f", t - a}')"
     used_pct="$(awk -v t="$total_gb" -v u="$used_gb" 'BEGIN{ if (t<=0) printf "0.0"; else printf "%.1f", (u/t)*100 }')"
 
+    # an info line with no threshold behind it, so it prints under -f like uptime does
     printf "Memory Usage: %s GB used of %s GB (%s%%)\n" "$(green_text "$used_gb")" "$(green_text "$total_gb")" "$(green_text "$used_pct")"
 
     local max_old_space
@@ -331,15 +348,20 @@ print_xoa_status_section() {
         printf "XO-Server Memory Limit: %s\n" "$(yellow_text "${max_old_space}")"
         rc_any=1
       else
-        printf "XO-Server Memory Limit: %s\n" "$(green_text "$max_old_space")"
+        [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "XO-Server Memory Limit: %s\n" "$(green_text "$max_old_space")"
       fi
     fi
   fi
 
-  local dmesg_t
-  dmesg_t="$(dmesg -T 2>/dev/null || true)"
+  # a dmesg we couldn't read is not a clean dmesg - check_dmesg_content can't tell an
+  # empty buffer from a failed read, so decide that here where the rc is still visible
+  local dmesg_t dmesg_rc=0
+  dmesg_t="$(dmesg -T 2>/dev/null)" || dmesg_rc=$?
 
-  if ! check_dmesg_content "$dmesg_t"; then
+  if (( dmesg_rc != 0 )); then
+    printf "Dmesg Content: %s\n" "$(yellow_text 'Unknown (could not read dmesg)')"
+    rc_any=1
+  elif ! check_dmesg_content "$dmesg_t"; then
     rc_any=1
     if [[ -n "$DMESG_ISSUES_BLOCK" ]]; then
       append_details "XOA" "Dmesg Issues" "$DMESG_ISSUES_BLOCK"
@@ -737,6 +759,12 @@ get_pool_host_details() {
 
   # one pipe-separated line per host via xe param-get, instead of scraping the
   # human-readable host-list output (no label parsing, no field-order assumptions)
+  #
+  # Do NOT fold the three param-gets into one
+  # 'xe host-list uuid=$u params=address,enabled,multipathing --minimal'. --minimal with
+  # several params does not emit the values in order - it prints a single value ("true")
+  # - and an unknown param name in the list is accepted silently, so the mistake would
+  # populate every host map with garbage without erroring. Measured on 8.3.0.
   local out rc cmd
   cmd='for u in $(xe host-list --minimal | tr , " "); do
     a=$(xe host-param-get uuid=$u param-name=address 2>/dev/null)
@@ -782,7 +810,7 @@ get_pool_missing_patches() {
   # yum itself failed (broken repo config, no network, ...). Piping straight into
   # wc -l used to swallow that last case as a green "0 missing patches" - emit a
   # non-numeric sentinel instead so it lands in the existing Unknown (-1) path.
-  local out rc cmd
+  local out cmd
   cmd="out=\$(sudo yum check-update -q); rc=\$?
 if [ \"\$rc\" -eq 100 ]; then
   printf '%s\n' \"\$out\" | awk '/^Loaded plugins:/||NF==0{next} /^Obsoleting Packages/{exit} NF==1&&!/^[[:space:]]/{pkg=\$0;next} pkg&&/^[[:space:]]+/{sub(/^[[:space:]]+/,\"\");print pkg,\$0;pkg=\"\";next} {print}' | wc -l
@@ -792,20 +820,20 @@ else
   echo YUMERR
 fi"
   if out=$(run_remote "$DETECTED_MASTER_IP" "$pass" "$cmd"); then
-    rc=0
+    out="$(tr -d '\r' <<< "$out")"
 
     if [[ -z "$out" || ! "$out" =~ ^[0-9]+$ ]]; then
       POOL_MISSING_PATCHES=-1
     else
       POOL_MISSING_PATCHES=$out
     fi
-
   else
-    rc=$?
     POOL_MISSING_PATCHES=-1
   fi
 
-  return
+  # the result is the global above, not an rc - print_pool_status_section reads it and
+  # renders -1 as Unknown
+  return 0
 }
 
 # Pool RAM match
@@ -888,17 +916,29 @@ load_mem_stats() {
 
   local uuid="${POOL_HOST_UUIDS[$host]:-}"
 
-  local total_mb used_mb avail_mb
+  local total_mb used_mb
   total_mb="${POOL_HOSTS_MEM[${uuid}_total]:-0}"
   used_mb="${POOL_HOSTS_MEM[${uuid}_used]:-0}"
-  avail_mb="${POOL_HOSTS_MEM[${uuid}_avail]:-0}"
+
+  # a total of 0 means we never got this host's meminfo - either its address isn't one
+  # xapi knows (so there's no uuid to key on) or the facts sweep failed for it. Say so
+  # via MEM_KNOWN: computing a percentage from 0 yields a green "0.0%", which reads as
+  # a healthy host when it actually means we never looked.
+  if [[ "$total_mb" =~ ^[0-9]+$ ]] && (( total_mb > 0 )); then
+    MEM_KNOWN=1
+  else
+    MEM_KNOWN=0
+  fi
 
   MEM_TOTAL_GB="$(awk -v m="$total_mb" 'BEGIN{printf "%.1f", m/1024}')"
   MEM_USED_PCT="$(awk -v u="$used_mb" -v t="$total_mb" 'BEGIN{ if (t<=0) printf "0.0"; else printf "%.1f", (u/t)*100 }')"
-  MEM_AVAIL_GB="$(awk -v a="$avail_mb" 'BEGIN{printf "%.1f", a/1024}')"
 }
 
 # RPM/Yum patch level stuff
+#
+# Every host's manifest is fetched with this one call and hashed locally by the caller -
+# master and slaves alike - so both sides of the comparison are always the same bytes
+# through the same digest, and each host runs 'rpm -qa' exactly once per run.
 rpm_manifest_cmd() {
   printf "%s" "rpm -qa --qf '%{NAME} %{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort"
 }
@@ -909,25 +949,6 @@ get_rpm_manifest_remote() {
 
   local out rc
   if out=$(run_remote "$host" "$pass" "$(rpm_manifest_cmd)"); then
-    echo "$out"
-    rc=0
-  else
-    rc=$?
-  fi
-
-  return "$rc"
-}
-
-get_rpm_manifest_hash_remote() {
-  local host="$1"
-  local pass="$2"
-
-  # sha256sum only (no md5 fallback): the master's hash is computed locally from the
-  # fetched manifest, so slave hashes must use the same algorithm to be comparable.
-  # A host somehow lacking sha256sum fails the call and lands in the Unknown path,
-  # which beats a fake mismatch.
-  local out rc
-  if out=$(run_remote "$host" "$pass" "$(rpm_manifest_cmd) | sha256sum | cut -d' ' -f1"); then
     echo "$out"
     rc=0
   else
@@ -1025,14 +1046,18 @@ check_hyper_version() {
   minor="$(echo "$version" | cut -d. -f2)"
 
   # Check if version >= 8.3 (8.2 is no longer supported)
+  # The line key stays "Hypervisor Version:" whatever the outcome and the product name
+  # rides in the value - keying it on $hyper meant the label itself changed to
+  # "Hypervisor Version:" exactly when os-release couldn't be read, so anything reading
+  # the output line by line lost the host on the one result it most needed to see.
   if [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]]; then
     if (( major > 8 )) || (( major == 8 && minor >= 3 )); then
-      printf "%s Version: %s\n" "$hyper" "$(green_text "$version")"
+      printf "Hypervisor Version: %s\n" "$(green_text "$hyper $version")"
       return 0
     fi
   fi
 
-  printf "%s Version: %s\n" "$hyper" "$(yellow_text "$version")"
+  printf "Hypervisor Version: %s\n" "$(yellow_text "$hyper $version")"
   return 1
 }
 
@@ -1119,7 +1144,7 @@ check_multipath() {
 check_host_timesync() {
   local ip="$1"
 
-  local uuid ntp sync utc
+  local uuid ntp sync
   uuid="${POOL_HOST_UUIDS[$ip]:-}"
   ntp="${POOL_HOSTS_NTP[${uuid}_ntp]:-Unknown}"
   sync="${POOL_HOSTS_NTP[${uuid}_sync]:-Unknown}"
@@ -1202,7 +1227,6 @@ awk '
     if [[ -n "$uuid" ]]; then
       POOL_HOSTS_MEM[${uuid}_total]=$total_mb
       POOL_HOSTS_MEM[${uuid}_used]=$used_mb
-      POOL_HOSTS_MEM[${uuid}_avail]=$avail_mb
     fi
 
     # --- time sync half (was get_pool_timesync) ---
@@ -1224,7 +1248,6 @@ awk '
     if [[ -n "$uuid" ]]; then
       POOL_HOSTS_NTP[${uuid}_ntp]="$ntp"
       POOL_HOSTS_NTP[${uuid}_sync]="$sync"
-      POOL_HOSTS_NTP[${uuid}_utc]="$utc"
     fi
 
     if [[ "$ntp" != "yes" || "$sync" != "yes" ]]; then
@@ -1293,6 +1316,14 @@ check_dom0_disk_usage() {
 }
 
 check_dom0_memory_lines() {
+  # never looked = never green: a 0.0% built from a missing meminfo used to read exactly
+  # like a healthy host, with only an stderr line to say otherwise
+  if (( MEM_KNOWN == 0 )); then
+    printf "Dom0 Memory: %s\n" "$(yellow_text 'Unknown')"
+    printf "Dom0 Memory Usage: %s\n" "$(yellow_text 'Unknown (could not read host memory)')"
+    return 1
+  fi
+
   printf "Dom0 Memory: %s\n" "$(green_text "${MEM_TOTAL_GB}G")"
 
   local used_int
@@ -1550,6 +1581,7 @@ check_silly_mtus() {
   fi
 
   local -a nonstandard=()
+  local line
   while IFS= read -r line; do
     [[ "$line" =~ ^[0-9]+:\  ]] || continue
 
@@ -1658,6 +1690,15 @@ get_pool_other_config_key() {
   local pass="$2"
   local key="$3"
 
+  # An empty pool uuid (get_pool_uuid failed - exactly the wedged-xapi case the rest of
+  # this script is built to survive) would go out as "uuid=" and make xapi log a
+  # UUID_INVALID exception plus its backtrace into xensource.log on every call, twice per
+  # run - the same self-inflicted spam this function exists to avoid, which check_log_errors
+  # would then report back as a problem we caused ourselves.
+  if [[ -z "${MASTER_POOL_UUID:-}" ]]; then
+    return 2
+  fi
+
   local out
   if ! out=$(run_remote "$host" "$pass" "xe pool-param-get uuid=${MASTER_POOL_UUID} param-name=other-config"); then
     return 2
@@ -1764,10 +1805,28 @@ check_backup_network_reachability_from_xoa() {
 
   (( ${#ips[@]} > 0 )) || return 3
 
-  local -a unreachable=()
-  for ip in "${ips[@]}"; do
-    timeout "$local_cmd_timeout" ping -c 1 -W 2 -n "$ip" >/dev/null 2>&1 || unreachable+=("$ip")
+  # Probe all of them at once: a silent IP costs the full -W 2 wait, so probing serially
+  # made a wholly unreachable backup network cost 2s per pool host. Each probe drops a
+  # marker file for the address that didn't answer, and the list is rebuilt in the
+  # original order afterwards so the reported order stays stable.
+  local probe_dir="${WORK_DIR:-/tmp}/bnr.$$"
+  rm -rf "$probe_dir"
+  mkdir -p "$probe_dir"
+
+  local i
+  for (( i = 0; i < ${#ips[@]}; i++ )); do
+    (
+      timeout "$local_cmd_timeout" ping -c 1 -W 2 -n "${ips[i]}" >/dev/null 2>&1 \
+        || : > "$probe_dir/$i"
+    ) &
   done
+  wait || true
+
+  local -a unreachable=()
+  for (( i = 0; i < ${#ips[@]}; i++ )); do
+    [[ -e "$probe_dir/$i" ]] && unreachable+=("${ips[i]}")
+  done
+  rm -rf "$probe_dir"
 
   if (( ${#unreachable[@]} > 0 )); then
     local msg
@@ -1790,6 +1849,14 @@ check_backup_network_reachability_from_xoa() {
 check_migration_compression() {
   local host="$1"
   local pass="$2"
+
+  # with an empty pool uuid the list form answers empty and rc 0 - indistinguishable from
+  # "the field doesn't exist", so it used to print a green "Not supported (pre-8.3)" on
+  # any version without having established anything
+  if [[ -z "${MASTER_POOL_UUID:-}" ]]; then
+    printf "Migration Compression: %s\n" "$(yellow_text 'Unknown (pool UUID not available)')"
+    return 1
+  fi
 
   local out rc
   if out=$(run_remote "$host" "$pass" "xe pool-list uuid=${MASTER_POOL_UUID} params=migration-compression --minimal" | tr -d '\r'); then
@@ -2019,6 +2086,10 @@ build_log_scan_cmd() {
   # exits 0 no matter what: no match, an unreadable log and a missing log are all
   # "nothing to report" here, and a nonzero rc would be read as an SSH failure.
   # The phrase list travels to awk via the environment: -v would reprocess backslashes.
+  # Note this script is bash-only, not POSIX sh: printf '%q' on a multi-line string emits
+  # bash ANSI-C quoting ($'a\nb') for HEALTH_SCAN_PHRASES. Fine because ssh runs it under
+  # dom0 root's login shell, which is bash - but keep that in mind before repointing this
+  # at anything else.
   # scan_last_hits prints "phraseindex:lineno" for the LAST hit of each phrase in $1;
   # the phrase loop below indexes phrases the same way the awk BEGIN block does (blank
   # lines skipped), so the two stay aligned.
@@ -2062,8 +2133,11 @@ for base in$q_files; do
     fi
     [ -n "\$n" ] || continue
     s=\$((n - CTX)); [ "\$s" -lt 1 ] && s=1
+    e=\$((n + CTX))
     printf '%s\n' "--- \$ph (\$cand) ---"
-    sed -n "\${s},\$((n + CTX))p" "\$cand" 2>/dev/null | sed 's/^/  /'
+    # the trailing q stops at the end of the range: without it sed reads on to EOF, and
+    # these files run to tens of MB with the interesting hits usually near the end
+    sed -n "\${s},\${e}p;\${e}q" "\$cand" 2>/dev/null | sed 's/^/  /'
     printf '\n'
   done <<HEALTH_PHRASES_EOF
 \$HEALTH_SCAN_PHRASES
@@ -2195,31 +2269,38 @@ check_rebooted_after_updates() {
   local host="$1"
   local pass="$2"
 
+  # yum.log records no year, so the year has to be guessed - but dom0 ships coreutils
+  # 8.22, which rejects the "YYYY Mon DD HH:MM:SS" ordering outright ("invalid date").
+  # Every parse here used to fail into a year-less fallback that silently assumed the
+  # current year, and the "that landed in the future, so try last year" correction used
+  # the same rejected ordering, so it produced nothing at all: a host last patched in
+  # December then read as "not rebooted" for most of the following year. "Mon DD YYYY
+  # HH:MM:SS" is the ordering coreutils 8.22 does accept, verified on 8.2.1 and 8.3.0.
   local out rc cmd
-  cmd="bash -lc '
-    line=\$(awk '\''\$4==\"Updated:\" || (\$4==\"Installed:\" && \$5 ~ /^(kernel|xen)/) {l=\$0} END{print l}'\'' /var/log/yum.log 2>/dev/null || true)
-    if [ -z \"\$line\" ]; then
-      echo \"NOUPDATES\"
-      exit 0
-    fi
+  cmd="line=\$(awk '\$4==\"Updated:\" || (\$4==\"Installed:\" && \$5 ~ /^(kernel|xen)/) {l=\$0} END{print l}' /var/log/yum.log 2>/dev/null || true)
+if [ -z \"\$line\" ]; then
+  echo NOUPDATES
+  exit 0
+fi
 
-    ts=\$(echo \"\$line\" | awk '\''{print \$1\" \"\$2\" \"\$3}'\'')
-    year=\$(date +%Y)
-    now=\$(date +%s)
+mon=\$(printf '%s\n' \"\$line\" | awk '{print \$1}')
+day=\$(printf '%s\n' \"\$line\" | awk '{print \$2}')
+tod=\$(printf '%s\n' \"\$line\" | awk '{print \$3}')
+year=\$(date +%Y)
+now=\$(date +%s)
 
-    upd=\$(date -d \"\$year \$ts\" +%s 2>/dev/null || true)
-    if [ -z \"\$upd\" ]; then
-      upd=\$(date -d \"\$ts\" +%s 2>/dev/null || true)
-    fi
-    if [ -n \"\$upd\" ] && [ \"\$upd\" -gt \$((now+60)) ]; then
-      upd=\$(date -d \"\$((year-1)) \$ts\" +%s 2>/dev/null || true)
-    fi
+upd=\$(date -d \"\$mon \$day \$year \$tod\" +%s 2>/dev/null || true)
+if [ -n \"\$upd\" ] && [ \"\$upd\" -gt \$((now + 60)) ]; then
+  upd=\$(date -d \"\$mon \$day \$((year - 1)) \$tod\" +%s 2>/dev/null || true)
+fi
 
-    boot_str=\$(who -b 2>/dev/null | awk '\''{print \$3\" \"\$4}'\'')
-    boot=\$(date -d \"\$boot_str\" +%s 2>/dev/null || true)
+# /proc/stat btime is the exact boot second and always present; 'who -b' rounds to the
+# minute, depends on a readable utmp, and prints in the locale's format
+boot=\$(awk '/^btime/ {print \$2; exit}' /proc/stat 2>/dev/null || true)
 
-    echo \"\$upd \$boot\"
-  '"
+# always two fields: an empty first one let the reader below shift the boot time into
+# the update slot and report a confident wrong answer instead of an unknown
+printf '%s %s\n' \"\${upd:-NONE}\" \"\${boot:-NONE}\""
 
   if out=$(run_remote "$host" "$pass" "$cmd"); then
     rc=0
@@ -2228,6 +2309,8 @@ check_rebooted_after_updates() {
     echo "SSH failed when trying to check reboot status on $host (exit code $rc)" >&2
     return "$rc"
   fi
+
+  out="$(tr -d '\r' <<< "$out")"
 
   if [[ "${out:-}" == "NOUPDATES" ]]; then
     [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Rebooted After Updates: %s\n" "$(green_text 'Yes')"
@@ -2238,8 +2321,10 @@ check_rebooted_after_updates() {
   upd_epoch="$(awk '{print $1}' <<< "$out")"
   boot_epoch="$(awk '{print $2}' <<< "$out")"
 
-  if [[ -z "${upd_epoch:-}" || -z "${boot_epoch:-}" || ! "$upd_epoch" =~ ^[0-9]+$ || ! "$boot_epoch" =~ ^[0-9]+$ ]]; then
-    printf "Rebooted After Updates: %s\n" "$(yellow_text 'No')"
+  # an unparseable timestamp is not the same finding as "did not reboot" - saying "No"
+  # here claimed a fact about the host that was never established
+  if [[ ! "${upd_epoch:-}" =~ ^[0-9]+$ || ! "${boot_epoch:-}" =~ ^[0-9]+$ ]]; then
+    printf "Rebooted After Updates: %s\n" "$(yellow_text 'Unknown (could not read update or boot time)')"
     return 1
   fi
 
@@ -2273,7 +2358,17 @@ check_xostor_in_use_and_ram() {
   fi
 
   XOSTOR_IN_USE=1
-  printf "XOSTOR In Use: %s\n" "$(yellow_text 'Yes')"
+  # a fact about the pool, not a finding, so it's reported like "Multipathing: true" is -
+  # printing it yellow while returning 0 was the one place that broke the rule that
+  # anything yellow flags the exit code
+  printf "XOSTOR In Use: %s\n" "$(green_text 'Yes')"
+
+  # with memory unknown this used to read "Not Enough: 0.0G", which names a cause the
+  # host may not have
+  if (( MEM_KNOWN == 0 )); then
+    printf "XOSTOR RAM: %s\n" "$(yellow_text 'Unknown (could not read dom0 memory)')"
+    return 1
+  fi
 
   local total_gb_int
   total_gb_int="$(awk -v g="$MEM_TOTAL_GB" 'BEGIN{printf "%d", g+0.00001}')"
@@ -2439,14 +2534,24 @@ check_yum_patch_level() {
     return 1
   fi
 
-  local h
-  h="$(get_rpm_manifest_hash_remote "$host" "$pass" | tr -d '\r' | head -n 1 || true)"
+  # Fetch the package list once and hash it here, the same way the master's baseline is
+  # built. Hashing remotely and then fetching the list on mismatch meant two separate
+  # 'rpm -qa' runs, i.e. two different snapshots: a package landing between them produced
+  # a "Mismatch, See Below" over an empty difference block. It also costs one less remote
+  # rpm run on any host that does differ (measured ~223ms each), and the list is only a
+  # few tens of KB over an already-open connection.
+  local slave_list
+  slave_list="$(get_rpm_manifest_remote "$host" "$pass" || true)"
 
-  if [[ -z "$h" ]]; then
-    # couldn't fetch the hash (transient ssh failure etc) - don't call that a mismatch
+  if [[ -z "${slave_list//[[:space:]]/}" ]]; then
+    # couldn't fetch the list (transient ssh failure etc) - don't call that a mismatch
     printf "Yum Patch Level: %s\n" "$(yellow_text 'Unknown (could not retrieve)')"
     return 1
   fi
+
+  # identical pipeline to the one main uses on MASTER_RPMLIST, so the digests compare
+  local h
+  h="$(printf '%s\n' "$slave_list" | sha256sum | cut -d' ' -f1)"
 
   if [[ "$h" == "$MASTER_RPMHASH" ]]; then
     [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Yum Patch Level: %s\n" "$(green_text 'Match')"
@@ -2454,14 +2559,6 @@ check_yum_patch_level() {
   fi
 
   printf "Yum Patch Level: %s\n" "$(yellow_text 'Mismatch, See Below')"
-
-  local slave_list
-  slave_list="$(get_rpm_manifest_remote "$host" "$pass" || true)"
-
-  if [[ -z "${slave_list//[[:space:]]/}" ]]; then
-    append_details "$hostlabel" "Yum Patch Level Differences" "(could not retrieve package list from host)"
-    return 1
-  fi
 
   local diff_all
   diff_all="$(
@@ -2496,8 +2593,15 @@ check_yum_patch_level() {
     ' <(printf "%s\n" "$MASTER_RPMLIST") <(printf "%s\n" "$slave_list") | sort
   )"
 
-  local diff_show
+  # count what's there before truncating, and say so - a silent cut at the cap reads as
+  # "these are all the differences" when it isn't (same reasoning as the coredump list)
+  local diff_count diff_show
+  diff_count="$(grep -c . <<< "$diff_all" || true)"
+  [[ "$diff_count" =~ ^[0-9]+$ ]] || diff_count=0
   diff_show="$(head -n "$pkg_diff_max_lines" <<< "$diff_all")"
+  if (( diff_count > pkg_diff_max_lines )); then
+    diff_show+=$'\n'"(plus $((diff_count - pkg_diff_max_lines)) more difference(s) not listed)"
+  fi
 
   append_details "$hostlabel" "Yum Patch Level Differences" "$diff_show"
   return 1
@@ -2679,9 +2783,12 @@ run_checks_for_host() {
   check_multipath "$ip"
   if ! check_host_timesync "$ip"; then rc_any=1; fi
 
-  # dmesg feeds the MTU/content/OOM checks - skip the fetch when none of them will run
+  # dmesg feeds the MTU/content/OOM checks - skip the fetch when none of them will run.
+  # dmesg_ok carries the fetch result to all three: fed an empty string they cannot tell
+  # a quiet kernel from one we never managed to ask, and all three reported green off a
+  # failed fetch with nothing but an stderr line to contradict them.
   local dmesg_t="" rc
-  local need_dmesg=0
+  local need_dmesg=0 dmesg_ok=1
   if (( POOL_MODE == 0 )) || (( is_master == 1 )) \
      || should_run_in_pool_for_slave pool_run_mtu_issues \
      || should_run_in_pool_for_slave pool_run_dmesg_content \
@@ -2696,6 +2803,7 @@ run_checks_for_host() {
       rc=$?
       echo "SSH failed when trying to get dmesg on $ip (exit code $rc)" >&2
       dmesg_t=""
+      dmesg_ok=0
     fi
   fi
 
@@ -2727,20 +2835,35 @@ run_checks_for_host() {
   fi
 
   if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_mtu_issues; then
-    if ! check_mtu_issues "$dmesg_t"; then rc_any=1; fi
+    if (( dmesg_ok == 0 )); then
+      printf "MTU Issues: %s\n" "$(yellow_text 'Unknown (could not read dmesg)')"
+      rc_any=1
+    elif ! check_mtu_issues "$dmesg_t"; then
+      rc_any=1
+    fi
   fi
 
   if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_dmesg_content; then
-    if ! check_dmesg_content "$dmesg_t"; then rc_any=1; fi
-    if [[ -n "$DMESG_ISSUES_BLOCK" ]]; then
-      append_details "$hostlabel" "Dmesg Issues" "$DMESG_ISSUES_BLOCK"
+    if (( dmesg_ok == 0 )); then
+      printf "Dmesg Content: %s\n" "$(yellow_text 'Unknown (could not read dmesg)')"
+      rc_any=1
+    else
+      if ! check_dmesg_content "$dmesg_t"; then rc_any=1; fi
+      if [[ -n "$DMESG_ISSUES_BLOCK" ]]; then
+        append_details "$hostlabel" "Dmesg Issues" "$DMESG_ISSUES_BLOCK"
+      fi
     fi
   fi
 
   if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_oom_events; then
-    if ! check_oom_events "$dmesg_t"; then rc_any=1; fi
-    if [[ -n "$OOM_EVENTS_BLOCK" ]]; then
-      append_details "$hostlabel" "OOM Events" "$OOM_EVENTS_BLOCK"
+    if (( dmesg_ok == 0 )); then
+      printf "OOM Events: %s\n" "$(yellow_text 'Unknown (could not read dmesg)')"
+      rc_any=1
+    else
+      if ! check_oom_events "$dmesg_t"; then rc_any=1; fi
+      if [[ -n "$OOM_EVENTS_BLOCK" ]]; then
+        append_details "$hostlabel" "OOM Events" "$OOM_EVENTS_BLOCK"
+      fi
     fi
   fi
 
@@ -2819,8 +2942,6 @@ fi
 }
 
 main() {
-  ORIGINAL_ARGS=("$@")
-
   local debver debver_major
   debver=$(awk -F '=' '/^VERSION_ID=/ {gsub(/"/,"",$2); print $2}' /etc/os-release 2>/dev/null || true)
   debver_major="${debver%%.*}"
@@ -2869,6 +2990,25 @@ main() {
   if [[ -n "$POOL_NAME_FILTER" && $# -gt 1 ]]; then
     echo "ERROR: -n/--name looks the host up in xo-server-db, so it takes at most a password after it." >&2
     usage
+  fi
+
+  # With one trailing argument the two readings are indistinguishable by shape, and the
+  # script reads it as a password - so './health.sh -n sec 192.168.1.5' silently tried to
+  # log into the -n-matched pool using an address as the password and surfaced as an
+  # authentication failure. Only xo-db can tell the cases apart: an argument that is the
+  # address of a pool it knows was meant as a host, since nobody's root password is one of
+  # their own pool addresses.
+  if [[ -n "$POOL_NAME_FILTER" && $# -eq 1 ]]; then
+    local host_clash
+    host_clash="$(get_pool_name_for_host "$1" || true)"
+    if [[ -n "$host_clash" ]]; then
+      {
+        printf "ERROR: '%s' is the address of pool '%s' in xo-server-db, but the value after\n" "$1" "$host_clash"
+        echo   "       -n/--name is read as a password, not a host - -n already selects the pool."
+        printf "       Use either '-n %s' or the host '%s', not both.\n" "$POOL_NAME_FILTER" "$1"
+      } >&2
+      usage
+    fi
   fi
 
   # -n, or no args at all = resolve a pool from xo-db (which prompts when more than
@@ -2967,7 +3107,8 @@ main() {
 
     MASTER_RPMLIST="$(get_rpm_manifest_remote "$DETECTED_MASTER_IP" "$pass" || true)"
     # hash the manifest we just fetched instead of running rpm -qa on the master a
-    # second time; slaves hash remotely with the same sha256sum, so they compare
+    # second time; check_yum_patch_level hashes each slave's manifest through this exact
+    # pipeline, so the two digests are always comparable
     MASTER_RPMHASH=""
     if [[ -n "${MASTER_RPMLIST//[[:space:]]/}" ]]; then
       MASTER_RPMHASH="$(printf '%s\n' "$MASTER_RPMLIST" | sha256sum | cut -d' ' -f1)"
