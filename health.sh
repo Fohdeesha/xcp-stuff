@@ -1091,7 +1091,7 @@ check_lastpatched() {
 
   local out last rc
   if out=$(run_remote "$host" "$pass" "rpm -qa --last 2>/dev/null | head -n 1 || true"); then
-    last=$(echo "$out" | awk 'NF>1 {$1=""; sub(/^ /,""); print}' | sed -E '/ UTC[+-]/! s/ ([+-][0-9]{2}(:?[0-9]{2})?)$/ UTC\1/' | xargs -I{} date -d "{}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)
+    last=$(echo "$out" | awk 'NF>1 {$1=""; sub(/^ /,""); print}' | sed -E -e '/ UTC[+-]/! s/ ([+-][0-9]{2}(:?[0-9]{2})?)$/ UTC\1/' -e '/ (AM|PM)$/! s/ [A-Za-z]{2,6}$//' | xargs -I{} date -d "{}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)
     rc=0
   else
     rc=$?
@@ -1342,15 +1342,23 @@ check_mtu_issues() {
   local dmesg_out="$1"
 
   local kw
+  local -a matched=()
   for kw in $mtu_dmesg_keywords; do
     if grep -qiFw -- "$kw" <<< "$dmesg_out"; then
-      printf "MTU Issues: %s\n" "$(yellow_text 'Detected, check output from dmesg -T')"
-      return 1
+      matched+=("$kw")
     fi
   done
 
-  [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "MTU Issues: %s\n" "$(none)"
-  return 0
+  if (( ${#matched[@]} == 0 )); then
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "MTU Issues: %s\n" "$(none)"
+    return 0
+  fi
+
+  local msg
+  msg="$(printf "'%s', " "${matched[@]}")"
+  msg="${msg%, }"
+  printf "MTU Issues: %s\n" "$(yellow_text "Detected (${msg}), check output from dmesg -T")"
+  return 1
 }
 
 check_dmesg_content() {
@@ -2238,6 +2246,33 @@ check_smapi_hidden_leaves() {
   return 1
 }
 
+check_xostor_qcow2_vdis() {
+  local host="$1"
+  local pass="$2"
+  local hostlabel="$3"
+
+  # trailing grep would make its own no-match rc (1) look like an SSH failure below,
+  # since run_remote's rc is the remote command's actual exit status - so "|| true" it
+  local cmd="xe vdi-list sr-uuid=\$(xe sr-list type=linstor --minimal) params=sm-config 2>/dev/null | grep qcow2 || true"
+
+  local out rc
+  if out=$(run_remote "$host" "$pass" "$cmd"); then
+    rc=0
+  else
+    rc=$?
+    echo "SSH failed when trying to check XOSTOR qcow2 VDIs on $host (exit code $rc)" >&2
+    return "$rc"
+  fi
+
+  if [[ -z "${out//[[:space:]]/}" ]]; then
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "XOSTOR QCOW2 VDIs: %s\n" "$(none)"
+    return 0
+  fi
+
+  printf "XOSTOR QCOW2 VDIs: %s\n" "$(yellow_text 'Yes')"
+  return 1
+}
+
 check_ha_enabled() {
   local host="$1"
   local pass="$2"
@@ -2706,6 +2741,7 @@ print_pool_status_section() {
     if ! check_xostor_faulty_resources "$DETECTED_MASTER_IP" "$pass" "$controllers_csv"; then rc_any=1; fi
     if ! check_xostor_nodes "$DETECTED_MASTER_IP" "$pass" "$controllers_csv"; then rc_any=1; fi
     if ! check_xostor_controller "$DETECTED_MASTER_IP" "$pass" "$controllers_csv"; then rc_any=1; fi
+    if ! check_xostor_qcow2_vdis "$DETECTED_MASTER_IP" "$pass" "${DETECTED_MASTER_HOSTNAME} (${DETECTED_MASTER_IP})"; then rc_any=1; fi
   fi
 
   local host_uuid="${POOL_HOST_UUIDS[$DETECTED_MASTER_IP]:-}"
