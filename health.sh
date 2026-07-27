@@ -57,6 +57,7 @@ crash_ignore_file=".sacrificial-space-for-logs" # file in /var/crash to ignore (
 coredump_dir="/var/lib/systemd/coredump"        # systemd-coredump drop dir - anything in here means a dom0 process died (tapdisk etc)
 coredump_max_lines=50                           # max amt of coredumps to list in the detail block (newest first)
 pkg_diff_max_lines=100                          # max amt of mismatched yum packages to list
+xostor_qcow2_max_lines=50                       # max amt of qcow2 VDIs on XOSTOR to list in the detail block
 time_sync_allowance_secs=300                    # max allowed time difference between hosts in seconds
 
 ## which tests should run on ALL hosts when script is ran in pool mode (which is default)
@@ -1091,7 +1092,26 @@ check_lastpatched() {
 
   local out last rc
   if out=$(run_remote "$host" "$pass" "rpm -qa --last 2>/dev/null | head -n 1 || true"); then
-    last=$(echo "$out" | awk 'NF>1 {$1=""; sub(/^ /,""); print}' | sed -E -e '/ UTC[+-]/! s/ ([+-][0-9]{2}(:?[0-9]{2})?)$/ UTC\1/' -e '/ (AM|PM)$/! s/ [A-Za-z]{2,6}$//' | xargs -I{} date -d "{}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)
+    # rpm prints the install time as the host's strftime %c, so it carries the HOST's
+    # zone - either an abbreviation (EDT, CEST, AEDT) or a numeric offset (+07, -05,
+    # sometimes already UTC-prefixed). Both are stripped, and what is left is read as a
+    # plain wall clock, so this line is reported in the host's own local time - the same
+    # frame as the "Last Booted" line right above it, which is printed raw from
+    # 'uptime -s' and never converted.
+    #
+    # Don't "fix" this back into a conversion by feeding the zone to date -d. It only
+    # knows a fixed table of abbreviations, so anything outside it (AEST/AEDT/ACST/AWST,
+    # ICT, HKT, PHT, WIB, COT, PET, IRST, NPT ...) fails outright and the whole line
+    # became "Unknown" - an entire continent's worth of hosts never reported a patch
+    # date. Worse, the ones it does accept are ambiguous: a Philippines host says PST
+    # (UTC+8) and date -d reads US Pacific (UTC-8), which silently reported a time 16
+    # hours off rather than failing. Stripping sidesteps that whole collision class
+    # (PST, IST, CST and BST all mean two different things).
+    #
+    # The AM/PM guard is matched case-insensitively (the I): a locale that renders %c
+    # with a lowercase "pm" and no zone would otherwise have the pm eaten as if it were
+    # an abbreviation, turning 03:14 PM into 03:14 AM - a silent 12h error.
+    last=$(echo "$out" | awk 'NF>1 {$1=""; sub(/^ /,""); print}' | sed -E -e 's/ (UTC)?[+-][0-9]{2}(:?[0-9]{2})?$//' -e '/ (AM|PM)$/I! s/ [A-Za-z]{2,6}$//' | xargs -I{} date -d "{}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)
     rc=0
   else
     rc=$?
@@ -2249,11 +2269,54 @@ check_smapi_hidden_leaves() {
 check_xostor_qcow2_vdis() {
   local host="$1"
   local pass="$2"
-  local hostlabel="$3"
 
-  # trailing grep would make its own no-match rc (1) look like an SSH failure below,
-  # since run_remote's rc is the remote command's actual exit status - so "|| true" it
-  local cmd="xe vdi-list sr-uuid=\$(xe sr-list type=linstor --minimal) params=sm-config 2>/dev/null | grep qcow2 || true"
+  # The remote half is a script rather than one pipeline, for three reasons:
+  #
+  #  - 'xe sr-list --minimal' answers with a COMMA-SEPARATED list when a pool has more
+  #    than one linstor SR, and sr-uuid= will not take that: it matches nothing and
+  #    still answers rc 0, so the pools most likely to have qcow2 VDIs were the ones
+  #    that read as a clean "None". Each SR is asked for separately instead.
+  #  - a failed xe must not read as "none" either. The old form swallowed xe's rc with
+  #    a trailing '|| true' (needed there, because a no-match grep exits 1 and run_remote
+  #    would have reported that as a transport failure), which made a wedged xapi print
+  #    a green None. Each xe rc is now checked and reported through a sentinel, and the
+  #    awk that does the filtering always exits 0, so no '|| true' is needed at all.
+  #  - it reports WHICH VDIs. sm-config alone does not name the VDI it belongs to, so
+  #    uuid and name-label are fetched with it and paired up per record.
+  #
+  # NB: the awk reads xe's whole output, deliberately. Do NOT "optimise" this to
+  # 'grep -q qcow2' or 'head -n': xe streams, so closing the pipe early hands xapi an
+  # EPIPE that it logs as an exception into xensource.log - which is exactly what
+  # check_log_errors greps. Measured on 8.3.0 at +4 exceptions per call, versus 0 for
+  # reading to EOF. Same self-inflicted-spam trap as param-key.
+  local cmd
+  cmd="$(cat <<'HEALTH_QCOW2_EOF'
+srs=$(xe sr-list type=linstor --minimal 2>/dev/null) || { echo XEERR; exit 0; }
+[ -n "$srs" ] || { echo NOSR; exit 0; }
+all=""
+for sr in $(printf '%s' "$srs" | tr , ' '); do
+  o=$(xe vdi-list sr-uuid="$sr" params=uuid,name-label,sm-config 2>/dev/null) || { echo XEERR; exit 0; }
+  all="$all
+$o"
+done
+printf '%s\n' "$all" | awk '
+# A record starts at its uuid line and ends at the next one, rather than at a blank
+# line: $(...) strips trailing newlines, so gluing two SRs together leaves only a
+# single newline between them, and paragraph mode then merged the last record of one
+# SR into the first of the next and dropped a VDI.
+/^[[:space:]]*uuid [(]/ {
+  if (uuid != "" && smc ~ /qcow2/) printf "%s  %s\n", uuid, name
+  uuid = $0; sub(/^[^:]*:[[:space:]]*/, "", uuid)
+  name = ""; smc = ""
+  next
+}
+/^[[:space:]]*name-label [(]/ { name = $0; sub(/^[^:]*:[[:space:]]*/, "", name); next }
+# matched on the sm-config line only, so a VDI merely *named* qcow2 is not a hit
+/^[[:space:]]*sm-config [(]/  { smc = $0; next }
+END { if (uuid != "" && smc ~ /qcow2/) printf "%s  %s\n", uuid, name }'
+exit 0
+HEALTH_QCOW2_EOF
+)"
 
   local out rc
   if out=$(run_remote "$host" "$pass" "$cmd"); then
@@ -2264,12 +2327,38 @@ check_xostor_qcow2_vdis() {
     return "$rc"
   fi
 
-  if [[ -z "${out//[[:space:]]/}" ]]; then
+  # the sentinels are emitted alone, so match the whole answer rather than a substring
+  local trimmed="${out//[[:space:]]/}"
+
+  if [[ "$trimmed" == "XEERR" ]]; then
+    printf "XOSTOR QCOW2 VDIs: %s\n" "$(yellow_text 'Unknown (could not read the VDI list)')"
+    return 1
+  fi
+
+  # only reachable if the linstor SR went away between check_xostor_in_use_and_ram and
+  # here - still not something to call green, since nothing was actually established
+  if [[ "$trimmed" == "NOSR" ]]; then
+    printf "XOSTOR QCOW2 VDIs: %s\n" "$(yellow_text 'Unknown (no XOSTOR SR found)')"
+    return 1
+  fi
+
+  if [[ -z "$trimmed" ]]; then
     [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "XOSTOR QCOW2 VDIs: %s\n" "$(none)"
     return 0
   fi
 
-  printf "XOSTOR QCOW2 VDIs: %s\n" "$(yellow_text 'Yes')"
+  # cap the list like the coredump/pkg-diff blocks do, counting the remainder rather
+  # than cutting it silently
+  local cnt show
+  cnt="$(awk 'NF {c++} END {print c+0}' <<< "$out")"
+  show="$out"
+  if (( cnt > xostor_qcow2_max_lines )); then
+    show="$(head -n "$xostor_qcow2_max_lines" <<< "$out")"
+    show+=$'\n'"(plus $((cnt - xostor_qcow2_max_lines)) more qcow2 VDI(s) not listed)"
+  fi
+
+  printf "XOSTOR QCOW2 VDIs: %s\n" "$(yellow_text 'Yes, See Below')"
+  append_pool_details "---xostor qcow2 vdis---" "$show"
   return 1
 }
 
@@ -2741,7 +2830,7 @@ print_pool_status_section() {
     if ! check_xostor_faulty_resources "$DETECTED_MASTER_IP" "$pass" "$controllers_csv"; then rc_any=1; fi
     if ! check_xostor_nodes "$DETECTED_MASTER_IP" "$pass" "$controllers_csv"; then rc_any=1; fi
     if ! check_xostor_controller "$DETECTED_MASTER_IP" "$pass" "$controllers_csv"; then rc_any=1; fi
-    if ! check_xostor_qcow2_vdis "$DETECTED_MASTER_IP" "$pass" "${DETECTED_MASTER_HOSTNAME} (${DETECTED_MASTER_IP})"; then rc_any=1; fi
+    if ! check_xostor_qcow2_vdis "$DETECTED_MASTER_IP" "$pass"; then rc_any=1; fi
   fi
 
   local host_uuid="${POOL_HOST_UUIDS[$DETECTED_MASTER_IP]:-}"
@@ -2991,8 +3080,12 @@ main() {
   trap 'rm -rf "$WORK_DIR"' EXIT
 
   local VALID_ARGS
+  # getopt has already printed its own "unrecognized option" to stderr; usage adds the
+  # invocation summary and exits 2. It used to exit 1 here, which is the same code a
+  # perfectly valid run returns when a check flags, so a wrapper or cron job could not
+  # tell "you typed the flag wrong" from "the pool has a problem".
   if ! VALID_ARGS=$(getopt -o fhsn: --long filter,help,single,name: -- "$@"); then
-      exit 1
+      usage
   fi
 
   eval set -- "$VALID_ARGS"
