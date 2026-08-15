@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # J-Sands / D-Pollak - Vates
-# V2.6
 #
+# The version, and the only place it lives. Bump it whenever this script changes - it is
+# printed as the last line of every run, so it is the only way to tell which script
+# produced a report someone pasted.
+script_version="2.7"
+
 # Runs in two environments, decided by /etc/os-release (see detect_run_env):
 #   XOA  - the normal case: reaches every host of a pool over ssh (sshpass + xo-server-db)
 #   host - run directly on an XCP-ng/XenServer dom0: commands for THIS host run locally
@@ -3825,6 +3829,11 @@ main() {
   if [[ -n "${DETAILS_OUTPUT//[[:space:]]/}" ]]; then
     printf "%s\n" "$DETAILS_OUTPUT"
   fi
+
+  # last line of every run, -f included: it can never flag, and the point of it is to say
+  # which script produced the report above
+  echo
+  printf "Health Script Version: %s\n" "$(green_text "v${script_version}")"
 
   exit "$overall_rc"
 }
