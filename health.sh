@@ -987,8 +987,6 @@ check_pool_hosts_access() {
 
   if (( ${#POOL_HOST_NOACCESS_IPS[@]} > 0 )); then
     local ips_str
-    # ips_str="$(printf "%s, " "${POOL_HOST_NOACCESS_IPS[@]}")"
-    # ips_str="${ips_str%, }"
     ips_str="${POOL_HOST_NOACCESS_IPS[*]}"
 
     echo "Warning: SSH access failed for the following pool hosts: $ips_str" >&2
@@ -1428,8 +1426,11 @@ check_enabled() {
   uuid="${POOL_HOST_UUIDS[$ip]:-}"
   enabled="${POOL_HOSTS_STATUS[${uuid}_enabled]:-Unknown}"
 
+  # this one can flag (false, below), so its green line is a result rather than an info
+  # line and -f suppresses it like every other passing check. Multipathing right below
+  # never flags, so that one stays in the always-printed info class.
   if [[ "$enabled" == "true" ]]; then
-    printf "Host Enabled: %s\n" "$(green_text "$enabled")"
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Host Enabled: %s\n" "$(green_text "$enabled")"
     return 0
   fi
 
@@ -1857,13 +1858,29 @@ check_lacp_negotiation_issues() {
 
   LACP_OUTPUT_BLOCK=""
 
+  # 'ovs-appctl lacp/show' answers rc 0 with EMPTY output when the host simply has no LACP
+  # bonds, and rc 1 when it cannot reach ovs-vswitchd at all (both measured on 8.2.1 and
+  # 8.3.0). Those are very different facts, and the old form ended '|| true', which threw
+  # the rc away and printed a green "No" for a host whose OVS was not answering - a result
+  # that was never established. Same class as the dmesg fetch below.
+  local cmd='o=$(ovs-appctl lacp/show 2>/dev/null); rc=$?
+if [ "$rc" -ne 0 ]; then echo OVSERR; exit 0; fi
+printf "%s\n" "$o"'
+
   local out rc
-  if out=$(run_remote "$host" "$pass" "ovs-appctl lacp/show 2>/dev/null || true"); then
+  if out=$(run_remote "$host" "$pass" "$cmd"); then
     rc=0
   else
     rc=$?
     echo "Failed when trying to check LACP negotiation on $host (exit code $rc)" >&2
     return "$rc"
+  fi
+
+  # the sentinel is emitted alone, so match the whole trimmed answer (a bond named OVSERR
+  # would otherwise be able to spoof it) - same convention as check_xostor_qcow2_vdis
+  if [[ "${out//[[:space:]]/}" == "OVSERR" ]]; then
+    printf "LACP Negotiation Issues: %s\n" "$(yellow_text 'Unknown (could not query Open vSwitch)')"
+    return 1
   fi
 
   if [[ -z "${out//[[:space:]]/}" ]]; then
@@ -2091,6 +2108,10 @@ check_migration_network() {
       printf "Migration Network: %s\n" "$(yellow_text 'Unknown (could not check bond membership)')"
       return 1
       ;;
+    3)
+      printf "Migration Network: %s\n" "$(yellow_text 'Configured, but that network has no PIFs (deleted network?)')"
+      return 1
+      ;;
     *)
       [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Migration Network: %s\n" "$(green_text 'Configured')"
       return 0
@@ -2251,6 +2272,12 @@ check_backup_network() {
       printf "Backup Network: %s\n" "$(yellow_text 'Unknown (could not check bond membership)')"
       return 1
       ;;
+    3)
+      # the ping half below would have reported this as "no usable IP was found", which is
+      # true but names the wrong cause - there are no PIFs to have an IP in the first place
+      printf "Backup Network: %s\n" "$(yellow_text 'Configured, but that network has no PIFs (deleted network?)')"
+      return 1
+      ;;
   esac
 
   # The ping half asks "can the XOA reach every host on this network", because that is what
@@ -2286,7 +2313,8 @@ check_backup_network() {
   esac
 }
 
-# returns 0 = network sits on a bond member, 1 = it doesn't, 2 = could not check
+# returns 0 = network sits on a bond member, 1 = it doesn't, 2 = could not check,
+#         3 = the network has no PIFs at all
 check_is_bond_member() {
   local host="$1"
   local pass="$2"
@@ -2296,6 +2324,17 @@ check_is_bond_member() {
   if ! out=$(run_remote "$host" "$pass" "xe pif-list network-uuid=${network_uuid} params=bond-slave-of"); then
     echo "Failed when trying to check for bond members on $host" >&2
     return 2
+  fi
+
+  # A network uuid that no longer exists is answered with rc 0 and NO output whatsoever
+  # (measured on 8.3.0 - and quietly, no exception lands in xensource.log). Read as "no
+  # bond-slave-of line, so not a bond member", that printed a green "Configured" for a
+  # pool whose xo:migrationNetwork points at a network somebody has since deleted. It gets
+  # its own code instead: nothing about the network was established. A network that exists
+  # but has no PIFs on any host lands here too, which is equally not something to call
+  # configured, since migration and backup traffic both need a PIF with an address.
+  if ! grep -q 'bond-slave-of' <<< "$out"; then
+    return 3
   fi
 
   # Check if bond-slave-of has a non-empty, non-database value
@@ -2814,7 +2853,7 @@ check_xostor_in_use_and_ram() {
     printf "XOSTOR RAM: %s\n" "$(yellow_text "Not Enough: ${MEM_TOTAL_GB}G (Need >=${xostor_min_ram_gb}G)")"
     return 1
   else
-    printf "XOSTOR RAM: %s\n" "$(green_text "${MEM_TOTAL_GB}G")"
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "XOSTOR RAM: %s\n" "$(green_text "${MEM_TOTAL_GB}G")"
     return 0
   fi
 }
@@ -2947,7 +2986,7 @@ check_xostor_controller() {
     return 1
   fi
 
-  printf "XOSTOR Controller IP: %s\n" "$(green_text "$ip")"
+  [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "XOSTOR Controller IP: %s\n" "$(green_text "$ip")"
   return 0
 }
 
@@ -2964,7 +3003,10 @@ check_yum_patch_level() {
   fi
 
   if (( is_master == 1 )); then
-    printf "Yum Patch Level: %s\n" "$(green_text 'Reference (Master)')"
+    # guarded like the slaves' "Match" line below - unguarded, -f printed the master's
+    # baseline line while suppressing every slave's passing one, which reads as though
+    # the slaves had not been checked at all
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Yum Patch Level: %s\n" "$(green_text 'Reference (Master)')"
     return 0
   fi
 
@@ -2999,33 +3041,33 @@ check_yum_patch_level() {
 
   printf "Yum Patch Level: %s\n" "$(yellow_text 'Mismatch, See Below')"
 
+  # A package NAME is NOT unique in an rpm manifest - gpg-pubkey is installed twice on
+  # every dom0 here, and a host carries two kernels between an update and the reboot that
+  # activates it. Keeping one entry per name (mline[$1]=...) silently dropped all but the
+  # last, so a difference confined to a duplicated name could print "Mismatch, See Below"
+  # over a block that never mentioned it - the same empty-block symptom the single-snapshot
+  # fix above was written to remove, reached a different way. Both manifests are sorted, so
+  # collecting each name's versions into one string compares them as a multiset, in order.
   local diff_all
   diff_all="$(
     awk '
-      NR==FNR {
-        name=$1
-        $1=""
-        sub(/^[[:space:]]+/, "", $0)
-        mline[name]=name " " $0
-        next
-      }
-      {
-        name=$1
-        $1=""
-        sub(/^[[:space:]]+/, "", $0)
-        sline[name]=name " " $0
-      }
+      # The "have we seen this name" test needs its OWN array: assigning to mver[$1]
+      # creates that element before the right-hand side is evaluated, so testing
+      # ($1 in mver) is already true the first time and prefixed every single-version
+      # package with a stray ", ".
+      NR==FNR { v = substr($0, index($0, " ") + 1); mver[$1] = (($1 in mseen) ? mver[$1] ", " : "") v; mseen[$1] = 1; next }
+              { v = substr($0, index($0, " ") + 1); sver[$1] = (($1 in sseen) ? sver[$1] ", " : "") v; sseen[$1] = 1 }
       END {
-        for (n in sline) {
-          if (!(n in mline)) {
-            print "Extra Package: " sline[n]
-          } else if (sline[n] != mline[n]) {
-            print "Does Not Match Master: " sline[n] " (Master: " mline[n] ")"
+        for (n in sver) {
+          if (!(n in mver)) {
+            print "Extra Package: " n " " sver[n]
+          } else if (sver[n] != mver[n]) {
+            print "Does Not Match Master: " n " " sver[n] " (Master: " n " " mver[n] ")"
           }
         }
-        for (n in mline) {
-          if (!(n in sline)) {
-            print "Missing Package: " mline[n]
+        for (n in mver) {
+          if (!(n in sver)) {
+            print "Missing Package: " n " " mver[n]
           }
         }
       }
@@ -3046,10 +3088,16 @@ check_yum_patch_level() {
   return 1
 }
 
-# pool mode control
-should_run_in_pool_for_slave() {
-  local var="$1"
-  [[ "${!var}" == "1" ]]
+# pool mode control: true when the check guarded by the named pool_run_* toggle should run
+# for the host currently being examined. Single mode and the pool master always run
+# everything; a slave in pool mode runs only what its toggle turns on, which is the entire
+# purpose of those toggles (keeping a pool sweep short).
+#
+# $is_master is read from the caller's scope - run_checks_for_host is the only caller, and
+# the only place the toggles mean anything. Called from anywhere else, set -u makes that a
+# loud abort rather than a silently wrong answer.
+gated() {
+  (( POOL_MODE == 0 )) || (( is_master == 1 )) || [[ "${!1}" == "1" ]]
 }
 
 append_details() {
@@ -3141,7 +3189,10 @@ print_pool_status_section() {
   if (( POOL_MISSING_PATCHES == 0 )); then
     [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Missing Patches: %s\n" "$(green_text "${POOL_MISSING_PATCHES}")"
   else
-    printf "Missing Patches: %s\n" "$(yellow_text "${POOL_MISSING_PATCHES/-1/Unknown}")"
+    # -1 is the "we could not find out" sentinel get_pool_missing_patches sets
+    local patches_txt="$POOL_MISSING_PATCHES"
+    (( POOL_MISSING_PATCHES < 0 )) && patches_txt="Unknown"
+    printf "Missing Patches: %s\n" "$(yellow_text "$patches_txt")"
     rc_any=1
   fi
 
@@ -3259,10 +3310,7 @@ run_checks_for_host() {
   # failed fetch with nothing but an stderr line to contradict them.
   local dmesg_t="" rc
   local need_dmesg=0 dmesg_ok=1
-  if (( POOL_MODE == 0 )) || (( is_master == 1 )) \
-     || should_run_in_pool_for_slave pool_run_mtu_issues \
-     || should_run_in_pool_for_slave pool_run_dmesg_content \
-     || should_run_in_pool_for_slave pool_run_oom_events; then
+  if gated pool_run_mtu_issues || gated pool_run_dmesg_content || gated pool_run_oom_events; then
     need_dmesg=1
   fi
 
@@ -3296,15 +3344,15 @@ run_checks_for_host() {
 
   local hostlabel="${hn} (${ip})"
 
-  if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_dom0_disk_usage; then
+  if gated pool_run_dom0_disk_usage; then
     if ! check_dom0_disk_usage "$ip" "$pass"; then rc_any=1; fi
   fi
 
-  if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_dom0_memory; then
+  if gated pool_run_dom0_memory; then
     if ! check_dom0_memory_lines; then rc_any=1; fi
   fi
 
-  if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_mtu_issues; then
+  if gated pool_run_mtu_issues; then
     if (( dmesg_ok == 0 )); then
       printf "MTU Issues: %s\n" "$(yellow_text 'Unknown (could not read dmesg)')"
       rc_any=1
@@ -3313,7 +3361,7 @@ run_checks_for_host() {
     fi
   fi
 
-  if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_dmesg_content; then
+  if gated pool_run_dmesg_content; then
     if (( dmesg_ok == 0 )); then
       printf "Dmesg Content: %s\n" "$(yellow_text 'Unknown (could not read dmesg)')"
       rc_any=1
@@ -3325,7 +3373,7 @@ run_checks_for_host() {
     fi
   fi
 
-  if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_oom_events; then
+  if gated pool_run_oom_events; then
     if (( dmesg_ok == 0 )); then
       printf "OOM Events: %s\n" "$(yellow_text 'Unknown (could not read dmesg)')"
       rc_any=1
@@ -3337,75 +3385,72 @@ run_checks_for_host() {
     fi
   fi
 
-  if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_crash_logs_present; then
+  if gated pool_run_crash_logs_present; then
     if ! check_crash_logs_present "$ip" "$pass"; then rc_any=1; fi
   fi
 
-  if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_coredumps_present; then
+  if gated pool_run_coredumps_present; then
     if ! check_coredumps_present "$ip" "$pass"; then rc_any=1; fi
     if [[ -n "$COREDUMPS_BLOCK" ]]; then
       append_details "$hostlabel" "Coredumps ($coredump_dir)" "$COREDUMPS_BLOCK"
     fi
   fi
 
-  if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_lacp_negotiation; then
+  if gated pool_run_lacp_negotiation; then
     if ! check_lacp_negotiation_issues "$ip" "$pass"; then rc_any=1; fi
     if [[ -n "$LACP_OUTPUT_BLOCK" ]]; then
       append_details "$hostlabel" "LACP Output" "$LACP_OUTPUT_BLOCK"
     fi
   fi
 
-  if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_silly_mtus; then
+  if gated pool_run_silly_mtus; then
     if ! check_silly_mtus "$ip" "$pass"; then rc_any=1; fi
   fi
 
-if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_dns_gw_non_mgmt_pifs; then
-  local host_uuid="${POOL_HOST_UUIDS[$ip]:-}"
+  if gated pool_run_dns_gw_non_mgmt_pifs; then
+    local host_uuid="${POOL_HOST_UUIDS[$ip]:-}"
+    if [[ -z "$host_uuid" ]]; then
+      host_uuid="$(get_host_uuid_by_address "$ip" "$pass" "$ip")"
+    fi
 
-
-  if [[ -z "$host_uuid" ]]; then
-    host_uuid="$(get_host_uuid_by_address "$ip" "$pass" "$ip")"
+    if [[ -n "$host_uuid" ]]; then
+      if ! check_dns_gw_non_mgmt_pifs "$ip" "$pass" "$host_uuid"; then rc_any=1; fi
+    else
+      printf "DNS/GW on Non-Mgmt PIFs: %s (could not resolve host identity for address=%s)\n" "$(yellow_text 'Unknown')" "$ip"
+      rc_any=1
+    fi
   fi
 
-  if [[ -n "$host_uuid" ]]; then
-    if ! check_dns_gw_non_mgmt_pifs "$ip" "$pass" "$host_uuid"; then rc_any=1; fi
-  else
-    printf "DNS/GW on Non-Mgmt PIFs: %s (could not resolve host identity for address=%s)\n" "$(yellow_text 'Unknown')" "$ip"
-    rc_any=1
-  fi
-fi
-
-
-  if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_overlapping_subnets; then
+  if gated pool_run_overlapping_subnets; then
     if ! check_overlapping_subnets "$ip" "$pass"; then rc_any=1; fi
   fi
 
-  if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_log_errors; then
+  if gated pool_run_log_errors; then
     if ! check_log_errors "$ip" "$pass"; then rc_any=1; fi
     if [[ -n "$LOG_ERRORS_BLOCK" ]]; then
       append_details "$hostlabel" "Log Errors" "$LOG_ERRORS_BLOCK"
     fi
   fi
 
-  if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_lun_assignments; then
+  if gated pool_run_lun_assignments; then
     if ! check_lun_assignments "$ip" "$pass"; then rc_any=1; fi
     if [[ -n "$LUN_CHANGES_BLOCK" ]]; then
       append_details "$hostlabel" "LUN Assignment Changes" "$LUN_CHANGES_BLOCK"
     fi
   fi
 
-  if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_smapi_hidden_leaves; then
+  if gated pool_run_smapi_hidden_leaves; then
     if ! check_smapi_hidden_leaves "$ip" "$pass" "$hostlabel"; then rc_any=1; fi
   fi
 
-  if (( POOL_MODE == 0 )) || (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_rebooted_after_updates; then
+  if gated pool_run_rebooted_after_updates; then
     if ! check_rebooted_after_updates "$ip" "$pass"; then rc_any=1; fi
   fi
 
-  if (( POOL_MODE == 1 )); then
-    if (( is_master == 1 )) || should_run_in_pool_for_slave pool_run_yum_patch_level; then
-      if ! check_yum_patch_level "$ip" "$pass" "$is_master" "$hostlabel"; then rc_any=1; fi
-    fi
+  # gated() covers the POOL_MODE==0 case itself, but this check is meaningless without a
+  # second host to compare against, so single mode skips it here rather than inside
+  if (( POOL_MODE == 1 )) && gated pool_run_yum_patch_level; then
+    if ! check_yum_patch_level "$ip" "$pass" "$is_master" "$hostlabel"; then rc_any=1; fi
   fi
 
   return "$rc_any"
@@ -3685,10 +3730,14 @@ main() {
       # master from the local pool.conf, so unlike the XOA path (where detection can only
       # pick a host we already logged into) it may be one we cannot reach. It is listed as
       # unreachable above; here we just make sure the heading still gets printed.
+      # count-guarded: on dom0's bash 4.2 an empty "${arr[@]}" under set -u aborts the
+      # script (see the note at the top of the file)
       local ip master_reachable=0
-      for ip in "${POOL_HOST_ACCESS_IPS[@]}"; do
-        if [[ "$ip" == "$DETECTED_MASTER_IP" ]]; then master_reachable=1; break; fi
-      done
+      if (( ${#POOL_HOST_ACCESS_IPS[@]} > 0 )); then
+        for ip in "${POOL_HOST_ACCESS_IPS[@]}"; do
+          if [[ "$ip" == "$DETECTED_MASTER_IP" ]]; then master_reachable=1; break; fi
+        done
+      fi
 
       if (( master_reachable == 1 )); then
         if ! run_checks_for_host "$DETECTED_MASTER_IP" "$pass" 1 ""; then overall_rc=1; fi
@@ -3696,10 +3745,12 @@ main() {
         echo "$(cyan_text "== Individual Hosts ==")"
       fi
 
-      for ip in "${POOL_HOST_ACCESS_IPS[@]}"; do
-        [[ "$ip" == "$DETECTED_MASTER_IP" ]] && continue
-        if ! run_checks_for_host "$ip" "$pass" 0 ""; then overall_rc=1; fi
-      done
+      if (( ${#POOL_HOST_ACCESS_IPS[@]} > 0 )); then
+        for ip in "${POOL_HOST_ACCESS_IPS[@]}"; do
+          [[ "$ip" == "$DETECTED_MASTER_IP" ]] && continue
+          if ! run_checks_for_host "$ip" "$pass" 0 ""; then overall_rc=1; fi
+        done
+      fi
     fi
 
     echo
