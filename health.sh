@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# J-Sands / Vates
-# V2.5
+# J-Sands / D-Pollak - Vates
+# V2.6
 #
 # Runs in two environments, decided by /etc/os-release (see detect_run_env):
 #   XOA  - the normal case: reaches every host of a pool over ssh (sshpass + xo-server-db)
@@ -162,6 +162,14 @@ MASTER_XOSTOR_IN_USE=0
 MASTER_POOL_UUID=""
 MEM_TOTAL_GB="0.0"
 MEM_USED_PCT="0.0"
+# filled by load_patch_facts, read by check_lastpatched and check_rebooted_after_updates -
+# both lines are answers about the same event, so they are fetched once and share a source
+PATCH_UPD_EPOCH=""                  # when the host was last UPDATED (not just installed to)
+PATCH_UPD_DISP=""                   # ...rendered in the host's own local time, on the host
+PATCH_BOOT_EPOCH=""
+PATCH_BOOT_DISP=""
+PATCH_NEWEST_RPM=""                 # newest rpm install of any kind, backstop only
+PATCH_FACTS_OK=0
 MEM_KNOWN=0                         # 0 = memory for the current host could not be read, so
                                     # the dom0 memory lines must say Unknown, not a green 0.0%
 PW_NOTIFY=0                         # flag to indicate we should print a warning about backslash in password
@@ -1359,63 +1367,144 @@ check_hyper_version() {
 }
 
 check_uptime() {
+  # Rendered from /proc/stat btime, which load_patch_facts already fetched, rather than
+  # from its own 'uptime -s' call. btime is the boot second the kernel recorded; uptime -s
+  # recomputes now-minus-uptime every time it runs and so drifts with clock adjustments -
+  # on two of the test hosts the two disagreed by a second, which showed up as this line
+  # and the "Rebooted After Updates" evidence below naming different boot times in the
+  # same report. (Preferring btime is the same reasoning the reboot check already applied
+  # when it chose btime over 'who -b'.) One less remote call per host, too.
+  if (( PATCH_FACTS_OK == 0 )) || [[ -z "$PATCH_BOOT_DISP" ]]; then
+    printf "Last Booted:  %s\n" "Unknown"
+    return 0
+  fi
+
+  printf "Last Booted:  %s\n" "$PATCH_BOOT_DISP"
+  return 0
+}
+
+# One remote call answering both "when was this host last updated" and "has it booted
+# since", because those are two readings of the same event and used to be fetched - and
+# defined - separately, which is what made the two lines look like they contradicted
+# each other. Fills the PATCH_* globals; check_lastpatched and check_rebooted_after_updates
+# just render them.
+#
+# What counts as being "patched" is one predicate, used for both lines: a yum.log
+# "Updated:" (any package upgraded) or an "Installed:" of a kernel/xen package - yum
+# installs a new kernel alongside the old one instead of upgrading it, so that is an
+# XCP-ng update too. A plain "Installed:" of anything else is a NEW package, not a patch,
+# and no longer moves the date: "Last Patched" used to be rpm -qa --last, i.e. the newest
+# package of any kind, so installing sshpass (which host mode does itself) redated the
+# host and made it look freshly patched.
+#
+# yum.log is read together with its rotated .1, like the other log scans: logrotate takes
+# it at size 30k with notifempty, so after a rotation the live file can sit near-empty for
+# months with the whole update history in .1 - and reading only the live file then found
+# nothing and printed a green "Rebooted After Updates: Yes" having established nothing.
+# (Seen on the 8.2.1 test host: 53-byte live log, real history in a .1 from December.)
+#
+# The TIMESTAMP comes from rpm, not from the log line: yum.log records no year, and rpm
+# knows exactly when the package landed. That removes the year guessing from the common
+# path entirely - and with it the old %c timezone-abbreviation parsing, since an epoch
+# rendered by date ON the host is in the host's own local time by construction, which is
+# all that parsing was ever trying to achieve.
+load_patch_facts() {
   local host="$1"
   local pass="$2"
 
-  # NOT 'if ! up=$(...)': $? after a negated pipeline is the negation's status (always
-  # 0 here), so the failure message used to claim "exit code 0" for every failure
-  local up rc
-  if up=$(run_remote "$host" "$pass" "uptime -s 2>/dev/null || true"); then
+  PATCH_UPD_EPOCH=""; PATCH_UPD_DISP=""
+  PATCH_BOOT_EPOCH=""; PATCH_BOOT_DISP=""
+  PATCH_NEWEST_RPM=""; PATCH_FACTS_OK=0
+
+  local cmd
+  cmd="$(cat <<'HEALTH_PATCHFACTS_EOF'
+boot=$(awk '/^btime/ {print $2; exit}' /proc/stat 2>/dev/null || true)
+
+# Newest rpm install of ANY kind - only a backstop for when yum.log tells us nothing.
+# sshpass and gpg-pubkey are excluded because host mode installs sshpass itself and that
+# import brings a key with it: the script must never date a host by its own footprint.
+newest=$(rpm -qa --qf '%{INSTALLTIME} %{NAME}\n' 2>/dev/null \
+  | awk '$2 != "sshpass" && $2 != "gpg-pubkey" {print $1}' | sort -rn | head -n 1)
+
+line=""; logf=""
+for f in /var/log/yum.log /var/log/yum.log.1; do
+  [ -r "$f" ] || continue
+  line=$(awk '$4=="Updated:" || ($4=="Installed:" && $5 ~ /^(kernel|xen)/) {l=$0} END{print l}' "$f" 2>/dev/null || true)
+  if [ -n "$line" ]; then logf="$f"; break; fi
+done
+
+upd=""
+if [ -n "$line" ]; then
+  # the log names the package; rpm knows exactly when it landed (with a year)
+  pkg=$(printf '%s\n' "$line" | awk '{print $5}' | sed 's/^[0-9]*://')
+  upd=$(rpm -q --qf '%{INSTALLTIME}\n' "$pkg" 2>/dev/null | head -n 1)
+  case "$upd" in ''|*[!0-9]*) upd="" ;; esac
+
+  if [ -z "$upd" ]; then
+    # rpm could not resolve it (erased since, or an epoch form we mangled). Fall back to
+    # the log's own stamp, taking the year from the FILE's mtime rather than from today:
+    # a rotated .1 can be well over a year old, which "this year, else last year" cannot
+    # reach. The last matching line is always near the file's mtime, so this is exact.
+    mon=$(printf '%s\n' "$line" | awk '{print $1}')
+    day=$(printf '%s\n' "$line" | awk '{print $2}')
+    tod=$(printf '%s\n' "$line" | awk '{print $3}')
+    fm=$(stat -c %Y "$logf" 2>/dev/null || true)
+    fy=$(date -d "@$fm" +%Y 2>/dev/null || date +%Y)
+    # "Mon DD YYYY HH:MM:SS" is the ordering dom0's coreutils 8.22 accepts; it rejects
+    # "YYYY Mon DD HH:MM:SS" outright
+    upd=$(date -d "$mon $day $fy $tod" +%s 2>/dev/null || true)
+    if [ -n "$upd" ] && [ -n "$fm" ] && [ "$upd" -gt "$fm" ]; then
+      upd=$(date -d "$mon $day $((fy - 1)) $tod" +%s 2>/dev/null || true)
+    fi
+    case "$upd" in ''|*[!0-9]*) upd="" ;; esac
+  fi
+fi
+
+# rendered here, on the host, so both dates are in the host's own local time
+updd=""; bootd=""
+[ -n "$upd" ]  && updd=$(date -d "@$upd" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)
+[ -n "$boot" ] && bootd=$(date -d "@$boot" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)
+
+echo "UPD=${upd:-NONE}"
+echo "UPDD=${updd:-}"
+echo "BOOT=${boot:-NONE}"
+echo "BOOTD=${bootd:-}"
+echo "NEWEST=${newest:-NONE}"
+exit 0
+HEALTH_PATCHFACTS_EOF
+)"
+
+  local out rc
+  if out=$(run_remote "$host" "$pass" "$cmd"); then
     rc=0
   else
     rc=$?
-    echo "Failed when trying to get uptime from $host (exit code $rc)" >&2
-    up=""
+    echo "Failed when trying to get patch/boot times from $host (exit code $rc)" >&2
+    return "$rc"
   fi
 
-  # strip CRs / keep the first line with builtins: piping into 'head -n 1' can SIGPIPE
-  # the upstream command, which pipefail would then report as a failure of the ssh call
-  up="${up//$'\r'/}"
-  up="${up%%$'\n'*}"
+  local k v
+  while IFS='=' read -r k v; do
+    case "$k" in
+      UPD)    [[ "$v" =~ ^[0-9]+$ ]] && PATCH_UPD_EPOCH="$v" ;;
+      UPDD)   PATCH_UPD_DISP="$v" ;;
+      BOOT)   [[ "$v" =~ ^[0-9]+$ ]] && PATCH_BOOT_EPOCH="$v" ;;
+      BOOTD)  PATCH_BOOT_DISP="$v" ;;
+      NEWEST) [[ "$v" =~ ^[0-9]+$ ]] && PATCH_NEWEST_RPM="$v" ;;
+    esac
+  done <<< "$(tr -d '\r' <<< "$out")"
 
-  printf "Last Booted:  %s\n" "${up:-Unknown}"
+  PATCH_FACTS_OK=1
   return 0
 }
 
 check_lastpatched() {
-  local host="$1"
-  local pass="$2"
-
-  local out last rc
-  if out=$(run_remote "$host" "$pass" "rpm -qa --last 2>/dev/null | head -n 1 || true"); then
-    # rpm prints the install time as the host's strftime %c, so it carries the HOST's
-    # zone - either an abbreviation (EDT, CEST, AEDT) or a numeric offset (+07, -05,
-    # sometimes already UTC-prefixed). Both are stripped, and what is left is read as a
-    # plain wall clock, so this line is reported in the host's own local time - the same
-    # frame as the "Last Booted" line right above it, which is printed raw from
-    # 'uptime -s' and never converted.
-    #
-    # Don't "fix" this back into a conversion by feeding the zone to date -d. It only
-    # knows a fixed table of abbreviations, so anything outside it (AEST/AEDT/ACST/AWST,
-    # ICT, HKT, PHT, WIB, COT, PET, IRST, NPT ...) fails outright and the whole line
-    # became "Unknown" - an entire continent's worth of hosts never reported a patch
-    # date. Worse, the ones it does accept are ambiguous: a Philippines host says PST
-    # (UTC+8) and date -d reads US Pacific (UTC-8), which silently reported a time 16
-    # hours off rather than failing. Stripping sidesteps that whole collision class
-    # (PST, IST, CST and BST all mean two different things).
-    #
-    # The AM/PM guard is matched case-insensitively (the I): a locale that renders %c
-    # with a lowercase "pm" and no zone would otherwise have the pm eaten as if it were
-    # an abbreviation, turning 03:14 PM into 03:14 AM - a silent 12h error.
-    last=$(echo "$out" | awk 'NF>1 {$1=""; sub(/^ /,""); print}' | sed -E -e 's/ (UTC)?[+-][0-9]{2}(:?[0-9]{2})?$//' -e '/ (AM|PM)$/I! s/ [A-Za-z]{2,6}$//' | xargs -I{} date -d "{}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)
-    rc=0
-  else
-    rc=$?
-    echo "Failed when trying to get last patched info from $host (exit code $rc)" >&2
+  if (( PATCH_FACTS_OK == 0 )) || [[ -z "$PATCH_UPD_DISP" ]]; then
+    printf "Last Patched: %s\n" "Unknown"
+    return 0
   fi
 
-  last="${last:-Unknown}"
-  printf "Last Patched: %s\n" "$last"
+  printf "Last Patched: %s\n" "$PATCH_UPD_DISP"
   return 0
 }
 
@@ -2742,75 +2831,41 @@ check_ha_enabled() {
 }
 
 check_rebooted_after_updates() {
-  local host="$1"
-  local pass="$2"
-
-  # yum.log records no year, so the year has to be guessed - but dom0 ships coreutils
-  # 8.22, which rejects the "YYYY Mon DD HH:MM:SS" ordering outright ("invalid date").
-  # Every parse here used to fail into a year-less fallback that silently assumed the
-  # current year, and the "that landed in the future, so try last year" correction used
-  # the same rejected ordering, so it produced nothing at all: a host last patched in
-  # December then read as "not rebooted" for most of the following year. "Mon DD YYYY
-  # HH:MM:SS" is the ordering coreutils 8.22 does accept, verified on 8.2.1 and 8.3.0.
-  local out rc cmd
-  cmd="line=\$(awk '\$4==\"Updated:\" || (\$4==\"Installed:\" && \$5 ~ /^(kernel|xen)/) {l=\$0} END{print l}' /var/log/yum.log 2>/dev/null || true)
-if [ -z \"\$line\" ]; then
-  echo NOUPDATES
-  exit 0
-fi
-
-mon=\$(printf '%s\n' \"\$line\" | awk '{print \$1}')
-day=\$(printf '%s\n' \"\$line\" | awk '{print \$2}')
-tod=\$(printf '%s\n' \"\$line\" | awk '{print \$3}')
-year=\$(date +%Y)
-now=\$(date +%s)
-
-upd=\$(date -d \"\$mon \$day \$year \$tod\" +%s 2>/dev/null || true)
-if [ -n \"\$upd\" ] && [ \"\$upd\" -gt \$((now + 60)) ]; then
-  upd=\$(date -d \"\$mon \$day \$((year - 1)) \$tod\" +%s 2>/dev/null || true)
-fi
-
-# /proc/stat btime is the exact boot second and always present; 'who -b' rounds to the
-# minute, depends on a readable utmp, and prints in the locale's format
-boot=\$(awk '/^btime/ {print \$2; exit}' /proc/stat 2>/dev/null || true)
-
-# always two fields: an empty first one let the reader below shift the boot time into
-# the update slot and report a confident wrong answer instead of an unknown
-printf '%s %s\n' \"\${upd:-NONE}\" \"\${boot:-NONE}\""
-
-  if out=$(run_remote "$host" "$pass" "$cmd"); then
-    rc=0
-  else
-    rc=$?
-    echo "Failed when trying to check reboot status on $host (exit code $rc)" >&2
-    return "$rc"
-  fi
-
-  out="$(tr -d '\r' <<< "$out")"
-
-  if [[ "${out:-}" == "NOUPDATES" ]]; then
-    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Rebooted After Updates: %s\n" "$(green_text 'Yes')"
-    return 0
-  fi
-
-  local upd_epoch boot_epoch
-  upd_epoch="$(awk '{print $1}' <<< "$out")"
-  boot_epoch="$(awk '{print $2}' <<< "$out")"
-
-  # an unparseable timestamp is not the same finding as "did not reboot" - saying "No"
-  # here claimed a fact about the host that was never established
-  if [[ ! "${upd_epoch:-}" =~ ^[0-9]+$ || ! "${boot_epoch:-}" =~ ^[0-9]+$ ]]; then
-    printf "Rebooted After Updates: %s\n" "$(yellow_text 'Unknown (could not read update or boot time)')"
+  # Reads the PATCH_* facts load_patch_facts already fetched - same update event that
+  # "Last Patched" reports, so the two lines can no longer disagree about what "patched"
+  # means. Both dates are printed as evidence: the pair is the whole answer, and showing
+  # only a bare Yes/No next to a "Last Patched" line that used to be derived differently
+  # is exactly what made this look self-contradictory.
+  if (( PATCH_FACTS_OK == 0 )) || [[ -z "$PATCH_BOOT_EPOCH" ]]; then
+    printf "Rebooted After Updates: %s
+" "$(yellow_text 'Unknown (could not read update or boot time)')"
     return 1
   fi
 
-  if (( boot_epoch >= upd_epoch )); then
-    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Rebooted After Updates: %s\n" "$(green_text 'Yes')"
-    return 0
-  else
-    printf "Rebooted After Updates: %s\n" "$(yellow_text 'No')"
+  if [[ -z "$PATCH_UPD_EPOCH" ]]; then
+    # No update recorded in yum.log or its .1. rpm can still settle it: if nothing at all
+    # has been installed since boot then certainly no update has, so "Yes" is safe. If
+    # something HAS landed since boot we cannot tell what kind it was - and that is an
+    # Unknown, not the green "Yes" the old NOUPDATES path printed off no evidence at all.
+    if [[ -n "$PATCH_NEWEST_RPM" ]] && (( PATCH_BOOT_EPOCH >= PATCH_NEWEST_RPM )); then
+      [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Rebooted After Updates: %s
+"         "$(green_text "Yes (nothing installed since boot ${PATCH_BOOT_DISP})")"
+      return 0
+    fi
+    printf "Rebooted After Updates: %s
+" "$(yellow_text 'Unknown (no update found in yum.log or yum.log.1)')"
     return 1
   fi
+
+  if (( PATCH_BOOT_EPOCH >= PATCH_UPD_EPOCH )); then
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Rebooted After Updates: %s
+"       "$(green_text "Yes (updated ${PATCH_UPD_DISP}, booted ${PATCH_BOOT_DISP})")"
+    return 0
+  fi
+
+  printf "Rebooted After Updates: %s
+"     "$(yellow_text "No (updated ${PATCH_UPD_DISP}, booted ${PATCH_BOOT_DISP})")"
+  return 1
 }
 
 check_xostor_in_use_and_ram() {
@@ -3298,8 +3353,13 @@ run_checks_for_host() {
   # info block - but an unsupported version, a disabled host, or NTP explicitly off
   # still count toward the exit code
   if ! check_hyper_version "$ip" "$pass"; then rc_any=1; fi
-  check_uptime "$ip" "$pass"
-  check_lastpatched "$ip" "$pass"
+  # one call feeding "Last Booted" and "Last Patched" here and "Rebooted After Updates"
+  # further down - all three are readings of the same two instants, so they are fetched
+  # together and can no longer disagree. A failure leaves PATCH_FACTS_OK at 0 and all
+  # three say Unknown rather than guessing.
+  load_patch_facts "$ip" "$pass" || true
+  check_uptime
+  check_lastpatched
   if ! check_enabled "$ip"; then rc_any=1; fi
   check_multipath "$ip"
   if ! check_host_timesync "$ip"; then rc_any=1; fi
@@ -3444,7 +3504,7 @@ run_checks_for_host() {
   fi
 
   if gated pool_run_rebooted_after_updates; then
-    if ! check_rebooted_after_updates "$ip" "$pass"; then rc_any=1; fi
+    if ! check_rebooted_after_updates; then rc_any=1; fi
   fi
 
   # gated() covers the POOL_MODE==0 case itself, but this check is meaningless without a
