@@ -40,6 +40,34 @@ Usage:
   ./health_test.sh -f -n 'xen-main'
   ```
 
+## Running it on an XCP-ng host instead of XOA
+
+The same script can be run directly on a host - it looks at `/etc/os-release` and adapts.
+Useful when there is no XOA to hand, or when XOA cannot reach the pool.
+
+```
+# on the host, as root:
+bash <(curl -fsSL https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/health.sh)
+```
+
+- **This host is always checked**, using local commands - no ssh and no password involved.
+- **The rest of the pool is checked too if you give a root password.** Pool members share
+  the master's root password, so one covers the pool. With a terminal you are simply asked
+  for it; you can also pass it as an argument, though the prompt is preferable since an
+  argument is visible in `ps` and lands in your shell history. dom0 has no `sshpass`, so
+  the script installs it the same way it does on XOA - from the stock `extras` repo
+  (Vates' own mirror, already configured, just disabled), a 21KB package with no
+  dependencies. `--enablerepo` is one-shot, so the host's yum config is left as it was.
+- **With no password it checks this host alone and says so** - a `Hosts in Pool` line
+  reports how much of the pool the run covered. Cron and piped runs take this path rather
+  than hanging on a prompt.
+- Pool-level results (pool master, HA, XOSTOR, VLAN 0, migration/backup network, migration
+  compression, missing patches) are reported either way - those are `xe` queries, and xapi
+  answers them from any pool member, slaves included.
+- The XOA section is never printed (there is no appliance). Running on a host with a
+  password otherwise produces the same report an XOA run does for that pool.
+- `-f` and `-s` apply as usual; `-n` is XOA-only and is rejected with an explanation.
+
   ## Example Output
 
 ![Alt text](example-output.png)

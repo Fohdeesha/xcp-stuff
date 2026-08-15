@@ -1,6 +1,21 @@
 #!/usr/bin/env bash
 # J-Sands / Vates
-# V2.4
+# V2.5
+#
+# Runs in two environments, decided by /etc/os-release (see detect_run_env):
+#   XOA  - the normal case: reaches every host of a pool over ssh (sshpass + xo-server-db)
+#   host - run directly on an XCP-ng/XenServer dom0: commands for THIS host run locally
+#          instead of over ssh, and the XOA-only parts (updater status, pool picker,
+#          password lookup) are gone. The other pool members are checked too as long as a
+#          root password is available (argument, or a prompt when there is a terminal) -
+#          dom0 ships no sshpass, so ensure_sshpass installs it from the stock 'extras'
+#          repo, exactly like the apt install it does on XOA. With no password it checks
+#          this host alone and says so; the pool-level section runs either way, since
+#          those are 'xe' calls and xapi answers them from any pool member, slave included.
+#
+# NB dom0 ships bash 4.2, where "${empty_array[@]}" under 'set -u' is an unbound-variable
+# error (fixed in 4.4, so XOA's bash 5.x never sees it). Array expansions that can legally
+# be empty are count-guarded for that reason - keep it that way when adding checks.
 set -euo pipefail
 set +H 2>/dev/null || true   # make ! in args no explode
 
@@ -106,6 +121,18 @@ yellow_text() { printf "%s%s%s" "$YELLOW" "$1" "$RESET"; }
 cyan_text()   { printf "%s%s%s" "$CYAN" "$1" "$RESET"; }
 
 # globals
+RUN_ENV="xoa"                       # "xoa" or "host" - set by detect_run_env from /etc/os-release
+LOCAL_HOST_IP=""                    # host mode: this host's address, as xapi spells it (map key)
+LOCAL_HOST_NAME=""                  # host mode: this host's hostname, for the banner
+LOCAL_HOST_UUID=""                  # host mode: this host's uuid, from /etc/xensource-inventory
+POOL_CMD_HOST=""                    # host the pool-level xe questions are asked on: the master
+                                    # over ssh from XOA, ourselves in host mode (xapi on a slave
+                                    # forwards pool queries to the master anyway)
+POOL_ALL_HOST_IPS=()                # every address xapi listed for the pool, kept before host
+                                    # mode narrows POOL_HOST_IPS down to this machine
+HOST_POOL_SWEEP=0                   # host mode: 1 = we have a password (and sshpass) and are
+                                    # checking the rest of the pool too, 0 = this host alone
+HOST_POOL_PASS=""                   # the password prepare_host_pool_sweep settled on
 POOL_MODE=1
 FILTER_OUTPUT=0
 POOL_NAME_FILTER=""                 # -n: substring to match a pool by name in xo-db (case insensitive)
@@ -140,31 +167,118 @@ MEM_KNOWN=0                         # 0 = memory for the current host could not 
 PW_NOTIFY=0                         # flag to indicate we should print a warning about backslash in password
 WORK_DIR=""                         # temp dir for ssh control sockets / stderr capture (set in main)
 
+# Are we on a hypervisor or on XOA? XCP-ng and XenServer dom0 both set ID=xenenterprise
+# in /etc/os-release (NAME is "XCP-ng" / "XenServer"), which nothing else does; anything
+# else is treated as XOA and still has to pass the Debian version gate in main.
+# Deliberately keyed on os-release rather than on "does /usr/bin/xe exist", so a machine
+# that merely has the CLI installed (an XOA with xe-cli, a dev box) is not mistaken for a
+# host - and so the failure when we are on a hypervisor without a working xe is a clear
+# message rather than a silent fallback into the XOA path.
+detect_run_env() {
+  local id name
+  id="$(awk -F= '/^ID=/ {gsub(/"/, "", $2); print $2; exit}' /etc/os-release 2>/dev/null || true)"
+  name="$(awk -F= '/^NAME=/ {gsub(/"/, "", $2); print $2; exit}' /etc/os-release 2>/dev/null || true)"
+
+  if [[ "$id" == "xenenterprise" || "$name" == XCP-ng* || "$name" == XenServer* ]]; then
+    RUN_ENV="host"
+  else
+    RUN_ENV="xoa"
+  fi
+}
+
+# Host mode: work out who we are, before anything else runs.
+#
+# The address has to be the exact string xapi uses, because every per-host map in this
+# script is keyed by it (POOL_HOST_UUIDS, and through it memory / enabled / multipathing /
+# NTP) - so it comes from xapi itself rather than from 'ip addr', which would spell a
+# management address differently the moment there is more than one on the interface.
+# The uuid comes from /etc/xensource-inventory, which is a local file and is exactly what
+# xapi means by "this host" (INSTALLATION_UUID), so it is right even when the host is a
+# slave and 'xe host-list' returns the whole pool.
+# Returns 1 (with a message) if either could not be established - guessing here would
+# silently check the wrong host or fill every map with misses.
+resolve_local_host_identity() {
+  LOCAL_HOST_UUID=""
+  LOCAL_HOST_IP=""
+  LOCAL_HOST_NAME=""
+
+  if ! command -v xe >/dev/null 2>&1; then
+    echo "ERROR: this looks like an XCP-ng/XenServer host, but 'xe' was not found in PATH." >&2
+    return 1
+  fi
+
+  LOCAL_HOST_UUID="$(awk -F"'" '/^INSTALLATION_UUID=/ {print $2; exit}' /etc/xensource-inventory 2>/dev/null || true)"
+  if [[ ! "$LOCAL_HOST_UUID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+    echo "ERROR: could not read INSTALLATION_UUID from /etc/xensource-inventory." >&2
+    return 1
+  fi
+
+  # same timeout the local xoa-updater calls get: a wedged xapi must not hang the run
+  LOCAL_HOST_IP="$(timeout "$local_cmd_timeout" xe host-param-get uuid="$LOCAL_HOST_UUID" param-name=address 2>/dev/null | tr -d '\r' | head -n 1 || true)"
+  LOCAL_HOST_IP="${LOCAL_HOST_IP//[[:space:]]/}"
+
+  if [[ -z "$LOCAL_HOST_IP" ]]; then
+    echo "ERROR: could not get this host's address from xapi (is the toolstack running?)." >&2
+    return 1
+  fi
+
+  # cosmetic only (the banner), so a failure here just leaves the address to speak for itself
+  LOCAL_HOST_NAME="$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)"
+  LOCAL_HOST_NAME="${LOCAL_HOST_NAME//[[:space:]]/}"
+
+  return 0
+}
+
 usage() {
   # help asked for (-h, exit 0) goes to stdout; usage *errors* go to stderr
   local rc="${1:-2}" fd=1
   (( rc == 0 )) || fd=2
   {
-  echo "Usage:"
-  echo "  $0 [-f] [-s] [-n name] [pool_master_or_host[:ssh_port] [root_password]]"
-  echo ""
-  echo "  - All parameters are optional"
-  echo "  - If a host is not supplied, the enabled pools in xo-server-db are listed to pick from"
-  echo "    (a single enabled pool, or non-interactive use, just takes the first one)"
-  echo "  - If a password is not supplied, it will be looked up locally in xo-server-db"
-  echo "  - By default, the script runs in pool mode (checks all hosts in the pool)"
-  echo "  - Use '-f' flag to filter output to only show issues found"
-  echo "  - Use '-s' flag to only check the specified host (do not check other pool members if present)"
-  echo "  - Use '-n' to pick a pool from xo-server-db by name instead of being prompted:"
-  echo "    the first pool whose name contains the text is used, matched anywhere in the"
-  echo "    name and ignoring case, so '-n sec' matches 'XEN-SECONDARY'"
-  echo ""
-  echo "  Examples:"
-  echo "  $0 192.168.1.5"
-  echo "  $0 192.168.1.6 'mypass'"
-  echo "  $0 -s 192.168.1.7 'mypass'"
-  echo "  $0 -n sec"
-  echo "  $0 -f -n 'xen-main'"
+  if [[ "$RUN_ENV" == "host" ]]; then
+    # on a hypervisor there is no xo-server-db to name a pool or look a password up in,
+    # and no sshpass to reach another host with, so the target is not selectable
+    echo "Usage (running on an XCP-ng host):"
+    echo "  $0 [-f] [-s] [root_password]"
+    echo ""
+    echo "  - This host is always checked, using local commands (no ssh, no password needed)"
+    echo "  - The other pool members are checked too if a root password is given: they are"
+    echo "    reached over ssh, and sshpass is installed from the stock 'extras' repo if missing."
+    echo "    Pool members share the master's root password, so one password covers the pool"
+    echo "  - With no password and a terminal you are asked for one; blank, or no terminal"
+    echo "    (cron, pipe), just checks this host and says so in the Pool Status section"
+    echo "  - Prefer the prompt over the argument: an argument is visible in 'ps' and lands"
+    echo "    in your shell history"
+    echo "  - Pool-level results are reported either way, since xapi answers those from any"
+    echo "    pool member, slave included"
+    echo "  - Use '-f' flag to filter output to only show issues found"
+    echo "  - Use '-s' flag to skip the pool-level section and only report on this host"
+    echo ""
+    echo "  Examples:"
+    echo "  $0"
+    echo "  $0 -f"
+    echo "  $0 'mypass'"
+  else
+    echo "Usage:"
+    echo "  $0 [-f] [-s] [-n name] [pool_master_or_host[:ssh_port] [root_password]]"
+    echo ""
+    echo "  - All parameters are optional"
+    echo "  - If a host is not supplied, the enabled pools in xo-server-db are listed to pick from"
+    echo "    (a single enabled pool, or non-interactive use, just takes the first one)"
+    echo "  - If a password is not supplied, it will be looked up locally in xo-server-db"
+    echo "  - By default, the script runs in pool mode (checks all hosts in the pool)"
+    echo "  - Use '-f' flag to filter output to only show issues found"
+    echo "  - Use '-s' flag to only check the specified host (do not check other pool members if present)"
+    echo "  - Use '-n' to pick a pool from xo-server-db by name instead of being prompted:"
+    echo "    the first pool whose name contains the text is used, matched anywhere in the"
+    echo "    name and ignoring case, so '-n sec' matches 'XEN-SECONDARY'"
+    echo ""
+    echo "  Examples:"
+    echo "  $0 192.168.1.5"
+    echo "  $0 192.168.1.6 'mypass'"
+    echo "  $0 -s 192.168.1.7 'mypass'"
+    echo "  $0 -n sec"
+    echo "  $0 -f -n 'xen-main'"
+  fi
   } >&"$fd"
   exit "$rc"
 }
@@ -187,8 +301,45 @@ parse_target_host_and_port() {
   fi
 }
 
+# True when we are on a hypervisor that cannot reach the rest of the pool (no password, or
+# nothing else to reach). That is the one thing that decides whether a host-mode run reports
+# on the pool or on this machine alone, so the checks that need a second host ask this
+# rather than testing RUN_ENV - a host WITH a password behaves like an XOA run.
+host_solo() {
+  [[ "$RUN_ENV" == "host" ]] && (( HOST_POOL_SWEEP == 0 ))
+}
+
 ensure_sshpass() {
   if command -v sshpass >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [[ "$RUN_ENV" == "host" ]]; then
+    # dom0 has no sshpass, but 'extras' is a stock XCP-ng repo - it ships in
+    # /etc/yum.repos.d/CentOS-Base.repo pointing at Vates' own mirror
+    # (repo.vates.tech/centos/$releasever/extras) - just disabled by default. --enablerepo
+    # is a one-shot: the repo is still disabled afterwards, so the host's yum config is
+    # left exactly as it was. The package is 21KB with no dependencies (verified on 8.2.1
+    # and 8.3.0), which is why installing it automatically is defensible at all.
+    #
+    # Output is captured rather than printed: a page of yum in the middle of a health
+    # report is noise, and it is only interesting when the install fails. Unlike the apt
+    # branch this reports failure instead of pressing on, so the caller can fall back to
+    # checking this host alone rather than dying.
+    echo "sshpass not found - installing it from the XCP-ng 'extras' repo to reach the other pool hosts..." >&2
+
+    local yum_out yum_rc=0
+    yum_out="$(timeout "$remote_cmd_timeout" yum --enablerepo=extras install -y sshpass 2>&1)" || yum_rc=$?
+
+    if ! command -v sshpass >/dev/null 2>&1; then
+      {
+        echo "ERROR: could not install sshpass (yum exit code $yum_rc)."
+        printf '%s\n' "$yum_out" | tail -n 5
+      } >&2
+      return 1
+    fi
+
+    echo "sshpass installed." >&2
     return 0
   fi
 
@@ -197,6 +348,46 @@ ensure_sshpass() {
   apt-get install -y sshpass
 
   # ezez
+  return 0
+}
+
+# Host mode: decide whether this run can also check the other pool members, and with what.
+# Called once, after get_pool_host_details has told us how big the pool is.
+#
+# A hypervisor has no xo-server-db to look a password up in, so it comes from the command
+# line or from asking - and asking only makes sense with a terminal, so cron/pipe runs
+# quietly check this host alone instead of hanging on a prompt. No password is not an
+# error: it is the documented single-host behaviour, and the Pool Status section says so.
+#
+# Sets HOST_POOL_SWEEP and HOST_POOL_PASS (the caller adopts the latter as its password).
+prepare_host_pool_sweep() {
+  HOST_POOL_SWEEP=0
+  HOST_POOL_PASS="$1"
+
+  # -s asked for this host only, and a single-host pool has nothing else to check
+  (( POOL_MODE == 1 )) || return 0
+  (( ${#POOL_ALL_HOST_IPS[@]} > 1 )) || return 0
+
+  if [[ -z "$HOST_POOL_PASS" && -t 0 ]]; then
+    # to stderr, like the pool picker's prompt, so it never lands in redirected output.
+    # -s so it is not echoed - which also means the newline the user typed is swallowed,
+    # so the first echo ends the prompt line and the second separates it from the report.
+    printf "This pool has %d hosts. Root password to check the others (blank = this host only): " \
+      "${#POOL_ALL_HOST_IPS[@]}" >&2
+    read -rs HOST_POOL_PASS || HOST_POOL_PASS=""
+    echo "" >&2
+    echo "" >&2
+  fi
+
+  [[ -n "$HOST_POOL_PASS" ]] || return 0
+
+  if ! ensure_sshpass; then
+    echo "Continuing with this host only." >&2
+    HOST_POOL_PASS=""
+    return 0
+  fi
+
+  HOST_POOL_SWEEP=1
   return 0
 }
 
@@ -644,14 +835,64 @@ print_target_banner() {
   echo ""
 }
 
+# Host mode's half of run_remote: the same command, run straight through bash instead of
+# ssh. Kept to the identical contract - stdout is the command's output, stderr is captured
+# to a file so it can never contaminate what the parsers read, the timeout is the same one
+# a remote command gets, and a failure is reported on stderr with the rc returned.
+#
+# bash (not sh) on purpose: the scripts build_log_scan_cmd generates use bash ANSI-C
+# quoting, exactly as they do when ssh hands them to dom0 root's login shell.
+# stdin is closed because nothing we run reads it, and a command that tried would
+# otherwise eat the script's own stdin.
+run_local() {
+  local cmd="$1"
+
+  local output rc
+  local errfile="${WORK_DIR:-/tmp}/health-local-err.$$"
+
+  output=$(timeout -k 5 "$remote_cmd_timeout" bash -c "$cmd" </dev/null 2>"$errfile")
+  rc=$?
+
+  if (( rc != 0 )); then
+    if (( rc == 124 )); then
+      echo "Local command timed out after ${remote_cmd_timeout}s" >&2
+    else
+      echo "Local command failed (exit code $rc)" >&2
+    fi
+    [[ -s "$errfile" ]] && cat "$errfile" >&2
+    [[ -n "$output" ]] && echo "$output" >&2
+    return "$rc"
+  fi
+
+  echo "$output"
+}
+
 run_remote() {
   local host="$1"
   local pass="$2"
   local cmd="$3"
 
+  # Running on a hypervisor: our own commands skip ssh entirely (nothing to gain from
+  # logging into ourselves, and it works with no credentials at all). Another pool member
+  # still goes over ssh below, but only once prepare_host_pool_sweep has established that
+  # we have a password and sshpass - otherwise the call is a bug in the caller, and
+  # answering it here would report confidently about the wrong machine.
+  if [[ "$RUN_ENV" == "host" ]]; then
+    if [[ -z "$LOCAL_HOST_IP" || "$host" == "$LOCAL_HOST_IP" ]]; then
+      run_local "$cmd"
+      return $?
+    fi
+    if (( HOST_POOL_SWEEP == 0 )); then
+      echo "ERROR: asked to run a command on $host from $LOCAL_HOST_IP with no password for it" >&2
+      return 1
+    fi
+  fi
+
   local output rc
   local errfile="${WORK_DIR:-/tmp}/health-ssh-err.$$"
 
+  # (the per-check messages that follow a failure say "Failed when trying to ..." rather
+  # than naming a transport - whether it was ssh or a local command is said right here)
   # - stderr goes to a file instead of being merged into stdout, so remote warnings
   #   and noise can never contaminate the output our parsers read
   # - timeout guards against remote commands that hang forever (eg xe when xapi is wedged);
@@ -700,7 +941,7 @@ get_remote_hostname() {
     echo "$out" | head -n 1
   else
     rc=$?
-    echo "SSH failed when trying to get hostname from $host (exit code $rc)" >&2
+    echo "Failed when trying to get hostname from $host (exit code $rc)" >&2
   fi
 
   return $rc
@@ -723,7 +964,7 @@ get_pool_uuid() {
     fi
   else
     rc=$?
-    echo "SSH failed when trying to get pool UUID from $host (exit code $rc)" >&2
+    echo "Failed when trying to get pool UUID from $host (exit code $rc)" >&2
   fi
 
   return $rc
@@ -779,6 +1020,7 @@ get_pool_host_details() {
     out=$(tr -d '\r' <<<"$out")
 
     POOL_HOST_IPS=()
+    POOL_ALL_HOST_IPS=()
     POOL_HOST_UUIDS=()
     POOL_HOSTS_STATUS=()
 
@@ -793,12 +1035,13 @@ get_pool_host_details() {
       fi
       POOL_HOST_UUIDS["$addr"]="$uuid"
       POOL_HOST_IPS+=("$addr")
+      POOL_ALL_HOST_IPS+=("$addr")
       POOL_HOSTS_STATUS["${uuid}_enabled"]="${en:-Unknown}"
       POOL_HOSTS_STATUS["${uuid}_multipath"]="${mp:-Unknown}"
     done <<< "$out"
   else
     rc=$?
-    echo "SSH failed when trying to get pool host list from $host (exit code $rc)" >&2
+    echo "Failed when trying to get pool host list from $host (exit code $rc)" >&2
   fi
 
   return $rc
@@ -820,7 +1063,11 @@ elif [ \"\$rc\" -eq 0 ]; then
 else
   echo YUMERR
 fi"
-  if out=$(run_remote "$DETECTED_MASTER_IP" "$pass" "$cmd"); then
+  # Asked of POOL_CMD_HOST: the master over ssh from XOA, this machine on a host - locally
+  # and for free even when sweeping the pool, rather than over ssh to the master. Pool
+  # members are meant to be at the same patch level, and the per-host "Yum Patch Level"
+  # check is what catches one that isn't.
+  if out=$(run_remote "$POOL_CMD_HOST" "$pass" "$cmd"); then
     out="$(tr -d '\r' <<< "$out")"
 
     if [[ -z "$out" || ! "$out" =~ ^[0-9]+$ ]]; then
@@ -849,10 +1096,13 @@ compute_pool_ram_match() {
   local -a all_ips=()
   all_ips+=("$seed_host")
   local ip
-  for ip in "${POOL_HOST_ACCESS_IPS[@]}"; do
-    [[ "$ip" == "$seed_host" ]] && continue
-    all_ips+=("$ip")
-  done
+  # count-guarded: on dom0's bash 4.2 an empty "${arr[@]}" under set -u aborts the script
+  if (( ${#POOL_HOST_ACCESS_IPS[@]} > 0 )); then
+    for ip in "${POOL_HOST_ACCESS_IPS[@]}"; do
+      [[ "$ip" == "$seed_host" ]] && continue
+      all_ips+=("$ip")
+    done
+  fi
 
   for ip in "${all_ips[@]}"; do
     local gb total_mb uuid
@@ -894,6 +1144,8 @@ detect_pool_master_by_poolconf() {
   DETECTED_MASTER_IP=""
   DETECTED_MASTER_HOSTNAME=""
 
+  (( ${#POOL_HOST_ACCESS_IPS[@]} > 0 )) || return 1
+
   local ip
   for ip in "${POOL_HOST_ACCESS_IPS[@]}"; do
     local pc
@@ -907,6 +1159,46 @@ detect_pool_master_by_poolconf() {
       fi
     fi
   done
+
+  return 1
+}
+
+# Host mode's version of the above. dom0 cannot ssh anywhere, so the answer comes from the
+# local pool.conf alone: "master" means this machine is it, "slave:<address>" names the
+# master outright - which is why pool.conf is worth reading rather than asking xapi, on top
+# of it being the thing that stays truthful when the toolstack is wedged.
+#
+# The master's hostname then comes from its xapi host record ('hostname', which is what
+# 'hostname -s' would have answered on it) instead of from a login we cannot make. When we
+# are the master ourselves, no lookup is needed at all.
+# Same contract as detect_pool_master_by_poolconf: 0 = master identified, 1 = not.
+detect_pool_master_local() {
+  DETECTED_MASTER_IP=""
+  DETECTED_MASTER_HOSTNAME=""
+
+  local pc
+  pc="$(tr -d '\r' < /etc/xensource/pool.conf 2>/dev/null | head -n 1 | awk '{$1=$1;print}' || true)"
+
+  case "${pc,,}" in
+    master)
+      DETECTED_MASTER_IP="$LOCAL_HOST_IP"
+      DETECTED_MASTER_HOSTNAME="${LOCAL_HOST_NAME:-$LOCAL_HOST_IP}"
+      return 0
+      ;;
+    slave:*)
+      DETECTED_MASTER_IP="${pc#*:}"
+      DETECTED_MASTER_IP="${DETECTED_MASTER_IP//[[:space:]]/}"
+      [[ -n "$DETECTED_MASTER_IP" ]] || return 1
+
+      local uuid="${POOL_HOST_UUIDS[$DETECTED_MASTER_IP]:-}"
+      if [[ -n "$uuid" ]]; then
+        DETECTED_MASTER_HOSTNAME="$(run_remote "$LOCAL_HOST_IP" "" "xe host-param-get uuid=$uuid param-name=hostname" || true)"
+        DETECTED_MASTER_HOSTNAME="${DETECTED_MASTER_HOSTNAME//[[:space:]]/}"
+      fi
+      [[ -n "$DETECTED_MASTER_HOSTNAME" ]] || DETECTED_MASTER_HOSTNAME="$DETECTED_MASTER_IP"
+      return 0
+      ;;
+  esac
 
   return 1
 }
@@ -940,8 +1232,14 @@ load_mem_stats() {
 # Every host's manifest is fetched with this one call and hashed locally by the caller -
 # master and slaves alike - so both sides of the comparison are always the same bytes
 # through the same digest, and each host runs 'rpm -qa' exactly once per run.
+# sshpass is filtered out on BOTH sides, so the comparison stays apples-to-apples: host mode
+# installs it on the one host it runs from (ensure_sshpass) to reach the others, which
+# otherwise shows up here as "Missing Package: sshpass" on every other host in the pool -
+# the script reporting its own footprint as pool drift. Measured: that is exactly what a
+# sweep from the master produced before this filter. Its presence on a dom0 says nothing
+# about hypervisor health either way.
 rpm_manifest_cmd() {
-  printf "%s" "rpm -qa --qf '%{NAME} %{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort"
+  printf "%s" "rpm -qa --qf '%{NAME} %{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' | grep -v '^sshpass ' | sort"
 }
 
 get_rpm_manifest_remote() {
@@ -1028,7 +1326,7 @@ check_hyper_version() {
     rc=0
   else
     rc=$?
-    echo "SSH failed when trying to get hypervisor version from $host (exit code $rc)" >&2
+    echo "Failed when trying to get hypervisor version from $host (exit code $rc)" >&2
     return "$rc"
   fi
 
@@ -1073,7 +1371,7 @@ check_uptime() {
     rc=0
   else
     rc=$?
-    echo "SSH failed when trying to get uptime from $host (exit code $rc)" >&2
+    echo "Failed when trying to get uptime from $host (exit code $rc)" >&2
     up=""
   fi
 
@@ -1115,7 +1413,7 @@ check_lastpatched() {
     rc=0
   else
     rc=$?
-    echo "SSH failed when trying to get last patched info from $host (exit code $rc)" >&2
+    echo "Failed when trying to get last patched info from $host (exit code $rc)" >&2
   fi
 
   last="${last:-Unknown}"
@@ -1210,6 +1508,8 @@ awk '
     printf \"%d %d\", int(t/1024), int(a/1024)
   }' /proc/meminfo 2>/dev/null || true"
 
+  (( ${#POOL_HOST_ACCESS_IPS[@]} > 0 )) || return 0
+
   local ip out rc ts_out mi uuid utc ntp sync unix_time time_diff xo_time
   local tmb amb total_mb used_mb avail_mb
   for ip in "${POOL_HOST_ACCESS_IPS[@]}"; do
@@ -1217,7 +1517,7 @@ awk '
       rc=0
     else
       rc=$?
-      echo "SSH failed when trying to get time/memory info from $ip (exit code $rc)" >&2
+      echo "Failed when trying to get time/memory info from $ip (exit code $rc)" >&2
       POOL_NTP_MATCH=0
       out=""
     fi
@@ -1303,7 +1603,7 @@ check_dom0_disk_usage() {
     rc=0
   else
     rc=$?
-    echo "SSH failed when trying to get disk usage from $host (exit code $rc)" >&2
+    echo "Failed when trying to get disk usage from $host (exit code $rc)" >&2
     return "$rc"
   fi
 
@@ -1495,7 +1795,7 @@ check_crash_logs_present() {
     rc=0
   else
     rc=$?
-    echo "SSH failed when trying to check for crash logs on $host (exit code $rc)" >&2
+    echo "Failed when trying to check for crash logs on $host (exit code $rc)" >&2
     return "$rc"
   fi
 
@@ -1525,7 +1825,7 @@ check_coredumps_present() {
     rc=0
   else
     rc=$?
-    echo "SSH failed when trying to check for coredumps on $host (exit code $rc)" >&2
+    echo "Failed when trying to check for coredumps on $host (exit code $rc)" >&2
     return "$rc"
   fi
 
@@ -1562,7 +1862,7 @@ check_lacp_negotiation_issues() {
     rc=0
   else
     rc=$?
-    echo "SSH failed when trying to check LACP negotiation on $host (exit code $rc)" >&2
+    echo "Failed when trying to check LACP negotiation on $host (exit code $rc)" >&2
     return "$rc"
   fi
 
@@ -1604,7 +1904,7 @@ check_silly_mtus() {
     rc=0
   else
     rc=$?
-    echo "SSH failed when trying to get link MTUs on $host (exit code $rc)" >&2
+    echo "Failed when trying to get link MTUs on $host (exit code $rc)" >&2
     return "$rc"
   fi
 
@@ -1648,7 +1948,7 @@ check_dns_gw_non_mgmt_pifs() {
     rc=0
   else
     rc=$?
-    echo "SSH failed when trying to check DNS/GW on non-mgmt PIFs on $host (exit code $rc)" >&2
+    echo "Failed when trying to check DNS/GW on non-mgmt PIFs on $host (exit code $rc)" >&2
     return "$rc"
   fi
 
@@ -1688,7 +1988,7 @@ check_vlan0_exist() {
     rc=0
   else
     rc=$?
-    echo "SSH failed when trying to check for VLAN PIFs on $host (exit code $rc)" >&2
+    echo "Failed when trying to check for VLAN PIFs on $host (exit code $rc)" >&2
     return "$rc"
   fi
 
@@ -1814,7 +2114,7 @@ check_backup_network_reachability_from_xoa() {
 
   local pif_out
   if ! pif_out=$(run_remote "$host" "$pass" "xe pif-list network-uuid=${network_uuid} params=IP --minimal" | tr -d '\r'); then
-    echo "SSH failed when trying to list backup network PIFs on $host" >&2
+    echo "Failed when trying to list backup network PIFs on $host" >&2
     return 2
   fi
 
@@ -1823,13 +2123,16 @@ check_backup_network_reachability_from_xoa() {
   local -a fields=() ips=()
   IFS=',' read -r -a fields <<< "$pif_out" || true
   local ip
-  for ip in "${fields[@]}"; do
-    ip="${ip//[[:space:]]/}"
-    [[ -n "$ip" ]] || continue
-    [[ "$ip" == "0.0.0.0" ]] && continue
-    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
-    ips+=("$ip")
-  done
+  # count-guarded for bash 4.2 (see the note at the top of the file)
+  if (( ${#fields[@]} > 0 )); then
+    for ip in "${fields[@]}"; do
+      ip="${ip//[[:space:]]/}"
+      [[ -n "$ip" ]] || continue
+      [[ "$ip" == "0.0.0.0" ]] && continue
+      [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+      ips+=("$ip")
+    done
+  fi
 
   (( ${#ips[@]} > 0 )) || return 3
 
@@ -1891,7 +2194,7 @@ check_migration_compression() {
     rc=0
   else
     rc=$?
-    echo "SSH failed when trying to check migration compression on $host (exit code $rc)" >&2
+    echo "Failed when trying to check migration compression on $host (exit code $rc)" >&2
     return "$rc"
   fi
 
@@ -1950,6 +2253,14 @@ check_backup_network() {
       ;;
   esac
 
+  # The ping half asks "can the XOA reach every host on this network", because that is what
+  # XO needs to move backup traffic. Pinging the same addresses from a pool host answers a
+  # different question, so in host mode it is not run at all rather than run and mislabelled.
+  if [[ "$RUN_ENV" == "host" ]]; then
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Backup Network: %s\n" "$(green_text 'Configured (reachability from XOA not checked - run this from XOA for that)')"
+    return 0
+  fi
+
   local reach_out reach_rc=0
   reach_out="$(check_backup_network_reachability_from_xoa "$host" "$pass" "$network_uuid")" || reach_rc=$?
 
@@ -1983,7 +2294,7 @@ check_is_bond_member() {
 
   local out
   if ! out=$(run_remote "$host" "$pass" "xe pif-list network-uuid=${network_uuid} params=bond-slave-of"); then
-    echo "SSH failed when trying to check for bond members on $host" >&2
+    echo "Failed when trying to check for bond members on $host" >&2
     return 2
   fi
 
@@ -2008,7 +2319,7 @@ check_overlapping_subnets() {
     rc=0
   else
     rc=$?
-    echo "SSH failed when trying to get addresses on $host (exit code $rc)" >&2
+    echo "Failed when trying to get addresses on $host (exit code $rc)" >&2
     return "$rc"
   fi
 
@@ -2182,9 +2493,11 @@ check_log_errors() {
   LOG_ERRORS_BLOCK=""
 
   local cmd
+  # the ":-" forms keep an emptied config list from aborting the script on dom0's bash 4.2;
+  # they yield a blank line, which build_log_scan_cmd already skips
   cmd="$(build_log_scan_cmd \
-    "$(printf '%s\n' "${log_error_files[@]}")" \
-    "$(printf '%s\n' "${log_error_phrases[@]}")" \
+    "$(printf '%s\n' "${log_error_files[@]:-}")" \
+    "$(printf '%s\n' "${log_error_phrases[@]:-}")" \
     "$log_error_context")"
 
   local out rc
@@ -2192,7 +2505,7 @@ check_log_errors() {
     rc=0
   else
     rc=$?
-    echo "SSH failed when trying to check logs for errors on $host (exit code $rc)" >&2
+    echo "Failed when trying to check logs for errors on $host (exit code $rc)" >&2
     return "$rc"
   fi
 
@@ -2215,8 +2528,8 @@ check_lun_assignments() {
 
   local cmd
   cmd="$(build_log_scan_cmd \
-    "$(printf '%s\n' "${lun_change_files[@]}")" \
-    "$(printf '%s\n' "${lun_change_phrases[@]}")" \
+    "$(printf '%s\n' "${lun_change_files[@]:-}")" \
+    "$(printf '%s\n' "${lun_change_phrases[@]:-}")" \
     "$log_error_context")"
 
   local out rc
@@ -2224,7 +2537,7 @@ check_lun_assignments() {
     rc=0
   else
     rc=$?
-    echo "SSH failed when trying to check LUN assignments on $host (exit code $rc)" >&2
+    echo "Failed when trying to check LUN assignments on $host (exit code $rc)" >&2
     return "$rc"
   fi
 
@@ -2252,7 +2565,7 @@ check_smapi_hidden_leaves() {
     rc=0
   else
     rc=$?
-    echo "SSH failed when trying to check SMlog hidden leaves on $host (exit code $rc)" >&2
+    echo "Failed when trying to check SMlog hidden leaves on $host (exit code $rc)" >&2
     return "$rc"
   fi
 
@@ -2323,7 +2636,7 @@ HEALTH_QCOW2_EOF
     rc=0
   else
     rc=$?
-    echo "SSH failed when trying to check XOSTOR qcow2 VDIs on $host (exit code $rc)" >&2
+    echo "Failed when trying to check XOSTOR qcow2 VDIs on $host (exit code $rc)" >&2
     return "$rc"
   fi
 
@@ -2372,7 +2685,7 @@ check_ha_enabled() {
     rc=0
   else
     rc=$?
-    echo "SSH failed when trying to check HA status on $host (exit code $rc)" >&2
+    echo "Failed when trying to check HA status on $host (exit code $rc)" >&2
     return "$rc"
   fi
 
@@ -2430,7 +2743,7 @@ printf '%s %s\n' \"\${upd:-NONE}\" \"\${boot:-NONE}\""
     rc=0
   else
     rc=$?
-    echo "SSH failed when trying to check reboot status on $host (exit code $rc)" >&2
+    echo "Failed when trying to check reboot status on $host (exit code $rc)" >&2
     return "$rc"
   fi
 
@@ -2472,7 +2785,7 @@ check_xostor_in_use_and_ram() {
     rc=0
   else
     rc=$?
-    echo "SSH failed when trying to check XOSTOR usage on $host (exit code $rc)" >&2
+    echo "Failed when trying to check XOSTOR usage on $host (exit code $rc)" >&2
     return "$rc"
   fi
 
@@ -2516,7 +2829,7 @@ check_xostor_nodes() {
     rc=0
   else
     rc=$?
-    echo "SSH failed when trying to check XOSTOR nodes on $host (exit code $rc)" >&2
+    echo "Failed when trying to check XOSTOR nodes on $host (exit code $rc)" >&2
     return "$rc"
   fi
 
@@ -2578,7 +2891,7 @@ check_xostor_faulty_resources() {
     rc=0
   else
     rc=$?
-    echo "SSH failed when trying to check XOSTOR faulty resources on $host (exit code $rc)" >&2
+    echo "Failed when trying to check XOSTOR faulty resources on $host (exit code $rc)" >&2
     return "$rc"
   fi
 
@@ -2614,7 +2927,7 @@ check_xostor_controller() {
     rc=0
   else
     rc=$?
-    echo "SSH failed when trying to check XOSTOR controller on $host (exit code $rc)" >&2
+    echo "Failed when trying to check XOSTOR controller on $host (exit code $rc)" >&2
     return "$rc"
   fi
 
@@ -2644,7 +2957,9 @@ check_yum_patch_level() {
   local is_master="$3"
   local hostlabel="$4"
 
-  if (( POOL_MODE == 0 )); then
+  # this check compares a host against the pool master's package list, so it needs two
+  # hosts: single mode has one by definition, and a solo host run cannot reach a second one
+  if (( POOL_MODE == 0 )) || host_solo; then
     return 0
   fi
 
@@ -2775,37 +3090,53 @@ print_pool_status_section() {
     printf "Pool Master: %s\n" "$(yellow_text '(unknown)')"
   fi
 
-  # a pool member we couldn't SSH into is excluded from every per-host check below,
-  # which used to leave only a stderr warning and a clean exit code - surface it here
-  if (( ${#POOL_HOST_NOACCESS_IPS[@]} > 0 )); then
-    printf "Unreachable Hosts: %s\n" "$(yellow_text "${POOL_HOST_NOACCESS_IPS[*]}")"
-    rc_any=1
+  if host_solo; then
+    # Nothing was probed beyond this machine, so there is no reachability result to report
+    # and nothing to compare across hosts: the RAM-match and pool-time-sync lines below
+    # would be claims about hosts we never looked at. Say how much of the pool this run
+    # covers instead - the count comes from xapi, so it is the whole pool either way.
+    local pool_size="${#POOL_ALL_HOST_IPS[@]}"
+    if (( pool_size > 1 )); then
+      printf "Hosts in Pool: %s\n" "$(green_text "${pool_size} (only this host checked - give the root password to include the others)")"
+    else
+      printf "Hosts in Pool: %s\n" "$(green_text "$pool_size")"
+    fi
   else
-    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Unreachable Hosts: %s\n" "$(green_text 'None')"
+    # a pool member we couldn't SSH into is excluded from every per-host check below,
+    # which used to leave only a stderr warning and a clean exit code - surface it here
+    if (( ${#POOL_HOST_NOACCESS_IPS[@]} > 0 )); then
+      printf "Unreachable Hosts: %s\n" "$(yellow_text "${POOL_HOST_NOACCESS_IPS[*]}")"
+      rc_any=1
+    else
+      [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Unreachable Hosts: %s\n" "$(green_text 'None')"
+    fi
+
+    if (( POOL_RAM_MATCH == 1 )); then
+      [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Dom0 RAM Allocations: %s\n" "$(green_text 'Matched')"
+    else
+      printf "Dom0 RAM Allocations: %s\n" "$(yellow_text 'Mismatched')"
+      rc_any=1
+    fi
+
+    if (( POOL_NTP_MATCH == 1 )); then
+      [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Pool Time Synchronization: %s\n" "$(green_text 'Matched')"
+    else
+      printf "Pool Time Synchronization: %s\n" "$(yellow_text 'Mismatched')"
+      rc_any=1
+    fi
   fi
 
-  if (( POOL_RAM_MATCH == 1 )); then
-    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Dom0 RAM Allocations: %s\n" "$(green_text 'Matched')"
-  else
-    printf "Dom0 RAM Allocations: %s\n" "$(yellow_text 'Mismatched')"
-    rc_any=1
-  fi
-
-  if (( POOL_NTP_MATCH == 1 )); then
-    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Pool Time Synchronization: %s\n" "$(green_text 'Matched')"
-  else
-    printf "Pool Time Synchronization: %s\n" "$(yellow_text 'Mismatched')"
-    rc_any=1
-  fi
-
+  # Everything from here down is a question for xapi rather than for a specific machine, so
+  # it goes to POOL_CMD_HOST: the master over ssh from XOA, this host when we are running on
+  # one (a slave's xapi forwards pool-wide queries to the master, so the answers match).
   if [[ -n "$MASTER_POOL_UUID" ]]; then
-    if ! check_ha_enabled "$DETECTED_MASTER_IP" "$pass" "$MASTER_POOL_UUID"; then rc_any=1; fi
+    if ! check_ha_enabled "$POOL_CMD_HOST" "$pass" "$MASTER_POOL_UUID"; then rc_any=1; fi
   else
     printf "HA Enabled: %s\n" "$(yellow_text 'Unknown')"
     rc_any=1
   fi
 
-  if ! check_migration_compression "$DETECTED_MASTER_IP" "$pass"; then rc_any=1; fi
+  if ! check_migration_compression "$POOL_CMD_HOST" "$pass"; then rc_any=1; fi
 
   if (( POOL_MISSING_PATCHES == 0 )); then
     [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "Missing Patches: %s\n" "$(green_text "${POOL_MISSING_PATCHES}")"
@@ -2818,32 +3149,41 @@ print_pool_status_section() {
     printf "Root Password: %s\n" "$(yellow_text 'Contains Backslash')"
   fi
 
-  load_mem_stats "$DETECTED_MASTER_IP"
-  if ! check_xostor_in_use_and_ram "$DETECTED_MASTER_IP" "$pass"; then rc_any=1; fi
+  load_mem_stats "$POOL_CMD_HOST"
+  if ! check_xostor_in_use_and_ram "$POOL_CMD_HOST" "$pass"; then rc_any=1; fi
   MASTER_XOSTOR_IN_USE=$(( XOSTOR_IN_USE ))
 
   if (( MASTER_XOSTOR_IN_USE == 1 )); then
-    # Build comma-separated list of controllers for LINSTOR cmds
+    # Build comma-separated list of controllers for LINSTOR cmds. The linstor CLI reaches
+    # the controller over the network from wherever it runs, so in host mode it gets every
+    # pool address rather than the one host this run probed - the controller usually lives
+    # on another host, and a one-entry list would just fail to find it.
+    local -a controller_ips=()
+    if host_solo && (( ${#POOL_ALL_HOST_IPS[@]} > 0 )); then
+      controller_ips=("${POOL_ALL_HOST_IPS[@]}")
+    elif (( ${#POOL_HOST_ACCESS_IPS[@]} > 0 )); then
+      controller_ips=("${POOL_HOST_ACCESS_IPS[@]}")
+    fi
     local IFS=,
-    local controllers_csv="${POOL_HOST_ACCESS_IPS[*]}"
+    local controllers_csv="${controller_ips[*]:-}"
     unset IFS
-    if ! check_xostor_faulty_resources "$DETECTED_MASTER_IP" "$pass" "$controllers_csv"; then rc_any=1; fi
-    if ! check_xostor_nodes "$DETECTED_MASTER_IP" "$pass" "$controllers_csv"; then rc_any=1; fi
-    if ! check_xostor_controller "$DETECTED_MASTER_IP" "$pass" "$controllers_csv"; then rc_any=1; fi
-    if ! check_xostor_qcow2_vdis "$DETECTED_MASTER_IP" "$pass"; then rc_any=1; fi
+    if ! check_xostor_faulty_resources "$POOL_CMD_HOST" "$pass" "$controllers_csv"; then rc_any=1; fi
+    if ! check_xostor_nodes "$POOL_CMD_HOST" "$pass" "$controllers_csv"; then rc_any=1; fi
+    if ! check_xostor_controller "$POOL_CMD_HOST" "$pass" "$controllers_csv"; then rc_any=1; fi
+    if ! check_xostor_qcow2_vdis "$POOL_CMD_HOST" "$pass"; then rc_any=1; fi
   fi
 
-  local host_uuid="${POOL_HOST_UUIDS[$DETECTED_MASTER_IP]:-}"
+  local host_uuid="${POOL_HOST_UUIDS[$POOL_CMD_HOST]:-}"
   if [[ -n "$host_uuid" ]]; then
-    if ! check_vlan0_exist "$DETECTED_MASTER_IP" "$pass" "$host_uuid"; then rc_any=1; fi
+    if ! check_vlan0_exist "$POOL_CMD_HOST" "$pass" "$host_uuid"; then rc_any=1; fi
   else
-    # don't skip the check silently just because the master's address wasn't in the
+    # don't skip the check silently just because the address wasn't in the
     # xe maps - say so, like the DNS/GW check does
-    printf "VLAN 0 Check: %s\n" "$(yellow_text 'Unknown (master address not in xe host list)')"
+    printf "VLAN 0 Check: %s\n" "$(yellow_text 'Unknown (host address not in xe host list)')"
     rc_any=1
   fi
-  if ! check_migration_network "$DETECTED_MASTER_IP" "$pass"; then rc_any=1; fi
-  if ! check_backup_network "$DETECTED_MASTER_IP" "$pass"; then rc_any=1; fi
+  if ! check_migration_network "$POOL_CMD_HOST" "$pass"; then rc_any=1; fi
+  if ! check_backup_network "$POOL_CMD_HOST" "$pass"; then rc_any=1; fi
   echo
   return "$rc_any"
 }
@@ -2858,7 +3198,7 @@ get_host_uuid_by_address() {
     rc=0
   else
     rc=$?
-    echo "SSH failed when trying to get host UUIDs on $host (exit code $rc)" >&2
+    echo "Failed when trying to get host UUIDs on $host (exit code $rc)" >&2
     return "$rc"
   fi
 
@@ -2880,7 +3220,12 @@ run_checks_for_host() {
     [[ -z "$hn" ]] && hn="$ip"
   fi
 
-  if (( POOL_MODE == 1 )); then
+  # The per-host banner only makes sense as a list heading when there is a list. A solo
+  # host run has one host, which may well be a slave, so it gets the single-host heading
+  # rather than one that would announce a lone "(Master)" - the master/slave fact is
+  # already in the Pool Status section and the pool.conf summary. A host run that sweeps
+  # the pool has a real list, so it gets the same headings an XOA run does.
+  if (( POOL_MODE == 1 )) && ! host_solo; then
     if (( is_master == 1 )); then
       echo "$(cyan_text "== Individual Hosts ==")"
       echo "$(cyan_text "$hn ($ip) (Master) Results:")"
@@ -2926,7 +3271,7 @@ run_checks_for_host() {
       rc=0
     else
       rc=$?
-      echo "SSH failed when trying to get dmesg on $ip (exit code $rc)" >&2
+      echo "Failed when trying to get dmesg on $ip (exit code $rc)" >&2
       dmesg_t=""
       dmesg_ok=0
     fi
@@ -2938,7 +3283,7 @@ run_checks_for_host() {
       rc=0
     else
       rc=$?
-      echo "SSH failed when trying to get pool.conf on $ip (exit code $rc)" >&2
+      echo "Failed when trying to get pool.conf on $ip (exit code $rc)" >&2
       poolconf_line="(unavailable)"
     fi
 
@@ -3067,12 +3412,22 @@ fi
 }
 
 main() {
-  local debver debver_major
-  debver=$(awk -F '=' '/^VERSION_ID=/ {gsub(/"/,"",$2); print $2}' /etc/os-release 2>/dev/null || true)
-  debver_major="${debver%%.*}"
-  if [[ ! "$debver_major" =~ ^[0-9]+$ ]] || (( debver_major < 11 )); then
-    echo "This script requires Debian 11 or later. Detected version: ${debver:-unknown}" >&2
-    exit 1
+  # decides the whole shape of the run - see the note at the top of the file
+  detect_run_env
+
+  if [[ "$RUN_ENV" == "host" ]]; then
+    # dom0's PATH is complete for an interactive root shell but not necessarily under cron,
+    # and several checks live in sbin (ip, dmesg, ovs-appctl). Appended, so nothing that is
+    # already found changes. Over ssh the remote login shell did this for us.
+    export PATH="$PATH:/usr/sbin:/sbin:/usr/local/sbin"
+  else
+    local debver debver_major
+    debver=$(awk -F '=' '/^VERSION_ID=/ {gsub(/"/,"",$2); print $2}' /etc/os-release 2>/dev/null || true)
+    debver_major="${debver%%.*}"
+    if [[ ! "$debver_major" =~ ^[0-9]+$ ]] || (( debver_major < 11 )); then
+      echo "This script requires Debian 11 or later (or an XCP-ng host). Detected version: ${debver:-unknown}" >&2
+      exit 1
+    fi
   fi
 
   # temp dir for ssh control sockets + stderr capture
@@ -3115,34 +3470,81 @@ main() {
 
    [[ $# -le 2 ]] || usage
 
-  # -n names a pool instead of giving a host, so only an optional password may follow it
-  if [[ -n "$POOL_NAME_FILTER" && $# -gt 1 ]]; then
-    echo "ERROR: -n/--name looks the host up in xo-server-db, so it takes at most a password after it." >&2
-    usage
-  fi
+  local seed_host=""
+  local pass=""
+  local rc
 
-  # With one trailing argument the two readings are indistinguishable by shape, and the
-  # script reads it as a password - so './health.sh -n sec 192.168.1.5' silently tried to
-  # log into the -n-matched pool using an address as the password and surfaced as an
-  # authentication failure. Only xo-db can tell the cases apart: an argument that is the
-  # address of a pool it knows was meant as a host, since nobody's root password is one of
-  # their own pool addresses.
-  if [[ -n "$POOL_NAME_FILTER" && $# -eq 1 ]]; then
-    local host_clash
-    host_clash="$(get_pool_name_for_host "$1" || true)"
-    if [[ -n "$host_clash" ]]; then
+  # ---- host mode: the target is fixed, there is nothing to select or log into ----
+  if [[ "$RUN_ENV" == "host" ]]; then
+    # From XOA every command arrived as root over ssh, so this is the first time the
+    # question comes up. Without it, xe / dmesg / the logs all fail one by one and the run
+    # blames the toolstack for what is really a missing sudo.
+    if [[ "$(id -u 2>/dev/null || echo 0)" != "0" ]]; then
+      echo "ERROR: this must run as root on an XCP-ng host (it reads dom0 logs and talks to xapi)." >&2
+      exit 1
+    fi
+
+    if [[ -n "$POOL_NAME_FILTER" ]]; then
+      echo "ERROR: -n/--name picks a pool out of xo-server-db, which only exists on XOA." >&2
+      usage
+    fi
+
+    # The target is this machine, so the one positional that makes sense here is the root
+    # password for the OTHER pool members. A second one would have been a host, which is
+    # not selectable - saying so beats failing later with an authentication error.
+    if (( $# > 1 )); then
       {
-        printf "ERROR: '%s' is the address of pool '%s' in xo-server-db, but the value after\n" "$1" "$host_clash"
-        echo   "       -n/--name is read as a password, not a host - -n already selects the pool."
-        printf "       Use either '-n %s' or the host '%s', not both.\n" "$POOL_NAME_FILTER" "$1"
+        echo "ERROR: running on an XCP-ng host, so the host to check is this one and cannot be chosen."
+        echo "       The only argument accepted here is the root password of the other pool members."
       } >&2
       usage
     fi
-  fi
 
-  # -n, or no args at all = resolve a pool from xo-db (which prompts when more than
-  # one is enabled and no -n narrowed it down)
-  if [[ -n "$POOL_NAME_FILTER" ]] || [ "$#" -eq 0 ]; then
+    if (( $# == 1 )); then
+      pass="$1"
+    fi
+
+    resolve_local_host_identity || exit 1
+    seed_host="$LOCAL_HOST_IP"
+
+    # no xo-db here, so there is no pool name to print - the address (with the hostname when
+    # we have it) is what this run is about
+    if [[ -n "$LOCAL_HOST_NAME" ]]; then
+      print_target_banner "$LOCAL_HOST_NAME ($LOCAL_HOST_IP)" ""
+    else
+      print_target_banner "$LOCAL_HOST_IP" ""
+    fi
+  else
+    # ---- XOA: pick a pool / take the host argument, then find a password for it ----
+
+    # -n names a pool instead of giving a host, so only an optional password may follow it
+    if [[ -n "$POOL_NAME_FILTER" && $# -gt 1 ]]; then
+      echo "ERROR: -n/--name looks the host up in xo-server-db, so it takes at most a password after it." >&2
+      usage
+    fi
+
+    # With one trailing argument the two readings are indistinguishable by shape, and the
+    # script reads it as a password - so './health.sh -n sec 192.168.1.5' silently tried to
+    # log into the -n-matched pool using an address as the password and surfaced as an
+    # authentication failure. Only xo-db can tell the cases apart: an argument that is the
+    # address of a pool it knows was meant as a host, since nobody's root password is one of
+    # their own pool addresses.
+    if [[ -n "$POOL_NAME_FILTER" && $# -eq 1 ]]; then
+      local host_clash
+      host_clash="$(get_pool_name_for_host "$1" || true)"
+      if [[ -n "$host_clash" ]]; then
+        {
+          printf "ERROR: '%s' is the address of pool '%s' in xo-server-db, but the value after\n" "$1" "$host_clash"
+          echo   "       -n/--name is read as a password, not a host - -n already selects the pool."
+          printf "       Use either '-n %s' or the host '%s', not both.\n" "$POOL_NAME_FILTER" "$1"
+        } >&2
+        usage
+      fi
+    fi
+
+    # -n, or no args at all = resolve a pool from xo-db (which prompts when more than
+    # one is enabled and no -n narrowed it down)
+    if [[ -n "$POOL_NAME_FILTER" ]] || [ "$#" -eq 0 ]; then
       local sel_rc=0
       select_host_from_xoa_db || sel_rc=$?
       case "$sel_rc" in
@@ -3156,52 +3558,51 @@ main() {
       esac
       # keep any password the user passed after -n as the second positional
       set -- "$SELECTED_HOST" "$@"
-  fi
+    fi
 
-  parse_target_host_and_port "$1"
-  local seed_host="$PARSED_HOST"
+    parse_target_host_and_port "$1"
+    seed_host="$PARSED_HOST"
 
-  # a host that came from the xo-db picker may carry ':port' - that's the XAPI HTTPS
-  # port XO connects on, not an SSH port, so strip it for SSH but stay on 22
-  if [[ -n "$SELECTED_HOST" ]]; then
-    SSH_PORT=22
-  fi
+    # a host that came from the xo-db picker may carry ':port' - that's the XAPI HTTPS
+    # port XO connects on, not an SSH port, so strip it for SSH but stay on 22
+    if [[ -n "$SELECTED_HOST" ]]; then
+      SSH_PORT=22
+    fi
 
-  # the picker already knows the name when it resolved the host; a host argument didn't
-  # go through it, so look that one up (this is the only path that can leave it empty)
-  if [[ -z "$SELECTED_POOL_NAME" ]]; then
-    SELECTED_POOL_NAME="$(get_pool_name_for_host "$seed_host" || true)"
-  fi
-  print_target_banner "$seed_host" "$SELECTED_POOL_NAME"
+    # the picker already knows the name when it resolved the host; a host argument didn't
+    # go through it, so look that one up (this is the only path that can leave it empty)
+    if [[ -z "$SELECTED_POOL_NAME" ]]; then
+      SELECTED_POOL_NAME="$(get_pool_name_for_host "$seed_host" || true)"
+    fi
+    print_target_banner "$seed_host" "$SELECTED_POOL_NAME"
 
-  ensure_sshpass
+    ensure_sshpass
 
-  local pass=""
-  local rc
-
-  if [[ $# -eq 2 ]]; then
-    pass="$2"
-  else
-    # look the password up under the exact string xo-db keys the record by: for a
-    # picker-chosen host that's SELECTED_HOST verbatim (which may carry ':port' -
-    # the port-stripped seed_host would miss such a record entirely)
-    local db_host="$seed_host"
-    [[ -n "$SELECTED_HOST" ]] && db_host="$SELECTED_HOST"
-	  if pass="$(get_password_from_xoa_db_simple "$db_host")"; then
-      rc=0
+    if [[ $# -eq 2 ]]; then
+      pass="$2"
     else
-		  rc=$?
+      # look the password up under the exact string xo-db keys the record by: for a
+      # picker-chosen host that's SELECTED_HOST verbatim (which may carry ':port' -
+      # the port-stripped seed_host would miss such a record entirely)
+      local db_host="$seed_host"
+      [[ -n "$SELECTED_HOST" ]] && db_host="$SELECTED_HOST"
+      if pass="$(get_password_from_xoa_db_simple "$db_host")"; then
+        rc=0
+      else
+        rc=$?
 
-      if [[ $rc -eq 2 ]]; then
-        PW_NOTIFY=1
+        if [[ $rc -eq 2 ]]; then
+          PW_NOTIFY=1
+        fi
+      fi
+
+      if [[ -z "$pass" ]]; then
+        echo "Host IP not found in xo-db, please manually provide a password, or check that the IP is the master host and not a slave"
+        exit 1
       fi
     fi
-
-    if [[ -z "$pass" ]]; then
-      echo "Host IP not found in xo-db, please manually provide a password, or check that the IP is the master host and not a slave"
-      exit 1
-    fi
   fi
+  # ---- end of the two target-resolution paths ----
 
   get_pool_host_details "$seed_host" "$pass" || true
 
@@ -3210,8 +3611,19 @@ main() {
     exit 1
   fi
 
-  # in single mode only the seed host gets checked - don't probe the rest of the pool
-  if (( POOL_MODE == 0 )); then
+  # On a hypervisor, decide here - now that we know how big the pool is - whether the other
+  # members can be checked too, asking for a password if there is someone to ask. It may
+  # install sshpass, so it deliberately runs after the cheap local work has succeeded.
+  if [[ "$RUN_ENV" == "host" ]]; then
+    prepare_host_pool_sweep "$pass"
+    pass="$HOST_POOL_PASS"
+  fi
+
+  # in single mode only the seed host gets checked - don't probe the rest of the pool.
+  # A solo host run narrows the list the same way, for a different reason: without a
+  # password those members are not unreachable, they are simply not being checked, and
+  # probing them would report them as failures.
+  if (( POOL_MODE == 0 )) || host_solo; then
     POOL_HOST_IPS=("$seed_host")
   fi
 
@@ -3220,38 +3632,75 @@ main() {
   local overall_rc=0
   get_pool_host_facts "$pass"
 
-  if ! print_xoa_status_section; then overall_rc=1; fi
+  # the XOA section is about the appliance itself - there is no appliance here
+  if [[ "$RUN_ENV" != "host" ]]; then
+    if ! print_xoa_status_section; then overall_rc=1; fi
+  fi
 
   if (( POOL_MODE == 0 )); then
     if ! run_checks_for_host "$seed_host" "$pass" 1 ""; then overall_rc=1; fi
   else
-    if ! detect_pool_master_by_poolconf "$pass"; then
-      echo "ERROR: Could not determine pool master (no host had 'master' in /etc/xensource/pool.conf)." >&2
-      exit 1
+    if [[ "$RUN_ENV" == "host" ]]; then
+      # pool.conf is read locally, and names the master even when we are a slave
+      if ! detect_pool_master_local; then
+        echo "ERROR: Could not determine pool master (no 'master' or 'slave:<address>' in /etc/xensource/pool.conf)." >&2
+        exit 1
+      fi
+      POOL_CMD_HOST="$seed_host"
+    else
+      if ! detect_pool_master_by_poolconf "$pass"; then
+        echo "ERROR: Could not determine pool master (no host had 'master' in /etc/xensource/pool.conf)." >&2
+        exit 1
+      fi
+      POOL_CMD_HOST="$DETECTED_MASTER_IP"
     fi
 
-    MASTER_POOL_UUID="$(get_pool_uuid "$DETECTED_MASTER_IP" "$pass" || true)"
-    compute_pool_ram_match "$DETECTED_MASTER_IP" "$pass"
+    MASTER_POOL_UUID="$(get_pool_uuid "$POOL_CMD_HOST" "$pass" || true)"
     get_pool_missing_patches "$pass"
 
-    MASTER_RPMLIST="$(get_rpm_manifest_remote "$DETECTED_MASTER_IP" "$pass" || true)"
-    # hash the manifest we just fetched instead of running rpm -qa on the master a
-    # second time; check_yum_patch_level hashes each slave's manifest through this exact
-    # pipeline, so the two digests are always comparable
-    MASTER_RPMHASH=""
-    if [[ -n "${MASTER_RPMLIST//[[:space:]]/}" ]]; then
-      MASTER_RPMHASH="$(printf '%s\n' "$MASTER_RPMLIST" | sha256sum | cut -d' ' -f1)"
+    # both of these need a second host to compare against
+    if ! host_solo; then
+      compute_pool_ram_match "$DETECTED_MASTER_IP" "$pass"
+
+      MASTER_RPMLIST="$(get_rpm_manifest_remote "$DETECTED_MASTER_IP" "$pass" || true)"
+      # hash the manifest we just fetched instead of running rpm -qa on the master a
+      # second time; check_yum_patch_level hashes each slave's manifest through this exact
+      # pipeline, so the two digests are always comparable
+      MASTER_RPMHASH=""
+      if [[ -n "${MASTER_RPMLIST//[[:space:]]/}" ]]; then
+        MASTER_RPMHASH="$(printf '%s\n' "$MASTER_RPMLIST" | sha256sum | cut -d' ' -f1)"
+      fi
     fi
 
     if ! print_pool_status_section "$pass"; then overall_rc=1; fi
 
-    if ! run_checks_for_host "$DETECTED_MASTER_IP" "$pass" 1 ""; then overall_rc=1; fi
+    if host_solo; then
+      # this machine is the only one we can check, master or slave. is_master=1 so every
+      # check runs, the way single mode runs them all - the pool_run_* toggles are about
+      # keeping a pool sweep short, and there is no sweep here
+      if ! run_checks_for_host "$seed_host" "$pass" 1 ""; then overall_rc=1; fi
+    else
+      # Shared by XOA runs and host runs that sweep the pool. The master goes first because
+      # it carries the section heading and sets the yum baseline - but a host run names the
+      # master from the local pool.conf, so unlike the XOA path (where detection can only
+      # pick a host we already logged into) it may be one we cannot reach. It is listed as
+      # unreachable above; here we just make sure the heading still gets printed.
+      local ip master_reachable=0
+      for ip in "${POOL_HOST_ACCESS_IPS[@]}"; do
+        if [[ "$ip" == "$DETECTED_MASTER_IP" ]]; then master_reachable=1; break; fi
+      done
 
-    local ip
-    for ip in "${POOL_HOST_ACCESS_IPS[@]}"; do
-      [[ "$ip" == "$DETECTED_MASTER_IP" ]] && continue
-      if ! run_checks_for_host "$ip" "$pass" 0 ""; then overall_rc=1; fi
-    done
+      if (( master_reachable == 1 )); then
+        if ! run_checks_for_host "$DETECTED_MASTER_IP" "$pass" 1 ""; then overall_rc=1; fi
+      else
+        echo "$(cyan_text "== Individual Hosts ==")"
+      fi
+
+      for ip in "${POOL_HOST_ACCESS_IPS[@]}"; do
+        [[ "$ip" == "$DETECTED_MASTER_IP" ]] && continue
+        if ! run_checks_for_host "$ip" "$pass" 0 ""; then overall_rc=1; fi
+      done
+    fi
 
     echo
     echo "$(cyan_text "---pool.conf contents---")"
