@@ -9,6 +9,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/hea
 # With args:
 bash <(curl -fsSL https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/health.sh) -n mainpool
 ```
+That first command works just the same run directly on an XCP-ng host as root - the script
+looks at `/etc/os-release` to see where it is and adapts. See
+[Running it on an XCP-ng host](#running-it-on-an-xcp-ng-host-instead-of-xoa) below for what
+differs there (`-n` is the one flag that doesn't apply, it needs XOA's database).
+
 Run the health.sh script on an XOA appliance with no arguments, it will pull pool/host information from XOA's database.  
 
 - If XOA is connected to more than one pool, it lists the enabled pools and asks which one to check
@@ -19,7 +24,7 @@ Run the health.sh script on an XOA appliance with no arguments, it will pull poo
 ```
 [03:34 14] xoa:~$ ./health.sh --help
 Usage:
-  ./health_test.sh [-f] [-s] [-n name] [pool_master_or_host[:ssh_port] [root_password]]
+  ./health.sh [-f] [-s] [-n name] [pool_master_or_host[:ssh_port] [root_password]]
 
   - All parameters are optional
   - If a host is not supplied, the enabled pools in xo-server-db are listed to pick from
@@ -33,11 +38,11 @@ Usage:
     name and ignoring case, so '-n sec' matches 'XEN-SECONDARY'
 
   Examples:
-  ./health_test.sh 192.168.1.5
-  ./health_test.sh 192.168.1.6 'mypass'
-  ./health_test.sh -s 192.168.1.7 'mypass'
-  ./health_test.sh -n sec
-  ./health_test.sh -f -n 'xen-main'
+  ./health.sh 192.168.1.5
+  ./health.sh 192.168.1.6 'mypass'
+  ./health.sh -s 192.168.1.7 'mypass'
+  ./health.sh -n sec
+  ./health.sh -f -n 'xen-main'
   ```
 
 ## Running it on an XCP-ng host instead of XOA
