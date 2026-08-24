@@ -4,7 +4,7 @@
 # The version, and the only place it lives. Bump it whenever this script changes - it is
 # printed as the last line of every run, so it is the only way to tell which script
 # produced a report someone pasted.
-script_version="2.7"
+script_version="2.8"
 
 # Runs in two environments, decided by /etc/os-release (see detect_run_env):
 #   XOA  - the normal case: reaches every host of a pool over ssh (sshpass + xo-server-db)
