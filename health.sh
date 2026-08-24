@@ -4,7 +4,7 @@
 # The version, and the only place it lives. Bump it whenever this script changes - it is
 # printed as the last line of every run, so it is the only way to tell which script
 # produced a report someone pasted.
-script_version="2.8"
+script_version="2.9"
 
 # Runs in two environments, decided by /etc/os-release (see detect_run_env):
 #   XOA  - the normal case: reaches every host of a pool over ssh (sshpass + xo-server-db)
@@ -141,6 +141,7 @@ HOST_POOL_PASS=""                   # the password prepare_host_pool_sweep settl
 POOL_MODE=1
 FILTER_OUTPUT=0
 POOL_NAME_FILTER=""                 # -n: substring to match a pool by name in xo-db (case insensitive)
+RUN_CMD=""                          # -c: arbitrary command to run on every pool host instead of the health report
 DETAILS_OUTPUT=""
 POOLDETAILS_OUTPUT=""
 POOLCONF_SUMMARY=""
@@ -251,7 +252,7 @@ usage() {
     # on a hypervisor there is no xo-server-db to name a pool or look a password up in,
     # and no sshpass to reach another host with, so the target is not selectable
     echo "Usage (running on an XCP-ng host):"
-    echo "  $0 [-f] [-s] [root_password]"
+    echo "  $0 [-f] [-s] [-c 'command'] [root_password]"
     echo ""
     echo "  - This host is always checked, using local commands (no ssh, no password needed)"
     echo "  - The other pool members are checked too if a root password is given: they are"
@@ -265,14 +266,17 @@ usage() {
     echo "    pool member, slave included"
     echo "  - Use '-f' flag to filter output to only show issues found"
     echo "  - Use '-s' flag to skip the pool-level section and only report on this host"
+    echo "  - Use '-c command' to run an arbitrary command on every reachable pool host"
+    echo "    instead of the health report, and print each host's output"
     echo ""
     echo "  Examples:"
     echo "  $0"
     echo "  $0 -f"
     echo "  $0 'mypass'"
+    echo "  $0 -c 'cat /etc/resolv.conf'"
   else
     echo "Usage:"
-    echo "  $0 [-f] [-s] [-n name] [pool_master_or_host[:ssh_port] [root_password]]"
+    echo "  $0 [-f] [-s] [-n name] [-c 'command'] [pool_master_or_host[:ssh_port] [root_password]]"
     echo ""
     echo "  - All parameters are optional"
     echo "  - If a host is not supplied, the enabled pools in xo-server-db are listed to pick from"
@@ -284,6 +288,8 @@ usage() {
     echo "  - Use '-n' to pick a pool from xo-server-db by name instead of being prompted:"
     echo "    the first pool whose name contains the text is used, matched anywhere in the"
     echo "    name and ignoring case, so '-n sec' matches 'XEN-SECONDARY'"
+    echo "  - Use '-c command' to run an arbitrary command on every reachable pool host"
+    echo "    instead of the health report, and print each host's output"
     echo ""
     echo "  Examples:"
     echo "  $0 192.168.1.5"
@@ -291,6 +297,7 @@ usage() {
     echo "  $0 -s 192.168.1.7 'mypass'"
     echo "  $0 -n sec"
     echo "  $0 -f -n 'xen-main'"
+    echo "  $0 -c 'cat /etc/resolv.conf'"
   fi
   } >&"$fd"
   exit "$rc"
@@ -942,6 +949,34 @@ run_remote() {
   fi
 
   echo "$output"
+}
+
+# -c/--command mode: run an arbitrary command on every pool host (POOL_HOST_IPS, already
+# narrowed to the reachable ones by check_pool_hosts_access / -s) and print each host's
+# output back to the caller, labelled by address. Goes through run_remote/run_local
+# exactly like every other check, so it gets the same timeout, ssh options and
+# host-mode local-vs-ssh handling for free. No hostname lookup: that's one extra SSH
+# round-trip per host this mode has no other use for, so hosts are labelled by address.
+#
+# This is a reporting helper, not a check - it does not participate in $overall_rc or
+# -f filtering: the caller asked for raw command output, not a pass/fail verdict.
+run_command_on_all_hosts() {
+  local cmd="$1"
+  local pass="$2"
+
+  local ip out rc
+  for ip in "${POOL_HOST_IPS[@]}"; do
+    echo "$(cyan_text "== $ip ==")"
+
+    if out=$(run_remote "$ip" "$pass" "$cmd"); then
+      rc=0
+      [[ -n "$out" ]] && printf "%s\n" "$out"
+    else
+      rc=$?
+      printf "%s\n" "$(yellow_text "Command failed (exit code $rc)")"
+    fi
+    echo ""
+  done
 }
 
 get_remote_hostname() {
@@ -3591,7 +3626,7 @@ main() {
   # invocation summary and exits 2. It used to exit 1 here, which is the same code a
   # perfectly valid run returns when a check flags, so a wrapper or cron job could not
   # tell "you typed the flag wrong" from "the pool has a problem".
-  if ! VALID_ARGS=$(getopt -o fhsn: --long filter,help,single,name: -- "$@"); then
+  if ! VALID_ARGS=$(getopt -o fhsn:c: --long filter,help,single,name:,command: -- "$@"); then
       usage
   fi
 
@@ -3612,6 +3647,10 @@ main() {
           ;;
       -n | --name)
           POOL_NAME_FILTER="$2"
+          shift 2
+          ;;
+      -c | --command)
+          RUN_CMD="$2"
           shift 2
           ;;
       --) shift;
@@ -3780,6 +3819,13 @@ main() {
   fi
 
   check_pool_hosts_access "$pass"
+
+  # -c/--command: run the given command on every reachable pool host and stop there -
+  # this is a raw diagnostic dump, not the health report, so nothing below it runs
+  if [[ -n "$RUN_CMD" ]]; then
+    run_command_on_all_hosts "$RUN_CMD" "$pass"
+    exit 0
+  fi
 
   local overall_rc=0
   get_pool_host_facts "$pass"
