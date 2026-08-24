@@ -4,7 +4,7 @@
 # The version, and the only place it lives. Bump it whenever this script changes - it is
 # printed as the last line of every run, so it is the only way to tell which script
 # produced a report someone pasted.
-script_version="2.7"
+script_version="2.8"
 
 # Runs in two environments, decided by /etc/os-release (see detect_run_env):
 #   XOA  - the normal case: reaches every host of a pool over ssh (sshpass + xo-server-db)
@@ -98,6 +98,7 @@ pool_run_lun_assignments=1
 pool_run_smapi_hidden_leaves=0
 pool_run_rebooted_after_updates=1
 pool_run_yum_patch_level=1
+pool_run_task_timeout_override=1
 
 # petula clark - color my world
 # only colorize when stdout is a terminal (or HEALTH_FORCE_COLOR=1), so piped/logged output
@@ -1945,6 +1946,44 @@ check_coredumps_present() {
   return 1
 }
 
+check_task_timeout_override() {
+  local host="$1"
+  local pass="$2"
+
+  # xapi's default pending_task_timeout lives in /etc/xapi.conf; a drop-in under
+  # /etc/xapi.conf.d/ can override it per host. Just surfacing that an override exists
+  # (and what its value is) - this is informational, not a pass/fail, since a deliberate
+  # override is a normal thing for support to have set.
+  local out rc
+  if out=$(run_remote "$host" "$pass" "grep -h -E '^[[:space:]]*pending_task_timeout[[:space:]]*=' /etc/xapi.conf.d/* 2>/dev/null || true"); then
+    rc=0
+  else
+    rc=$?
+    echo "Failed when trying to check for pending_task_timeout override on $host (exit code $rc)" >&2
+    return "$rc"
+  fi
+
+  local values=() line value
+  while IFS= read -r line; do
+    line="${line//$'\r'/}"
+    [[ -z "${line//[[:space:]]/}" ]] && continue
+    value="${line#*=}"
+    value="${value//[[:space:]]/}"
+    [[ -n "$value" ]] && values+=("$value")
+  done <<< "$out"
+
+  local cnt="${#values[@]}"
+  if (( cnt == 0 )); then
+    [[ "$FILTER_OUTPUT" -eq 0 ]] && printf "XAPI Task Timeout Override: %s\n" "$(green_text 'No')"
+    return 0
+  fi
+
+  local joined
+  joined="$(IFS=,; echo "${values[*]}")"
+  printf "XAPI Task Timeout Override: %s\n" "$(yellow_text "Yes - ${joined}")"
+  return 0
+}
+
 check_lacp_negotiation_issues() {
   local host="$1"
   local pass="$2"
@@ -3458,6 +3497,10 @@ run_checks_for_host() {
     if [[ -n "$COREDUMPS_BLOCK" ]]; then
       append_details "$hostlabel" "Coredumps ($coredump_dir)" "$COREDUMPS_BLOCK"
     fi
+  fi
+
+  if gated pool_run_task_timeout_override; then
+    if ! check_task_timeout_override "$ip" "$pass"; then rc_any=1; fi
   fi
 
   if gated pool_run_lacp_negotiation; then
