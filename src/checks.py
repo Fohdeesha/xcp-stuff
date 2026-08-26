@@ -172,6 +172,27 @@ def crash_logs(host):
     return ok("Crash Logs Present", "No")
 
 
+def task_timeout_override(host):
+    """Is xapi's pending_task_timeout overridden by a drop-in on this host?
+
+    A fact about the configuration, not a finding: an override is a normal thing for
+    support to have set deliberately, so 'Yes' is yellow and exit-code neutral - the same
+    class as 'XOSTOR In Use: Yes'. The values are echoed because which one it is, is the
+    whole content of the line.
+
+    'Unknown' is a departure from the bash script this came from, which printed no line at
+    all when the read failed. A missing line reads as 'not applicable', which is a claim
+    of its own - and there it also flagged the exit code while saying nothing.
+    """
+    f = host.fact("task_timeout")
+    if not f.ok:
+        return unknown("XAPI Task Timeout Override", "Unknown (%s)" % f.error)
+    values = f.value or []
+    if not values:
+        return ok("XAPI Task Timeout Override", "No")
+    return info("XAPI Task Timeout Override", "Yes - " + ",".join(values), "yellow")
+
+
 def coredumps(host):
     """Anything in the systemd coredump drop dir means a dom0 process died. The filename
     is the payload - systemd names them core.<comm>.<...> - so the list says WHICH."""

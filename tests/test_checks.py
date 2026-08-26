@@ -8,6 +8,8 @@ green.
 """
 
 import checks
+import config
+import main
 import model
 import result
 
@@ -54,6 +56,7 @@ UNCOLLECTED = [
     ("OOM Events", checks.oom_events),
     ("Crash Logs Present", checks.crash_logs),
     ("Coredumps Present", checks.coredumps),
+    ("XAPI Task Timeout Override", checks.task_timeout_override),
     ("LACP Negotiation Issues", checks.lacp),
     ("Silly MTUs", checks.silly_mtus),
     ("DNS/GW on Non-Mgmt PIFs", checks.dns_gw_non_mgmt_pifs),
@@ -66,17 +69,39 @@ UNCOLLECTED = [
 
 
 def test_every_host_check_says_unknown_when_the_fact_is_missing():
+    """Driven by main's own check table, not by a list kept alongside it.
+
+    A hand-maintained list only covers the checks somebody remembered to add to it, and
+    the check this rule most needs to bind is the one just written. Enumerating the table
+    the report itself iterates means a new per-host line is in this test the moment it can
+    appear in a report.
+    """
     empty = host()
-    for key, fn in UNCOLLECTED:
-        line = fn(empty)
-        assert line.status == UNKNOWN, "%s answered %s off no fact" % (key, line.status)
-        assert line.flags, "%s must flag the exit code" % key
+    for _toggle, key, fn in main.per_host_checks():
+        produced = fn(empty)
+        for line in (produced if isinstance(produced, list) else [produced]):
+            assert line.status == UNKNOWN, "%s answered %s off no fact" % (key, line.status)
+            assert line.flags, "%s must flag the exit code" % key
+
+
+def test_the_check_table_and_the_slave_toggles_stay_in_step():
+    """Every gated check needs a POOL_RUN entry, and every entry needs a check.
+
+    gated() defaults a missing toggle to True, so a typo would silently run a check on
+    every slave that was meant to be off - and an orphaned toggle reads as a check that
+    exists when it does not.
+    """
+    toggles = set(config.POOL_RUN)
+    table = set(toggle for toggle, _key, _fn in main.per_host_checks())
+    # yum_patch_level is gated too, but from its own call site: it needs the master's
+    # manifest passed in, so it is not one of the (host) -> Line entries in the table
+    assert table | {"yum_patch_level"} == toggles
 
 
 def test_every_host_check_says_unknown_when_the_fact_is_an_error():
     broken = host(df=err(), dmesg=err(), crash_count=err(), coredumps=err(), lacp=err(),
                   iplink=err(), pifs_dns_gw=err(), ipaddr=err(), log_scan=err(),
-                  lun_scan=err(), smapi=err(), boot_epoch=err())
+                  lun_scan=err(), smapi=err(), boot_epoch=err(), task_timeout=err())
     for key, fn in UNCOLLECTED:
         line = fn(broken)
         assert line.status == UNKNOWN, "%s answered %s off an error" % (key, line.status)
@@ -394,6 +419,26 @@ def test_lacp_states():
     assert bad.status == FLAG and bad.detail_title == "LACP Output"
     # rc != 0 means OVS is not answering, which is not "no bonds"
     assert checks.lacp(host(lacp=err("could not query Open vSwitch"))).status == UNKNOWN
+
+
+def test_task_timeout_override_states():
+    # no drop-in directory, and a directory with nothing in it, are the same real answer
+    assert checks.task_timeout_override(host(task_timeout=fact([]))).status == OK
+    assert checks.task_timeout_override(host(task_timeout=fact([]))).text.endswith("No")
+
+    line = checks.task_timeout_override(host(task_timeout=fact(["86400"])))
+    assert line.text.endswith("Yes - 86400")
+    # a deliberate override is a normal thing for support to have set: yellow, and
+    # explicitly NOT a finding - the same class as 'XOSTOR In Use: Yes'
+    assert line.status == INFO and not line.flags
+    assert line.always_print                     # ...so -f still shows it
+
+    several = checks.task_timeout_override(host(task_timeout=fact(["86400", "3600"])))
+    assert several.text.endswith("Yes - 86400,3600")
+
+    # bash printed no line at all when the read failed, which reads as 'not applicable'
+    unreadable = checks.task_timeout_override(host(task_timeout=err("could not read")))
+    assert unreadable.status == UNKNOWN and unreadable.flags
 
 
 def test_coredumps_cap_and_wording():

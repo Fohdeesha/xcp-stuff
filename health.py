@@ -22,6 +22,7 @@
 
 
 
+from concurrent.futures import ThreadPoolExecutor
 import atexit
 import base64
 import getopt
@@ -41,10 +42,11 @@ import unicodedata
 # ======================================================================================
 # --- config ----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "3.0"
+SCRIPT_VERSION = "3.1"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
+MAX_PARALLEL_HOSTS = 8           # hosts collected at once (HEALTH_MAX_PARALLEL overrides)
 LOCAL_CMD_TIMEOUT = 10           # max seconds a local command may run (hung xoa-updater etc)
 XOA_CHECK_TIMEOUT = 60           # 'xoa check' does real network probes, so it gets longer
 
@@ -105,6 +107,7 @@ POOL_RUN = {
     "oom_events": True,
     "crash_logs_present": True,
     "coredumps_present": True,
+    "task_timeout_override": True,
     "lacp_negotiation": True,
     "silly_mtus": True,
     "dns_gw_non_mgmt_pifs": True,
@@ -126,9 +129,17 @@ CYAN = ""
 RESET = ""
 
 
-def init(stream=None):
-    """Decide once whether this run is coloured. Called from main()."""
+def init(stream=None, force_off=False):
+    """Decide once whether this run is coloured. Called from main().
+
+    force_off is --json: a document is not read by a terminal, and colouring it would
+    mean every consumer had to strip the escape codes back out of every value. It beats
+    HEALTH_FORCE_COLOR, which exists to colour output for a human.
+    """
     global GREEN, YELLOW, CYAN, RESET
+    if force_off:
+        GREEN = YELLOW = CYAN = RESET = ""
+        return
     stream = stream if stream is not None else sys.stdout
     forced = os.environ.get("HEALTH_FORCE_COLOR", "0") == "1"
     try:
@@ -1264,6 +1275,59 @@ def collect_coredumps(coredump_dir):
     return fact(rows)
 
 
+TASK_TIMEOUT_CONF_DIR = "/etc/xapi.conf.d"
+_TASK_TIMEOUT_RE = re.compile(r"^\s*pending_task_timeout\s*=(.*)$")
+
+
+def task_timeout_values(text):
+    """The pending_task_timeout settings in one drop-in file's text.
+
+    All whitespace is stripped out of the value rather than just trimmed, so a setting
+    written as '1 hour' is reported as '1hour' - which is what the bash script this was
+    ported from does, and the line is a verbatim echo of the override either way.
+    A commented-out setting cannot match: the key has to start the line.
+    """
+    values = []
+    for line in text.replace("\r", "").split("\n"):
+        m = _TASK_TIMEOUT_RE.match(line)
+        if not m:
+            continue
+        value = re.sub(r"\s+", "", m.group(1))
+        if value:
+            values.append(value)
+    return values
+
+
+def collect_task_timeout_override():
+    """xapi's default pending_task_timeout lives in /etc/xapi.conf; a drop-in under
+    /etc/xapi.conf.d/ can override it for this host.
+
+    No directory and no matching line are both real answers ('no override'), which is why
+    they return an empty list rather than an error - but a directory we cannot read is
+    NOT, and says so, because 'no override found' would be a claim we did not establish.
+    Dot-files are skipped: the shell glob this replaces did not match them either, and
+    an editor's leftover .swp is not a live configuration file.
+    """
+    if not os.path.isdir(TASK_TIMEOUT_CONF_DIR):
+        return fact([])
+    try:
+        names = sorted(os.listdir(TASK_TIMEOUT_CONF_DIR))
+    except OSError as exc:
+        return err("could not list %s (%s)" % (TASK_TIMEOUT_CONF_DIR, exc))
+    values = []
+    for name in names:
+        if name.startswith("."):
+            continue
+        path = os.path.join(TASK_TIMEOUT_CONF_DIR, name)
+        if not os.path.isfile(path):
+            continue
+        text = read_file(path)
+        if text is None:
+            return err("could not read %s" % path)
+        values.extend(task_timeout_values(text))
+    return fact(values)
+
+
 def collect_smapi_hidden_leaves():
     """Live SMlog only - reading the rotated copy too was considered and declined."""
     path = "/var/log/SMlog"
@@ -1789,6 +1853,7 @@ def collect(spec):
         out["lacp"] = collect_lacp()
         out["crash_count"] = collect_crash_count(spec.get("crash_ignore_file") or "")
         out["coredumps"] = collect_coredumps(spec.get("coredump_dir") or "")
+        out["task_timeout"] = collect_task_timeout_override()
         out["rpm_manifest"] = collect_rpm_manifest()
         out.update(collect_patch_facts())
 
@@ -1867,9 +1932,37 @@ class CollectError(Exception):
     """Could not get a document out of a host. Never confused with 'the host is fine'."""
 
 
+_DEBUG_LOCK = threading.Lock()
+
+
 def debug(msg):
+    """Trace to stderr under HEALTH_DEBUG=1, one whole message at a time.
+
+    Worker threads all write here, and a TextIOWrapper gives no atomicity guarantee, so
+    the lock is what stops two hosts' traces from being spliced into one unreadable line.
+    """
     if os.environ.get("HEALTH_DEBUG") == "1":
-        sys.stderr.write("[health-debug] %s\n" % msg)
+        with _DEBUG_LOCK:
+            sys.stderr.write("[health-debug] %s\n" % msg)
+            sys.stderr.flush()
+
+
+# Every child process currently running, so an interrupted run can take the whole tree
+# down with it. start_new_session puts each child in its own session, which is what makes
+# the timeout killpg work - but it also means the terminal's ctrl-C never reaches them.
+# Serially that left one orphan ssh behind; with hosts collected concurrently the worker
+# threads cannot be interrupted at all, so without this an interrupt would sit for up to
+# REMOTE_CMD_TIMEOUT waiting for the last collector to finish on its own.
+_LIVE = set()
+_LIVE_LOCK = threading.Lock()
+
+
+def kill_all_children():
+    """Kill every child still running. For an interrupted run, not for normal shutdown."""
+    with _LIVE_LOCK:
+        procs = list(_LIVE)
+    for proc in procs:
+        _kill_tree(proc)
 
 
 def _remote_launch(blob):
@@ -1903,6 +1996,8 @@ def run_local_cmd(argv, timeout, env=None, stdin_text=None):
     except OSError as exc:
         return (127, "", "%s: %s" % (argv[0], exc))
 
+    with _LIVE_LOCK:
+        _LIVE.add(proc)
     payload = stdin_text.encode("utf-8") if stdin_text is not None else None
     try:
         out, err = proc.communicate(input=payload, timeout=timeout)
@@ -1914,6 +2009,14 @@ def run_local_cmd(argv, timeout, env=None, stdin_text=None):
         except subprocess.TimeoutExpired:
             out, err = b"", b""
         rc = 124
+    except KeyboardInterrupt:
+        # only ever raised in the MAIN thread, so this is the serial path; the child is in
+        # its own session and never saw the ctrl-C, so it has to be told
+        _kill_tree(proc)
+        raise
+    finally:
+        with _LIVE_LOCK:
+            _LIVE.discard(proc)
     return (rc,
             out.decode("utf-8", "backslashreplace") if out else "",
             err.decode("utf-8", "backslashreplace") if err else "")
@@ -2497,6 +2600,27 @@ def crash_logs(host):
     if f.value:
         return flag("Crash Logs Present", "Yes - check /var/crash")
     return ok("Crash Logs Present", "No")
+
+
+def task_timeout_override(host):
+    """Is xapi's pending_task_timeout overridden by a drop-in on this host?
+
+    A fact about the configuration, not a finding: an override is a normal thing for
+    support to have set deliberately, so 'Yes' is yellow and exit-code neutral - the same
+    class as 'XOSTOR In Use: Yes'. The values are echoed because which one it is, is the
+    whole content of the line.
+
+    'Unknown' is a departure from the bash script this came from, which printed no line at
+    all when the read failed. A missing line reads as 'not applicable', which is a claim
+    of its own - and there it also flagged the exit code while saying nothing.
+    """
+    f = host.fact("task_timeout")
+    if not f.ok:
+        return unknown("XAPI Task Timeout Override", "Unknown (%s)" % f.error)
+    values = f.value or []
+    if not values:
+        return ok("XAPI Task Timeout Override", "No")
+    return info("XAPI Task Timeout Override", "Yes - " + ",".join(values), "yellow")
 
 
 def coredumps(host):
@@ -3100,19 +3224,89 @@ def running_as_root():
 # ======================================================================================
 # --- report ----------------------------------------------------------------------------
 
+def _as_entry(line):
+    """One Line as a document entry.
+
+    'flags' is carried explicitly rather than left for the consumer to derive from the
+    status. Whether a yellow line counts against the run is a real rule with real
+    exceptions - 'XOSTOR In Use: Yes' and a backslash in the root password are facts, not
+    findings - and a monitoring consumer that re-derived it from the colour would get
+    those wrong in exactly the direction that raises false alarms.
+    """
+    entry = {"key": line.key, "value": line.text, "status": line.status,
+             "flags": line.flags}
+    if line.detail_text:
+        entry["detail"] = {"title": line.detail_title, "text": line.detail_text}
+    return entry
+
+
 class Report(object):
-    def __init__(self, filter_output=False, stream=None):
+    def __init__(self, filter_output=False, stream=None, json_mode=False, meta=None):
         self.filter_output = filter_output
         self.stream = stream if stream is not None else sys.stdout
+        self.json_mode = json_mode
+        self.meta = meta or {}
         self.flagged = False
         self._host_details = []
         self._pool_details = []
         self._poolconf = []
         self.host_label = None   # which detail bucket the current section writes into
+        self._sections = []      # json only: the buckets, in the order the report makes them
+        self._section = None
 
     # -- raw output ---------------------------------------------------------------
     def write(self, text=""):
+        """--json puts the document on stdout and nothing else, so the rendered report is
+        suppressed at the single point that produces it rather than at every caller."""
+        if self.json_mode:
+            return
         self.stream.write(text + "\n")
+
+    def write_raw(self, text):
+        """Exactly these bytes, no newline added. The pool.conf block carries its own
+        spacing, and putting it through write() would silently reshape the report."""
+        if self.json_mode:
+            return
+        self.stream.write(text)
+
+    # -- sections -----------------------------------------------------------------
+    def begin_section(self, kind, host=None):
+        """Say which part of the report the lines that follow belong to.
+
+        This is also what sets host_label, so the bucket a detail blob is filed under and
+        the bucket the document lists a check in are decided in one place and cannot
+        disagree.
+        """
+        self.host_label = "XOA" if kind == "xoa" else (host.label if host is not None else None)
+        if not self.json_mode:
+            return
+        section = {"kind": kind}
+        if host is not None:
+            section["name"] = host.name
+            section["address"] = host.address
+            section["master"] = bool(host.is_master)
+            section["reachable"] = True
+        section["checks"] = []
+        self._sections.append(section)
+        self._section = section
+
+    def end_section(self):
+        self.host_label = None
+        self._section = None
+
+    def unreachable_host(self, host):
+        """A host we could not collect, recorded with no 'checks' key at all.
+
+        The rendered report gives such a host no block: there is nothing to say about it,
+        and an empty block would read as a host that passed everything. That trap is
+        sharper in a document a machine walks, where an empty checks list counts as zero
+        findings - so the key is absent rather than empty, which cannot be summed.
+        """
+        if not self.json_mode:
+            return
+        self._sections.append({"kind": "host", "name": host.name, "address": host.address,
+                               "master": bool(host.is_master), "reachable": False,
+                               "error": host.error or "not collected"})
 
     def heading(self, text):
         """Section headings always print: -f hides passing results, not structure."""
@@ -3138,6 +3332,10 @@ class Report(object):
             self.flagged = True
         if line.always_print or not self.filter_output:
             self.write(line.render())
+            # recorded under the same guard, so --json and the rendered report answer
+            # 'was this line in the output' identically, -f included
+            if self.json_mode and self._section is not None:
+                self._section["checks"].append(_as_entry(line))
         if line.detail_text:
             if host_label is None:
                 self.add_pool_detail(line.detail_title, line.detail_text)
@@ -3159,12 +3357,38 @@ class Report(object):
     def add_poolconf(self, host_label, text):
         first = (text or "").replace("\r", "").split("\n")[0]
         self._poolconf.append("%s\n%s\n\n" % (host_label, first))
+        if self.json_mode and self._section is not None:
+            # in the document it belongs to the host it describes, rather than to a
+            # separate block at the end that a consumer would have to re-attribute
+            self._section["pool_conf"] = first
 
     # -- tail ---------------------------------------------------------------------
     def print_poolconf_section(self):
         self.blank()
         self.heading("---pool.conf contents---")
-        self.stream.write("".join(self._poolconf))
+        self.write_raw("".join(self._poolconf))
+
+    def document(self):
+        """The whole run as one JSON-ready object.
+
+        No timestamp: two runs of an unchanged pool should produce the same document, so
+        that diffing one against another says something. A consumer that wants to know
+        when it read this knows that better than the script does.
+        """
+        doc = {"script_version": config.SCRIPT_VERSION}
+        doc.update(self.meta)
+        hosts = []
+        for section in self._sections:
+            body = dict(section)
+            kind = body.pop("kind")
+            if kind == "host":
+                hosts.append(body)
+            else:
+                doc[kind] = body
+        doc["hosts"] = hosts
+        doc["flagged"] = self.flagged
+        doc["exit_code"] = 1 if self.flagged else 0
+        return doc
 
     def finish(self):
         """Detail blobs, then the version line, which is the last line of every run.
@@ -3172,6 +3396,14 @@ class Report(object):
         It can never flag, so -f prints it too - saying which script produced the report
         above is the entire point of it.
         """
+        if self.json_mode:
+            # ensure_ascii is the default, but it is stated because it is load-bearing:
+            # log excerpts reach here as whatever the host had, and a pure-ASCII document
+            # survives any locale a cron job runs under. Escaped characters are still
+            # valid JSON and every parser turns them back into the same text.
+            self.stream.write(
+                json.dumps(self.document(), indent=2, ensure_ascii=True) + "\n")
+            return 1 if self.flagged else 0
         for blob in (self._pool_details, self._host_details):
             text = "".join(blob)
             if text.strip():
@@ -3210,6 +3442,9 @@ USAGE_XOA = """Usage:
   - Use '-n' to pick a pool from xo-server-db by name instead of being prompted:
     the first pool whose name contains the text is used, matched anywhere in the
     name and ignoring case, so '-n sec' matches 'XEN-SECONDARY'
+  - Use '--json' to print the results as a JSON document instead of a report, for
+    cron and monitoring. Same checks, same exit code; '-f' narrows it the same way,
+    and everything that is not the document goes to stderr
 
   Examples:
   %(prog)s 192.168.1.5
@@ -3217,6 +3452,7 @@ USAGE_XOA = """Usage:
   %(prog)s -s 192.168.1.7 'mypass'
   %(prog)s -n sec
   %(prog)s -f -n 'xen-main'
+  %(prog)s --json -n sec
 """
 
 USAGE_HOST = """Usage (running on an XCP-ng host):
@@ -3234,11 +3470,15 @@ USAGE_HOST = """Usage (running on an XCP-ng host):
     pool member, slave included
   - Use '-f' flag to filter output to only show issues found
   - Use '-s' flag to skip the pool-level section and only report on this host
+  - Use '--json' to print the results as a JSON document instead of a report, for
+    cron and monitoring. Same checks, same exit code; '-f' narrows it the same way,
+    and everything that is not the document goes to stderr
 
   Examples:
   %(prog)s
   %(prog)s -f
   %(prog)s 'mypass'
+  %(prog)s --json
 """
 
 
@@ -3327,6 +3567,7 @@ class Run(object):
         self.filter_output = False
         self.pool_mode = True
         self.name_filter = ""
+        self.json_output = False
         self.seed = ""
         self.password = ""
         self.pw_has_backslash = False
@@ -3336,6 +3577,7 @@ class Run(object):
         self.pool = model.Pool()
         self.master_address = ""
         self.master_name = ""
+        self.pool_name = ""
         self.pool_cmd_host = ""
         self.pool_size = 0
         self.all_addresses = []
@@ -3360,8 +3602,8 @@ class Run(object):
 
     def parse_args(self, argv):
         try:
-            opts, args = getopt.gnu_getopt(argv, "fhsn:",
-                                           ["filter", "help", "single", "name="])
+            opts, args = getopt.gnu_getopt(
+                argv, "fhsn:", ["filter", "help", "single", "name=", "json"])
         except getopt.GetoptError as exc:
             sys.stderr.write("%s\n" % exc)
             usage(self.run_env)
@@ -3374,22 +3616,34 @@ class Run(object):
                 self.pool_mode = False
             elif opt in ("-n", "--name"):
                 self.name_filter = value
+            elif opt == "--json":
+                self.json_output = True
         if len(args) > 2:
             usage(self.run_env)
         return args
 
 
-def print_banner(host, name):
+def notice(run, text):
+    """A message the rendered report puts on stdout.
+
+    Under --json stdout carries the document and nothing else, so these go to stderr
+    instead: a consumer's stdout is then either a whole valid document or empty, never a
+    mixture that fails to parse for a reason it cannot see.
+    """
+    (sys.stderr if run.json_output else sys.stdout).write(text)
+
+
+def print_banner(run, host, name):
     """Every run names what it is about to check, before any of the slow work.
 
     The paths that pick silently - the sole enabled pool, and cron/pipe runs - are exactly
     the ones where this line is the only record of which pool was taken.
     """
     if name:
-        sys.stdout.write("Checking pool: %s\n" % colors.green("%s (%s)" % (name, host)))
+        notice(run, "Checking pool: %s\n" % colors.green("%s (%s)" % (name, host)))
     else:
-        sys.stdout.write("Checking host: %s\n" % colors.green(host))
-    sys.stdout.write("\n")
+        notice(run, "Checking host: %s\n" % colors.green(host))
+    notice(run, "\n")
 
 
 def resolve_target_xoa(run, args):
@@ -3434,8 +3688,8 @@ def resolve_target_xoa(run, args):
     # not an ssh port, so it is stripped for ssh and we stay on 22
     run.transport.ssh_port = 22 if selected else port
 
-    pool_name = selected.name if selected else xodb.pool_name_for_host(host)
-    print_banner(host, pool_name)
+    run.pool_name = selected.name if selected else xodb.pool_name_for_host(host)
+    print_banner(run, host, run.pool_name)
 
     if not transport.ensure_sshpass(run.run_env):
         sys.stderr.write("ERROR: sshpass is required to reach the pool over ssh.\n")
@@ -3450,9 +3704,9 @@ def resolve_target_xoa(run, args):
         password, has_backslash = xodb.password_for(db_host)
         run.pw_has_backslash = has_backslash
         if not password:
-            sys.stdout.write("Host IP not found in xo-db, please manually provide a "
-                             "password, or check that the IP is the master host and not "
-                             "a slave\n")
+            notice(run, "Host IP not found in xo-db, please manually provide a "
+                        "password, or check that the IP is the master host and not "
+                        "a slave\n")
             sys.exit(1)
         run.password = password
     run.transport.password = run.password
@@ -3537,7 +3791,7 @@ def discover(run):
         name = result.wrap(payload, "hostname")
         shown = ("%s (%s)" % (name.value, address.value)
                  if name.ok and name.value else address.value)
-        print_banner(shown, "")
+        print_banner(run, shown, "")
 
     hosts_fact = result.wrap(payload, "pool_hosts")
     if not hosts_fact.ok:
@@ -3580,25 +3834,81 @@ def discover(run):
     return hosts
 
 
+def _collect_one(run, host, pool_spec):
+    """Gather one host. Anything it wants said is RETURNED, not printed.
+
+    A worker thread writing straight to stderr would interleave the messages in whatever
+    order the hosts happened to finish, which is not reproducible between runs; the caller
+    writes them out in host order instead.
+    """
+    # is_master is already settled (see main): it decides which checks run for this
+    # host, and therefore what has to be collected for them
+    spec = _host_spec(with_smapi=(not run.pool_mode or host.is_master
+                                  or config.POOL_RUN["smapi_hidden_leaves"]))
+    if run.pool_mode and host.address == run.pool_cmd_host:
+        spec = _merge(spec, pool_spec)
+    note = ""
+    try:
+        host.payload = run.transport.collect(host.address, spec)
+    except transport.CollectError as exc:
+        host.error = str(exc)
+        note = "Failed when trying to check %s: %s\n" % (host.address, exc)
+    host.local_now = _now()
+    return note
+
+
+def parallel_workers(host_count):
+    """How many hosts to gather at once.
+
+    Capped because the win is had by the time a handful are in flight, while the cost of
+    lifting the cap is real: every host in flight is an ssh process, a ControlMaster
+    socket and a collector holding a whole host's document in memory. HEALTH_MAX_PARALLEL
+    overrides it, and =1 restores the strictly sequential order - which is how the two are
+    diffed against each other.
+    """
+    limit = config.MAX_PARALLEL_HOSTS
+    override = os.environ.get("HEALTH_MAX_PARALLEL", "")
+    if override.isdigit() and int(override) > 0:
+        limit = int(override)
+    return max(1, min(limit, host_count))
+
+
+def _collect_in_parallel(run, pool_spec, workers):
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = [pool.submit(_collect_one, run, host, pool_spec) for host in run.hosts]
+        try:
+            return [f.result() for f in futures]
+        except BaseException:
+            # named and immediately re-raised, so this is not a swallowed error: the
+            # workers are blocked in communicate() and cannot see a ctrl-C, so without
+            # this the shutdown below would wait out every collector still running
+            transport.kill_all_children()
+            raise
+    finally:
+        pool.shutdown(wait=True)
+
+
 def collect_hosts(run):
-    """Phase B: one call per host. The pool-level questions ride along on the host they
-    are asked of, so the usual case is exactly one round trip per host."""
+    """Phase B: one call per host, several hosts at a time.
+
+    The pool-level questions ride along on the host they are asked of, so the usual case
+    is exactly one round trip per host. Hosts are wholly independent of each other - each
+    is its own ssh connection, its own collector process and its own slice of the
+    document - so gathering them concurrently changes nothing but the wall clock.
+    """
     controllers = run.all_addresses if run.host_solo() else [h.address for h in run.hosts]
     pool_spec = _pool_spec(controllers)
 
-    for host in run.hosts:
-        # is_master is already settled (see main): it decides which checks run for this
-        # host, and therefore what has to be collected for them
-        spec = _host_spec(with_smapi=(not run.pool_mode or host.is_master
-                                      or config.POOL_RUN["smapi_hidden_leaves"]))
-        if run.pool_mode and host.address == run.pool_cmd_host:
-            spec = _merge(spec, pool_spec)
-        try:
-            host.payload = run.transport.collect(host.address, spec)
-        except transport.CollectError as exc:
-            host.error = str(exc)
-            sys.stderr.write("Failed when trying to check %s: %s\n" % (host.address, exc))
-        host.local_now = _now()
+    workers = parallel_workers(len(run.hosts))
+    transport.debug("collecting %d host(s), %d at a time" % (len(run.hosts), workers))
+    if workers > 1:
+        notes = _collect_in_parallel(run, pool_spec, workers)
+    else:
+        notes = [_collect_one(run, host, pool_spec) for host in run.hosts]
+    for note in notes:
+        if note:
+            sys.stderr.write(note)
 
     if run.pool_mode:
         cmd_host = run.host_by_address(run.pool_cmd_host)
@@ -3637,7 +3947,7 @@ def _now():
 
 def pool_status_section(run, rep):
     rep.heading("== Pool Status ==")
-    rep.host_label = None
+    rep.begin_section("pool")
 
     if run.master_address:
         name = run.master_name or run.master_address
@@ -3689,7 +3999,58 @@ def pool_status_section(run, rep):
     rep.check("Migration Network", checks.migration_network, run.pool)
     rep.check("Backup Network", checks.backup_network, run.pool, run.run_env,
               xoa.ping_silent)
+    rep.end_section()
     rep.blank()
+
+
+def run_meta(run):
+    """What the run itself was, for the head of a --json document.
+
+    Three host counts, because they routinely differ and collapsing them would overclaim:
+    the pool has N members, -s or a solo run may put fewer than N in scope, and of those
+    some may not have answered. A consumer told only 'checked: 2' would read a run that
+    reached one host of two as a clean pool. It is the same distinction the Pool Status
+    section is careful to make in words.
+    """
+    return {"run": {
+        "environment": run.run_env,
+        "pool_mode": run.pool_mode,
+        "filtered": run.filter_output,
+        "target": run.seed,
+        "pool_name": run.pool_name or None,
+        "hosts_in_pool": run.pool_size,
+        "hosts_attempted": len(run.hosts),
+        "hosts_checked": len([h for h in run.hosts if h.reachable]),
+    }}
+
+
+def per_host_checks():
+    """(POOL_RUN toggle, line key, check) for every gated per-host line, in print order.
+
+    A function rather than a constant because in the stitched artifact every module body
+    runs before the module aliases exist, so a top-level list mentioning `checks.x` would
+    fail at import. It is also the table the tests enumerate, so a check added here cannot
+    quietly skip the rule that a missing fact answers Unknown.
+    """
+    return [
+        ("dom0_disk_usage", "Dom0 Disk Usage", checks.dom0_disk_usage),
+        ("dom0_memory", "Dom0 Memory", checks.dom0_memory),
+        ("mtu_issues", "MTU Issues", checks.mtu_issues),
+        ("dmesg_content", "Dmesg Content", checks.dmesg_content),
+        ("oom_events", "OOM Events", checks.oom_events),
+        ("crash_logs_present", "Crash Logs Present", checks.crash_logs),
+        ("coredumps_present", "Coredumps Present", checks.coredumps),
+        ("task_timeout_override", "XAPI Task Timeout Override",
+         checks.task_timeout_override),
+        ("lacp_negotiation", "LACP Negotiation Issues", checks.lacp),
+        ("silly_mtus", "Silly MTUs", checks.silly_mtus),
+        ("dns_gw_non_mgmt_pifs", "DNS/GW on Non-Mgmt PIFs", checks.dns_gw_non_mgmt_pifs),
+        ("overlapping_subnets", "Overlapping Subnets", checks.overlapping_subnets),
+        ("log_errors", "Log Errors", checks.log_errors),
+        ("lun_assignments", "LUN Assignments", checks.lun_assignments),
+        ("smapi_hidden_leaves", "SMAPI Hidden Leaves", checks.smapi_hidden_leaves),
+        ("rebooted_after_updates", "Rebooted After Updates", checks.rebooted_after_updates),
+    ]
 
 
 def gated(run, host, name):
@@ -3717,7 +4078,7 @@ def host_section(run, rep, host):
     else:
         rep.heading("== Health check on: %s ==" % host.name)
 
-    rep.host_label = host.label
+    rep.begin_section("host", host)
 
     # pool mode prints this in the pool status section; single mode has nowhere else to
     if not run.pool_mode and run.pw_has_backslash:
@@ -3733,24 +4094,7 @@ def host_section(run, rep, host):
     if run.pool_mode:
         rep.add_poolconf(host.label, host.pool_conf_text())
 
-    order = [
-        ("dom0_disk_usage", "Dom0 Disk Usage", checks.dom0_disk_usage),
-        ("dom0_memory", "Dom0 Memory", checks.dom0_memory),
-        ("mtu_issues", "MTU Issues", checks.mtu_issues),
-        ("dmesg_content", "Dmesg Content", checks.dmesg_content),
-        ("oom_events", "OOM Events", checks.oom_events),
-        ("crash_logs_present", "Crash Logs Present", checks.crash_logs),
-        ("coredumps_present", "Coredumps Present", checks.coredumps),
-        ("lacp_negotiation", "LACP Negotiation Issues", checks.lacp),
-        ("silly_mtus", "Silly MTUs", checks.silly_mtus),
-        ("dns_gw_non_mgmt_pifs", "DNS/GW on Non-Mgmt PIFs", checks.dns_gw_non_mgmt_pifs),
-        ("overlapping_subnets", "Overlapping Subnets", checks.overlapping_subnets),
-        ("log_errors", "Log Errors", checks.log_errors),
-        ("lun_assignments", "LUN Assignments", checks.lun_assignments),
-        ("smapi_hidden_leaves", "SMAPI Hidden Leaves", checks.smapi_hidden_leaves),
-        ("rebooted_after_updates", "Rebooted After Updates", checks.rebooted_after_updates),
-    ]
-    for toggle, key, fn in order:
+    for toggle, key, fn in per_host_checks():
         if gated(run, host, toggle):
             rep.check(key, fn, host)
 
@@ -3758,7 +4102,7 @@ def host_section(run, rep, host):
     if run.pool_mode and not run.host_solo() and gated(run, host, "yum_patch_level"):
         rep.check("Yum Patch Level", checks.yum_patch_level, host, host.is_master,
                   run.master_manifest())
-    rep.host_label = None
+    rep.end_section()
 
 
 def main(argv=None):
@@ -3778,6 +4122,8 @@ def main(argv=None):
             return 1
 
     args = run.parse_args(argv)
+    if run.json_output:
+        colors.init(force_off=True)
 
     work_dir = transport.make_work_dir()
     atexit.register(transport.cleanup_work_dir, work_dir)
@@ -3825,13 +4171,14 @@ def main(argv=None):
         # what it calls itself, once we have actually spoken to it
         run.master_name = master.name
 
-    rep = report.Report(run.filter_output)
+    rep = report.Report(run.filter_output, json_mode=run.json_output,
+                        meta=run_meta(run))
     if run.run_env != "host":
-        rep.host_label = "XOA"
+        rep.begin_section("xoa")
         rep.heading("== XOA Status ==")
         rep.add_all(xoa.lines(), "XOA")
+        rep.end_section()
         rep.blank()
-        rep.host_label = None
 
     if run.pool_mode:
         pool_status_section(run, rep)
@@ -3851,6 +4198,12 @@ def main(argv=None):
                 rep.heading("== Individual Hosts ==")
             for host in ordered:
                 host_section(run, rep, host)
+            # named in 'Unreachable Hosts' and given no block of their own; the
+            # document records them so a consumer walking hosts[] cannot simply not
+            # see a host that was meant to be checked
+            for host in run.hosts:
+                if not host.reachable:
+                    rep.unreachable_host(host)
         rep.print_poolconf_section()
     else:
         host_section(run, rep, run.hosts[0])
@@ -3889,17 +4242,17 @@ def _module(name, exported):
     return module
 
 
-config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MTU_DMESG_KEYWORDS', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'REMOTE_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_QCOW2_MAX_LINES'])
+config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MTU_DMESG_KEYWORDS', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'REMOTE_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_QCOW2_MAX_LINES'])
 colors = _module('colors', ['CYAN', 'GREEN', 'RESET', 'YELLOW', 'cyan', 'green', 'init', 'strip_ansi', 'yellow'])
 result = _module('result', ['FLAG', 'Fact', 'INFO', 'Line', 'MISSING', 'OK', 'UNKNOWN', 'flag', 'guard', 'info', 'ok', 'raw', 'unknown', 'wrap'])
 parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'SKIP_FILESYSTEMS', '_LINK_RE', '_MTU_RE', '_PARAM_RE', '_cidr_range', '_normalise', '_word_re', 'cap_lines', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'has_overlapping_subnets', 'manifest_diff', 'manifest_versions', 'parse_bond_slave_of', 'parse_df', 'parse_dns_gw_pifs', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_meminfo', 'parse_other_config', 'parse_pool_conf', 'parse_timedatectl', 'parse_xe_records', 'round_1dp'])
 model = _module('model', ['Host', 'Pool', 'ntp_match', 'ram_match'])
 collectorsrc = _module('collectorsrc', ['EMBEDDED', 'collector_source'])
-transport = _module('transport', ['BEGIN_MARKER', 'CollectError', 'END_MARKER', 'Transport', '_REMOTE_LAUNCH', '_REMOTE_LAUNCH_PINNED', '_kill_tree', '_remote_launch', 'cleanup_work_dir', 'debug', 'ensure_sshpass', 'have', 'make_work_dir', 'run_local_cmd'])
+transport = _module('transport', ['BEGIN_MARKER', 'CollectError', 'END_MARKER', 'Transport', '_DEBUG_LOCK', '_LIVE', '_LIVE_LOCK', '_REMOTE_LAUNCH', '_REMOTE_LAUNCH_PINNED', '_kill_tree', '_remote_launch', 'cleanup_work_dir', 'debug', 'ensure_sshpass', 'have', 'kill_all_children', 'make_work_dir', 'run_local_cmd'])
 xodb = _module('xodb', ['QUOTES', 'SELECT_NONE', 'SELECT_NO_MATCH', 'SELECT_OK', 'SELECT_QUIT', 'Server', '_ESCAPE_RE', '_KEY_RE', '_SIMPLE_ESCAPES', '_ls', '_sort_key', 'clean', 'enabled_servers', 'have_xo_server_db', 'password_for', 'pool_name_for_host', 'scan_records', 'select_pool', 'unescape'])
-checks = _module('checks', ['_linstor_has_rows', '_linstor_line', '_linstor_node_offline', '_network_line', '_render_scan_blocks', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_content', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mtu_issues', 'multipathing', 'ntp', 'oom_events', 'overlapping_subnets', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'vlan0', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_nodes', 'xostor_qcow2', 'xostor_ram', 'yum_patch_level'])
+checks = _module('checks', ['_linstor_has_rows', '_linstor_line', '_linstor_node_offline', '_network_line', '_render_scan_blocks', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_content', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mtu_issues', 'multipathing', 'ntp', 'oom_events', 'overlapping_subnets', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'task_timeout_override', 'vlan0', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_nodes', 'xostor_qcow2', 'xostor_ram', 'yum_patch_level'])
 xoa = _module('xoa', ['_dmesg', '_first_token', '_max_old_space', '_meminfo', '_os_version', '_updater', 'collect_xoa', 'debian_version_ok', 'lines', 'ping_silent', 'running_as_root'])
-report = _module('report', ['Report'])
+report = _module('report', ['Report', '_as_entry'])
 
 
 

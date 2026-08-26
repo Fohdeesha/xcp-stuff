@@ -36,6 +36,9 @@ Usage:
   - Use '-n' to pick a pool from xo-server-db by name instead of being prompted:
     the first pool whose name contains the text is used, matched anywhere in the
     name and ignoring case, so '-n sec' matches 'XEN-SECONDARY'
+  - Use '--json' to print the results as a JSON document instead of a report, for
+    cron and monitoring. Same checks, same exit code; '-f' narrows it the same way,
+    and everything that is not the document goes to stderr
 
   Examples:
   health.py 192.168.1.5
@@ -43,6 +46,7 @@ Usage:
   health.py -s 192.168.1.7 'mypass'
   health.py -n sec
   health.py -f -n 'xen-main'
+  health.py --json -n sec
   ```
 
 Exit code is **0** when everything passed, **1** when any check flagged, **2** for a usage
@@ -62,7 +66,7 @@ Python 3 only - no pip, no modules to install, nothing outside the standard libr
 
 **XCP-ng 8.2.1 dom0 has no `python3`**, so health.py cannot be run *on* an 8.2 host. Checking
 an 8.2.1 **pool from XOA** works exactly as it always has. For host mode on 8.2.1, use the
-frozen `health.sh` (v2.7) that lives beside it in this repo:
+frozen `health.sh` (v2.8) that lives beside it in this repo:
 
 ```
 # on an 8.2.1 host only:
@@ -97,14 +101,68 @@ python3 <(curl -fsSL https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/
   password otherwise produces the same report an XOA run does for that pool.
 - `-f` and `-s` apply as usual; `-n` is XOA-only and is rejected with an explanation.
 
+## Machine-readable output
+
+`--json` prints the same run as one JSON document instead of a report. Same checks, same
+exit code, and the document is the only thing on stdout - the banner, prompts and warnings
+all go to stderr, so `health.py --json -n sec | jq` works with nothing to strip first.
+
+```json
+{
+  "script_version": "3.1",
+  "run": { "environment": "xoa", "pool_mode": true, "filtered": false,
+           "target": "192.168.1.13", "pool_name": "XEN-SECONDARY",
+           "hosts_in_pool": 2, "hosts_attempted": 2, "hosts_checked": 1 },
+  "xoa":  { "checks": [ ... ] },
+  "pool": { "checks": [ ... ] },
+  "hosts": [
+    { "name": "xen-sec-01", "address": "192.168.1.13", "master": true, "reachable": true,
+      "pool_conf": "master",
+      "checks": [
+        { "key": "Dom0 Disk Usage", "value": "OK", "status": "ok", "flags": false },
+        { "key": "Log Errors", "value": "Yes, See Error Output", "status": "flag",
+          "flags": true, "detail": { "title": "Log Errors", "text": "..." } }
+      ] },
+    { "name": "xen-sec-02", "address": "192.168.1.34", "master": false,
+      "reachable": false, "error": "ssh to 192.168.1.34 failed (exit 255): ..." }
+  ],
+  "flagged": true,
+  "exit_code": 1
+}
+```
+
+Worth knowing:
+
+- **`flags` is the field to alert on**, not the colour and not `status`. A yellow line is
+  usually a finding, but `XOSTOR In Use: Yes` and a backslash in the root password are
+  facts rather than problems, and `flags` already encodes that rule.
+- **A host that could not be reached has no `checks` key at all** - not an empty one. An
+  empty list sums to zero findings, which is exactly the "looks healthy because we never
+  looked" claim the whole script is built to avoid. Check `reachable` and `error`.
+- **The three host counts are all reported** because they routinely differ: how many
+  members the pool has, how many this run put in scope (`-s`, a solo host run), and how
+  many actually answered.
+- **`-f` narrows the document exactly as it narrows the report** - so it still contains the
+  always-printed informational lines. For findings only, filter on `flags`, which is
+  cheaper and does not depend on how the run was invoked.
+- **There is no timestamp in the document**, deliberately: two runs of an unchanged pool
+  produce identical output, so diffing one against the last one says something.
+- On a usage error nothing is written to stdout at all, so stdout is always either a whole
+  valid document or empty - never a fragment that fails to parse for an invisible reason.
+
 ## How it works
 
-Every host is asked **once**. The script ships a small collector to it over ssh stdin (or
-runs it locally, in host mode), and the collector answers with one JSON document holding
-every fact the report needs. Nothing is written to the host, no shell quoting is involved,
-and each fact says either "here is the value" or "here is why I could not get it" - which
-is what keeps the report from ever printing a green line for something it never
-established.
+Every host is asked **once**, and the hosts are asked **at the same time** - up to eight at
+a time by default (`HEALTH_MAX_PARALLEL` changes it, `=1` makes it strictly sequential).
+The script ships a small collector to each host over ssh stdin (or runs it locally, in host
+mode), and the collector answers with one JSON document holding every fact the report
+needs. Nothing is written to the host, no shell quoting is involved, and each fact says
+either "here is the value" or "here is why I could not get it" - which is what keeps the
+report from ever printing a green line for something it never established.
+
+Collecting and reporting are separate passes, so running the hosts concurrently changes
+the wall clock and nothing else: the report is still written host by host, in order, and
+reads identically either way.
 
 The collector is written to the Python 2.7 / 3.6 intersection on purpose: 8.2.1 dom0 has
 only `python` (2.7.5), 8.3 has both, and that is what keeps 8.2.1 pools checkable from XOA.
@@ -117,11 +175,11 @@ only `python` (2.7.5), 8.3 has both, and that is what keeps 8.2.1 pools checkabl
 | `src/` | the sources it is built from, one module per concern |
 | `build/stitch.py` | builds `health.py` from `src/`; fails the build on a name collision or a collector that does not round-trip |
 | `tests/` | pytest, no network or hosts needed |
-| `health.sh` | the previous bash implementation, frozen at v2.7. Kept as the 8.2.1 host-mode fallback and the rollback path |
+| `health.sh` | the previous bash implementation, frozen at v2.8. Kept as the 8.2.1 host-mode fallback and the rollback path |
 
 ```
 python build/stitch.py     # rebuild health.py after changing src/
-python -m pytest tests/    # ~100 tests, all offline
+python -m pytest tests/    # ~150 tests, all offline
 ```
 
   ## Example Output

@@ -97,6 +97,56 @@ def test_count_yum_updates_empty():
     assert collector.count_yum_updates("Loaded plugins: x\n") == 0
 
 
+TASK_TIMEOUT_CONF = """# a drop-in that support left behind
+pending_task_timeout = 86400
+#pending_task_timeout = 1
+  pending_task_timeout=3600
+other_setting = 5
+xpending_task_timeout = 9
+"""
+
+
+def test_task_timeout_values_reads_only_live_settings():
+    # leading whitespace is allowed, a commented-out line is not a setting, and the key
+    # has to START the line - 'xpending_task_timeout' is a different setting entirely
+    assert collector.task_timeout_values(TASK_TIMEOUT_CONF) == ["86400", "3600"]
+
+
+def test_task_timeout_values_strips_all_whitespace_from_the_value():
+    # '1 hour' becomes '1hour': the line is a verbatim echo of whatever is configured,
+    # and this is what the bash script it was ported from does
+    assert collector.task_timeout_values("pending_task_timeout = 1 hour\n") == ["1hour"]
+    # a setting with no value at all is not a value
+    assert collector.task_timeout_values("pending_task_timeout =   \n") == []
+
+
+def test_task_timeout_values_on_nothing():
+    assert collector.task_timeout_values("") == []
+    assert collector.task_timeout_values("# nothing to see\n") == []
+
+
+def test_task_timeout_values_tolerates_crlf():
+    assert collector.task_timeout_values("pending_task_timeout = 42\r\n") == ["42"]
+
+
+def test_task_timeout_collection_states(tmp_path, monkeypatch):
+    # no drop-in directory at all is a real answer - 'no override' - not an error
+    monkeypatch.setattr(collector, "TASK_TIMEOUT_CONF_DIR", str(tmp_path / "absent"))
+    assert collector.collect_task_timeout_override() == {"ok": True, "value": []}
+
+    conf = tmp_path / "xapi.conf.d"
+    conf.mkdir()
+    monkeypatch.setattr(collector, "TASK_TIMEOUT_CONF_DIR", str(conf))
+    assert collector.collect_task_timeout_override() == {"ok": True, "value": []}
+
+    # files are read in name order, so the reported values do not shuffle between runs
+    (conf / "20-later.conf").write_text("pending_task_timeout = 2\n")
+    (conf / "10-first.conf").write_text("pending_task_timeout = 1\n")
+    (conf / ".10-first.conf.swp").write_text("pending_task_timeout = 999\n")
+    (conf / "subdir").mkdir()
+    assert collector.collect_task_timeout_override() == {"ok": True, "value": ["1", "2"]}
+
+
 def test_other_config_parse_matches_the_local_one():
     import parsers
     text = "xo:clientInfo:ab-cd: {\"a\":1}; xo:backupNetwork: 1234"

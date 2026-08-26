@@ -5,12 +5,17 @@ Collection and rendering are two phases: every host is gathered first, then the 
 report is written. That is what lets the Pool Status section state reachability before
 the per-host blocks appear, and it is why one broken host cannot leave a half-printed
 section behind it.
+
+It is also what lets the gathering run several hosts at a time without moving a line of
+output: the report is written afterwards, from run.hosts in order, so the concurrency is
+a wall-clock change and nothing else.
 """
 
 import atexit
 import getopt
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 import checks
 import colors
@@ -36,6 +41,9 @@ USAGE_XOA = """Usage:
   - Use '-n' to pick a pool from xo-server-db by name instead of being prompted:
     the first pool whose name contains the text is used, matched anywhere in the
     name and ignoring case, so '-n sec' matches 'XEN-SECONDARY'
+  - Use '--json' to print the results as a JSON document instead of a report, for
+    cron and monitoring. Same checks, same exit code; '-f' narrows it the same way,
+    and everything that is not the document goes to stderr
 
   Examples:
   %(prog)s 192.168.1.5
@@ -43,6 +51,7 @@ USAGE_XOA = """Usage:
   %(prog)s -s 192.168.1.7 'mypass'
   %(prog)s -n sec
   %(prog)s -f -n 'xen-main'
+  %(prog)s --json -n sec
 """
 
 USAGE_HOST = """Usage (running on an XCP-ng host):
@@ -60,11 +69,15 @@ USAGE_HOST = """Usage (running on an XCP-ng host):
     pool member, slave included
   - Use '-f' flag to filter output to only show issues found
   - Use '-s' flag to skip the pool-level section and only report on this host
+  - Use '--json' to print the results as a JSON document instead of a report, for
+    cron and monitoring. Same checks, same exit code; '-f' narrows it the same way,
+    and everything that is not the document goes to stderr
 
   Examples:
   %(prog)s
   %(prog)s -f
   %(prog)s 'mypass'
+  %(prog)s --json
 """
 
 
@@ -153,6 +166,7 @@ class Run(object):
         self.filter_output = False
         self.pool_mode = True
         self.name_filter = ""
+        self.json_output = False
         self.seed = ""
         self.password = ""
         self.pw_has_backslash = False
@@ -162,6 +176,7 @@ class Run(object):
         self.pool = model.Pool()
         self.master_address = ""
         self.master_name = ""
+        self.pool_name = ""
         self.pool_cmd_host = ""
         self.pool_size = 0
         self.all_addresses = []
@@ -186,8 +201,8 @@ class Run(object):
 
     def parse_args(self, argv):
         try:
-            opts, args = getopt.gnu_getopt(argv, "fhsn:",
-                                           ["filter", "help", "single", "name="])
+            opts, args = getopt.gnu_getopt(
+                argv, "fhsn:", ["filter", "help", "single", "name=", "json"])
         except getopt.GetoptError as exc:
             sys.stderr.write("%s\n" % exc)
             usage(self.run_env)
@@ -200,22 +215,34 @@ class Run(object):
                 self.pool_mode = False
             elif opt in ("-n", "--name"):
                 self.name_filter = value
+            elif opt == "--json":
+                self.json_output = True
         if len(args) > 2:
             usage(self.run_env)
         return args
 
 
-def print_banner(host, name):
+def notice(run, text):
+    """A message the rendered report puts on stdout.
+
+    Under --json stdout carries the document and nothing else, so these go to stderr
+    instead: a consumer's stdout is then either a whole valid document or empty, never a
+    mixture that fails to parse for a reason it cannot see.
+    """
+    (sys.stderr if run.json_output else sys.stdout).write(text)
+
+
+def print_banner(run, host, name):
     """Every run names what it is about to check, before any of the slow work.
 
     The paths that pick silently - the sole enabled pool, and cron/pipe runs - are exactly
     the ones where this line is the only record of which pool was taken.
     """
     if name:
-        sys.stdout.write("Checking pool: %s\n" % colors.green("%s (%s)" % (name, host)))
+        notice(run, "Checking pool: %s\n" % colors.green("%s (%s)" % (name, host)))
     else:
-        sys.stdout.write("Checking host: %s\n" % colors.green(host))
-    sys.stdout.write("\n")
+        notice(run, "Checking host: %s\n" % colors.green(host))
+    notice(run, "\n")
 
 
 def resolve_target_xoa(run, args):
@@ -260,8 +287,8 @@ def resolve_target_xoa(run, args):
     # not an ssh port, so it is stripped for ssh and we stay on 22
     run.transport.ssh_port = 22 if selected else port
 
-    pool_name = selected.name if selected else xodb.pool_name_for_host(host)
-    print_banner(host, pool_name)
+    run.pool_name = selected.name if selected else xodb.pool_name_for_host(host)
+    print_banner(run, host, run.pool_name)
 
     if not transport.ensure_sshpass(run.run_env):
         sys.stderr.write("ERROR: sshpass is required to reach the pool over ssh.\n")
@@ -276,9 +303,9 @@ def resolve_target_xoa(run, args):
         password, has_backslash = xodb.password_for(db_host)
         run.pw_has_backslash = has_backslash
         if not password:
-            sys.stdout.write("Host IP not found in xo-db, please manually provide a "
-                             "password, or check that the IP is the master host and not "
-                             "a slave\n")
+            notice(run, "Host IP not found in xo-db, please manually provide a "
+                        "password, or check that the IP is the master host and not "
+                        "a slave\n")
             sys.exit(1)
         run.password = password
     run.transport.password = run.password
@@ -363,7 +390,7 @@ def discover(run):
         name = result.wrap(payload, "hostname")
         shown = ("%s (%s)" % (name.value, address.value)
                  if name.ok and name.value else address.value)
-        print_banner(shown, "")
+        print_banner(run, shown, "")
 
     hosts_fact = result.wrap(payload, "pool_hosts")
     if not hosts_fact.ok:
@@ -406,25 +433,81 @@ def discover(run):
     return hosts
 
 
+def _collect_one(run, host, pool_spec):
+    """Gather one host. Anything it wants said is RETURNED, not printed.
+
+    A worker thread writing straight to stderr would interleave the messages in whatever
+    order the hosts happened to finish, which is not reproducible between runs; the caller
+    writes them out in host order instead.
+    """
+    # is_master is already settled (see main): it decides which checks run for this
+    # host, and therefore what has to be collected for them
+    spec = _host_spec(with_smapi=(not run.pool_mode or host.is_master
+                                  or config.POOL_RUN["smapi_hidden_leaves"]))
+    if run.pool_mode and host.address == run.pool_cmd_host:
+        spec = _merge(spec, pool_spec)
+    note = ""
+    try:
+        host.payload = run.transport.collect(host.address, spec)
+    except transport.CollectError as exc:
+        host.error = str(exc)
+        note = "Failed when trying to check %s: %s\n" % (host.address, exc)
+    host.local_now = _now()
+    return note
+
+
+def parallel_workers(host_count):
+    """How many hosts to gather at once.
+
+    Capped because the win is had by the time a handful are in flight, while the cost of
+    lifting the cap is real: every host in flight is an ssh process, a ControlMaster
+    socket and a collector holding a whole host's document in memory. HEALTH_MAX_PARALLEL
+    overrides it, and =1 restores the strictly sequential order - which is how the two are
+    diffed against each other.
+    """
+    limit = config.MAX_PARALLEL_HOSTS
+    override = os.environ.get("HEALTH_MAX_PARALLEL", "")
+    if override.isdigit() and int(override) > 0:
+        limit = int(override)
+    return max(1, min(limit, host_count))
+
+
+def _collect_in_parallel(run, pool_spec, workers):
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = [pool.submit(_collect_one, run, host, pool_spec) for host in run.hosts]
+        try:
+            return [f.result() for f in futures]
+        except BaseException:
+            # named and immediately re-raised, so this is not a swallowed error: the
+            # workers are blocked in communicate() and cannot see a ctrl-C, so without
+            # this the shutdown below would wait out every collector still running
+            transport.kill_all_children()
+            raise
+    finally:
+        pool.shutdown(wait=True)
+
+
 def collect_hosts(run):
-    """Phase B: one call per host. The pool-level questions ride along on the host they
-    are asked of, so the usual case is exactly one round trip per host."""
+    """Phase B: one call per host, several hosts at a time.
+
+    The pool-level questions ride along on the host they are asked of, so the usual case
+    is exactly one round trip per host. Hosts are wholly independent of each other - each
+    is its own ssh connection, its own collector process and its own slice of the
+    document - so gathering them concurrently changes nothing but the wall clock.
+    """
     controllers = run.all_addresses if run.host_solo() else [h.address for h in run.hosts]
     pool_spec = _pool_spec(controllers)
 
-    for host in run.hosts:
-        # is_master is already settled (see main): it decides which checks run for this
-        # host, and therefore what has to be collected for them
-        spec = _host_spec(with_smapi=(not run.pool_mode or host.is_master
-                                      or config.POOL_RUN["smapi_hidden_leaves"]))
-        if run.pool_mode and host.address == run.pool_cmd_host:
-            spec = _merge(spec, pool_spec)
-        try:
-            host.payload = run.transport.collect(host.address, spec)
-        except transport.CollectError as exc:
-            host.error = str(exc)
-            sys.stderr.write("Failed when trying to check %s: %s\n" % (host.address, exc))
-        host.local_now = _now()
+    workers = parallel_workers(len(run.hosts))
+    transport.debug("collecting %d host(s), %d at a time" % (len(run.hosts), workers))
+    if workers > 1:
+        notes = _collect_in_parallel(run, pool_spec, workers)
+    else:
+        notes = [_collect_one(run, host, pool_spec) for host in run.hosts]
+    for note in notes:
+        if note:
+            sys.stderr.write(note)
 
     if run.pool_mode:
         cmd_host = run.host_by_address(run.pool_cmd_host)
@@ -463,7 +546,7 @@ def _now():
 
 def pool_status_section(run, rep):
     rep.heading("== Pool Status ==")
-    rep.host_label = None
+    rep.begin_section("pool")
 
     if run.master_address:
         name = run.master_name or run.master_address
@@ -515,7 +598,58 @@ def pool_status_section(run, rep):
     rep.check("Migration Network", checks.migration_network, run.pool)
     rep.check("Backup Network", checks.backup_network, run.pool, run.run_env,
               xoa.ping_silent)
+    rep.end_section()
     rep.blank()
+
+
+def run_meta(run):
+    """What the run itself was, for the head of a --json document.
+
+    Three host counts, because they routinely differ and collapsing them would overclaim:
+    the pool has N members, -s or a solo run may put fewer than N in scope, and of those
+    some may not have answered. A consumer told only 'checked: 2' would read a run that
+    reached one host of two as a clean pool. It is the same distinction the Pool Status
+    section is careful to make in words.
+    """
+    return {"run": {
+        "environment": run.run_env,
+        "pool_mode": run.pool_mode,
+        "filtered": run.filter_output,
+        "target": run.seed,
+        "pool_name": run.pool_name or None,
+        "hosts_in_pool": run.pool_size,
+        "hosts_attempted": len(run.hosts),
+        "hosts_checked": len([h for h in run.hosts if h.reachable]),
+    }}
+
+
+def per_host_checks():
+    """(POOL_RUN toggle, line key, check) for every gated per-host line, in print order.
+
+    A function rather than a constant because in the stitched artifact every module body
+    runs before the module aliases exist, so a top-level list mentioning `checks.x` would
+    fail at import. It is also the table the tests enumerate, so a check added here cannot
+    quietly skip the rule that a missing fact answers Unknown.
+    """
+    return [
+        ("dom0_disk_usage", "Dom0 Disk Usage", checks.dom0_disk_usage),
+        ("dom0_memory", "Dom0 Memory", checks.dom0_memory),
+        ("mtu_issues", "MTU Issues", checks.mtu_issues),
+        ("dmesg_content", "Dmesg Content", checks.dmesg_content),
+        ("oom_events", "OOM Events", checks.oom_events),
+        ("crash_logs_present", "Crash Logs Present", checks.crash_logs),
+        ("coredumps_present", "Coredumps Present", checks.coredumps),
+        ("task_timeout_override", "XAPI Task Timeout Override",
+         checks.task_timeout_override),
+        ("lacp_negotiation", "LACP Negotiation Issues", checks.lacp),
+        ("silly_mtus", "Silly MTUs", checks.silly_mtus),
+        ("dns_gw_non_mgmt_pifs", "DNS/GW on Non-Mgmt PIFs", checks.dns_gw_non_mgmt_pifs),
+        ("overlapping_subnets", "Overlapping Subnets", checks.overlapping_subnets),
+        ("log_errors", "Log Errors", checks.log_errors),
+        ("lun_assignments", "LUN Assignments", checks.lun_assignments),
+        ("smapi_hidden_leaves", "SMAPI Hidden Leaves", checks.smapi_hidden_leaves),
+        ("rebooted_after_updates", "Rebooted After Updates", checks.rebooted_after_updates),
+    ]
 
 
 def gated(run, host, name):
@@ -543,7 +677,7 @@ def host_section(run, rep, host):
     else:
         rep.heading("== Health check on: %s ==" % host.name)
 
-    rep.host_label = host.label
+    rep.begin_section("host", host)
 
     # pool mode prints this in the pool status section; single mode has nowhere else to
     if not run.pool_mode and run.pw_has_backslash:
@@ -559,24 +693,7 @@ def host_section(run, rep, host):
     if run.pool_mode:
         rep.add_poolconf(host.label, host.pool_conf_text())
 
-    order = [
-        ("dom0_disk_usage", "Dom0 Disk Usage", checks.dom0_disk_usage),
-        ("dom0_memory", "Dom0 Memory", checks.dom0_memory),
-        ("mtu_issues", "MTU Issues", checks.mtu_issues),
-        ("dmesg_content", "Dmesg Content", checks.dmesg_content),
-        ("oom_events", "OOM Events", checks.oom_events),
-        ("crash_logs_present", "Crash Logs Present", checks.crash_logs),
-        ("coredumps_present", "Coredumps Present", checks.coredumps),
-        ("lacp_negotiation", "LACP Negotiation Issues", checks.lacp),
-        ("silly_mtus", "Silly MTUs", checks.silly_mtus),
-        ("dns_gw_non_mgmt_pifs", "DNS/GW on Non-Mgmt PIFs", checks.dns_gw_non_mgmt_pifs),
-        ("overlapping_subnets", "Overlapping Subnets", checks.overlapping_subnets),
-        ("log_errors", "Log Errors", checks.log_errors),
-        ("lun_assignments", "LUN Assignments", checks.lun_assignments),
-        ("smapi_hidden_leaves", "SMAPI Hidden Leaves", checks.smapi_hidden_leaves),
-        ("rebooted_after_updates", "Rebooted After Updates", checks.rebooted_after_updates),
-    ]
-    for toggle, key, fn in order:
+    for toggle, key, fn in per_host_checks():
         if gated(run, host, toggle):
             rep.check(key, fn, host)
 
@@ -584,7 +701,7 @@ def host_section(run, rep, host):
     if run.pool_mode and not run.host_solo() and gated(run, host, "yum_patch_level"):
         rep.check("Yum Patch Level", checks.yum_patch_level, host, host.is_master,
                   run.master_manifest())
-    rep.host_label = None
+    rep.end_section()
 
 
 def main(argv=None):
@@ -604,6 +721,8 @@ def main(argv=None):
             return 1
 
     args = run.parse_args(argv)
+    if run.json_output:
+        colors.init(force_off=True)
 
     work_dir = transport.make_work_dir()
     atexit.register(transport.cleanup_work_dir, work_dir)
@@ -651,13 +770,14 @@ def main(argv=None):
         # what it calls itself, once we have actually spoken to it
         run.master_name = master.name
 
-    rep = report.Report(run.filter_output)
+    rep = report.Report(run.filter_output, json_mode=run.json_output,
+                        meta=run_meta(run))
     if run.run_env != "host":
-        rep.host_label = "XOA"
+        rep.begin_section("xoa")
         rep.heading("== XOA Status ==")
         rep.add_all(xoa.lines(), "XOA")
+        rep.end_section()
         rep.blank()
-        rep.host_label = None
 
     if run.pool_mode:
         pool_status_section(run, rep)
@@ -677,6 +797,12 @@ def main(argv=None):
                 rep.heading("== Individual Hosts ==")
             for host in ordered:
                 host_section(run, rep, host)
+            # named in 'Unreachable Hosts' and given no block of their own; the
+            # document records them so a consumer walking hosts[] cannot simply not
+            # see a host that was meant to be checked
+            for host in run.hosts:
+                if not host.reachable:
+                    rep.unreachable_host(host)
         rep.print_poolconf_section()
     else:
         host_section(run, rep, run.hosts[0])

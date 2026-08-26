@@ -372,6 +372,59 @@ def collect_coredumps(coredump_dir):
     return fact(rows)
 
 
+TASK_TIMEOUT_CONF_DIR = "/etc/xapi.conf.d"
+_TASK_TIMEOUT_RE = re.compile(r"^\s*pending_task_timeout\s*=(.*)$")
+
+
+def task_timeout_values(text):
+    """The pending_task_timeout settings in one drop-in file's text.
+
+    All whitespace is stripped out of the value rather than just trimmed, so a setting
+    written as '1 hour' is reported as '1hour' - which is what the bash script this was
+    ported from does, and the line is a verbatim echo of the override either way.
+    A commented-out setting cannot match: the key has to start the line.
+    """
+    values = []
+    for line in text.replace("\r", "").split("\n"):
+        m = _TASK_TIMEOUT_RE.match(line)
+        if not m:
+            continue
+        value = re.sub(r"\s+", "", m.group(1))
+        if value:
+            values.append(value)
+    return values
+
+
+def collect_task_timeout_override():
+    """xapi's default pending_task_timeout lives in /etc/xapi.conf; a drop-in under
+    /etc/xapi.conf.d/ can override it for this host.
+
+    No directory and no matching line are both real answers ('no override'), which is why
+    they return an empty list rather than an error - but a directory we cannot read is
+    NOT, and says so, because 'no override found' would be a claim we did not establish.
+    Dot-files are skipped: the shell glob this replaces did not match them either, and
+    an editor's leftover .swp is not a live configuration file.
+    """
+    if not os.path.isdir(TASK_TIMEOUT_CONF_DIR):
+        return fact([])
+    try:
+        names = sorted(os.listdir(TASK_TIMEOUT_CONF_DIR))
+    except OSError as exc:
+        return err("could not list %s (%s)" % (TASK_TIMEOUT_CONF_DIR, exc))
+    values = []
+    for name in names:
+        if name.startswith("."):
+            continue
+        path = os.path.join(TASK_TIMEOUT_CONF_DIR, name)
+        if not os.path.isfile(path):
+            continue
+        text = read_file(path)
+        if text is None:
+            return err("could not read %s" % path)
+        values.extend(task_timeout_values(text))
+    return fact(values)
+
+
 def collect_smapi_hidden_leaves():
     """Live SMlog only - reading the rotated copy too was considered and declined."""
     path = "/var/log/SMlog"
@@ -897,6 +950,7 @@ def collect(spec):
         out["lacp"] = collect_lacp()
         out["crash_count"] = collect_crash_count(spec.get("crash_ignore_file") or "")
         out["coredumps"] = collect_coredumps(spec.get("coredump_dir") or "")
+        out["task_timeout"] = collect_task_timeout_override()
         out["rpm_manifest"] = collect_rpm_manifest()
         out.update(collect_patch_facts())
 

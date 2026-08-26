@@ -15,9 +15,17 @@ CYAN = ""
 RESET = ""
 
 
-def init(stream=None):
-    """Decide once whether this run is coloured. Called from main()."""
+def init(stream=None, force_off=False):
+    """Decide once whether this run is coloured. Called from main().
+
+    force_off is --json: a document is not read by a terminal, and colouring it would
+    mean every consumer had to strip the escape codes back out of every value. It beats
+    HEALTH_FORCE_COLOR, which exists to colour output for a human.
+    """
     global GREEN, YELLOW, CYAN, RESET
+    if force_off:
+        GREEN = YELLOW = CYAN = RESET = ""
+        return
     stream = stream if stream is not None else sys.stdout
     forced = os.environ.get("HEALTH_FORCE_COLOR", "0") == "1"
     try:

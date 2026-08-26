@@ -13,6 +13,11 @@ Contract, unchanged from the bash run_remote it replaces:
     the ssh multiplexing tree behind)
   * ControlMaster/ControlPersist so one real connection per host serves the whole run
   * the password lives in the child's environment only - never argv, never a file
+
+Several hosts are collected at once, so everything here is called from worker threads.
+Nothing in Transport is mutated during a collection - the password, port and collector
+source are all set before the first call - and the one piece of shared state that is
+written, the live-child registry below, has its own lock.
 """
 
 import base64
@@ -23,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 
 import collectorsrc
 import config
@@ -49,9 +55,37 @@ class CollectError(Exception):
     """Could not get a document out of a host. Never confused with 'the host is fine'."""
 
 
+_DEBUG_LOCK = threading.Lock()
+
+
 def debug(msg):
+    """Trace to stderr under HEALTH_DEBUG=1, one whole message at a time.
+
+    Worker threads all write here, and a TextIOWrapper gives no atomicity guarantee, so
+    the lock is what stops two hosts' traces from being spliced into one unreadable line.
+    """
     if os.environ.get("HEALTH_DEBUG") == "1":
-        sys.stderr.write("[health-debug] %s\n" % msg)
+        with _DEBUG_LOCK:
+            sys.stderr.write("[health-debug] %s\n" % msg)
+            sys.stderr.flush()
+
+
+# Every child process currently running, so an interrupted run can take the whole tree
+# down with it. start_new_session puts each child in its own session, which is what makes
+# the timeout killpg work - but it also means the terminal's ctrl-C never reaches them.
+# Serially that left one orphan ssh behind; with hosts collected concurrently the worker
+# threads cannot be interrupted at all, so without this an interrupt would sit for up to
+# REMOTE_CMD_TIMEOUT waiting for the last collector to finish on its own.
+_LIVE = set()
+_LIVE_LOCK = threading.Lock()
+
+
+def kill_all_children():
+    """Kill every child still running. For an interrupted run, not for normal shutdown."""
+    with _LIVE_LOCK:
+        procs = list(_LIVE)
+    for proc in procs:
+        _kill_tree(proc)
 
 
 def _remote_launch(blob):
@@ -85,6 +119,8 @@ def run_local_cmd(argv, timeout, env=None, stdin_text=None):
     except OSError as exc:
         return (127, "", "%s: %s" % (argv[0], exc))
 
+    with _LIVE_LOCK:
+        _LIVE.add(proc)
     payload = stdin_text.encode("utf-8") if stdin_text is not None else None
     try:
         out, err = proc.communicate(input=payload, timeout=timeout)
@@ -96,6 +132,14 @@ def run_local_cmd(argv, timeout, env=None, stdin_text=None):
         except subprocess.TimeoutExpired:
             out, err = b"", b""
         rc = 124
+    except KeyboardInterrupt:
+        # only ever raised in the MAIN thread, so this is the serial path; the child is in
+        # its own session and never saw the ctrl-C, so it has to be told
+        _kill_tree(proc)
+        raise
+    finally:
+        with _LIVE_LOCK:
+            _LIVE.discard(proc)
     return (rc,
             out.decode("utf-8", "backslashreplace") if out else "",
             err.decode("utf-8", "backslashreplace") if err else "")
