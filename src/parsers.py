@@ -1,0 +1,469 @@
+# -*- coding: utf-8 -*-
+"""Pure parsing. No I/O, no subprocesses, no globals.
+
+Everything in here takes text in and gives structured data out, which is why it is also
+where every unit test lives: this is where the bash script's real bugs were - the manifest
+diff that dropped duplicate package names, the util.inspect scan, the timedatectl label
+generations, the record splitting that merged two SRs' VDIs into one.
+"""
+
+import re
+
+# --------------------------------------------------------------------------------------
+# xe labelled output
+# --------------------------------------------------------------------------------------
+
+_PARAM_RE = re.compile(r"^\s*([A-Za-z0-9_.:-]+)\s*\(\s*[A-Z]{2}\s*\)\s*:\s?(.*)$")
+
+
+def parse_xe_records(text, start_key="uuid"):
+    """Split xe's labelled output into records.
+
+    A record starts at its start_key line and ends at the next one - NOT at a blank line.
+    Output that has been through a strip() or been glued together from two calls has only
+    a single newline between records, and paragraph splitting then merges the last record
+    of one block into the first of the next and silently drops an object.
+    """
+    records = []
+    current = None
+    for line in text.splitlines():
+        m = _PARAM_RE.match(line)
+        if not m:
+            continue
+        key, value = m.group(1), m.group(2).strip()
+        if key == start_key:
+            if current is not None:
+                records.append(current)
+            current = {}
+        if current is None:
+            continue
+        current[key] = value
+    if current is not None:
+        records.append(current)
+    return records
+
+
+def parse_host_list(text):
+    """xe host-list params=uuid,name-label,hostname,address,enabled,multipathing.
+
+    Parsed by label, never by position: xapi does not print the fields in the order they
+    were asked for.
+    """
+    hosts = []
+    for rec in parse_xe_records(text):
+        if not rec.get("uuid"):
+            continue
+        hosts.append({
+            "uuid": rec.get("uuid", ""),
+            "name_label": rec.get("name-label", ""),
+            "hostname": rec.get("hostname", ""),
+            "address": rec.get("address", ""),
+            "enabled": rec.get("enabled") or "Unknown",
+            "multipathing": rec.get("multipathing") or "Unknown",
+        })
+    return hosts
+
+
+def parse_dns_gw_pifs(text):
+    """True when any non-management PIF carries a gateway or a DNS server."""
+    for line in text.splitlines():
+        if not re.match(r"^\s*(gateway|DNS)\s*\([^)]*\)\s*:", line):
+            continue
+        value = line.split(":", 1)[1].strip() if ":" in line else ""
+        if value:
+            return True
+    return False
+
+
+BOND_MEMBER = 0
+BOND_NOT_MEMBER = 1
+BOND_NO_PIFS = 3
+
+
+def parse_bond_slave_of(text):
+    """Is the network a bond member?
+
+    A network uuid that no longer exists is answered rc 0 with NO output at all (measured
+    on 8.3.0, and quietly - no exception lands in xensource.log). Read as "no
+    bond-slave-of line, therefore not a bond member", that printed a green 'Configured'
+    for a pool whose xo:migrationNetwork points at a network somebody deleted. It gets its
+    own state instead: nothing about the network was established.
+    """
+    if "bond-slave-of" not in text:
+        return BOND_NO_PIFS
+    for line in text.splitlines():
+        if "bond-slave-of" not in line:
+            continue
+        value = line.split(":", 1)[1].strip() if ":" in line else ""
+        if value and value != "<not in database>":
+            return BOND_MEMBER
+    return BOND_NOT_MEMBER
+
+
+def parse_other_config(text):
+    """The map prints as 'key: value; key: value'.
+
+    Splitting records on ';' is safe for the keys looked up here, whose values are network
+    UUIDs. Note keys themselves contain colons (xo:clientInfo:<uuid>), so the split is at
+    the first ': ' - colon plus space - not at the first colon.
+    """
+    out = {}
+    for entry in text.split(";"):
+        entry = entry.strip()
+        idx = entry.find(": ")
+        if idx <= 0:
+            continue
+        out[entry[:idx].strip()] = entry[idx + 2:].strip()
+    return out
+
+
+# --------------------------------------------------------------------------------------
+# /proc, timedatectl, df, ip
+# --------------------------------------------------------------------------------------
+
+def parse_meminfo(text):
+    """(total_mb, avail_mb), or None when the numbers are not there.
+
+    None is the whole point: a percentage computed from a zero total is a green 0.0%,
+    which reads exactly like a healthy host when it actually means we never looked.
+    """
+    total = avail = None
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "MemTotal:" and parts[1].isdigit():
+            total = int(parts[1])
+        elif len(parts) >= 2 and parts[0] == "MemAvailable:" and parts[1].isdigit():
+            avail = int(parts[1])
+    if not total:
+        return None
+    if avail is None:
+        return None
+    return (total // 1024, avail // 1024)
+
+
+def parse_timedatectl(text):
+    """NTP enabled / synchronized, across both systemd label generations.
+
+    Older systemd (xcp-ng 8.x dom0) says 'NTP enabled' / 'NTP synchronized'; newer says
+    'NTP service' / 'System clock synchronized'. Both are accepted, and 'active' /
+    'inactive' are normalised to yes / no.
+    """
+    ntp = sync = "Unknown"
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        label, value = line.split(":", 1)
+        label = label.strip()
+        value = value.strip()
+        if label in ("NTP enabled", "NTP service"):
+            ntp = value
+        elif label in ("NTP synchronized", "System clock synchronized"):
+            sync = value
+    if ntp == "active":
+        ntp = "yes"
+    elif ntp == "inactive":
+        ntp = "no"
+    return {"ntp": ntp or "Unknown", "sync": sync or "Unknown"}
+
+
+def round_1dp(value):
+    """The one-decimal value the report prints.
+
+    Thresholds are applied to this, not to the full-precision figure, so the number on
+    the line and the number that decided the colour can never disagree.
+    """
+    return float("%.1f" % value)
+
+
+SKIP_FILESYSTEMS = ("tmpfs", "devtmpfs", "xenstore")
+
+
+def parse_df(text, max_used):
+    """Mount points over max_used%.
+
+    tmpfs/devtmpfs/xenstore are not disks, and /run/sr-mount/* are SRs rather than dom0
+    storage - a filling shared SR would otherwise flag every host in the pool for a
+    problem that is neither dom0's nor per-host.
+    """
+    bad = []
+    for line in text.splitlines():
+        parts = line.split(None, 5)
+        if len(parts) < 6:
+            continue
+        fs, _size, _used, _avail, usep, mount = parts
+        if fs == "Filesystem":
+            continue
+        if fs in SKIP_FILESYSTEMS:
+            continue
+        if mount.startswith("/run/sr-mount/"):
+            continue
+        if not usep.endswith("%"):
+            continue
+        digits = usep[:-1]
+        if not digits.isdigit():
+            continue
+        if int(digits) > max_used:
+            bad.append("%s is at %s%%" % (mount, digits))
+    return bad
+
+
+_LINK_RE = re.compile(r"^\d+:\s+(\S+?):?\s")
+_MTU_RE = re.compile(r"\smtu\s+(\d+)\s")
+
+
+def parse_link_mtus(text):
+    """[(ifname, mtu)] from 'ip -o link show', loopback excluded."""
+    out = []
+    for line in text.splitlines():
+        m = _LINK_RE.match(line)
+        if not m:
+            continue
+        name = m.group(1).rstrip(":")
+        if name == "lo":
+            continue
+        mm = _MTU_RE.search(line)
+        if not mm:
+            continue
+        out.append((name, mm.group(1)))
+    return out
+
+
+def parse_ipv4_addrs(text):
+    """[(ifname, 'a.b.c.d/len')] from 'ip -o -4 addr show', loopback excluded."""
+    out = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        name = parts[1]
+        if name in ("lo", "lo0"):
+            continue
+        for i, token in enumerate(parts):
+            if token == "inet" and i + 1 < len(parts):
+                out.append((name, parts[i + 1]))
+                break
+    return out
+
+
+def _cidr_range(cidr):
+    if "/" not in cidr:
+        return None
+    ip, plen = cidr.split("/", 1)
+    octets = ip.split(".")
+    if len(octets) != 4:
+        return None
+    try:
+        value = 0
+        for o in octets:
+            n = int(o)
+            if n < 0 or n > 255:
+                return None
+            value = value * 256 + n
+        bits = int(plen)
+    except ValueError:
+        return None
+    if bits < 0 or bits > 32:
+        return None
+    size = 1 << (32 - bits)
+    net = (value // size) * size
+    return (net, net + size - 1)
+
+
+def has_overlapping_subnets(entries):
+    """True when two DIFFERENT interfaces carry overlapping IPv4 ranges.
+
+    Several addresses on one interface are deliberate, not a fault, so same-interface
+    pairs are skipped.
+    """
+    ranges = []
+    for name, cidr in entries:
+        r = _cidr_range(cidr)
+        if r is not None:
+            ranges.append((name, r[0], r[1]))
+    if len(ranges) < 2:
+        return False
+    for i in range(len(ranges)):
+        for j in range(i + 1, len(ranges)):
+            if ranges[i][0] == ranges[j][0]:
+                continue
+            if not (ranges[i][2] < ranges[j][1] or ranges[j][2] < ranges[i][1]):
+                return True
+    return False
+
+
+def parse_lacp(text):
+    """True when any LACP port line is not 'current attached'.
+
+    OVS <= 2.16 (XCP-ng 8.2) writes 'slave: eth0: current attached'; OVS 2.17 (XCP-ng 8.3)
+    renamed it to 'member:'. Matching only 'slave:' made every 8.3 host a false green.
+    """
+    for line in text.splitlines():
+        if not re.match(r"^\s*(slave|member):", line):
+            continue
+        if not line.rstrip().endswith(": current attached"):
+            return True
+    return False
+
+
+def parse_pool_conf(text):
+    """('master', None) | ('slave', address) | (None, None)."""
+    first = (text or "").replace("\r", "").strip().splitlines()
+    if not first:
+        return (None, None)
+    line = first[0].strip()
+    low = line.lower()
+    if low == "master":
+        return ("master", None)
+    if low.startswith("slave:"):
+        addr = re.sub(r"\s+", "", line.split(":", 1)[1])
+        return ("slave", addr) if addr else (None, None)
+    return (None, None)
+
+
+# --------------------------------------------------------------------------------------
+# dmesg scanning
+# --------------------------------------------------------------------------------------
+
+def _normalise(line):
+    return re.sub(r"\s+", " ", line.lower())
+
+
+def _word_re(word):
+    """grep -iw: whole word, case-insensitive. Word characters are [A-Za-z0-9_], and a
+    newline is not one, so this anchors at line starts as well as at the string's."""
+    return re.compile(r"(^|[^A-Za-z0-9_])" + re.escape(word) + r"([^A-Za-z0-9_]|$)",
+                      re.IGNORECASE)
+
+
+def find_mtu_keywords(text, keywords):
+    """Whole-word, case-insensitive, on the raw text - and every match is collected.
+
+    Returning on the first hit meant the line could not say WHICH keyword tripped it.
+    """
+    found = []
+    for kw in keywords:
+        if _word_re(kw).search(text):
+            found.append(kw)
+    return found
+
+
+def dmesg_issue_lines(text, words, phrases, ignore_rules):
+    """1-based line numbers of dmesg lines that look like trouble.
+
+    A line is exempted when it contains ALL substrings of any one ignore rule - the
+    megaraid driver's "firmware crash dump : no" is the shipped example of a benign line
+    that matches an issue word.
+    """
+    lowered_words = [w.lower() for w in words if w]
+    lowered_phrases = [p.lower().strip() for p in phrases if p and p.strip()]
+    rules = []
+    for rule in ignore_rules:
+        subs = [_normalise(s).strip() for s in rule if s and s.strip()]
+        if subs:
+            rules.append(subs)
+    word_res = [_word_re(w) for w in lowered_words]
+
+    hits = []
+    for idx, line in enumerate(text.splitlines(), 1):
+        norm = _normalise(line)
+        if any(all(sub in norm for sub in rule) for rule in rules):
+            continue
+        if any(p in norm for p in lowered_phrases):
+            hits.append(idx)
+            continue
+        if any(r.search(norm) for r in word_res):
+            hits.append(idx)
+    return hits
+
+
+def find_phrase_lines(text, phrase):
+    low = phrase.lower()
+    return [i for i, line in enumerate(text.splitlines(), 1) if low in line.lower()]
+
+
+def context_block(text, line_numbers, ctx=3):
+    """+/- ctx lines around each hit, overlapping ranges merged, each line indented by 2.
+
+    Merged ranges are separated by a blank line, which is what makes a block with several
+    distant hits readable.
+    """
+    if not line_numbers:
+        return ""
+    lines = text.splitlines()
+    total = len(lines)
+    ranges = sorted((max(1, n - ctx), n + ctx) for n in line_numbers)
+    merged = []
+    start, end = ranges[0]
+    for s, e in ranges[1:]:
+        if s <= end + 1:
+            end = max(end, e)
+        else:
+            merged.append((start, end))
+            start, end = s, e
+    merged.append((start, end))
+
+    out = []
+    for i, (s, e) in enumerate(merged):
+        e = min(e, total)
+        for k in range(s, e + 1):
+            out.append("  " + lines[k - 1])
+        if i != len(merged) - 1:
+            out.append("")
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------------------
+# rpm manifests
+# --------------------------------------------------------------------------------------
+
+def manifest_versions(text):
+    """{name: 'v1, v2'} - a package NAME is NOT unique in an rpm manifest.
+
+    gpg-pubkey is installed twice on every dom0 here, and a host carries two kernels
+    between an update and the reboot that activates it. Keeping one entry per name
+    silently dropped all but the last, so a difference confined to a duplicated name
+    printed 'Mismatch, See Below' over a block that never mentioned it. Both manifests are
+    sorted, so joining each name's versions compares them as an ordered multiset.
+    """
+    out = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or " " not in line:
+            continue
+        name, version = line.split(" ", 1)
+        if name in out:
+            out[name] = out[name] + ", " + version
+        else:
+            out[name] = version
+    return out
+
+
+def manifest_diff(master_text, slave_text):
+    """The difference lines, sorted, exactly as the report prints them."""
+    master = manifest_versions(master_text)
+    slave = manifest_versions(slave_text)
+    lines = []
+    for name in slave:
+        if name not in master:
+            lines.append("Extra Package: %s %s" % (name, slave[name]))
+        elif slave[name] != master[name]:
+            lines.append("Does Not Match Master: %s %s (Master: %s %s)"
+                         % (name, slave[name], name, master[name]))
+    for name in master:
+        if name not in slave:
+            lines.append("Missing Package: %s %s" % (name, master[name]))
+    lines.sort()
+    return lines
+
+
+def cap_lines(lines, limit, noun):
+    """First `limit` lines plus a count of what was left out.
+
+    A silent cut reads as 'these are all of them' when it is not - the same reasoning
+    behind the coredump and package-difference caps.
+    """
+    if limit and len(lines) > limit:
+        shown = list(lines[:limit])
+        shown.append("(plus %d %s not listed)" % (len(lines) - limit, noun))
+        return shown
+    return list(lines)

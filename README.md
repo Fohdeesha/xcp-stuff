@@ -4,17 +4,17 @@ Home of the XCP-ng infra health check script & misc xcp tooling
 ## how to use
 ```
 # from XOA as root (no args = interactive menu to choose pool):
-bash <(curl -fsSL https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/health.sh)
+python3 <(curl -fsSL https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/health.py)
 
 # With args:
-bash <(curl -fsSL https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/health.sh) -n mainpool
+python3 <(curl -fsSL https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/health.py) -n mainpool
 ```
 That first command works just the same run directly on an XCP-ng host as root - the script
 looks at `/etc/os-release` to see where it is and adapts. See
 [Running it on an XCP-ng host](#running-it-on-an-xcp-ng-host-instead-of-xoa) below for what
 differs there (`-n` is the one flag that doesn't apply, it needs XOA's database).
 
-Run the health.sh script on an XOA appliance with no arguments, it will pull pool/host information from XOA's database.  
+Run health.py on an XOA appliance with no arguments, it will pull pool/host information from XOA's database.
 
 - If XOA is connected to more than one pool, it lists the enabled pools and asks which one to check
 - You can also provide a pool's name or part of a name with "-n", (for example, "-n pri" would match XEN-PRIMARY) or by giving the IP of the pool master directly
@@ -22,9 +22,9 @@ Run the health.sh script on an XOA appliance with no arguments, it will pull poo
 - If the host/pool is not in XOA, you can manually specify the pool master IP and password
 - If the host it's checking is part of a pool, it will health check every pool member, unless you provide "-s" for single host check only
 ```
-[03:34 14] xoa:~$ ./health.sh --help
+[03:34 14] xoa:~$ ./health.py --help
 Usage:
-  ./health.sh [-f] [-s] [-n name] [pool_master_or_host[:ssh_port] [root_password]]
+  health.py [-f] [-s] [-n name] [pool_master_or_host[:ssh_port] [root_password]]
 
   - All parameters are optional
   - If a host is not supplied, the enabled pools in xo-server-db are listed to pick from
@@ -38,12 +38,36 @@ Usage:
     name and ignoring case, so '-n sec' matches 'XEN-SECONDARY'
 
   Examples:
-  ./health.sh 192.168.1.5
-  ./health.sh 192.168.1.6 'mypass'
-  ./health.sh -s 192.168.1.7 'mypass'
-  ./health.sh -n sec
-  ./health.sh -f -n 'xen-main'
+  health.py 192.168.1.5
+  health.py 192.168.1.6 'mypass'
+  health.py -s 192.168.1.7 'mypass'
+  health.py -n sec
+  health.py -f -n 'xen-main'
   ```
+
+Exit code is **0** when everything passed, **1** when any check flagged, **2** for a usage
+error - so a wrapper or cron job can tell "you typed the flag wrong" from "the pool has a
+problem". Nothing is installed and nothing is written on the hosts; the only exception is
+`sshpass`, and only in the one case described below.
+
+## Requirements
+
+Python 3 only - no pip, no modules to install, nothing outside the standard library.
+
+| | needs |
+|---|---|
+| XOA (Debian 11+) | `python3` (Debian ships it; XOA has 3.11) |
+| XCP-ng / XenServer host, 8.3+ | `python3` (dom0 ships 3.6.8) |
+| XCP-ng hosts being *checked from XOA* | nothing - the collector runs under the `python` that every dom0 has, 8.2.1 included |
+
+**XCP-ng 8.2.1 dom0 has no `python3`**, so health.py cannot be run *on* an 8.2 host. Checking
+an 8.2.1 **pool from XOA** works exactly as it always has. For host mode on 8.2.1, use the
+frozen `health.sh` (v2.7) that lives beside it in this repo:
+
+```
+# on an 8.2.1 host only:
+bash <(curl -fsSL https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/health.sh)
+```
 
 ## Running it on an XCP-ng host instead of XOA
 
@@ -51,8 +75,8 @@ The same script can be run directly on a host - it looks at `/etc/os-release` an
 Useful when there is no XOA to hand, or when XOA cannot reach the pool.
 
 ```
-# on the host, as root:
-bash <(curl -fsSL https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/health.sh)
+# on the host, as root (8.3 or newer):
+python3 <(curl -fsSL https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/health.py)
 ```
 
 - **This host is always checked**, using local commands - no ssh and no password involved.
@@ -72,6 +96,33 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/hea
 - The XOA section is never printed (there is no appliance). Running on a host with a
   password otherwise produces the same report an XOA run does for that pool.
 - `-f` and `-s` apply as usual; `-n` is XOA-only and is rejected with an explanation.
+
+## How it works
+
+Every host is asked **once**. The script ships a small collector to it over ssh stdin (or
+runs it locally, in host mode), and the collector answers with one JSON document holding
+every fact the report needs. Nothing is written to the host, no shell quoting is involved,
+and each fact says either "here is the value" or "here is why I could not get it" - which
+is what keeps the report from ever printing a green line for something it never
+established.
+
+The collector is written to the Python 2.7 / 3.6 intersection on purpose: 8.2.1 dom0 has
+only `python` (2.7.5), 8.3 has both, and that is what keeps 8.2.1 pools checkable from XOA.
+
+## Repo layout
+
+| | |
+|---|---|
+| `health.py` | the published artifact - one file, no install. **Generated**; do not edit |
+| `src/` | the sources it is built from, one module per concern |
+| `build/stitch.py` | builds `health.py` from `src/`; fails the build on a name collision or a collector that does not round-trip |
+| `tests/` | pytest, no network or hosts needed |
+| `health.sh` | the previous bash implementation, frozen at v2.7. Kept as the 8.2.1 host-mode fallback and the rollback path |
+
+```
+python build/stitch.py     # rebuild health.py after changing src/
+python -m pytest tests/    # ~100 tests, all offline
+```
 
   ## Example Output
 
