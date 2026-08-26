@@ -25,12 +25,6 @@ def build(rep):
     host_b = model.Host("10.0.0.2", "uuid-b", "beta")
     host_b.error = "ssh to 10.0.0.2 failed (exit 255)"
 
-    rep.begin_section("xoa")
-    rep.heading("== XOA Status ==")
-    rep.add(result.ok("Registration", "someone@example.com"))
-    rep.add(result.flag("XOA Status", "Updates available"))
-    rep.end_section()
-
     rep.heading("== Pool Status ==")
     rep.begin_section("pool")
     rep.add(result.info("Pool Master", "alpha (10.0.0.1)"))
@@ -47,6 +41,15 @@ def build(rep):
 
     rep.unreachable_host(host_b)
     rep.print_poolconf_section()
+
+    # last, the way main() writes it: the appliance's own section has nothing to do with
+    # the pool that was asked about, and runs on its own thread while the hosts are
+    # collected
+    rep.begin_section("xoa")
+    rep.heading("== XOA Status ==")
+    rep.add(result.ok("Registration", "someone@example.com"))
+    rep.add(result.flag("XOA Status", "Updates available"))
+    rep.end_section()
     return rep.finish()
 
 
@@ -218,6 +221,39 @@ def test_no_timestamp_so_two_runs_of_a_stable_pool_diff_to_nothing():
     first = run_both()[2]
     second = run_both()[2]
     assert first == second
+
+
+def test_the_document_shape_does_not_follow_the_report_order():
+    """The XOA section moved to the end of the REPORT. The document did not move with it.
+
+    A consumer diffing one run against another - which is the whole point of a document
+    with no timestamp in it - should not see keys change places because the report was
+    reordered for a human's benefit.
+    """
+    colors.init(io.StringIO())
+    order = []
+    for kinds in (("xoa", "pool"), ("pool", "xoa")):
+        rep = report.Report(False, io.StringIO(), json_mode=True)
+        for kind in kinds:
+            rep.begin_section(kind)
+            rep.add(result.ok("K", "v"))
+            rep.end_section()
+        rep.finish()
+        order.append(list(json.loads(rep.stream.getvalue()).keys()))
+    assert order[0] == order[1]
+    assert order[0] == ["script_version", "xoa", "pool", "hosts", "flagged", "exit_code"]
+
+
+def test_a_section_nobody_named_still_reaches_the_document():
+    """SECTION_ORDER is a preference, not a filter: a kind added later must not vanish."""
+    colors.init(io.StringIO())
+    rep = report.Report(False, io.StringIO(), json_mode=True)
+    rep.begin_section("something_new")
+    rep.add(result.ok("K", "v"))
+    rep.end_section()
+    rep.finish()
+    doc = json.loads(rep.stream.getvalue())
+    assert doc["something_new"]["checks"][0]["key"] == "K"
 
 
 def test_colours_are_forced_off_even_when_the_environment_asks_for_them(monkeypatch):

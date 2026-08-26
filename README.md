@@ -164,6 +164,16 @@ Collecting and reporting are separate passes, so running the hosts concurrently 
 the wall clock and nothing else: the report is still written host by host, in order, and
 reads identically either way.
 
+The `== XOA Status ==` section - the appliance checking itself - runs on its own thread
+alongside the pool and is printed **last**, after the hosts. It shares nothing with them,
+so there is no reason for its `xoa-updater` and `xoa check` calls to stand in front of
+results that are ready. Measured across three pools, that turned 2.9 s of blocking into a
+0-1.3 s wait at the very end, depending on how much host work there was to hide it behind.
+`xo-server-db` is likewise read exactly once per run: one `ls server` returns every record,
+password field included, and costs the same as a narrower query, so the second call the
+password lookup used to make was re-reading what was already in hand. Between them those
+two changes took a typical run from 11-13 s to 6 s.
+
 The collector is written to the Python 2.7 / 3.6 intersection on purpose: 8.2.1 dom0 has
 only `python` (2.7.5), 8.3 has both, and that is what keeps 8.2.1 pools checkable from XOA.
 

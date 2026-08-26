@@ -4,6 +4,11 @@
 All local commands, all timed out individually - a wedged xoa-updater that answers one
 call and hangs on the next used to stall the whole run. A timeout degrades to a yellow
 Unknown; it never kills the report.
+
+lines() is called from a worker thread (main._Background) while the pool is being
+collected, and its result is printed after the hosts. So nothing in here may write to
+stdout or stderr, or mutate anything a check reads - it builds Lines and returns them,
+and everything it runs goes through transport.run_local_cmd, which is thread-safe.
 """
 
 import os

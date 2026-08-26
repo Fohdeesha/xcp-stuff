@@ -166,6 +166,13 @@ class Report(object):
         self.heading("---pool.conf contents---")
         self.write_raw("".join(self._poolconf))
 
+    # The document's shape is fixed here rather than left to follow whatever order the
+    # rendered report happens to print its sections in. The XOA section moved to the end
+    # of the report - after the hosts it has nothing to do with - and the document did not
+    # move with it. Anything not named here still lands, after these, rather than
+    # vanishing because someone added a section and not a name.
+    SECTION_ORDER = ("xoa", "pool")
+
     def document(self):
         """The whole run as one JSON-ready object.
 
@@ -176,13 +183,17 @@ class Report(object):
         doc = {"script_version": config.SCRIPT_VERSION}
         doc.update(self.meta)
         hosts = []
+        buckets = {}
         for section in self._sections:
             body = dict(section)
             kind = body.pop("kind")
             if kind == "host":
                 hosts.append(body)
             else:
-                doc[kind] = body
+                buckets[kind] = body
+        for kind in ([k for k in self.SECTION_ORDER if k in buckets]
+                     + [k for k in buckets if k not in self.SECTION_ORDER]):
+            doc[kind] = buckets[kind]
         doc["hosts"] = hosts
         doc["flagged"] = self.flagged
         doc["exit_code"] = 1 if self.flagged else 0

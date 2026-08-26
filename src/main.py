@@ -9,12 +9,19 @@ section behind it.
 It is also what lets the gathering run several hosts at a time without moving a line of
 output: the report is written afterwards, from run.hosts in order, so the concurrency is
 a wall-clock change and nothing else.
+
+The '== XOA Status ==' section is the same idea taken one step further. It asks the
+appliance about itself and shares nothing with the pool, so it runs on its own thread from
+the moment the target is known and is printed LAST, after the hosts. It used to run at
+render time and print first: ~2.9s spent after every host had already answered, in front
+of results that had been ready the whole time.
 """
 
 import atexit
 import getopt
 import os
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import checks
@@ -704,6 +711,51 @@ def host_section(run, rep, host):
     rep.end_section()
 
 
+class _Background(object):
+    """Run one function on a thread now, collect what it returned later.
+
+    Used for the '== XOA Status ==' section, which asks the appliance about itself and so
+    shares nothing at all with the pool: not a command, not a file, not a connection. It
+    used to run at render time, in front of everything it had no bearing on, and its ~2.9s
+    of xoa-updater and 'xoa check' calls were 2.9s in which nothing else happened.
+
+    Daemon, so an early sys.exit - an unreadable xo-db, a seed that would not answer -
+    is not held up by a 'xoa check' with XOA_CHECK_TIMEOUT still to run. The exception is
+    carried across the thread boundary and re-raised in result() rather than swallowed:
+    the section blew the run up when it ran inline, and it still does - only now the host
+    results are already on screen instead of being lost with it.
+    """
+
+    def __init__(self, fn):
+        self._value = None
+        self._error = None
+        self._thread = threading.Thread(target=self._run, args=(fn,))
+        self._thread.daemon = True
+        self._thread.start()
+
+    def _run(self, fn):
+        try:
+            self._value = fn()
+        except Exception as exc:
+            # not a swallowed error and not a decision: it is held so that result() can
+            # raise it in the main thread, exactly as an inline call would have
+            self._error = exc
+
+    def result(self):
+        """Wait for it and answer, or raise what it raised.
+
+        Bounded by the timeouts on the individual commands - LOCAL_CMD_TIMEOUT each and
+        XOA_CHECK_TIMEOUT for 'xoa check' - which are the section's designed defence
+        against a wedged updater. A second deadline here would only be able to report an
+        Unknown the section can already report for itself, and could cut off a slow but
+        perfectly healthy answer.
+        """
+        self._thread.join()
+        if self._error is not None:
+            raise self._error
+        return self._value
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     colors.init()
@@ -725,6 +777,12 @@ def main(argv=None):
         colors.init(force_off=True)
 
     work_dir = transport.make_work_dir()
+    # Registered before the work dir's cleanup so it runs first (atexit is LIFO): the
+    # children hold the ControlPath sockets that live in it. On a run that finishes this
+    # is a no-op - nothing is left running by then. It is for the exits that do not:
+    # sys.exit on an unreadable xo-db or a seed that will not answer, with the XOA
+    # section's daemon thread still part way through a 'xoa check'.
+    atexit.register(transport.kill_all_children)
     atexit.register(transport.cleanup_work_dir, work_dir)
     run.transport = transport.Transport(run.run_env, work_dir)
 
@@ -740,6 +798,26 @@ def main(argv=None):
         argument_password = resolve_target_host_mode(run, args)
     else:
         resolve_target_xoa(run, args)
+
+    # The appliance's own section starts here and is not looked at again until the report
+    # has nothing left to say about the pool. Here, and not at the top of main(), on
+    # measurement rather than taste - 5 runs of each, on the 2-core appliance an XOA
+    # actually is:
+    #
+    #   -n sec (2 hosts)   6.33s from the top | 6.23s here      -n east (remote)  7.04 | 6.49
+    #   -n primary (1 host)     5.52          | 6.19            -s slave + pw     6.29 | 6.15
+    #   -n nomatch (error)      3.95          | 3.39  (old script: 3.40)
+    #
+    # A wash on average, and better here in four cases of five. Started at the top it
+    # spends its first 3.3s fighting xo-server-db - both are node, and there are two
+    # cores - whereas from here it runs against the host collection, which is waiting on
+    # ssh and leaves the CPU idle. It also leaves every exit above untouched: a pool name
+    # that matched nothing, an unreadable xo-db, the interactive picker, the sshpass
+    # install. Those cost the run nothing, exactly as before.
+    #
+    # The one case it loses is a single fast host, where there is under 2s of collection
+    # to hide 2.9s of appliance behind. Do not move it back without re-measuring all five.
+    xoa_worker = _Background(xoa.lines) if run.run_env != "host" else None
 
     hosts = discover(run)
 
@@ -772,12 +850,6 @@ def main(argv=None):
 
     rep = report.Report(run.filter_output, json_mode=run.json_output,
                         meta=run_meta(run))
-    if run.run_env != "host":
-        rep.begin_section("xoa")
-        rep.heading("== XOA Status ==")
-        rep.add_all(xoa.lines(), "XOA")
-        rep.end_section()
-        rep.blank()
 
     if run.pool_mode:
         pool_status_section(run, rep)
@@ -806,6 +878,19 @@ def main(argv=None):
         rep.print_poolconf_section()
     else:
         host_section(run, rep, run.hosts[0])
+
+    # Last, and only now waited for. It is about the appliance rather than about the pool
+    # that was asked about, so it has no business standing in front of the host results -
+    # and by here it has almost always finished on its thread, making it free.
+    if xoa_worker is not None:
+        if not run.pool_mode:
+            # every section is preceded by exactly one blank line; in pool mode the
+            # pool.conf block already ends in one
+            rep.blank()
+        rep.begin_section("xoa")
+        rep.heading("== XOA Status ==")
+        rep.add_all(xoa_worker.result(), "XOA")
+        rep.end_section()
 
     return rep.finish()
 

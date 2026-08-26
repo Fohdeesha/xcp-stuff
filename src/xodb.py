@@ -158,6 +158,9 @@ def have_xo_server_db():
     return transport.have("xo-server-db")
 
 
+_ALL_SERVERS = None     # the one `xo-server-db ls server` scan; None until it is read
+
+
 def _ls(args):
     rc, out, err = transport.run_local_cmd(["xo-server-db", "ls"] + list(args),
                                            timeout=config.LOCAL_CMD_TIMEOUT * 3)
@@ -166,13 +169,43 @@ def _ls(args):
     return out
 
 
+def all_servers():
+    """Every server record in the db, read once per run.
+
+    One `xo-server-db ls server` costs ~3.3s on the test appliance, and a narrower query
+    costs exactly the same: it is node starting up, loading xo-server's app-conf and
+    opening a redis connection, not the query. It also answers with WHOLE records -
+    password field included, disabled servers as well as enabled ones. Measured against
+    the indexed `host=` lookup on the live db: 7/7 records, every field equal, passwords
+    equal.
+
+    So the second call the password lookup used to make spent 3.3s re-reading what was
+    already in hand, and a run that also had to name its pool made a third. That was
+    ~55% of the wall clock of a whole health check.
+
+    Read from the main thread only, before any host is contacted; nothing else in a run
+    touches it, so the cache needs no lock.
+    """
+    global _ALL_SERVERS
+    if _ALL_SERVERS is None:
+        out = _ls(["server"])
+        # a db that could not be read is cached as empty: every caller already treats
+        # "no such record" and "could not ask" the same way, and asking again would cost
+        # another 3.3s to fail again
+        _ALL_SERVERS = scan_records(out) if out is not None else []
+    return _ALL_SERVERS
+
+
+def reset_cache():
+    """Forget the scan. For tests - a real run reads the db once and then exits."""
+    global _ALL_SERVERS
+    _ALL_SERVERS = None
+
+
 def enabled_servers():
     """The enabled pools, sorted for display. [] if the db has none we can use."""
-    out = _ls(["server"])
-    if out is None:
-        return []
     rows = []
-    for rec in scan_records(out):
+    for rec in all_servers():
         if str(rec.get("enabled")) != "true" or not rec.get("host"):
             continue
         # poolNameLabel only exists once XO has connected to the pool at least once, so
@@ -190,18 +223,20 @@ def enabled_servers():
 def password_for(host):
     """(password, has_backslash) or (None, False).
 
-    host= is an indexed lookup, so at most one record comes back.
+    Answered out of the one scan rather than with a second `xo-server-db ls server
+    host=...`: the indexed query returns the same record field for field and costs another
+    3.3s (see all_servers).
+
+    Searched across ALL records, not the enabled ones - a host given as an argument may
+    well be a server XO has disabled, and the indexed lookup found its password before.
     """
-    out = _ls(["server", "host=" + host])
-    if out is None:
-        return (None, False)
-    records = scan_records(out)
-    if not records:
-        return (None, False)
-    pwd = records[0].get("password")
-    if not pwd:
-        return (None, False)
-    return (pwd, "\\" in pwd)
+    for rec in all_servers():
+        if rec.get("host") == host:
+            pwd = rec.get("password")
+            if not pwd:
+                return (None, False)
+            return (pwd, "\\" in pwd)
+    return (None, False)
 
 
 def pool_name_for_host(want):

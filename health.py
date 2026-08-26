@@ -42,7 +42,7 @@ import unicodedata
 # ======================================================================================
 # --- config ----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "3.1"
+SCRIPT_VERSION = "3.2"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
@@ -2320,6 +2320,9 @@ def have_xo_server_db():
     return transport.have("xo-server-db")
 
 
+_ALL_SERVERS = None     # the one `xo-server-db ls server` scan; None until it is read
+
+
 def _ls(args):
     rc, out, err = transport.run_local_cmd(["xo-server-db", "ls"] + list(args),
                                            timeout=config.LOCAL_CMD_TIMEOUT * 3)
@@ -2328,13 +2331,43 @@ def _ls(args):
     return out
 
 
+def all_servers():
+    """Every server record in the db, read once per run.
+
+    One `xo-server-db ls server` costs ~3.3s on the test appliance, and a narrower query
+    costs exactly the same: it is node starting up, loading xo-server's app-conf and
+    opening a redis connection, not the query. It also answers with WHOLE records -
+    password field included, disabled servers as well as enabled ones. Measured against
+    the indexed `host=` lookup on the live db: 7/7 records, every field equal, passwords
+    equal.
+
+    So the second call the password lookup used to make spent 3.3s re-reading what was
+    already in hand, and a run that also had to name its pool made a third. That was
+    ~55% of the wall clock of a whole health check.
+
+    Read from the main thread only, before any host is contacted; nothing else in a run
+    touches it, so the cache needs no lock.
+    """
+    global _ALL_SERVERS
+    if _ALL_SERVERS is None:
+        out = _ls(["server"])
+        # a db that could not be read is cached as empty: every caller already treats
+        # "no such record" and "could not ask" the same way, and asking again would cost
+        # another 3.3s to fail again
+        _ALL_SERVERS = scan_records(out) if out is not None else []
+    return _ALL_SERVERS
+
+
+def reset_cache():
+    """Forget the scan. For tests - a real run reads the db once and then exits."""
+    global _ALL_SERVERS
+    _ALL_SERVERS = None
+
+
 def enabled_servers():
     """The enabled pools, sorted for display. [] if the db has none we can use."""
-    out = _ls(["server"])
-    if out is None:
-        return []
     rows = []
-    for rec in scan_records(out):
+    for rec in all_servers():
         if str(rec.get("enabled")) != "true" or not rec.get("host"):
             continue
         # poolNameLabel only exists once XO has connected to the pool at least once, so
@@ -2352,18 +2385,20 @@ def enabled_servers():
 def password_for(host):
     """(password, has_backslash) or (None, False).
 
-    host= is an indexed lookup, so at most one record comes back.
+    Answered out of the one scan rather than with a second `xo-server-db ls server
+    host=...`: the indexed query returns the same record field for field and costs another
+    3.3s (see all_servers).
+
+    Searched across ALL records, not the enabled ones - a host given as an argument may
+    well be a server XO has disabled, and the indexed lookup found its password before.
     """
-    out = _ls(["server", "host=" + host])
-    if out is None:
-        return (None, False)
-    records = scan_records(out)
-    if not records:
-        return (None, False)
-    pwd = records[0].get("password")
-    if not pwd:
-        return (None, False)
-    return (pwd, "\\" in pwd)
+    for rec in all_servers():
+        if rec.get("host") == host:
+            pwd = rec.get("password")
+            if not pwd:
+                return (None, False)
+            return (pwd, "\\" in pwd)
+    return (None, False)
 
 
 def pool_name_for_host(want):
@@ -3368,6 +3403,13 @@ class Report(object):
         self.heading("---pool.conf contents---")
         self.write_raw("".join(self._poolconf))
 
+    # The document's shape is fixed here rather than left to follow whatever order the
+    # rendered report happens to print its sections in. The XOA section moved to the end
+    # of the report - after the hosts it has nothing to do with - and the document did not
+    # move with it. Anything not named here still lands, after these, rather than
+    # vanishing because someone added a section and not a name.
+    SECTION_ORDER = ("xoa", "pool")
+
     def document(self):
         """The whole run as one JSON-ready object.
 
@@ -3378,13 +3420,17 @@ class Report(object):
         doc = {"script_version": config.SCRIPT_VERSION}
         doc.update(self.meta)
         hosts = []
+        buckets = {}
         for section in self._sections:
             body = dict(section)
             kind = body.pop("kind")
             if kind == "host":
                 hosts.append(body)
             else:
-                doc[kind] = body
+                buckets[kind] = body
+        for kind in ([k for k in self.SECTION_ORDER if k in buckets]
+                     + [k for k in buckets if k not in self.SECTION_ORDER]):
+            doc[kind] = buckets[kind]
         doc["hosts"] = hosts
         doc["flagged"] = self.flagged
         doc["exit_code"] = 1 if self.flagged else 0
@@ -4105,6 +4151,51 @@ def host_section(run, rep, host):
     rep.end_section()
 
 
+class _Background(object):
+    """Run one function on a thread now, collect what it returned later.
+
+    Used for the '== XOA Status ==' section, which asks the appliance about itself and so
+    shares nothing at all with the pool: not a command, not a file, not a connection. It
+    used to run at render time, in front of everything it had no bearing on, and its ~2.9s
+    of xoa-updater and 'xoa check' calls were 2.9s in which nothing else happened.
+
+    Daemon, so an early sys.exit - an unreadable xo-db, a seed that would not answer -
+    is not held up by a 'xoa check' with XOA_CHECK_TIMEOUT still to run. The exception is
+    carried across the thread boundary and re-raised in result() rather than swallowed:
+    the section blew the run up when it ran inline, and it still does - only now the host
+    results are already on screen instead of being lost with it.
+    """
+
+    def __init__(self, fn):
+        self._value = None
+        self._error = None
+        self._thread = threading.Thread(target=self._run, args=(fn,))
+        self._thread.daemon = True
+        self._thread.start()
+
+    def _run(self, fn):
+        try:
+            self._value = fn()
+        except Exception as exc:
+            # not a swallowed error and not a decision: it is held so that result() can
+            # raise it in the main thread, exactly as an inline call would have
+            self._error = exc
+
+    def result(self):
+        """Wait for it and answer, or raise what it raised.
+
+        Bounded by the timeouts on the individual commands - LOCAL_CMD_TIMEOUT each and
+        XOA_CHECK_TIMEOUT for 'xoa check' - which are the section's designed defence
+        against a wedged updater. A second deadline here would only be able to report an
+        Unknown the section can already report for itself, and could cut off a slow but
+        perfectly healthy answer.
+        """
+        self._thread.join()
+        if self._error is not None:
+            raise self._error
+        return self._value
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     colors.init()
@@ -4126,6 +4217,12 @@ def main(argv=None):
         colors.init(force_off=True)
 
     work_dir = transport.make_work_dir()
+    # Registered before the work dir's cleanup so it runs first (atexit is LIFO): the
+    # children hold the ControlPath sockets that live in it. On a run that finishes this
+    # is a no-op - nothing is left running by then. It is for the exits that do not:
+    # sys.exit on an unreadable xo-db or a seed that will not answer, with the XOA
+    # section's daemon thread still part way through a 'xoa check'.
+    atexit.register(transport.kill_all_children)
     atexit.register(transport.cleanup_work_dir, work_dir)
     run.transport = transport.Transport(run.run_env, work_dir)
 
@@ -4141,6 +4238,26 @@ def main(argv=None):
         argument_password = resolve_target_host_mode(run, args)
     else:
         resolve_target_xoa(run, args)
+
+    # The appliance's own section starts here and is not looked at again until the report
+    # has nothing left to say about the pool. Here, and not at the top of main(), on
+    # measurement rather than taste - 5 runs of each, on the 2-core appliance an XOA
+    # actually is:
+    #
+    #   -n sec (2 hosts)   6.33s from the top | 6.23s here      -n east (remote)  7.04 | 6.49
+    #   -n primary (1 host)     5.52          | 6.19            -s slave + pw     6.29 | 6.15
+    #   -n nomatch (error)      3.95          | 3.39  (old script: 3.40)
+    #
+    # A wash on average, and better here in four cases of five. Started at the top it
+    # spends its first 3.3s fighting xo-server-db - both are node, and there are two
+    # cores - whereas from here it runs against the host collection, which is waiting on
+    # ssh and leaves the CPU idle. It also leaves every exit above untouched: a pool name
+    # that matched nothing, an unreadable xo-db, the interactive picker, the sshpass
+    # install. Those cost the run nothing, exactly as before.
+    #
+    # The one case it loses is a single fast host, where there is under 2s of collection
+    # to hide 2.9s of appliance behind. Do not move it back without re-measuring all five.
+    xoa_worker = _Background(xoa.lines) if run.run_env != "host" else None
 
     hosts = discover(run)
 
@@ -4173,12 +4290,6 @@ def main(argv=None):
 
     rep = report.Report(run.filter_output, json_mode=run.json_output,
                         meta=run_meta(run))
-    if run.run_env != "host":
-        rep.begin_section("xoa")
-        rep.heading("== XOA Status ==")
-        rep.add_all(xoa.lines(), "XOA")
-        rep.end_section()
-        rep.blank()
 
     if run.pool_mode:
         pool_status_section(run, rep)
@@ -4207,6 +4318,19 @@ def main(argv=None):
         rep.print_poolconf_section()
     else:
         host_section(run, rep, run.hosts[0])
+
+    # Last, and only now waited for. It is about the appliance rather than about the pool
+    # that was asked about, so it has no business standing in front of the host results -
+    # and by here it has almost always finished on its thread, making it free.
+    if xoa_worker is not None:
+        if not run.pool_mode:
+            # every section is preceded by exactly one blank line; in pool mode the
+            # pool.conf block already ends in one
+            rep.blank()
+        rep.begin_section("xoa")
+        rep.heading("== XOA Status ==")
+        rep.add_all(xoa_worker.result(), "XOA")
+        rep.end_section()
 
     return rep.finish()
 
@@ -4249,7 +4373,7 @@ parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 
 model = _module('model', ['Host', 'Pool', 'ntp_match', 'ram_match'])
 collectorsrc = _module('collectorsrc', ['EMBEDDED', 'collector_source'])
 transport = _module('transport', ['BEGIN_MARKER', 'CollectError', 'END_MARKER', 'Transport', '_DEBUG_LOCK', '_LIVE', '_LIVE_LOCK', '_REMOTE_LAUNCH', '_REMOTE_LAUNCH_PINNED', '_kill_tree', '_remote_launch', 'cleanup_work_dir', 'debug', 'ensure_sshpass', 'have', 'kill_all_children', 'make_work_dir', 'run_local_cmd'])
-xodb = _module('xodb', ['QUOTES', 'SELECT_NONE', 'SELECT_NO_MATCH', 'SELECT_OK', 'SELECT_QUIT', 'Server', '_ESCAPE_RE', '_KEY_RE', '_SIMPLE_ESCAPES', '_ls', '_sort_key', 'clean', 'enabled_servers', 'have_xo_server_db', 'password_for', 'pool_name_for_host', 'scan_records', 'select_pool', 'unescape'])
+xodb = _module('xodb', ['QUOTES', 'SELECT_NONE', 'SELECT_NO_MATCH', 'SELECT_OK', 'SELECT_QUIT', 'Server', '_ALL_SERVERS', '_ESCAPE_RE', '_KEY_RE', '_SIMPLE_ESCAPES', '_ls', '_sort_key', 'all_servers', 'clean', 'enabled_servers', 'have_xo_server_db', 'password_for', 'pool_name_for_host', 'reset_cache', 'scan_records', 'select_pool', 'unescape'])
 checks = _module('checks', ['_linstor_has_rows', '_linstor_line', '_linstor_node_offline', '_network_line', '_render_scan_blocks', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_content', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mtu_issues', 'multipathing', 'ntp', 'oom_events', 'overlapping_subnets', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'task_timeout_override', 'vlan0', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_nodes', 'xostor_qcow2', 'xostor_ram', 'yum_patch_level'])
 xoa = _module('xoa', ['_dmesg', '_first_token', '_max_old_space', '_meminfo', '_os_version', '_updater', 'collect_xoa', 'debian_version_ok', 'lines', 'ping_silent', 'running_as_root'])
 report = _module('report', ['Report', '_as_entry'])
