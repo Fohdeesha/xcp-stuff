@@ -147,6 +147,11 @@ def _host_spec(with_smapi):
         "lun_scan": {"files": config.LUN_CHANGE_FILES,
                      "phrases": config.LUN_CHANGE_PHRASES,
                      "context": config.LOG_ERROR_CONTEXT},
+        "multipath_scan": {"files": config.MULTIPATH_EVENT_FILES,
+                           "phrases": config.MULTIPATH_EVENT_PHRASES,
+                           "context": config.LOG_ERROR_CONTEXT},
+        "multipath": {"transient": config.MULTIPATH_TRANSIENT_CHK_STATES,
+                      "recheck_delay": config.MULTIPATH_RECHECK_DELAY},
     }
 
 
@@ -583,6 +588,9 @@ def pool_status_section(run, rep):
                 else result.flag("Dom0 RAM Allocations", "Mismatched"))
         rep.add(result.ok("Pool Time Synchronization", "Matched") if model.ntp_match(reachable)
                 else result.flag("Pool Time Synchronization", "Mismatched"))
+        # like the two above, a comparison ACROSS hosts, so it belongs to the pool rather
+        # than to any one host and has nothing to say when only one host was looked at
+        rep.check("Multipath Path Counts", checks.multipath_path_counts, reachable)
 
     rep.check("HA Enabled", checks.ha_enabled, run.pool)
     rep.check("Migration Compression", checks.migration_compression, run.pool)
@@ -649,6 +657,8 @@ def per_host_checks():
         ("task_timeout_override", "XAPI Task Timeout Override",
          checks.task_timeout_override),
         ("lacp_negotiation", "LACP Negotiation Issues", checks.lacp),
+        ("multipath_health", "Multipath Path Health", checks.multipath_health),
+        ("multipath_events", "Multipath Path Events", checks.multipath_events),
         ("silly_mtus", "Silly MTUs", checks.silly_mtus),
         ("dns_gw_non_mgmt_pifs", "DNS/GW on Non-Mgmt PIFs", checks.dns_gw_non_mgmt_pifs),
         ("overlapping_subnets", "Overlapping Subnets", checks.overlapping_subnets),

@@ -58,6 +58,8 @@ UNCOLLECTED = [
     ("Coredumps Present", checks.coredumps),
     ("XAPI Task Timeout Override", checks.task_timeout_override),
     ("LACP Negotiation Issues", checks.lacp),
+    ("Multipath Path Health", checks.multipath_health),
+    ("Multipath Path Events", checks.multipath_events),
     ("Silly MTUs", checks.silly_mtus),
     ("DNS/GW on Non-Mgmt PIFs", checks.dns_gw_non_mgmt_pifs),
     ("Overlapping Subnets", checks.overlapping_subnets),
@@ -101,7 +103,8 @@ def test_the_check_table_and_the_slave_toggles_stay_in_step():
 def test_every_host_check_says_unknown_when_the_fact_is_an_error():
     broken = host(df=err(), dmesg=err(), crash_count=err(), coredumps=err(), lacp=err(),
                   iplink=err(), pifs_dns_gw=err(), ipaddr=err(), log_scan=err(),
-                  lun_scan=err(), smapi=err(), boot_epoch=err(), task_timeout=err())
+                  lun_scan=err(), smapi=err(), boot_epoch=err(), task_timeout=err(),
+                  multipath=err(), multipath_scan=err())
     for key, fn in UNCOLLECTED:
         line = fn(broken)
         assert line.status == UNKNOWN, "%s answered %s off an error" % (key, line.status)

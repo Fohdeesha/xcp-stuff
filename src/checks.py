@@ -223,6 +223,281 @@ def lacp(host):
     return ok("LACP Negotiation Issues", "No")
 
 
+def _maps(count):
+    """'1 map' / '3 maps'. Each count gets its own word: pluralising every phrase off the
+    total once printed 'no usable path on 1 maps'."""
+    return "%d map" % count if count == 1 else "%d maps" % count
+
+
+def _multipath_detail(summary, unmanaged, rechecked):
+    """One block per map, then anything device-mapper holds that multipathd does not."""
+    lines = []
+    for entry in summary["maps"]:
+        usable = entry["ok"] + entry["standby"]
+        head = "%s (%d/%d path(s) usable" % (entry["name"], usable, len(entry["paths"]))
+        if entry["dm_st"]:
+            head += ", dm-st %s" % entry["dm_st"]
+        if entry["queueing"]:
+            head += ", queueing %s" % entry["queueing"]
+        if entry["path_faults"]:
+            head += ", %d path failure(s) since map load" % entry["path_faults"]
+        if entry["map_failures"]:
+            head += ", %d all-paths-down event(s)" % entry["map_failures"]
+        if not entry["listed"]:
+            head += ", NOT LISTED BY multipathd"
+        lines.append("--- %s) ---" % head)
+        rows = []
+        for path in entry["paths"]:
+            row = "  %-6s %-6s %-7s %-7s %-8s prio=%s" % (
+                path["dev"], path["dev_t"], path["dm_st"], path["chk_st"],
+                path["dev_st"], path["prio"])
+            if path["state"] == "bad":
+                row += "   <- NOT USABLE"
+            elif path["state"] == "standby":
+                row += "   (standby)"
+            rows.append(row)
+        if not rows:
+            rows.append("  (no paths)")
+        lines.extend(parsers.cap_lines(rows, config.MULTIPATH_MAX_LINES, "path(s) not listed"))
+        lines.append("")
+    if unmanaged:
+        lines.append("--- in device-mapper but not managed by multipathd ---")
+        lines.extend(["  " + name for name in unmanaged])
+        lines.append("")
+    if rechecked:
+        lines.append("(a path was mid-check, so this state was read a second time)")
+    return "\n".join(lines).rstrip("\n")
+
+
+def _multipath_read(host):
+    """(summary, unmanaged, rechecked, reason).
+
+    summary is None when nothing could be established, and `reason` says why - the pool
+    line needs exactly the same judgement as the per-host one, and two copies of it would
+    be two chances to disagree about what counts as an answer.
+    """
+    f = host.fact("multipath")
+    if not f.ok:
+        return None, [], False, f.error
+    node = f.value or {}
+    daemon = result.wrap(node, "daemon")
+    dm = result.wrap(node, "dm")
+    maps_f = result.wrap(node, "maps")
+    paths_f = result.wrap(node, "paths")
+    rechecked = result.wrap(node, "rechecked")
+
+    dm_maps = parsers.parse_dm_multipath_maps(dm.value) if dm.ok else None
+
+    if not daemon.ok or not parsers.multipathd_alive(daemon.value):
+        extra = ""
+        if dm_maps:
+            # the dangerous version of a dead daemon: the maps exist, so I/O is still
+            # being routed down paths nothing is checking or failing over
+            extra = "; %d map(s) present in device-mapper" % len(dm_maps)
+        return None, [], False, "multipathd is not answering%s" % extra
+
+    if not maps_f.ok:
+        return None, [], False, maps_f.error
+    if not paths_f.ok:
+        return None, [], False, paths_f.error
+    if parsers.MP_HELP_MARKER in (maps_f.value or "") or \
+            parsers.MP_HELP_MARKER in (paths_f.value or ""):
+        # rc 0 plus the help text is how multipathd rejects a query it does not
+        # understand, so rc cannot be trusted to tell a refused query from an empty one
+        return None, [], False, "multipathd did not accept the query"
+
+    summary = parsers.multipath_summary(
+        parsers.parse_multipath_paths(paths_f.value),
+        parsers.parse_multipath_maps(maps_f.value),
+        config.MULTIPATH_OK_DM_STATES, config.MULTIPATH_OK_CHK_STATES,
+        config.MULTIPATH_OK_DEV_STATES, config.MULTIPATH_STANDBY_CHK_STATES)
+
+    known = set(entry["name"] for entry in summary["maps"])
+    unmanaged = [name for name in (dm_maps or []) if name not in known]
+    return summary, unmanaged, bool(rechecked.ok and rechecked.value), None
+
+
+def multipath_health(host):
+    """The paths themselves, as opposed to `Multipathing`, which is the xapi setting.
+
+    Green here needs three things established: that multipathd answered at all, what it
+    says about every path of every map, and - for the "there is simply no multipath here"
+    answer - that the kernel agrees there are no maps. An empty answer from a daemon that
+    is not running looks exactly like a host with no multipath, and that is the shape of
+    every silent green this tool has ever shipped.
+    """
+    summary, unmanaged, rechecked, reason = _multipath_read(host)
+    if summary is None:
+        return unknown("Multipath Path Health", "Unknown (%s)" % reason)
+    detail = _multipath_detail(summary, unmanaged, rechecked)
+
+    if not summary["maps"]:
+        if unmanaged:
+            return flag("Multipath Path Health",
+                        "%d device-mapper map(s) multipathd does not manage, See Below"
+                        % len(unmanaged)).with_detail("Multipath Paths", detail)
+        # dm could not be read here only means the corroboration was missing: multipathd
+        # is alive and says there is nothing, which is itself an established answer
+        return ok("Multipath Path Health", "N/A - No multipath maps")
+
+    usable = summary["ok_paths"] + summary["standby_paths"]
+    total = summary["total_paths"]
+
+    problems = []
+    if summary["dead_maps"]:
+        problems.append("no usable path on %s" % _maps(len(summary["dead_maps"])))
+    if summary["bad_paths"]:
+        problems.append("%d of %d path(s) not usable" % (summary["bad_paths"], total))
+    if summary["suspended_maps"]:
+        problems.append("%s suspended" % _maps(len(summary["suspended_maps"])))
+    if unmanaged:
+        problems.append("%s multipathd does not manage" % _maps(len(unmanaged)))
+    if problems:
+        # a map with nothing left to send I/O down is not degraded, it is down: I/O is
+        # queueing or erroring on it right now, which is a different phone call
+        lead = "Down" if summary["dead_maps"] else "Degraded"
+        return flag("Multipath Path Health",
+                    "%s - %s, See Below" % (lead, ", ".join(problems))
+                    ).with_detail("Multipath Paths", detail)
+
+    text = "OK - %d/%d paths usable on %s" % (usable, total, _maps(len(summary["maps"])))
+    if summary["standby_paths"]:
+        # normal on an active/passive array, and worth saying out loud so nobody reads
+        # 4/4 and assumes four paths are carrying I/O
+        text += " (%d standby)" % summary["standby_paths"]
+    return ok("Multipath Path Health", text)
+
+
+def multipath_path_counts(hosts):
+    """Every host's view of the same LUN, compared.
+
+    The per-host line can only say whether a path is up; it cannot know how many there
+    are meant to be. Two hosts of one pool looking at one SAN can: a host that sees one
+    path where its peers see two is a missing session, a dead HBA or a NIC that never came
+    up - the "iSCSI multipath not connected on one host" case - and it is invisible from
+    the host itself, where one working path looks perfectly healthy.
+
+    Counts CONFIGURED paths, not usable ones: a failed path is still a row (measured), so
+    a path failure moves the per-host line and leaves this one alone, which is what keeps
+    the two lines from reporting the same fault twice in different words.
+    """
+    known, unreadable = [], []
+    for host in hosts:
+        summary, _unmanaged, _rechecked, _reason = _multipath_read(host)
+        if summary is None:
+            unreadable.append(host)
+            continue
+        known.append((host, dict((entry["name"], len(entry["paths"]))
+                                 for entry in summary["maps"])))
+
+    caveat = ""
+    if unreadable:
+        # every one of these already has its own Unknown in its host block, so this line
+        # reports what it CAN compare rather than throwing the comparison away
+        caveat = " (%d of %d hosts readable)" % (len(known), len(known) + len(unreadable))
+
+    if not known:
+        return unknown("Multipath Path Counts",
+                       "Unknown (no host's multipath state could be read)")
+    if not any(maps for _host, maps in known):
+        return ok("Multipath Path Counts", "N/A - No multipath maps in pool" + caveat)
+    if len(known) < 2:
+        return ok("Multipath Path Counts", "N/A - Nothing to compare" + caveat)
+
+    all_maps = sorted(set(name for _host, maps in known for name in maps))
+    blocks, mismatched = [], 0
+    for name in all_maps:
+        counts = [(host, maps.get(name)) for host, maps in known]
+        highest = max(count for _host, count in counts if count is not None)
+        if all(count == highest for _host, count in counts):
+            continue
+        mismatched += 1
+        blocks.append("--- %s ---" % name)
+        for host, count in counts:
+            if count is None:
+                blocks.append("  %s: map not present" % host.label)
+            elif count < highest:
+                blocks.append("  %s: %d path(s)   <- fewer than %d" % (host.label, count,
+                                                                       highest))
+            else:
+                blocks.append("  %s: %d path(s)" % (host.label, count))
+        blocks.append("")
+    if not mismatched:
+        return ok("Multipath Path Counts", "Matched" + caveat)
+    return flag("Multipath Path Counts",
+                "Mismatched on %d map(s), See Below%s" % (mismatched, caveat)
+                ).with_detail("Multipath Path Counts", "\n".join(blocks).rstrip("\n"))
+
+
+def _dmesg_phrase_blocks(text, phrases, ctx):
+    """The most recent hit of each phrase in the dmesg ring, shaped like a log-scan block.
+
+    Same shape and same "last occurrence with context" rule as the file scanner, so both
+    sources render through one renderer and read the same way.
+    """
+    text = text or ""
+    lines = text.splitlines()
+    blocks = []
+    for phrase in phrases:
+        hits = parsers.find_phrase_lines(text, phrase)
+        if not hits:
+            continue
+        label = "dmesg ring"
+        if len(hits) > 1:
+            # the count is the point: one blip and a fabric that flaps daily look
+            # identical when only the newest line is shown
+            label += ", %d occurrences, most recent shown" % len(hits)
+        n = hits[-1]
+        start, end = max(1, n - ctx), min(len(lines), n + ctx)
+        blocks.append({"phrase": phrase, "file": label, "line": n,
+                       "context": lines[start - 1:end]})
+    return blocks
+
+
+def multipath_events(host):
+    """Kernel-side, timestamped path failures - what the current-state check cannot see.
+
+    Read from BOTH sources, because neither contains the other:
+
+      * `kern.log` + its rotation - survives a reboot, but is a ~2-rotation window, and on
+        a quiet dom0 the live file is routinely 0 bytes with everything in `.1`.
+      * the **dmesg ring** - covers the whole uptime on a quiet host (measured on 8.3.0:
+        70 KB, unwrapped, back to the boot three days earlier, holding path failures that
+        were in NEITHER kern.log file), but wraps on a busy one and is gone after a reboot.
+
+    So an event can be in either, or both. Both are shown, each labelled with where it came
+    from, and no attempt is made to merge them: `dmesg -T` recomputes its timestamps from
+    (now - uptime) on every run, so the same failure is stamped a second or two away from
+    syslog's copy and cannot be matched on reliably.
+
+    Deliberately not the per-map path_faults counter, which never resets until the map
+    reloads: that would leave a permanent yellow behind a switch reboot last month. These
+    two windows both close by themselves.
+    """
+    scan = host.fact("multipath_scan")
+    dmesg = host.fact("dmesg")
+
+    blocks = list(scan.value) if (scan.ok and scan.value) else []
+    if dmesg.ok:
+        blocks = blocks + _dmesg_phrase_blocks(dmesg.value, config.MULTIPATH_EVENT_PHRASES,
+                                               config.LOG_ERROR_CONTEXT)
+    if blocks:
+        # a finding is established whatever the other source did or did not manage to say
+        detail = _render_scan_blocks(blocks)
+        if len(blocks) > 1:
+            detail += ("\n\n(the same event can appear under both sources - dmesg -T "
+                       "recomputes its timestamps each run, so they sit a second or two "
+                       "from syslog's)")
+        return flag("Multipath Path Events", "Yes, See Error Output").with_detail(
+            "Multipath Path Events", detail)
+    # nothing found, so every source has to have actually been read before this is a "None"
+    if not scan.ok:
+        return unknown("Multipath Path Events", "Unknown (%s)" % scan.error)
+    if not dmesg.ok:
+        return unknown("Multipath Path Events", "Unknown (could not read dmesg)")
+    return ok("Multipath Path Events", "None")
+
+
 def silly_mtus(host):
     f = host.fact("iplink")
     if not f.ok:

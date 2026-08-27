@@ -291,6 +291,163 @@ def has_overlapping_subnets(entries):
     return False
 
 
+# --------------------------------------------------------------------------------------
+# multipath
+# --------------------------------------------------------------------------------------
+
+# multipathd answers a query it does not understand with rc 0 and its whole help text, so
+# rc alone cannot tell a bad query from a good one. This is the tell.
+MP_HELP_MARKER = "CLI commands reference"
+
+# multipathd's own placeholders for "this path is in no map": '[orphan]' for a device that
+# belongs to none, '[undef]'/'[unknown]' when it cannot say. Every local disk on every host
+# comes back as one of these, permanently undef/unknown - judging them would flag every
+# host with a boot disk.
+def _mp_unmapped(name):
+    return not name or name.startswith("[")
+
+
+def parse_multipath_paths(text):
+    """Rows of `multipathd show paths raw format '%m|%d|%D|%t|%T|%o|%p'`.
+
+    Only paths that belong to a map are returned; see _mp_unmapped. A line whose field
+    count is wrong is dropped rather than guessed at - which is also what discards the
+    help text if some future multipathd rejects the query with rc 0.
+    """
+    rows = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or "|" not in line:
+            continue
+        fields = [f.strip() for f in line.split("|")]
+        if len(fields) != 7:
+            continue
+        if _mp_unmapped(fields[0]):
+            continue
+        rows.append({"map": fields[0], "dev": fields[1], "dev_t": fields[2],
+                     "dm_st": fields[3], "chk_st": fields[4], "dev_st": fields[5],
+                     "prio": fields[6]})
+    return rows
+
+
+def parse_multipath_maps(text):
+    """Rows of `multipathd show maps raw format '%n|%N|%t|%Q|%x|%0|%f'`.
+
+    `usable` (%N) is the count of paths device-mapper will actually send I/O down, not the
+    number configured: failing one of a two-path map took it from 2 to 1 and reinstating
+    the path took it back (measured on 8.3.0, 2026-08-27). `path_faults` (%0) is cumulative
+    since the map was loaded and does NOT reset on recovery - it stayed 1 after the path
+    came back - which is why it is evidence in the detail block and never a finding of its
+    own.
+    """
+    rows = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or "|" not in line:
+            continue
+        fields = [f.strip() for f in line.split("|")]
+        if len(fields) != 7:
+            continue
+        rows.append({"name": fields[0], "usable": _int_or_none(fields[1]),
+                     "dm_st": fields[2], "queueing": fields[3],
+                     "map_failures": _int_or_none(fields[4]),
+                     "path_faults": _int_or_none(fields[5]), "features": fields[6]})
+    return rows
+
+
+def parse_dm_multipath_maps(text):
+    """Map names from `dmsetup ls --target multipath`.
+
+    With no multipath maps this prints NOTHING AT ALL - empty stdout, empty stderr, rc 0
+    (measured on 8.2.1 and 8.3.0). The 'No devices found' line belongs to plain
+    `dmsetup ls`, and is dropped here in case a version prints it anyway.
+    """
+    names = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.lower().startswith("no devices found"):
+            continue
+        names.append(line.split("\t")[0].split()[0])
+    return names
+
+
+def multipathd_alive(text):
+    """`multipathd show daemon` says 'pid 1305 running'. Anything else is not an answer."""
+    return bool(re.search(r"\bpid\s+\d+\s+running\b", text or ""))
+
+
+def _int_or_none(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def classify_multipath_path(row, ok_dm, ok_chk, ok_dev, standby_chk):
+    """'ok' | 'standby' | 'bad' for one path row.
+
+    Whitelists on all three states, so a state string this build does not print - a newer
+    multipath-tools inventing one - lands in 'bad' and gets looked at, rather than passing
+    because it was not on a list of known-bad words.
+    """
+    chk = row.get("chk_st", "")
+    if row.get("dm_st", "") not in ok_dm or row.get("dev_st", "") not in ok_dev:
+        return "bad"
+    if chk in standby_chk:
+        return "standby"
+    if chk not in ok_chk:
+        return "bad"
+    return "ok"
+
+
+def multipath_summary(path_rows, map_rows, ok_dm, ok_chk, ok_dev, standby_chk):
+    """Per-map roll-up of paths and maps, keyed by map name.
+
+    Both sides are used: a map multipathd lists with no path rows is still a map, and a
+    path whose map multipathd did not list is still a path. Losing either would understate
+    the topology, and the second is exactly what a half-loaded daemon looks like.
+    """
+    maps = {}
+
+    def slot(name):
+        if name not in maps:
+            maps[name] = {"name": name, "paths": [], "ok": 0, "standby": 0, "bad": 0,
+                          "usable": None, "dm_st": "", "queueing": "",
+                          "path_faults": None, "map_failures": None, "listed": False}
+        return maps[name]
+
+    for row in map_rows:
+        entry = slot(row["name"])
+        entry["listed"] = True
+        entry["usable"] = row["usable"]
+        entry["dm_st"] = row["dm_st"]
+        entry["queueing"] = row["queueing"]
+        entry["path_faults"] = row["path_faults"]
+        entry["map_failures"] = row["map_failures"]
+
+    for row in path_rows:
+        entry = slot(row["map"])
+        state = classify_multipath_path(row, ok_dm, ok_chk, ok_dev, standby_chk)
+        item = dict(row)
+        item["state"] = state
+        entry["paths"].append(item)
+        entry[state] += 1
+
+    order = sorted(maps.values(), key=lambda m: m["name"])
+    return {
+        "maps": order,
+        "total_paths": sum(len(m["paths"]) for m in order),
+        "ok_paths": sum(m["ok"] for m in order),
+        "standby_paths": sum(m["standby"] for m in order),
+        "bad_paths": sum(m["bad"] for m in order),
+        # a map with nothing left to send I/O down: the failure this whole check exists
+        # for, and worth saying in different words from "one path of four is down"
+        "dead_maps": [m["name"] for m in order if (m["ok"] + m["standby"]) == 0],
+        "suspended_maps": [m["name"] for m in order
+                           if m["dm_st"] and m["dm_st"] != "active"],
+    }
+
+
 def parse_lacp(text):
     """True when any LACP port line is not 'current attached'.
 

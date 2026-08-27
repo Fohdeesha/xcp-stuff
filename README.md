@@ -189,7 +189,7 @@ only `python` (2.7.5), 8.3 has both, and that is what keeps 8.2.1 pools checkabl
 
 ```
 python build/stitch.py     # rebuild health.py after changing src/
-python -m pytest tests/    # ~150 tests, all offline
+python -m pytest tests/    # ~220 tests, all offline
 ```
 
   ## Example Output

@@ -42,7 +42,7 @@ import unicodedata
 # ======================================================================================
 # --- config ----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "3.2"
+SCRIPT_VERSION = "3.3"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
@@ -83,6 +83,49 @@ LOG_ERROR_FILES = [
 ]
 LOG_ERROR_CONTEXT = 3            # lines of context shown either side of a match
 
+# --- multipath checks -----------------------------------------------------------------
+# `Multipathing` reports the xapi SETTING. These describe the paths themselves, which is a
+# different question: a host printed a green "Multipathing: true" while its dmesg said
+# "device-mapper: multipath: Failing path 8:48".
+#
+# All three state whitelists, deliberately. multipath-tools 0.4.9 (both 8.2.1 and 8.3.0,
+# same build, verified in the binary's own string table 2026-08-27) prints:
+#   dm_st  (%t) undef | active | failed
+#   chk_st (%T) undef | ready | faulty | shaky | ghost | delayed
+#   dev_st (%o) unknown | running | offline | blocked | quiesce | dead | deleting | live
+# A state that is not listed here is NOT healthy - a newer multipath-tools inventing a
+# state name must read as "not established", never as a pass.
+MULTIPATH_OK_DM_STATES = ["active"]
+MULTIPATH_OK_CHK_STATES = ["ready", "ghost"]
+MULTIPATH_OK_DEV_STATES = ["running", "live"]
+# 'ghost' is the standby path of an active/passive (ALUA) array: healthy by design, and
+# counted separately so the line can say how many there are. Move it out of OK_CHK_STATES
+# to flag ghost paths instead - correct for an active/active array, wrong for the rest.
+MULTIPATH_STANDBY_CHK_STATES = ["ghost"]
+# 'undef' on a path that belongs to a map means the checker has not finished its first
+# probe, not that the path is bad - likeliest right after a boot or an SR plug, i.e.
+# exactly when someone runs a health check. Seeing one, the collector waits and asks once
+# more; if it is still undef, that is reported as found.
+MULTIPATH_TRANSIENT_CHK_STATES = ["undef"]
+MULTIPATH_RECHECK_DELAY = 2.0    # seconds before that single re-query
+MULTIPATH_MAX_LINES = 60         # path rows listed in a detail block
+
+# Kernel-side, timestamped path events. Deliberately NOT the per-map path_faults counter,
+# which never resets until the map reloads and would leave a permanent finding behind a
+# switch reboot last month; both windows below close by themselves.
+#
+# Scanned in the FILES below (plus their .1) *and* in the dmesg ring, which is already
+# collected for `Dmesg Content` and so costs nothing extra. Neither contains the other:
+# kern.log survives a reboot but spans about two rotations, while the ring covers the
+# whole uptime on a quiet dom0 and wraps on a busy one. Measured on 8.3.0: path failures
+# sat in the ring that were in neither kern.log file.
+MULTIPATH_EVENT_PHRASES = [
+    "device-mapper: multipath: Failing path",
+]
+MULTIPATH_EVENT_FILES = [
+    "/var/log/kern.log",
+]
+
 # --- "LUN Assignments" check ----------------------------------------------------------
 LUN_CHANGE_PHRASES = [
     "Warning! Received an indication that the LUN assignments on this target have changed",
@@ -109,6 +152,8 @@ POOL_RUN = {
     "coredumps_present": True,
     "task_timeout_override": True,
     "lacp_negotiation": True,
+    "multipath_health": True,
+    "multipath_events": True,
     "silly_mtus": True,
     "dns_gw_non_mgmt_pifs": True,
     "overlapping_subnets": True,
@@ -570,6 +615,163 @@ def has_overlapping_subnets(entries):
             if not (ranges[i][2] < ranges[j][1] or ranges[j][2] < ranges[i][1]):
                 return True
     return False
+
+
+# --------------------------------------------------------------------------------------
+# multipath
+# --------------------------------------------------------------------------------------
+
+# multipathd answers a query it does not understand with rc 0 and its whole help text, so
+# rc alone cannot tell a bad query from a good one. This is the tell.
+MP_HELP_MARKER = "CLI commands reference"
+
+# multipathd's own placeholders for "this path is in no map": '[orphan]' for a device that
+# belongs to none, '[undef]'/'[unknown]' when it cannot say. Every local disk on every host
+# comes back as one of these, permanently undef/unknown - judging them would flag every
+# host with a boot disk.
+def _mp_unmapped(name):
+    return not name or name.startswith("[")
+
+
+def parse_multipath_paths(text):
+    """Rows of `multipathd show paths raw format '%m|%d|%D|%t|%T|%o|%p'`.
+
+    Only paths that belong to a map are returned; see _mp_unmapped. A line whose field
+    count is wrong is dropped rather than guessed at - which is also what discards the
+    help text if some future multipathd rejects the query with rc 0.
+    """
+    rows = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or "|" not in line:
+            continue
+        fields = [f.strip() for f in line.split("|")]
+        if len(fields) != 7:
+            continue
+        if _mp_unmapped(fields[0]):
+            continue
+        rows.append({"map": fields[0], "dev": fields[1], "dev_t": fields[2],
+                     "dm_st": fields[3], "chk_st": fields[4], "dev_st": fields[5],
+                     "prio": fields[6]})
+    return rows
+
+
+def parse_multipath_maps(text):
+    """Rows of `multipathd show maps raw format '%n|%N|%t|%Q|%x|%0|%f'`.
+
+    `usable` (%N) is the count of paths device-mapper will actually send I/O down, not the
+    number configured: failing one of a two-path map took it from 2 to 1 and reinstating
+    the path took it back (measured on 8.3.0, 2026-08-27). `path_faults` (%0) is cumulative
+    since the map was loaded and does NOT reset on recovery - it stayed 1 after the path
+    came back - which is why it is evidence in the detail block and never a finding of its
+    own.
+    """
+    rows = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or "|" not in line:
+            continue
+        fields = [f.strip() for f in line.split("|")]
+        if len(fields) != 7:
+            continue
+        rows.append({"name": fields[0], "usable": _int_or_none(fields[1]),
+                     "dm_st": fields[2], "queueing": fields[3],
+                     "map_failures": _int_or_none(fields[4]),
+                     "path_faults": _int_or_none(fields[5]), "features": fields[6]})
+    return rows
+
+
+def parse_dm_multipath_maps(text):
+    """Map names from `dmsetup ls --target multipath`.
+
+    With no multipath maps this prints NOTHING AT ALL - empty stdout, empty stderr, rc 0
+    (measured on 8.2.1 and 8.3.0). The 'No devices found' line belongs to plain
+    `dmsetup ls`, and is dropped here in case a version prints it anyway.
+    """
+    names = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.lower().startswith("no devices found"):
+            continue
+        names.append(line.split("\t")[0].split()[0])
+    return names
+
+
+def multipathd_alive(text):
+    """`multipathd show daemon` says 'pid 1305 running'. Anything else is not an answer."""
+    return bool(re.search(r"\bpid\s+\d+\s+running\b", text or ""))
+
+
+def _int_or_none(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def classify_multipath_path(row, ok_dm, ok_chk, ok_dev, standby_chk):
+    """'ok' | 'standby' | 'bad' for one path row.
+
+    Whitelists on all three states, so a state string this build does not print - a newer
+    multipath-tools inventing one - lands in 'bad' and gets looked at, rather than passing
+    because it was not on a list of known-bad words.
+    """
+    chk = row.get("chk_st", "")
+    if row.get("dm_st", "") not in ok_dm or row.get("dev_st", "") not in ok_dev:
+        return "bad"
+    if chk in standby_chk:
+        return "standby"
+    if chk not in ok_chk:
+        return "bad"
+    return "ok"
+
+
+def multipath_summary(path_rows, map_rows, ok_dm, ok_chk, ok_dev, standby_chk):
+    """Per-map roll-up of paths and maps, keyed by map name.
+
+    Both sides are used: a map multipathd lists with no path rows is still a map, and a
+    path whose map multipathd did not list is still a path. Losing either would understate
+    the topology, and the second is exactly what a half-loaded daemon looks like.
+    """
+    maps = {}
+
+    def slot(name):
+        if name not in maps:
+            maps[name] = {"name": name, "paths": [], "ok": 0, "standby": 0, "bad": 0,
+                          "usable": None, "dm_st": "", "queueing": "",
+                          "path_faults": None, "map_failures": None, "listed": False}
+        return maps[name]
+
+    for row in map_rows:
+        entry = slot(row["name"])
+        entry["listed"] = True
+        entry["usable"] = row["usable"]
+        entry["dm_st"] = row["dm_st"]
+        entry["queueing"] = row["queueing"]
+        entry["path_faults"] = row["path_faults"]
+        entry["map_failures"] = row["map_failures"]
+
+    for row in path_rows:
+        entry = slot(row["map"])
+        state = classify_multipath_path(row, ok_dm, ok_chk, ok_dev, standby_chk)
+        item = dict(row)
+        item["state"] = state
+        entry["paths"].append(item)
+        entry[state] += 1
+
+    order = sorted(maps.values(), key=lambda m: m["name"])
+    return {
+        "maps": order,
+        "total_paths": sum(len(m["paths"]) for m in order),
+        "ok_paths": sum(m["ok"] for m in order),
+        "standby_paths": sum(m["standby"] for m in order),
+        "bad_paths": sum(m["bad"] for m in order),
+        # a map with nothing left to send I/O down: the failure this whole check exists
+        # for, and worth saying in different words from "one path of four is down"
+        "dead_maps": [m["name"] for m in order if (m["ok"] + m["standby"]) == 0],
+        "suspended_maps": [m["name"] for m in order
+                           if m["dm_st"] and m["dm_st"] != "active"],
+    }
 
 
 def parse_lacp(text):
@@ -1224,6 +1426,101 @@ def collect_lacp():
     return fact(r.out)
 
 
+# multipathd's own format wildcards. 'raw' is what omits the header row - verified on
+# 0.4.9-136 on both 8.2.1 and 8.3.0, so every line that comes back is data.
+#   paths: %m map  %d dev  %D dev_t  %t dm_st  %T chk_st  %o dev_st  %p prio
+#   maps:  %n name %N usable-paths %t dm_st %Q queueing %x map-failures %0 path-faults
+#          %f features
+MP_PATH_FORMAT = "%m|%d|%D|%t|%T|%o|%p"
+MP_MAP_FORMAT = "%n|%N|%t|%Q|%x|%0|%f"
+MP_PATH_CHK_FIELD = 4       # index of %T in MP_PATH_FORMAT
+MP_QUERY_TIMEOUT = 20
+
+
+def _mp_transient(text, transient):
+    """True when a path that BELONGS TO A MAP is still mid-check.
+
+    A path in no map is reported under a bracketed pseudo-name ('[orphan]', '[undef]',
+    '[unknown]') and is permanently 'undef' - every local disk on every host is one of
+    those - so the bracket test is what keeps a boot disk from triggering a re-query on
+    every host in the pool, forever.
+    """
+    if not transient:
+        return False
+    for line in text.splitlines():
+        fields = line.split("|")
+        if len(fields) <= MP_PATH_CHK_FIELD:
+            continue
+        if not fields[0] or fields[0].startswith("["):
+            continue
+        if fields[MP_PATH_CHK_FIELD].strip() in transient:
+            return True
+    return False
+
+
+def collect_multipath(opts):
+    """Path-level multipath state: from the daemon, cross-checked against the kernel.
+
+    Four questions, ~9 ms each on the test hosts:
+
+      * `multipathd show daemon` - a POSITIVE liveness answer ('pid N running'). Without
+        it, "this host has no multipath" and "nobody answered" are the same empty output,
+        and the first one is green. A host with no maps prints exactly nothing (measured
+        on 8.2.1 and 8.3.0), so the difference has to be established somewhere else.
+      * maps and paths, in `raw format`.
+      * `dmsetup ls --target multipath` - what the KERNEL holds, which needs no daemon.
+        multipathd reporting no maps while device-mapper has some means the daemon is not
+        managing them: no failover, and precisely the silent case this check exists for.
+
+    `multipath -ll` is deliberately NOT used. It re-runs the path checkers itself, so it
+    does device I/O and can block on the dead path we are asking about, and it disagrees
+    with the daemon that actually routes the I/O: with sdd failed, multipathd said
+    'failed faulty running' while `multipath -ll` said 'failed ready running' (both
+    measured on 8.3.0, 2026-08-27).
+    """
+    opts = opts or {}
+    out = {}
+
+    r = run(["multipathd", "show", "daemon"], timeout=MP_QUERY_TIMEOUT)
+    out["daemon"] = fact(r.out) if r.ok else \
+        err("multipathd show daemon failed (%s)" % r.why())
+
+    r = run(["dmsetup", "ls", "--target", "multipath"], timeout=MP_QUERY_TIMEOUT)
+    out["dm"] = fact(r.out) if r.ok else err("dmsetup ls failed (%s)" % r.why())
+
+    r = run(["multipathd", "show", "maps", "raw", "format", MP_MAP_FORMAT],
+            timeout=MP_QUERY_TIMEOUT)
+    out["maps"] = fact(r.out) if r.ok else err("multipathd show maps failed (%s)" % r.why())
+
+    r = run(["multipathd", "show", "paths", "raw", "format", MP_PATH_FORMAT],
+            timeout=MP_QUERY_TIMEOUT)
+    if not r.ok:
+        out["paths"] = err("multipathd show paths failed (%s)" % r.why())
+        return fact(out)
+
+    text = r.out
+    rechecked = False
+    delay = opts.get("recheck_delay") or 0
+    left = budget_left()
+    if delay and _mp_transient(text, opts.get("transient") or []) \
+            and (left is None or left > delay + 10):
+        # one re-query, not a loop: the point is to let an in-flight check land, not to
+        # wait for a path to come back. Still undef the second time is reported as found.
+        time.sleep(delay)
+        again = run(["multipathd", "show", "paths", "raw", "format", MP_PATH_FORMAT],
+                    timeout=MP_QUERY_TIMEOUT)
+        if again.ok:
+            text = again.out
+            rechecked = True
+            r2 = run(["multipathd", "show", "maps", "raw", "format", MP_MAP_FORMAT],
+                     timeout=MP_QUERY_TIMEOUT)
+            if r2.ok:
+                out["maps"] = fact(r2.out)
+    out["paths"] = fact(text)
+    out["rechecked"] = fact(rechecked)
+    return fact(out)
+
+
 def collect_crash_count(ignore_name):
     """Files under /var/crash, two levels deep - crash dumps live in subdirectories."""
     root = "/var/crash"
@@ -1851,6 +2148,7 @@ def collect(spec):
         out["iplink"] = collect_iplink()
         out["ipaddr"] = collect_ipaddr()
         out["lacp"] = collect_lacp()
+        out["multipath"] = collect_multipath(spec.get("multipath"))
         out["crash_count"] = collect_crash_count(spec.get("crash_ignore_file") or "")
         out["coredumps"] = collect_coredumps(spec.get("coredump_dir") or "")
         out["task_timeout"] = collect_task_timeout_override()
@@ -1873,6 +2171,10 @@ def collect(spec):
         out["lun_scan"] = collect_log_scan(lun.get("files") or [],
                                            lun.get("phrases") or [],
                                            lun.get("context") or 3)
+        mps = spec.get("multipath_scan") or {}
+        out["multipath_scan"] = collect_log_scan(mps.get("files") or [],
+                                                 mps.get("phrases") or [],
+                                                 mps.get("context") or 3)
         if spec.get("smapi"):
             out["smapi"] = collect_smapi_hidden_leaves()
 
@@ -2686,6 +2988,281 @@ def lacp(host):
         return flag("LACP Negotiation Issues", "Yes, See Below").with_detail(
             "LACP Output", text)
     return ok("LACP Negotiation Issues", "No")
+
+
+def _maps(count):
+    """'1 map' / '3 maps'. Each count gets its own word: pluralising every phrase off the
+    total once printed 'no usable path on 1 maps'."""
+    return "%d map" % count if count == 1 else "%d maps" % count
+
+
+def _multipath_detail(summary, unmanaged, rechecked):
+    """One block per map, then anything device-mapper holds that multipathd does not."""
+    lines = []
+    for entry in summary["maps"]:
+        usable = entry["ok"] + entry["standby"]
+        head = "%s (%d/%d path(s) usable" % (entry["name"], usable, len(entry["paths"]))
+        if entry["dm_st"]:
+            head += ", dm-st %s" % entry["dm_st"]
+        if entry["queueing"]:
+            head += ", queueing %s" % entry["queueing"]
+        if entry["path_faults"]:
+            head += ", %d path failure(s) since map load" % entry["path_faults"]
+        if entry["map_failures"]:
+            head += ", %d all-paths-down event(s)" % entry["map_failures"]
+        if not entry["listed"]:
+            head += ", NOT LISTED BY multipathd"
+        lines.append("--- %s) ---" % head)
+        rows = []
+        for path in entry["paths"]:
+            row = "  %-6s %-6s %-7s %-7s %-8s prio=%s" % (
+                path["dev"], path["dev_t"], path["dm_st"], path["chk_st"],
+                path["dev_st"], path["prio"])
+            if path["state"] == "bad":
+                row += "   <- NOT USABLE"
+            elif path["state"] == "standby":
+                row += "   (standby)"
+            rows.append(row)
+        if not rows:
+            rows.append("  (no paths)")
+        lines.extend(parsers.cap_lines(rows, config.MULTIPATH_MAX_LINES, "path(s) not listed"))
+        lines.append("")
+    if unmanaged:
+        lines.append("--- in device-mapper but not managed by multipathd ---")
+        lines.extend(["  " + name for name in unmanaged])
+        lines.append("")
+    if rechecked:
+        lines.append("(a path was mid-check, so this state was read a second time)")
+    return "\n".join(lines).rstrip("\n")
+
+
+def _multipath_read(host):
+    """(summary, unmanaged, rechecked, reason).
+
+    summary is None when nothing could be established, and `reason` says why - the pool
+    line needs exactly the same judgement as the per-host one, and two copies of it would
+    be two chances to disagree about what counts as an answer.
+    """
+    f = host.fact("multipath")
+    if not f.ok:
+        return None, [], False, f.error
+    node = f.value or {}
+    daemon = result.wrap(node, "daemon")
+    dm = result.wrap(node, "dm")
+    maps_f = result.wrap(node, "maps")
+    paths_f = result.wrap(node, "paths")
+    rechecked = result.wrap(node, "rechecked")
+
+    dm_maps = parsers.parse_dm_multipath_maps(dm.value) if dm.ok else None
+
+    if not daemon.ok or not parsers.multipathd_alive(daemon.value):
+        extra = ""
+        if dm_maps:
+            # the dangerous version of a dead daemon: the maps exist, so I/O is still
+            # being routed down paths nothing is checking or failing over
+            extra = "; %d map(s) present in device-mapper" % len(dm_maps)
+        return None, [], False, "multipathd is not answering%s" % extra
+
+    if not maps_f.ok:
+        return None, [], False, maps_f.error
+    if not paths_f.ok:
+        return None, [], False, paths_f.error
+    if parsers.MP_HELP_MARKER in (maps_f.value or "") or \
+            parsers.MP_HELP_MARKER in (paths_f.value or ""):
+        # rc 0 plus the help text is how multipathd rejects a query it does not
+        # understand, so rc cannot be trusted to tell a refused query from an empty one
+        return None, [], False, "multipathd did not accept the query"
+
+    summary = parsers.multipath_summary(
+        parsers.parse_multipath_paths(paths_f.value),
+        parsers.parse_multipath_maps(maps_f.value),
+        config.MULTIPATH_OK_DM_STATES, config.MULTIPATH_OK_CHK_STATES,
+        config.MULTIPATH_OK_DEV_STATES, config.MULTIPATH_STANDBY_CHK_STATES)
+
+    known = set(entry["name"] for entry in summary["maps"])
+    unmanaged = [name for name in (dm_maps or []) if name not in known]
+    return summary, unmanaged, bool(rechecked.ok and rechecked.value), None
+
+
+def multipath_health(host):
+    """The paths themselves, as opposed to `Multipathing`, which is the xapi setting.
+
+    Green here needs three things established: that multipathd answered at all, what it
+    says about every path of every map, and - for the "there is simply no multipath here"
+    answer - that the kernel agrees there are no maps. An empty answer from a daemon that
+    is not running looks exactly like a host with no multipath, and that is the shape of
+    every silent green this tool has ever shipped.
+    """
+    summary, unmanaged, rechecked, reason = _multipath_read(host)
+    if summary is None:
+        return unknown("Multipath Path Health", "Unknown (%s)" % reason)
+    detail = _multipath_detail(summary, unmanaged, rechecked)
+
+    if not summary["maps"]:
+        if unmanaged:
+            return flag("Multipath Path Health",
+                        "%d device-mapper map(s) multipathd does not manage, See Below"
+                        % len(unmanaged)).with_detail("Multipath Paths", detail)
+        # dm could not be read here only means the corroboration was missing: multipathd
+        # is alive and says there is nothing, which is itself an established answer
+        return ok("Multipath Path Health", "N/A - No multipath maps")
+
+    usable = summary["ok_paths"] + summary["standby_paths"]
+    total = summary["total_paths"]
+
+    problems = []
+    if summary["dead_maps"]:
+        problems.append("no usable path on %s" % _maps(len(summary["dead_maps"])))
+    if summary["bad_paths"]:
+        problems.append("%d of %d path(s) not usable" % (summary["bad_paths"], total))
+    if summary["suspended_maps"]:
+        problems.append("%s suspended" % _maps(len(summary["suspended_maps"])))
+    if unmanaged:
+        problems.append("%s multipathd does not manage" % _maps(len(unmanaged)))
+    if problems:
+        # a map with nothing left to send I/O down is not degraded, it is down: I/O is
+        # queueing or erroring on it right now, which is a different phone call
+        lead = "Down" if summary["dead_maps"] else "Degraded"
+        return flag("Multipath Path Health",
+                    "%s - %s, See Below" % (lead, ", ".join(problems))
+                    ).with_detail("Multipath Paths", detail)
+
+    text = "OK - %d/%d paths usable on %s" % (usable, total, _maps(len(summary["maps"])))
+    if summary["standby_paths"]:
+        # normal on an active/passive array, and worth saying out loud so nobody reads
+        # 4/4 and assumes four paths are carrying I/O
+        text += " (%d standby)" % summary["standby_paths"]
+    return ok("Multipath Path Health", text)
+
+
+def multipath_path_counts(hosts):
+    """Every host's view of the same LUN, compared.
+
+    The per-host line can only say whether a path is up; it cannot know how many there
+    are meant to be. Two hosts of one pool looking at one SAN can: a host that sees one
+    path where its peers see two is a missing session, a dead HBA or a NIC that never came
+    up - the "iSCSI multipath not connected on one host" case - and it is invisible from
+    the host itself, where one working path looks perfectly healthy.
+
+    Counts CONFIGURED paths, not usable ones: a failed path is still a row (measured), so
+    a path failure moves the per-host line and leaves this one alone, which is what keeps
+    the two lines from reporting the same fault twice in different words.
+    """
+    known, unreadable = [], []
+    for host in hosts:
+        summary, _unmanaged, _rechecked, _reason = _multipath_read(host)
+        if summary is None:
+            unreadable.append(host)
+            continue
+        known.append((host, dict((entry["name"], len(entry["paths"]))
+                                 for entry in summary["maps"])))
+
+    caveat = ""
+    if unreadable:
+        # every one of these already has its own Unknown in its host block, so this line
+        # reports what it CAN compare rather than throwing the comparison away
+        caveat = " (%d of %d hosts readable)" % (len(known), len(known) + len(unreadable))
+
+    if not known:
+        return unknown("Multipath Path Counts",
+                       "Unknown (no host's multipath state could be read)")
+    if not any(maps for _host, maps in known):
+        return ok("Multipath Path Counts", "N/A - No multipath maps in pool" + caveat)
+    if len(known) < 2:
+        return ok("Multipath Path Counts", "N/A - Nothing to compare" + caveat)
+
+    all_maps = sorted(set(name for _host, maps in known for name in maps))
+    blocks, mismatched = [], 0
+    for name in all_maps:
+        counts = [(host, maps.get(name)) for host, maps in known]
+        highest = max(count for _host, count in counts if count is not None)
+        if all(count == highest for _host, count in counts):
+            continue
+        mismatched += 1
+        blocks.append("--- %s ---" % name)
+        for host, count in counts:
+            if count is None:
+                blocks.append("  %s: map not present" % host.label)
+            elif count < highest:
+                blocks.append("  %s: %d path(s)   <- fewer than %d" % (host.label, count,
+                                                                       highest))
+            else:
+                blocks.append("  %s: %d path(s)" % (host.label, count))
+        blocks.append("")
+    if not mismatched:
+        return ok("Multipath Path Counts", "Matched" + caveat)
+    return flag("Multipath Path Counts",
+                "Mismatched on %d map(s), See Below%s" % (mismatched, caveat)
+                ).with_detail("Multipath Path Counts", "\n".join(blocks).rstrip("\n"))
+
+
+def _dmesg_phrase_blocks(text, phrases, ctx):
+    """The most recent hit of each phrase in the dmesg ring, shaped like a log-scan block.
+
+    Same shape and same "last occurrence with context" rule as the file scanner, so both
+    sources render through one renderer and read the same way.
+    """
+    text = text or ""
+    lines = text.splitlines()
+    blocks = []
+    for phrase in phrases:
+        hits = parsers.find_phrase_lines(text, phrase)
+        if not hits:
+            continue
+        label = "dmesg ring"
+        if len(hits) > 1:
+            # the count is the point: one blip and a fabric that flaps daily look
+            # identical when only the newest line is shown
+            label += ", %d occurrences, most recent shown" % len(hits)
+        n = hits[-1]
+        start, end = max(1, n - ctx), min(len(lines), n + ctx)
+        blocks.append({"phrase": phrase, "file": label, "line": n,
+                       "context": lines[start - 1:end]})
+    return blocks
+
+
+def multipath_events(host):
+    """Kernel-side, timestamped path failures - what the current-state check cannot see.
+
+    Read from BOTH sources, because neither contains the other:
+
+      * `kern.log` + its rotation - survives a reboot, but is a ~2-rotation window, and on
+        a quiet dom0 the live file is routinely 0 bytes with everything in `.1`.
+      * the **dmesg ring** - covers the whole uptime on a quiet host (measured on 8.3.0:
+        70 KB, unwrapped, back to the boot three days earlier, holding path failures that
+        were in NEITHER kern.log file), but wraps on a busy one and is gone after a reboot.
+
+    So an event can be in either, or both. Both are shown, each labelled with where it came
+    from, and no attempt is made to merge them: `dmesg -T` recomputes its timestamps from
+    (now - uptime) on every run, so the same failure is stamped a second or two away from
+    syslog's copy and cannot be matched on reliably.
+
+    Deliberately not the per-map path_faults counter, which never resets until the map
+    reloads: that would leave a permanent yellow behind a switch reboot last month. These
+    two windows both close by themselves.
+    """
+    scan = host.fact("multipath_scan")
+    dmesg = host.fact("dmesg")
+
+    blocks = list(scan.value) if (scan.ok and scan.value) else []
+    if dmesg.ok:
+        blocks = blocks + _dmesg_phrase_blocks(dmesg.value, config.MULTIPATH_EVENT_PHRASES,
+                                               config.LOG_ERROR_CONTEXT)
+    if blocks:
+        # a finding is established whatever the other source did or did not manage to say
+        detail = _render_scan_blocks(blocks)
+        if len(blocks) > 1:
+            detail += ("\n\n(the same event can appear under both sources - dmesg -T "
+                       "recomputes its timestamps each run, so they sit a second or two "
+                       "from syslog's)")
+        return flag("Multipath Path Events", "Yes, See Error Output").with_detail(
+            "Multipath Path Events", detail)
+    # nothing found, so every source has to have actually been read before this is a "None"
+    if not scan.ok:
+        return unknown("Multipath Path Events", "Unknown (%s)" % scan.error)
+    if not dmesg.ok:
+        return unknown("Multipath Path Events", "Unknown (could not read dmesg)")
+    return ok("Multipath Path Events", "None")
 
 
 def silly_mtus(host):
@@ -3587,6 +4164,11 @@ def _host_spec(with_smapi):
         "lun_scan": {"files": config.LUN_CHANGE_FILES,
                      "phrases": config.LUN_CHANGE_PHRASES,
                      "context": config.LOG_ERROR_CONTEXT},
+        "multipath_scan": {"files": config.MULTIPATH_EVENT_FILES,
+                           "phrases": config.MULTIPATH_EVENT_PHRASES,
+                           "context": config.LOG_ERROR_CONTEXT},
+        "multipath": {"transient": config.MULTIPATH_TRANSIENT_CHK_STATES,
+                      "recheck_delay": config.MULTIPATH_RECHECK_DELAY},
     }
 
 
@@ -4023,6 +4605,9 @@ def pool_status_section(run, rep):
                 else result.flag("Dom0 RAM Allocations", "Mismatched"))
         rep.add(result.ok("Pool Time Synchronization", "Matched") if model.ntp_match(reachable)
                 else result.flag("Pool Time Synchronization", "Mismatched"))
+        # like the two above, a comparison ACROSS hosts, so it belongs to the pool rather
+        # than to any one host and has nothing to say when only one host was looked at
+        rep.check("Multipath Path Counts", checks.multipath_path_counts, reachable)
 
     rep.check("HA Enabled", checks.ha_enabled, run.pool)
     rep.check("Migration Compression", checks.migration_compression, run.pool)
@@ -4089,6 +4674,8 @@ def per_host_checks():
         ("task_timeout_override", "XAPI Task Timeout Override",
          checks.task_timeout_override),
         ("lacp_negotiation", "LACP Negotiation Issues", checks.lacp),
+        ("multipath_health", "Multipath Path Health", checks.multipath_health),
+        ("multipath_events", "Multipath Path Events", checks.multipath_events),
         ("silly_mtus", "Silly MTUs", checks.silly_mtus),
         ("dns_gw_non_mgmt_pifs", "DNS/GW on Non-Mgmt PIFs", checks.dns_gw_non_mgmt_pifs),
         ("overlapping_subnets", "Overlapping Subnets", checks.overlapping_subnets),
@@ -4366,15 +4953,15 @@ def _module(name, exported):
     return module
 
 
-config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MTU_DMESG_KEYWORDS', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'REMOTE_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_QCOW2_MAX_LINES'])
+config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'REMOTE_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_QCOW2_MAX_LINES'])
 colors = _module('colors', ['CYAN', 'GREEN', 'RESET', 'YELLOW', 'cyan', 'green', 'init', 'strip_ansi', 'yellow'])
 result = _module('result', ['FLAG', 'Fact', 'INFO', 'Line', 'MISSING', 'OK', 'UNKNOWN', 'flag', 'guard', 'info', 'ok', 'raw', 'unknown', 'wrap'])
-parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'SKIP_FILESYSTEMS', '_LINK_RE', '_MTU_RE', '_PARAM_RE', '_cidr_range', '_normalise', '_word_re', 'cap_lines', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'has_overlapping_subnets', 'manifest_diff', 'manifest_versions', 'parse_bond_slave_of', 'parse_df', 'parse_dns_gw_pifs', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_meminfo', 'parse_other_config', 'parse_pool_conf', 'parse_timedatectl', 'parse_xe_records', 'round_1dp'])
+parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', '_LINK_RE', '_MTU_RE', '_PARAM_RE', '_cidr_range', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'cap_lines', 'classify_multipath_path', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'has_overlapping_subnets', 'manifest_diff', 'manifest_versions', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pool_conf', 'parse_timedatectl', 'parse_xe_records', 'round_1dp'])
 model = _module('model', ['Host', 'Pool', 'ntp_match', 'ram_match'])
 collectorsrc = _module('collectorsrc', ['EMBEDDED', 'collector_source'])
 transport = _module('transport', ['BEGIN_MARKER', 'CollectError', 'END_MARKER', 'Transport', '_DEBUG_LOCK', '_LIVE', '_LIVE_LOCK', '_REMOTE_LAUNCH', '_REMOTE_LAUNCH_PINNED', '_kill_tree', '_remote_launch', 'cleanup_work_dir', 'debug', 'ensure_sshpass', 'have', 'kill_all_children', 'make_work_dir', 'run_local_cmd'])
 xodb = _module('xodb', ['QUOTES', 'SELECT_NONE', 'SELECT_NO_MATCH', 'SELECT_OK', 'SELECT_QUIT', 'Server', '_ALL_SERVERS', '_ESCAPE_RE', '_KEY_RE', '_SIMPLE_ESCAPES', '_ls', '_sort_key', 'all_servers', 'clean', 'enabled_servers', 'have_xo_server_db', 'password_for', 'pool_name_for_host', 'reset_cache', 'scan_records', 'select_pool', 'unescape'])
-checks = _module('checks', ['_linstor_has_rows', '_linstor_line', '_linstor_node_offline', '_network_line', '_render_scan_blocks', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_content', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mtu_issues', 'multipathing', 'ntp', 'oom_events', 'overlapping_subnets', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'task_timeout_override', 'vlan0', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_nodes', 'xostor_qcow2', 'xostor_ram', 'yum_patch_level'])
+checks = _module('checks', ['_dmesg_phrase_blocks', '_linstor_has_rows', '_linstor_line', '_linstor_node_offline', '_maps', '_multipath_detail', '_multipath_read', '_network_line', '_render_scan_blocks', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_content', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'ntp', 'oom_events', 'overlapping_subnets', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'task_timeout_override', 'vlan0', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_nodes', 'xostor_qcow2', 'xostor_ram', 'yum_patch_level'])
 xoa = _module('xoa', ['_dmesg', '_first_token', '_max_old_space', '_meminfo', '_os_version', '_updater', 'collect_xoa', 'debian_version_ok', 'lines', 'ping_silent', 'running_as_root'])
 report = _module('report', ['Report', '_as_entry'])
 

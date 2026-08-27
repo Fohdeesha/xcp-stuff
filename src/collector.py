@@ -321,6 +321,101 @@ def collect_lacp():
     return fact(r.out)
 
 
+# multipathd's own format wildcards. 'raw' is what omits the header row - verified on
+# 0.4.9-136 on both 8.2.1 and 8.3.0, so every line that comes back is data.
+#   paths: %m map  %d dev  %D dev_t  %t dm_st  %T chk_st  %o dev_st  %p prio
+#   maps:  %n name %N usable-paths %t dm_st %Q queueing %x map-failures %0 path-faults
+#          %f features
+MP_PATH_FORMAT = "%m|%d|%D|%t|%T|%o|%p"
+MP_MAP_FORMAT = "%n|%N|%t|%Q|%x|%0|%f"
+MP_PATH_CHK_FIELD = 4       # index of %T in MP_PATH_FORMAT
+MP_QUERY_TIMEOUT = 20
+
+
+def _mp_transient(text, transient):
+    """True when a path that BELONGS TO A MAP is still mid-check.
+
+    A path in no map is reported under a bracketed pseudo-name ('[orphan]', '[undef]',
+    '[unknown]') and is permanently 'undef' - every local disk on every host is one of
+    those - so the bracket test is what keeps a boot disk from triggering a re-query on
+    every host in the pool, forever.
+    """
+    if not transient:
+        return False
+    for line in text.splitlines():
+        fields = line.split("|")
+        if len(fields) <= MP_PATH_CHK_FIELD:
+            continue
+        if not fields[0] or fields[0].startswith("["):
+            continue
+        if fields[MP_PATH_CHK_FIELD].strip() in transient:
+            return True
+    return False
+
+
+def collect_multipath(opts):
+    """Path-level multipath state: from the daemon, cross-checked against the kernel.
+
+    Four questions, ~9 ms each on the test hosts:
+
+      * `multipathd show daemon` - a POSITIVE liveness answer ('pid N running'). Without
+        it, "this host has no multipath" and "nobody answered" are the same empty output,
+        and the first one is green. A host with no maps prints exactly nothing (measured
+        on 8.2.1 and 8.3.0), so the difference has to be established somewhere else.
+      * maps and paths, in `raw format`.
+      * `dmsetup ls --target multipath` - what the KERNEL holds, which needs no daemon.
+        multipathd reporting no maps while device-mapper has some means the daemon is not
+        managing them: no failover, and precisely the silent case this check exists for.
+
+    `multipath -ll` is deliberately NOT used. It re-runs the path checkers itself, so it
+    does device I/O and can block on the dead path we are asking about, and it disagrees
+    with the daemon that actually routes the I/O: with sdd failed, multipathd said
+    'failed faulty running' while `multipath -ll` said 'failed ready running' (both
+    measured on 8.3.0, 2026-08-27).
+    """
+    opts = opts or {}
+    out = {}
+
+    r = run(["multipathd", "show", "daemon"], timeout=MP_QUERY_TIMEOUT)
+    out["daemon"] = fact(r.out) if r.ok else \
+        err("multipathd show daemon failed (%s)" % r.why())
+
+    r = run(["dmsetup", "ls", "--target", "multipath"], timeout=MP_QUERY_TIMEOUT)
+    out["dm"] = fact(r.out) if r.ok else err("dmsetup ls failed (%s)" % r.why())
+
+    r = run(["multipathd", "show", "maps", "raw", "format", MP_MAP_FORMAT],
+            timeout=MP_QUERY_TIMEOUT)
+    out["maps"] = fact(r.out) if r.ok else err("multipathd show maps failed (%s)" % r.why())
+
+    r = run(["multipathd", "show", "paths", "raw", "format", MP_PATH_FORMAT],
+            timeout=MP_QUERY_TIMEOUT)
+    if not r.ok:
+        out["paths"] = err("multipathd show paths failed (%s)" % r.why())
+        return fact(out)
+
+    text = r.out
+    rechecked = False
+    delay = opts.get("recheck_delay") or 0
+    left = budget_left()
+    if delay and _mp_transient(text, opts.get("transient") or []) \
+            and (left is None or left > delay + 10):
+        # one re-query, not a loop: the point is to let an in-flight check land, not to
+        # wait for a path to come back. Still undef the second time is reported as found.
+        time.sleep(delay)
+        again = run(["multipathd", "show", "paths", "raw", "format", MP_PATH_FORMAT],
+                    timeout=MP_QUERY_TIMEOUT)
+        if again.ok:
+            text = again.out
+            rechecked = True
+            r2 = run(["multipathd", "show", "maps", "raw", "format", MP_MAP_FORMAT],
+                     timeout=MP_QUERY_TIMEOUT)
+            if r2.ok:
+                out["maps"] = fact(r2.out)
+    out["paths"] = fact(text)
+    out["rechecked"] = fact(rechecked)
+    return fact(out)
+
+
 def collect_crash_count(ignore_name):
     """Files under /var/crash, two levels deep - crash dumps live in subdirectories."""
     root = "/var/crash"
@@ -948,6 +1043,7 @@ def collect(spec):
         out["iplink"] = collect_iplink()
         out["ipaddr"] = collect_ipaddr()
         out["lacp"] = collect_lacp()
+        out["multipath"] = collect_multipath(spec.get("multipath"))
         out["crash_count"] = collect_crash_count(spec.get("crash_ignore_file") or "")
         out["coredumps"] = collect_coredumps(spec.get("coredump_dir") or "")
         out["task_timeout"] = collect_task_timeout_override()
@@ -970,6 +1066,10 @@ def collect(spec):
         out["lun_scan"] = collect_log_scan(lun.get("files") or [],
                                            lun.get("phrases") or [],
                                            lun.get("context") or 3)
+        mps = spec.get("multipath_scan") or {}
+        out["multipath_scan"] = collect_log_scan(mps.get("files") or [],
+                                                 mps.get("phrases") or [],
+                                                 mps.get("context") or 3)
         if spec.get("smapi"):
             out["smapi"] = collect_smapi_hidden_leaves()
 
