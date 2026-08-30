@@ -424,6 +424,14 @@ def test_lacp_states():
     assert checks.lacp(host(lacp=err("could not query Open vSwitch"))).status == UNKNOWN
 
 
+def test_tap_status_states():
+    assert checks.tap_status(host(tap_status=fact("blktap2 ..."))).status == OK
+    timeout = checks.tap_status(host(tap_status=err("tap-ctl list timed out after 20s")))
+    assert timeout.status == UNKNOWN and "Timeout" in timeout.text
+    other = checks.tap_status(host(tap_status=err("tap-ctl list failed (exit 1: ...)")))
+    assert other.status == UNKNOWN and "Timeout" not in other.text
+
+
 def test_task_timeout_override_states():
     # no drop-in directory, and a directory with nothing in it, are the same real answer
     assert checks.task_timeout_override(host(task_timeout=fact([]))).status == OK

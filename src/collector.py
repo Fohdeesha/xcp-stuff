@@ -416,6 +416,20 @@ def collect_multipath(opts):
     return fact(out)
 
 
+TAP_CTL_TIMEOUT = 20
+
+def collect_tap_status():
+    """'tap-ctl list' talks to blktap over its control socket - a wedged tapdisk answers
+    nothing and hangs the call, which is exactly the failure this exists to surface as its
+    own fact rather than as a blank/missing one."""
+    r = run(["tap-ctl", "list"], timeout=TAP_CTL_TIMEOUT)
+    if r.timed_out:
+        return err("tap-ctl list timed out after %ds" % TAP_CTL_TIMEOUT)
+    if not r.ok:
+        return err("tap-ctl list failed (%s)" % r.why())
+    return fact(r.out)
+
+
 def collect_crash_count(ignore_name):
     """Files under /var/crash, two levels deep - crash dumps live in subdirectories."""
     root = "/var/crash"
@@ -1044,6 +1058,7 @@ def collect(spec):
         out["ipaddr"] = collect_ipaddr()
         out["lacp"] = collect_lacp()
         out["multipath"] = collect_multipath(spec.get("multipath"))
+        out["tap_status"] = collect_tap_status()
         out["crash_count"] = collect_crash_count(spec.get("crash_ignore_file") or "")
         out["coredumps"] = collect_coredumps(spec.get("coredump_dir") or "")
         out["task_timeout"] = collect_task_timeout_override()
