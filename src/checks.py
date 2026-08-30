@@ -767,6 +767,31 @@ def xostor_controller(pool):
     return ok("XOSTOR Controller IP", value)
 
 
+def xostor_pref_nic(pool):
+    """XOSTOR replication should run over the same dedicated NIC/bond on every node - a
+    node missing PrefNic falls back to the default route, and nodes disagreeing means
+    replication traffic for the same resource takes different paths depending on which
+    node initiates it. Neither is visible from any single node's own report."""
+    f = pool.fact("linstor_pref_nics")
+    if not f.ok:
+        return unknown("XOSTOR PrefNic", "Unknown (%s)" % f.error)
+    nics = f.value or {}
+    if not nics:
+        return unknown("XOSTOR PrefNic", "Unknown (no linstor nodes found)")
+    missing = sorted(name for name, nic in nics.items() if not nic)
+    values = set(nic for nic in nics.values() if nic)
+    if missing:
+        detail = "\n".join("%s: %s" % (name, nics[name] or "(not set)")
+                           for name in sorted(nics))
+        return flag("XOSTOR PrefNic", "Not set on: %s" % ", ".join(missing)).with_detail(
+            "---xostor prefnic---", detail)
+    if len(values) > 1:
+        detail = "\n".join("%s: %s" % (name, nics[name]) for name in sorted(nics))
+        return flag("XOSTOR PrefNic", "Inconsistent Across Nodes, See Below").with_detail(
+            "---xostor prefnic---", detail)
+    return ok("XOSTOR PrefNic", "%s (all nodes)" % values.pop())
+
+
 def xostor_qcow2(pool):
     f = pool.fact("qcow2")
     if not f.ok:

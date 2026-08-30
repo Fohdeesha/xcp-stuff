@@ -326,6 +326,23 @@ def test_xostor_controller_none_is_a_failure():
     assert line.status == OK and "10.0.0.5" in line.text
 
 
+def test_xostor_pref_nic_states():
+    assert checks.xostor_pref_nic(
+        pool(linstor_pref_nics=fact({"a": "bond0", "b": "bond0"}))).status == OK
+
+    missing = checks.xostor_pref_nic(
+        pool(linstor_pref_nics=fact({"a": "bond0", "b": None})))
+    assert missing.status == FLAG and "b" in missing.text
+
+    inconsistent = checks.xostor_pref_nic(
+        pool(linstor_pref_nics=fact({"a": "bond0", "b": "bond1"})))
+    assert inconsistent.status == FLAG and "Inconsistent" in inconsistent.text
+
+    assert checks.xostor_pref_nic(pool(linstor_pref_nics=fact({}))).status == UNKNOWN
+    assert checks.xostor_pref_nic(pool(linstor_pref_nics=err("linstor CLI not found"))).status \
+        == UNKNOWN
+
+
 def test_xostor_qcow2_cap_counts_the_remainder():
     rows = ["uuid%d  name%d" % (i, i) for i in range(50)]
     line = checks.xostor_qcow2(pool(qcow2=fact(rows), qcow2_total=fact(63)))
