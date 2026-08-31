@@ -42,7 +42,7 @@ import unicodedata
 # ======================================================================================
 # --- config ----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "3.3"
+SCRIPT_VERSION = "3.4"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
@@ -150,6 +150,7 @@ POOL_RUN = {
     "oom_events": True,
     "crash_logs_present": True,
     "coredumps_present": True,
+    "tap_ctl_list": True,
     "task_timeout_override": True,
     "lacp_negotiation": True,
     "multipath_health": True,
@@ -1521,6 +1522,30 @@ def collect_multipath(opts):
     return fact(out)
 
 
+TAP_CTL_TIMEOUT = 20
+
+
+def collect_tap_status():
+    """'tap-ctl list' talks to blktap over its control socket - a wedged tapdisk answers
+    nothing and hangs the call, which is exactly the failure this exists to surface as its
+    own fact rather than as a blank/missing one.
+
+    The rows come back raw and are counted, not judged. Each is
+    'pid=N minor=N state=N args=...', and the state field is NOT a health value: blktap
+    exposes 'tap-ctl pause' / 'unpause' as ordinary operations (verified on blktap
+    3.55.5, 8.3.0), so SMAPI parks tapdisks in non-zero states during snapshot and
+    coalesce. Flagging on it would fire through every backup window. What this fact
+    establishes is that blktap answered and how many tapdisks it named - so the check
+    says exactly that, and nothing about whether each one is happy.
+    """
+    r = run(["tap-ctl", "list"], timeout=TAP_CTL_TIMEOUT)
+    if r.timed_out:
+        return err("tap-ctl list timed out after %ds" % TAP_CTL_TIMEOUT)
+    if not r.ok:
+        return err("tap-ctl list failed (%s)" % r.why())
+    return fact(r.out)
+
+
 def collect_crash_count(ignore_name):
     """Files under /var/crash, two levels deep - crash dumps live in subdirectories."""
     root = "/var/crash"
@@ -1991,14 +2016,121 @@ def _network_info(network_uuid, want_ips):
     return info
 
 
-def _linstor(controllers, args):
+LINSTOR_TIMEOUT = 120
+LINSTOR_PROP_TIMEOUT = 30       # one node's properties, not a whole-cluster listing
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def strip_ansi(text):
+    """Defensive, exactly as colors.strip_ansi is on the XOA side: some tools colourise
+    even when their output is a pipe. The collector cannot import colors - it ships alone -
+    so it carries its own."""
+    return ANSI_RE.sub("", text)
+
+
+def _linstor(controllers, args, timeout=LINSTOR_TIMEOUT):
     if which("linstor") is None:
         return err("linstor CLI not found")
     argv = ["linstor", "--controllers=" + ",".join(controllers)] + list(args)
-    r = run(argv, timeout=120)
+    r = run(argv, timeout=timeout)
     if not r.ok:
         return err("linstor %s failed (%s)" % (" ".join(args), r.why()))
     return fact(r.out)
+
+
+def linstor_table_column(text, header):
+    """Values under `header` in one of linstor's ASCII tables, in row order.
+
+    The header row is located by its own cell rather than assumed to be row one, since a
+    faulty-nodes or resource table uses the same box-drawing style with different columns.
+    ANSI is stripped from every cell: checks._linstor_node_offline, which reads the State
+    column of this same 'n l' table on the XOA side, has always done so - a coloured Node
+    cell here would be a name no subsequent 'n lp <node>' call could match, and every node
+    would then read as unqueryable.
+
+    That XOA-side twin cannot be shared with this one: it runs where the report is built
+    and this runs on the hypervisor, so the two are deliberate duplicates. Keep the header
+    location and the cell-splitting rule identical in both.
+    """
+    col = None
+    values = []
+    for raw in text.splitlines():
+        line = strip_ansi(raw)
+        if not line.startswith("|"):
+            continue
+        # Any rule row, however it is drawn. Testing for the '|===|' spelling alone let a
+        # '|---|' separator through as a data row, and its dashes were then returned as a
+        # node name - a name no 'n lp' call can match, which reads downstream as a node
+        # that would not answer. Cheap to be exhaustive about instead.
+        if not set(line) - set("|-=+ "):
+            continue
+        cells = [c.strip() for c in line.split("|")[1:-1]]
+        if col is None:
+            if header in cells:
+                col = cells.index(header)
+            continue
+        if col < len(cells) and cells[col]:
+            values.append(cells[col])
+    return values
+
+
+def _linstor_node_names(text):
+    return linstor_table_column(text, "Node")
+
+
+def _linstor_pref_nics(controllers, node_names):
+    """PrefNic for every node, one 'linstor -m n lp <node>' call each - list-properties has
+    no all-nodes form, unlike 'n l'.
+
+    Returns {node_name: nic_or_None} holding ONLY the nodes that answered. Which nodes
+    were asked is carried separately by the caller, because the difference between the two
+    is the whole finding: a node whose properties could not be read is not a node with no
+    PrefNic, and reporting agreement across the survivors of a partial read would be a
+    green line claiming more than was established. The check compares the two sets.
+
+    -m (machine-readable JSON) is used here rather than the plain-text property table:
+    that table's border style depends on whether linstor thinks it has a terminal - piped
+    through subprocess as this always is, it prints the same ASCII '+'/'|' borders as the
+    'n l' node table, not the Unicode box the interactive CLI shows. Parsing JSON sidesteps
+    having to track which glyph set a given linstor version/mode falls back to.
+
+    Serial, one call per node: a cluster is a handful of nodes, and the per-call timeout is
+    LINSTOR_PROP_TIMEOUT rather than the full LINSTOR_TIMEOUT so that a degraded controller
+    cannot spend the whole-run budget here. If it does run out anyway, run() answers
+    'run budget exhausted' and those nodes land in the unread set - visible, not silent.
+    """
+    out = {}
+    for name in node_names:
+        r = _linstor(controllers, ["-m", "n", "lp", name], timeout=LINSTOR_PROP_TIMEOUT)
+        if not r["ok"]:
+            continue
+        nic = parse_linstor_pref_nic(r["value"])
+        if nic is not False:
+            out[name] = nic
+    return out
+
+
+def parse_linstor_pref_nic(text):
+    """PrefNic out of 'linstor -m node list-properties' JSON.
+
+    The real shape (verified against 8.3.0, 2026-08-30) is a list wrapping ONE list of
+    {"key", "value"} property objects - [[{...}, {...}]] - not a bare property list.
+    None means the node has no PrefNic property set (linstor omits it rather than
+    printing an empty value); False means the JSON itself could not be parsed, which the
+    caller treats as 'skip this node' rather than 'not set' - different facts that must
+    not collapse into the same flag.
+    """
+    try:
+        outer = json.loads(text)
+    except ValueError:
+        return False
+    if not isinstance(outer, list) or not outer or not isinstance(outer[0], list):
+        return False
+    for entry in outer[0]:
+        if isinstance(entry, dict) and entry.get("key") == "PrefNic":
+            return entry.get("value")
+    return None
 
 
 def _qcow2_vdis(sr_uuids, cap):
@@ -2103,9 +2235,23 @@ def collect_pool(spec, self_uuid):
 
     if sr_uuids:
         controllers = spec.get("controllers") or []
-        out["linstor_nodes"] = _linstor(controllers, ["n", "l"])
+        nodes_r = _linstor(controllers, ["n", "l"])
+        out["linstor_nodes"] = nodes_r
         out["linstor_faulty"] = _linstor(controllers, ["r", "l", "--faulty"])
         out["linstor_controller"] = _linstor(controllers, ["c", "which"])
+        if not nodes_r["ok"]:
+            out["linstor_pref_nics"] = err("could not list linstor nodes")
+        else:
+            names = _linstor_node_names(nodes_r["value"])
+            if not names:
+                # 'n l' answered, but nothing recognisable as a Node column came out of it
+                # - a linstor that changed its table format, not a cluster with no nodes.
+                # Saying "no nodes found" here would be a reading, and this is a failure.
+                out["linstor_pref_nics"] = err(
+                    "no node names in 'linstor n l' output")
+            else:
+                out["linstor_pref_nics"] = fact(
+                    {"nodes": names, "nics": _linstor_pref_nics(controllers, names)})
         rows, total = _qcow2_vdis(sr_uuids, spec.get("qcow2_max") or 0)
         out["qcow2"] = rows
         out["qcow2_total"] = fact(total)
@@ -2149,6 +2295,7 @@ def collect(spec):
         out["ipaddr"] = collect_ipaddr()
         out["lacp"] = collect_lacp()
         out["multipath"] = collect_multipath(spec.get("multipath"))
+        out["tap_status"] = collect_tap_status()
         out["crash_count"] = collect_crash_count(spec.get("crash_ignore_file") or "")
         out["coredumps"] = collect_coredumps(spec.get("coredump_dir") or "")
         out["task_timeout"] = collect_task_timeout_override()
@@ -2990,6 +3137,27 @@ def lacp(host):
     return ok("LACP Negotiation Issues", "No")
 
 
+def tap_status(host):
+    """A timed-out 'tap-ctl list' means blktap itself is wedged - distinct from every
+    other failure of that call, so it gets its own message rather than a generic Unknown.
+
+    The green value says 'Responding' and counts the rows, because responding is the whole
+    of what the call established. It deliberately does not read the per-tapdisk 'state='
+    field: blktap offers 'tap-ctl pause'/'unpause' as ordinary operations, so SMAPI parks
+    tapdisks in non-zero states during snapshot and coalesce, and judging that number would
+    flag a healthy host through every backup window. The count is evidence rather than a
+    verdict - a host that should have tapdisks and reports zero is visible in the report
+    without this line having to guess what the right number is.
+    """
+    f = host.fact("tap_status")
+    if f.ok:
+        rows = [ln for ln in (f.value or "").splitlines() if ln.strip()]
+        return ok("Tapdisk Status", "Responding (%d tapdisk(s))" % len(rows))
+    if "timed out" in (f.error or ""):
+        return unknown("Tapdisk Status", "Timeout issues, unable to determine tap status")
+    return unknown("Tapdisk Status", "Unknown (%s)" % f.error)
+
+
 def _maps(count):
     """'1 map' / '3 maps'. Each count gets its own word: pluralising every phrase off the
     total once printed 'no usable path on 1 maps'."""
@@ -3474,6 +3642,11 @@ def _linstor_line(pool, key, label, predicate, detail_title):
 
 
 def _linstor_node_offline(text):
+    """The State column of 'linstor n l'. Deliberate twin of collector.linstor_table_column,
+    which reads the Node column of this same table on the hypervisor: one runs where the
+    report is built and one runs where linstor is, so they cannot be shared. Keep the
+    header location, the cell splitting and the ANSI stripping identical in both.
+    """
     state_col = None
     for line in text.splitlines():
         if line.startswith("+") or line.startswith("|="):
@@ -3521,6 +3694,55 @@ def xostor_controller(pool):
     if not value.strip():
         return flag("XOSTOR Controller IP", "None")
     return ok("XOSTOR Controller IP", value)
+
+
+def xostor_pref_nic(pool):
+    """XOSTOR replication should run over the same dedicated NIC/bond on every node - a
+    node missing PrefNic falls back to the default route, and nodes disagreeing means
+    replication traffic for the same resource takes different paths depending on which
+    node initiates it. Neither is visible from any single node's own report.
+
+    The fact carries both the nodes that were ASKED and the answers that came back, and
+    they are compared before anything green is printed. A node whose properties could not
+    be read has not been shown to agree with the others, so a run that heard from two of
+    five nodes cannot say 'all nodes' - it says which three it could not read. The unread
+    set is what a partial linstor answer, a controller that went away mid-run, or the
+    collector's whole-run budget running out all arrive as.
+
+    A PrefNic genuinely absent on a node that DID answer stays a finding either way: it is
+    established, so an unread peer elsewhere in the cluster does not suppress it. Every
+    node appears in the detail block, unread ones included, so the reading is auditable.
+    """
+    f = pool.fact("linstor_pref_nics")
+    if not f.ok:
+        return unknown("XOSTOR PrefNic", "Unknown (%s)" % f.error)
+    value = f.value or {}
+    nodes = sorted(value.get("nodes") or [])
+    nics = value.get("nics") or {}
+    if not nodes:
+        return unknown("XOSTOR PrefNic", "Unknown (no linstor nodes found)")
+
+    unread = [name for name in nodes if name not in nics]
+    detail = "\n".join(
+        "%s: %s" % (name, "(could not read)" if name in unread else (nics[name] or "(not set)"))
+        for name in nodes)
+
+    if len(unread) == len(nodes):
+        return unknown("XOSTOR PrefNic",
+                       "Unknown (could not read PrefNic on any of %d node(s))" % len(nodes))
+    missing = sorted(name for name in nics if not nics[name])
+    if missing:
+        return flag("XOSTOR PrefNic", "Not set on: %s" % ", ".join(missing)).with_detail(
+            "---xostor prefnic---", detail)
+    values = set(nic for nic in nics.values() if nic)
+    if len(values) > 1:
+        return flag("XOSTOR PrefNic", "Inconsistent Across Nodes, See Below").with_detail(
+            "---xostor prefnic---", detail)
+    if unread:
+        return unknown("XOSTOR PrefNic",
+                       "Unknown (could not read: %s)" % ", ".join(unread)).with_detail(
+            "---xostor prefnic---", detail)
+    return ok("XOSTOR PrefNic", "%s (all %d nodes)" % (values.pop(), len(nodes)))
 
 
 def xostor_qcow2(pool):
@@ -3616,9 +3838,37 @@ def _first_token(text):
     return ""
 
 
+def _service_state(name):
+    """systemd's word for the unit, or None if systemd could not be asked at all.
+
+    'is-active' puts a state on stdout whether or not the unit is up, and the word is what
+    is reported rather than a yes/no of our own. Measured on the XOA (Debian 12, systemd
+    252): rc 0 + 'active' for a running unit, rc 3 + 'inactive' for one that is installed
+    and stopped, and rc 3 + 'inactive' for a unit that does not exist at all - so the rc
+    alone does not separate those, and none of them is the case this guards against.
+
+    A missing systemctl (rc 127, nothing on stdout) and a timeout (rc 124) are NOT answers:
+    they leave the unit's state unestablished, and reporting that as 'not running' would be
+    a claim of its own. Those are the None.
+    """
+    rc, out, _err = transport.run_local_cmd(["systemctl", "is-active", name],
+                                            timeout=config.LOCAL_CMD_TIMEOUT)
+    state = out.strip()
+    if rc == 124 or not state:
+        return None
+    return state
+
+
 def collect_xoa():
     """Everything the section needs, gathered before anything is printed."""
     data = {}
+    # Asked before the updater is, because every xoa-updater call below talks to this
+    # daemon: with it down they fail, and a failed call used to read as 'Unregistered' and
+    # 'Updates available' - findings invented by the tool rather than found by it.
+    data["updater_service_state"] = _service_state("xoa-updater")
+    if data["updater_service_state"] != "active":
+        return data
+
     rc, out = _updater()
     data["updater_timeout"] = (rc == 124)
     if rc == 124:
@@ -3696,7 +3946,14 @@ def lines():
     out = []
     data = collect_xoa()
 
-    if data.get("updater_timeout"):
+    state = data.get("updater_service_state")
+    if state is None:
+        out.append(unknown("XOA-Updater",
+                           "Could not query the service, unable to determine XOA status"))
+    elif state != "active":
+        out.append(unknown("XOA-Updater",
+                           "Service is %s, unable to determine XOA status" % state))
+    elif data.get("updater_timeout"):
         out.append(unknown("XOA-Updater",
                            "Timeout issues, unable to determine XOA status"))
     else:
@@ -4624,6 +4881,7 @@ def pool_status_section(run, rep):
         rep.check("XOSTOR Faulty Resources", checks.xostor_faulty_resources, run.pool)
         rep.check("XOSTOR Faulty Nodes", checks.xostor_nodes, run.pool)
         rep.check("XOSTOR Controller IP", checks.xostor_controller, run.pool)
+        rep.check("XOSTOR PrefNic", checks.xostor_pref_nic, run.pool)
         rep.check("XOSTOR QCOW2 VDIs", checks.xostor_qcow2, run.pool)
 
     rep.check("VLAN 0 Check", checks.vlan0, run.pool)
@@ -4671,8 +4929,8 @@ def per_host_checks():
         ("oom_events", "OOM Events", checks.oom_events),
         ("crash_logs_present", "Crash Logs Present", checks.crash_logs),
         ("coredumps_present", "Coredumps Present", checks.coredumps),
-        ("task_timeout_override", "XAPI Task Timeout Override",
-         checks.task_timeout_override),
+        ("tap_ctl_list", "Tapdisk Status", checks.tap_status),
+        ("task_timeout_override", "XAPI Task Timeout Override", checks.task_timeout_override),
         ("lacp_negotiation", "LACP Negotiation Issues", checks.lacp),
         ("multipath_health", "Multipath Path Health", checks.multipath_health),
         ("multipath_events", "Multipath Path Events", checks.multipath_events),
@@ -4961,8 +5219,8 @@ model = _module('model', ['Host', 'Pool', 'ntp_match', 'ram_match'])
 collectorsrc = _module('collectorsrc', ['EMBEDDED', 'collector_source'])
 transport = _module('transport', ['BEGIN_MARKER', 'CollectError', 'END_MARKER', 'Transport', '_DEBUG_LOCK', '_LIVE', '_LIVE_LOCK', '_REMOTE_LAUNCH', '_REMOTE_LAUNCH_PINNED', '_kill_tree', '_remote_launch', 'cleanup_work_dir', 'debug', 'ensure_sshpass', 'have', 'kill_all_children', 'make_work_dir', 'run_local_cmd'])
 xodb = _module('xodb', ['QUOTES', 'SELECT_NONE', 'SELECT_NO_MATCH', 'SELECT_OK', 'SELECT_QUIT', 'Server', '_ALL_SERVERS', '_ESCAPE_RE', '_KEY_RE', '_SIMPLE_ESCAPES', '_ls', '_sort_key', 'all_servers', 'clean', 'enabled_servers', 'have_xo_server_db', 'password_for', 'pool_name_for_host', 'reset_cache', 'scan_records', 'select_pool', 'unescape'])
-checks = _module('checks', ['_dmesg_phrase_blocks', '_linstor_has_rows', '_linstor_line', '_linstor_node_offline', '_maps', '_multipath_detail', '_multipath_read', '_network_line', '_render_scan_blocks', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_content', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'ntp', 'oom_events', 'overlapping_subnets', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'task_timeout_override', 'vlan0', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_nodes', 'xostor_qcow2', 'xostor_ram', 'yum_patch_level'])
-xoa = _module('xoa', ['_dmesg', '_first_token', '_max_old_space', '_meminfo', '_os_version', '_updater', 'collect_xoa', 'debian_version_ok', 'lines', 'ping_silent', 'running_as_root'])
+checks = _module('checks', ['_dmesg_phrase_blocks', '_linstor_has_rows', '_linstor_line', '_linstor_node_offline', '_maps', '_multipath_detail', '_multipath_read', '_network_line', '_render_scan_blocks', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_content', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'ntp', 'oom_events', 'overlapping_subnets', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'tap_status', 'task_timeout_override', 'vlan0', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_nodes', 'xostor_pref_nic', 'xostor_qcow2', 'xostor_ram', 'yum_patch_level'])
+xoa = _module('xoa', ['_dmesg', '_first_token', '_max_old_space', '_meminfo', '_os_version', '_service_state', '_updater', 'collect_xoa', 'debian_version_ok', 'lines', 'ping_silent', 'running_as_root'])
 report = _module('report', ['Report', '_as_entry'])
 
 

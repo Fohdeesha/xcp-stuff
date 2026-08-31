@@ -184,6 +184,33 @@ def test_linstor_node_names_on_a_table_with_no_node_column():
     assert collector._linstor_node_names(other) == []
 
 
+def test_linstor_table_column_reads_any_named_column():
+    assert collector.linstor_table_column(LINSTOR_NODES, "State") == ["Online", "OFFLINE"]
+    assert collector.linstor_table_column(LINSTOR_NODES, "NoSuchColumn") == []
+
+
+def test_linstor_table_column_never_returns_a_rule_row_as_a_value():
+    """A separator drawn any way at all is a separator. Returning its dashes as a node
+    name would send an 'n lp ---' call that cannot match, and the node it displaced would
+    silently never be asked about."""
+    for rule in ("|-------------|", "|=============|", "| ----- | --- |", "+-------------+"):
+        table = "%s\n| Node | State |\n%s\n| xen-01 | Online |\n%s\n" % (rule, rule, rule)
+        assert collector.linstor_table_column(table, "Node") == ["xen-01"]
+
+
+def test_linstor_node_names_strips_ansi():
+    """A coloured Node cell would be a name no 'n lp <node>' call could ever match, so
+    every node would read as unqueryable. checks._linstor_node_offline strips ANSI off
+    this same table for the same reason."""
+    coloured = LINSTOR_NODES.replace("xen-sec-01", "\x1b[32mxen-sec-01\x1b[0m")
+    assert collector._linstor_node_names(coloured) == ["xen-sec-01", "xen-sec-02"]
+
+
+def test_linstor_node_names_strips_ansi_from_the_header_too():
+    coloured = LINSTOR_NODES.replace("| Node ", "| \x1b[1mNode\x1b[0m ")
+    assert collector._linstor_node_names(coloured) == ["xen-sec-01", "xen-sec-02"]
+
+
 # verified against 8.3.0, 2026-08-30: the outer list wraps ONE list of property objects
 LINSTOR_PREFNIC_JSON = json.dumps([[
     {"key": "CurStltConnName", "value": "default"},
@@ -212,10 +239,14 @@ def test_parse_linstor_pref_nic_unparseable_json_is_false():
         json.dumps([{"key": "PrefNic", "value": "bond0"}])) is False
 
 
-def test_linstor_pref_nics_skips_nodes_that_could_not_be_queried_or_parsed(monkeypatch):
+def test_linstor_pref_nics_omits_nodes_that_could_not_be_queried_or_parsed(monkeypatch):
+    """The dict holds only what was READ. The caller pairs it with the list of nodes that
+    were ASKED, and the check reports the difference - see
+    test_xostor_pref_nic_never_says_all_nodes_off_a_partial_read. Dropping a node here is
+    only safe because it stays visible there."""
     calls = []
 
-    def fake(controllers, args):
+    def fake(controllers, args, timeout=None):
         calls.append(args)
         if args[-1] == "bad-node":
             return collector.err("linstor failed")
@@ -224,9 +255,42 @@ def test_linstor_pref_nics_skips_nodes_that_could_not_be_queried_or_parsed(monke
         return collector.fact(LINSTOR_PREFNIC_JSON)
 
     monkeypatch.setattr(collector, "_linstor", fake)
-    result = collector._linstor_pref_nics(
-        [], ["good-node", "bad-node", "unparseable-node"])
+    asked = ["good-node", "bad-node", "unparseable-node"]
+    result = collector._linstor_pref_nics([], asked)
     assert result == {"good-node": "bond0"}
+    assert [n for n in asked if n not in result] == ["bad-node", "unparseable-node"]
     # -m: parsing depends on JSON, not on which border glyphs a non-interactive
     # linstor call happens to fall back to
     assert all(a[:3] == ["-m", "n", "lp"] for a in calls)
+
+
+def test_linstor_pref_nics_uses_the_short_per_node_timeout(monkeypatch):
+    """A whole-cluster listing gets LINSTOR_TIMEOUT; one node's properties must not, or a
+    degraded controller can spend the collector's whole-run budget in this loop."""
+    seen = []
+
+    def fake(controllers, args, timeout=None):
+        seen.append(timeout)
+        return collector.fact(LINSTOR_PREFNIC_JSON)
+
+    monkeypatch.setattr(collector, "_linstor", fake)
+    collector._linstor_pref_nics([], ["a", "b"])
+    assert seen == [collector.LINSTOR_PROP_TIMEOUT] * 2
+    assert collector.LINSTOR_PROP_TIMEOUT < collector.LINSTOR_TIMEOUT
+
+
+def test_collect_pool_pairs_the_asked_nodes_with_the_answers(monkeypatch):
+    """The wire shape the check depends on: which nodes were asked travels with what came
+    back, so a partial read cannot arrive looking like a complete one."""
+    def fake(controllers, args, timeout=None):
+        if args[:2] == ["n", "l"]:
+            return collector.fact(LINSTOR_NODES)
+        if args[-1] == "xen-sec-02":
+            return collector.err("linstor failed")
+        return collector.fact(LINSTOR_PREFNIC_JSON)
+
+    monkeypatch.setattr(collector, "_linstor", fake)
+    names = collector._linstor_node_names(LINSTOR_NODES)
+    value = {"nodes": names, "nics": collector._linstor_pref_nics([], names)}
+    assert value["nodes"] == ["xen-sec-01", "xen-sec-02"]
+    assert value["nics"] == {"xen-sec-01": "bond0"}

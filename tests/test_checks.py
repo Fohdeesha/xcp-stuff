@@ -58,6 +58,7 @@ UNCOLLECTED = [
     ("Coredumps Present", checks.coredumps),
     ("XAPI Task Timeout Override", checks.task_timeout_override),
     ("LACP Negotiation Issues", checks.lacp),
+    ("Tapdisk Status", checks.tap_status),
     ("Multipath Path Health", checks.multipath_health),
     ("Multipath Path Events", checks.multipath_events),
     ("Silly MTUs", checks.silly_mtus),
@@ -104,7 +105,7 @@ def test_every_host_check_says_unknown_when_the_fact_is_an_error():
     broken = host(df=err(), dmesg=err(), crash_count=err(), coredumps=err(), lacp=err(),
                   iplink=err(), pifs_dns_gw=err(), ipaddr=err(), log_scan=err(),
                   lun_scan=err(), smapi=err(), boot_epoch=err(), task_timeout=err(),
-                  multipath=err(), multipath_scan=err())
+                  multipath=err(), multipath_scan=err(), tap_status=err())
     for key, fn in UNCOLLECTED:
         line = fn(broken)
         assert line.status == UNKNOWN, "%s answered %s off an error" % (key, line.status)
@@ -326,21 +327,59 @@ def test_xostor_controller_none_is_a_failure():
     assert line.status == OK and "10.0.0.5" in line.text
 
 
+def _prefnic(nodes, nics):
+    return pool(linstor_pref_nics=fact({"nodes": nodes, "nics": nics}))
+
+
 def test_xostor_pref_nic_states():
     assert checks.xostor_pref_nic(
-        pool(linstor_pref_nics=fact({"a": "bond0", "b": "bond0"}))).status == OK
+        _prefnic(["a", "b"], {"a": "bond0", "b": "bond0"})).status == OK
 
-    missing = checks.xostor_pref_nic(
-        pool(linstor_pref_nics=fact({"a": "bond0", "b": None})))
+    missing = checks.xostor_pref_nic(_prefnic(["a", "b"], {"a": "bond0", "b": None}))
     assert missing.status == FLAG and "b" in missing.text
 
     inconsistent = checks.xostor_pref_nic(
-        pool(linstor_pref_nics=fact({"a": "bond0", "b": "bond1"})))
+        _prefnic(["a", "b"], {"a": "bond0", "b": "bond1"}))
     assert inconsistent.status == FLAG and "Inconsistent" in inconsistent.text
 
-    assert checks.xostor_pref_nic(pool(linstor_pref_nics=fact({}))).status == UNKNOWN
+    assert checks.xostor_pref_nic(_prefnic([], {})).status == UNKNOWN
     assert checks.xostor_pref_nic(pool(linstor_pref_nics=err("linstor CLI not found"))).status \
         == UNKNOWN
+
+
+def test_xostor_pref_nic_never_says_all_nodes_off_a_partial_read():
+    """The regression this shape exists to prevent.
+
+    Three nodes were asked and one answered. Agreement among the survivors of a partial
+    read is not agreement across the cluster, and the node that did not answer is exactly
+    where a misconfiguration would hide.
+    """
+    line = checks.xostor_pref_nic(_prefnic(["a", "b", "c"], {"a": "bond0"}))
+    assert line.status == UNKNOWN
+    assert "b" in line.text and "c" in line.text
+    assert "all" not in line.text
+    assert line.flags
+    # every node is accounted for in the detail, unread ones included
+    assert "a: bond0" in line.detail_text
+    assert "b: (could not read)" in line.detail_text
+    assert "c: (could not read)" in line.detail_text
+
+
+def test_xostor_pref_nic_established_finding_survives_an_unread_peer():
+    """A node that answered 'no PrefNic' is a finding whether or not a peer went quiet."""
+    line = checks.xostor_pref_nic(_prefnic(["a", "b", "c"], {"a": "bond0", "b": None}))
+    assert line.status == FLAG and "b" in line.text
+    assert "c: (could not read)" in line.detail_text
+
+
+def test_xostor_pref_nic_when_no_node_answered_at_all():
+    line = checks.xostor_pref_nic(_prefnic(["a", "b"], {}))
+    assert line.status == UNKNOWN and "any of 2" in line.text
+
+
+def test_xostor_pref_nic_green_line_names_the_node_count():
+    line = checks.xostor_pref_nic(_prefnic(["a", "b", "c"], dict.fromkeys("abc", "bond0")))
+    assert line.status == OK and line.text == "bond0 (all 3 nodes)"
 
 
 def test_xostor_qcow2_cap_counts_the_remainder():
@@ -441,12 +480,29 @@ def test_lacp_states():
     assert checks.lacp(host(lacp=err("could not query Open vSwitch"))).status == UNKNOWN
 
 
+TAP_CTL_LIST = """pid=6216 minor=0 state=0 args=vhd:/var/run/sr-mount/a/one.vhd
+pid=6697 minor=1 state=0 args=vhd:/var/run/sr-mount/a/two.vhd
+"""
+
+
 def test_tap_status_states():
-    assert checks.tap_status(host(tap_status=fact("blktap2 ..."))).status == OK
+    line = checks.tap_status(host(tap_status=fact(TAP_CTL_LIST)))
+    assert line.status == OK and line.text == "Responding (2 tapdisk(s))"
     timeout = checks.tap_status(host(tap_status=err("tap-ctl list timed out after 20s")))
     assert timeout.status == UNKNOWN and "Timeout" in timeout.text
     other = checks.tap_status(host(tap_status=err("tap-ctl list failed (exit 1: ...)")))
     assert other.status == UNKNOWN and "Timeout" not in other.text
+
+
+def test_tap_status_reports_what_it_established_not_a_verdict():
+    """A host with no tapdisks answered; that is not the same as a host with a problem,
+    and neither is a tapdisk parked in a non-zero state by a running snapshot."""
+    empty = checks.tap_status(host(tap_status=fact("")))
+    assert empty.status == OK and empty.text == "Responding (0 tapdisk(s))"
+    # state=1 is 'paused', which SMAPI does deliberately during coalesce - not a finding
+    paused = checks.tap_status(host(tap_status=fact(
+        "pid=1 minor=0 state=1 args=vhd:/var/run/sr-mount/a/one.vhd\n")))
+    assert paused.status == OK and paused.text == "Responding (1 tapdisk(s))"
 
 
 def test_task_timeout_override_states():

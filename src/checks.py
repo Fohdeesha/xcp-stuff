@@ -225,10 +225,20 @@ def lacp(host):
 
 def tap_status(host):
     """A timed-out 'tap-ctl list' means blktap itself is wedged - distinct from every
-    other failure of that call, so it gets its own message rather than a generic Unknown."""
+    other failure of that call, so it gets its own message rather than a generic Unknown.
+
+    The green value says 'Responding' and counts the rows, because responding is the whole
+    of what the call established. It deliberately does not read the per-tapdisk 'state='
+    field: blktap offers 'tap-ctl pause'/'unpause' as ordinary operations, so SMAPI parks
+    tapdisks in non-zero states during snapshot and coalesce, and judging that number would
+    flag a healthy host through every backup window. The count is evidence rather than a
+    verdict - a host that should have tapdisks and reports zero is visible in the report
+    without this line having to guess what the right number is.
+    """
     f = host.fact("tap_status")
     if f.ok:
-        return ok("Tapdisk Status", "OK")
+        rows = [ln for ln in (f.value or "").splitlines() if ln.strip()]
+        return ok("Tapdisk Status", "Responding (%d tapdisk(s))" % len(rows))
     if "timed out" in (f.error or ""):
         return unknown("Tapdisk Status", "Timeout issues, unable to determine tap status")
     return unknown("Tapdisk Status", "Unknown (%s)" % f.error)
@@ -718,6 +728,11 @@ def _linstor_line(pool, key, label, predicate, detail_title):
 
 
 def _linstor_node_offline(text):
+    """The State column of 'linstor n l'. Deliberate twin of collector.linstor_table_column,
+    which reads the Node column of this same table on the hypervisor: one runs where the
+    report is built and one runs where linstor is, so they cannot be shared. Keep the
+    header location, the cell splitting and the ANSI stripping identical in both.
+    """
     state_col = None
     for line in text.splitlines():
         if line.startswith("+") or line.startswith("|="):
@@ -771,25 +786,49 @@ def xostor_pref_nic(pool):
     """XOSTOR replication should run over the same dedicated NIC/bond on every node - a
     node missing PrefNic falls back to the default route, and nodes disagreeing means
     replication traffic for the same resource takes different paths depending on which
-    node initiates it. Neither is visible from any single node's own report."""
+    node initiates it. Neither is visible from any single node's own report.
+
+    The fact carries both the nodes that were ASKED and the answers that came back, and
+    they are compared before anything green is printed. A node whose properties could not
+    be read has not been shown to agree with the others, so a run that heard from two of
+    five nodes cannot say 'all nodes' - it says which three it could not read. The unread
+    set is what a partial linstor answer, a controller that went away mid-run, or the
+    collector's whole-run budget running out all arrive as.
+
+    A PrefNic genuinely absent on a node that DID answer stays a finding either way: it is
+    established, so an unread peer elsewhere in the cluster does not suppress it. Every
+    node appears in the detail block, unread ones included, so the reading is auditable.
+    """
     f = pool.fact("linstor_pref_nics")
     if not f.ok:
         return unknown("XOSTOR PrefNic", "Unknown (%s)" % f.error)
-    nics = f.value or {}
-    if not nics:
+    value = f.value or {}
+    nodes = sorted(value.get("nodes") or [])
+    nics = value.get("nics") or {}
+    if not nodes:
         return unknown("XOSTOR PrefNic", "Unknown (no linstor nodes found)")
-    missing = sorted(name for name, nic in nics.items() if not nic)
-    values = set(nic for nic in nics.values() if nic)
+
+    unread = [name for name in nodes if name not in nics]
+    detail = "\n".join(
+        "%s: %s" % (name, "(could not read)" if name in unread else (nics[name] or "(not set)"))
+        for name in nodes)
+
+    if len(unread) == len(nodes):
+        return unknown("XOSTOR PrefNic",
+                       "Unknown (could not read PrefNic on any of %d node(s))" % len(nodes))
+    missing = sorted(name for name in nics if not nics[name])
     if missing:
-        detail = "\n".join("%s: %s" % (name, nics[name] or "(not set)")
-                           for name in sorted(nics))
         return flag("XOSTOR PrefNic", "Not set on: %s" % ", ".join(missing)).with_detail(
             "---xostor prefnic---", detail)
+    values = set(nic for nic in nics.values() if nic)
     if len(values) > 1:
-        detail = "\n".join("%s: %s" % (name, nics[name]) for name in sorted(nics))
         return flag("XOSTOR PrefNic", "Inconsistent Across Nodes, See Below").with_detail(
             "---xostor prefnic---", detail)
-    return ok("XOSTOR PrefNic", "%s (all nodes)" % values.pop())
+    if unread:
+        return unknown("XOSTOR PrefNic",
+                       "Unknown (could not read: %s)" % ", ".join(unread)).with_detail(
+            "---xostor prefnic---", detail)
+    return ok("XOSTOR PrefNic", "%s (all %d nodes)" % (values.pop(), len(nodes)))
 
 
 def xostor_qcow2(pool):

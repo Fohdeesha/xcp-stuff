@@ -39,17 +39,35 @@ def _first_token(text):
     return ""
 
 
-def _service_active(name):
+def _service_state(name):
+    """systemd's word for the unit, or None if systemd could not be asked at all.
+
+    'is-active' puts a state on stdout whether or not the unit is up, and the word is what
+    is reported rather than a yes/no of our own. Measured on the XOA (Debian 12, systemd
+    252): rc 0 + 'active' for a running unit, rc 3 + 'inactive' for one that is installed
+    and stopped, and rc 3 + 'inactive' for a unit that does not exist at all - so the rc
+    alone does not separate those, and none of them is the case this guards against.
+
+    A missing systemctl (rc 127, nothing on stdout) and a timeout (rc 124) are NOT answers:
+    they leave the unit's state unestablished, and reporting that as 'not running' would be
+    a claim of its own. Those are the None.
+    """
     rc, out, _err = transport.run_local_cmd(["systemctl", "is-active", name],
                                             timeout=config.LOCAL_CMD_TIMEOUT)
-    return rc == 0 and out.strip() == "active"
+    state = out.strip()
+    if rc == 124 or not state:
+        return None
+    return state
 
 
 def collect_xoa():
     """Everything the section needs, gathered before anything is printed."""
     data = {}
-    data["updater_service_down"] = not _service_active("xoa-updater")
-    if data["updater_service_down"]:
+    # Asked before the updater is, because every xoa-updater call below talks to this
+    # daemon: with it down they fail, and a failed call used to read as 'Unregistered' and
+    # 'Updates available' - findings invented by the tool rather than found by it.
+    data["updater_service_state"] = _service_state("xoa-updater")
+    if data["updater_service_state"] != "active":
         return data
 
     rc, out = _updater()
@@ -129,9 +147,13 @@ def lines():
     out = []
     data = collect_xoa()
 
-    if data.get("updater_service_down"):
+    state = data.get("updater_service_state")
+    if state is None:
         out.append(unknown("XOA-Updater",
-                           "Service not running, unable to determine XOA status"))
+                           "Could not query the service, unable to determine XOA status"))
+    elif state != "active":
+        out.append(unknown("XOA-Updater",
+                           "Service is %s, unable to determine XOA status" % state))
     elif data.get("updater_timeout"):
         out.append(unknown("XOA-Updater",
                            "Timeout issues, unable to determine XOA status"))

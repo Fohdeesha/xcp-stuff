@@ -418,10 +418,20 @@ def collect_multipath(opts):
 
 TAP_CTL_TIMEOUT = 20
 
+
 def collect_tap_status():
     """'tap-ctl list' talks to blktap over its control socket - a wedged tapdisk answers
     nothing and hangs the call, which is exactly the failure this exists to surface as its
-    own fact rather than as a blank/missing one."""
+    own fact rather than as a blank/missing one.
+
+    The rows come back raw and are counted, not judged. Each is
+    'pid=N minor=N state=N args=...', and the state field is NOT a health value: blktap
+    exposes 'tap-ctl pause' / 'unpause' as ordinary operations (verified on blktap
+    3.55.5, 8.3.0), so SMAPI parks tapdisks in non-zero states during snapshot and
+    coalesce. Flagging on it would fire through every backup window. What this fact
+    establishes is that blktap answered and how many tapdisks it named - so the check
+    says exactly that, and nothing about whether each one is happy.
+    """
     r = run(["tap-ctl", "list"], timeout=TAP_CTL_TIMEOUT)
     if r.timed_out:
         return err("tap-ctl list timed out after %ds" % TAP_CTL_TIMEOUT)
@@ -900,51 +910,93 @@ def _network_info(network_uuid, want_ips):
     return info
 
 
-def _linstor(controllers, args):
+LINSTOR_TIMEOUT = 120
+LINSTOR_PROP_TIMEOUT = 30       # one node's properties, not a whole-cluster listing
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def strip_ansi(text):
+    """Defensive, exactly as colors.strip_ansi is on the XOA side: some tools colourise
+    even when their output is a pipe. The collector cannot import colors - it ships alone -
+    so it carries its own."""
+    return ANSI_RE.sub("", text)
+
+
+def _linstor(controllers, args, timeout=LINSTOR_TIMEOUT):
     if which("linstor") is None:
         return err("linstor CLI not found")
     argv = ["linstor", "--controllers=" + ",".join(controllers)] + list(args)
-    r = run(argv, timeout=120)
+    r = run(argv, timeout=timeout)
     if not r.ok:
         return err("linstor %s failed (%s)" % (" ".join(args), r.why()))
     return fact(r.out)
 
 
-def _linstor_node_names(text):
-    """Node names out of 'linstor n l's ASCII table (see LINSTOR_NODES in the tests).
+def linstor_table_column(text, header):
+    """Values under `header` in one of linstor's ASCII tables, in row order.
 
-    The header row is located by its 'Node' cell rather than assumed to be row one, since
-    a faulty-nodes or resource table uses the same box-drawing style with different columns.
+    The header row is located by its own cell rather than assumed to be row one, since a
+    faulty-nodes or resource table uses the same box-drawing style with different columns.
+    ANSI is stripped from every cell: checks._linstor_node_offline, which reads the State
+    column of this same 'n l' table on the XOA side, has always done so - a coloured Node
+    cell here would be a name no subsequent 'n lp <node>' call could match, and every node
+    would then read as unqueryable.
+
+    That XOA-side twin cannot be shared with this one: it runs where the report is built
+    and this runs on the hypervisor, so the two are deliberate duplicates. Keep the header
+    location and the cell-splitting rule identical in both.
     """
-    name_col = None
-    names = []
-    for line in text.splitlines():
-        if not line.startswith("|") or line.startswith("|="):
+    col = None
+    values = []
+    for raw in text.splitlines():
+        line = strip_ansi(raw)
+        if not line.startswith("|"):
+            continue
+        # Any rule row, however it is drawn. Testing for the '|===|' spelling alone let a
+        # '|---|' separator through as a data row, and its dashes were then returned as a
+        # node name - a name no 'n lp' call can match, which reads downstream as a node
+        # that would not answer. Cheap to be exhaustive about instead.
+        if not set(line) - set("|-=+ "):
             continue
         cells = [c.strip() for c in line.split("|")[1:-1]]
-        if name_col is None:
-            if "Node" in cells:
-                name_col = cells.index("Node")
+        if col is None:
+            if header in cells:
+                col = cells.index(header)
             continue
-        if name_col < len(cells) and cells[name_col]:
-            names.append(cells[name_col])
-    return names
+        if col < len(cells) and cells[col]:
+            values.append(cells[col])
+    return values
+
+
+def _linstor_node_names(text):
+    return linstor_table_column(text, "Node")
 
 
 def _linstor_pref_nics(controllers, node_names):
     """PrefNic for every node, one 'linstor -m n lp <node>' call each - list-properties has
-    no all-nodes form, unlike 'n l'. {node_name: nic_or_None}; a node whose properties
-    could not be read or parsed is left out rather than guessed at.
+    no all-nodes form, unlike 'n l'.
+
+    Returns {node_name: nic_or_None} holding ONLY the nodes that answered. Which nodes
+    were asked is carried separately by the caller, because the difference between the two
+    is the whole finding: a node whose properties could not be read is not a node with no
+    PrefNic, and reporting agreement across the survivors of a partial read would be a
+    green line claiming more than was established. The check compares the two sets.
 
     -m (machine-readable JSON) is used here rather than the plain-text property table:
     that table's border style depends on whether linstor thinks it has a terminal - piped
     through subprocess as this always is, it prints the same ASCII '+'/'|' borders as the
     'n l' node table, not the Unicode box the interactive CLI shows. Parsing JSON sidesteps
     having to track which glyph set a given linstor version/mode falls back to.
+
+    Serial, one call per node: a cluster is a handful of nodes, and the per-call timeout is
+    LINSTOR_PROP_TIMEOUT rather than the full LINSTOR_TIMEOUT so that a degraded controller
+    cannot spend the whole-run budget here. If it does run out anyway, run() answers
+    'run budget exhausted' and those nodes land in the unread set - visible, not silent.
     """
     out = {}
     for name in node_names:
-        r = _linstor(controllers, ["-m", "n", "lp", name])
+        r = _linstor(controllers, ["-m", "n", "lp", name], timeout=LINSTOR_PROP_TIMEOUT)
         if not r["ok"]:
             continue
         nic = parse_linstor_pref_nic(r["value"])
@@ -1081,11 +1133,19 @@ def collect_pool(spec, self_uuid):
         out["linstor_nodes"] = nodes_r
         out["linstor_faulty"] = _linstor(controllers, ["r", "l", "--faulty"])
         out["linstor_controller"] = _linstor(controllers, ["c", "which"])
-        if nodes_r["ok"]:
-            names = _linstor_node_names(nodes_r["value"])
-            out["linstor_pref_nics"] = fact(_linstor_pref_nics(controllers, names))
-        else:
+        if not nodes_r["ok"]:
             out["linstor_pref_nics"] = err("could not list linstor nodes")
+        else:
+            names = _linstor_node_names(nodes_r["value"])
+            if not names:
+                # 'n l' answered, but nothing recognisable as a Node column came out of it
+                # - a linstor that changed its table format, not a cluster with no nodes.
+                # Saying "no nodes found" here would be a reading, and this is a failure.
+                out["linstor_pref_nics"] = err(
+                    "no node names in 'linstor n l' output")
+            else:
+                out["linstor_pref_nics"] = fact(
+                    {"nodes": names, "nics": _linstor_pref_nics(controllers, names)})
         rows, total = _qcow2_vdis(sr_uuids, spec.get("qcow2_max") or 0)
         out["qcow2"] = rows
         out["qcow2_total"] = fact(total)

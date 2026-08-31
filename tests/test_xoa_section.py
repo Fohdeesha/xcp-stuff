@@ -78,32 +78,68 @@ def drive(monkeypatch, tmp_path, argv, lines_fn=xoa_lines, addresses=("10.0.0.1"
 # the updater service gate
 # --------------------------------------------------------------------------------------
 
-def test_service_active_reads_systemctl_is_active(monkeypatch):
-    calls = []
-
+def _systemctl(rc, out):
     def fake(argv, timeout, env=None, stdin_text=None):
-        calls.append(argv)
-        return (0, "active\n", "")
-
-    monkeypatch.setattr(transport, "run_local_cmd", fake)
-    assert xoa._service_active("xoa-updater") is True
-    assert calls == [["systemctl", "is-active", "xoa-updater"]]
+        assert argv == ["systemctl", "is-active", "xoa-updater"]
+        return (rc, out, "")
+    return fake
 
 
-def test_service_active_false_on_inactive_or_failed_status(monkeypatch):
-    def fake(argv, timeout, env=None, stdin_text=None):
-        return (3, "inactive\n", "")
-
-    monkeypatch.setattr(transport, "run_local_cmd", fake)
-    assert xoa._service_active("xoa-updater") is False
+def test_service_state_reads_systemctl_is_active(monkeypatch):
+    monkeypatch.setattr(transport, "run_local_cmd", _systemctl(0, "active\n"))
+    assert xoa._service_state("xoa-updater") == "active"
 
 
-def test_service_active_false_when_the_command_itself_fails(monkeypatch):
-    def fake(argv, timeout, env=None, stdin_text=None):
-        return (127, "", "systemctl: command not found")
+def test_service_state_reports_a_down_unit_by_the_word_systemd_used(monkeypatch):
+    """Whatever word comes back is passed through rather than reduced to a boolean, so the
+    report can say which one it was. (3, 'inactive') is what a stopped unit AND a unit that
+    does not exist both answer on the XOA's systemd - measured, see _service_state.)"""
+    for rc, word in ((3, "inactive"), (3, "failed"), (0, "activating"), (4, "unknown")):
+        monkeypatch.setattr(transport, "run_local_cmd", _systemctl(rc, word + "\n"))
+        assert xoa._service_state("xoa-updater") == word
 
-    monkeypatch.setattr(transport, "run_local_cmd", fake)
-    assert xoa._service_active("xoa-updater") is False
+
+def test_service_state_is_none_when_systemd_could_not_be_asked(monkeypatch):
+    """'systemctl is missing' and 'the unit is down' are different facts. Collapsing them
+    would print 'Service not running' having established no such thing."""
+    monkeypatch.setattr(transport, "run_local_cmd", _systemctl(127, ""))
+    assert xoa._service_state("xoa-updater") is None
+    monkeypatch.setattr(transport, "run_local_cmd", _systemctl(124, ""))
+    assert xoa._service_state("xoa-updater") is None
+
+
+def _updater_line(monkeypatch, state):
+    monkeypatch.setattr(xoa, "collect_xoa", lambda: {"updater_service_state": state})
+    monkeypatch.setattr(xoa, "_os_version", lambda: "Debian 12")
+    monkeypatch.setattr(xoa, "_meminfo", lambda: None)
+    monkeypatch.setattr(xoa, "_dmesg", lambda: None)
+    return [ln for ln in xoa.lines() if ln.key == "XOA-Updater"][0]
+
+
+def test_updater_line_distinguishes_a_down_unit_from_an_unaskable_one(monkeypatch):
+    down = _updater_line(monkeypatch, "inactive")
+    assert down.status == result.UNKNOWN and "is inactive" in down.text and down.flags
+
+    failed = _updater_line(monkeypatch, "failed")
+    assert failed.status == result.UNKNOWN and "is failed" in failed.text
+
+    unaskable = _updater_line(monkeypatch, None)
+    assert unaskable.status == result.UNKNOWN and "Could not query" in unaskable.text
+    assert unaskable.flags
+
+
+def test_a_down_updater_suppresses_the_lines_it_would_have_invented(monkeypatch):
+    """With the daemon down every xoa-updater call fails, which used to surface as
+    'Registration: Unregistered' and 'XOA Status: Updates available' - findings the tool
+    made up. None of those keys may appear at all."""
+    monkeypatch.setattr(xoa, "collect_xoa", lambda: {"updater_service_state": "inactive"})
+    monkeypatch.setattr(xoa, "_os_version", lambda: "Debian 12")
+    monkeypatch.setattr(xoa, "_meminfo", lambda: None)
+    monkeypatch.setattr(xoa, "_dmesg", lambda: None)
+    keys = set(ln.key for ln in xoa.lines())
+    assert "XOA-Updater" in keys
+    assert not keys & {"Registration", "XOA Channel", "XOA Version", "XOA Plan",
+                       "XOA Status", "XOA Check"}
 
 
 # --------------------------------------------------------------------------------------
