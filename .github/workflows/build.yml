@@ -1,0 +1,66 @@
+name: build
+
+# health.py is generated from src/ by build/stitch.py, so it can fall behind its sources
+# the moment someone forgets to run the build. This runs the build on GitHub instead:
+# every push rebuilds health.py, and if the result differs from what was pushed, it is
+# committed back to the same branch. Merging a PR is a push to main, so a merge rebuilds
+# it too.
+#
+# A push made with GITHUB_TOKEN does not start another workflow run, so this cannot
+# loop.
+
+on:
+  push:
+    branches: ['**']      # every branch; not tags
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false      # never cancel a run that may be mid-push
+
+jobs:
+  stitch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write            # to push the rebuilt health.py back
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0     # full history: the rebase below cannot work on a shallow clone
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'      # what a current XOA (Debian 12) runs
+
+      - name: Rebuild health.py from src/
+        run: python build/stitch.py
+
+      - run: pip install pytest
+
+      - name: Tests
+        run: python -m pytest tests/
+
+      - name: Commit health.py if the build changed it
+        run: |
+          if git diff --quiet -- health.py; then
+            echo "health.py was already up to date - nothing to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add health.py
+          git commit -m "Rebuild health.py from src/"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          echo "::notice::health.py was stale and has been rebuilt and committed"
+
+  collector-python27:
+    # src/collector.py is the one file that must also parse under Python 2.7: XCP-ng
+    # 8.2.1 dom0 has no python3, and that is the mainstream path for checking an 8.2.1
+    # pool from XOA. The test suite says outright that it does not cover the 2.7 side.
+    # Parse only - actually running the collector needs a hypervisor.
+    runs-on: ubuntu-latest
+    container: python:2.7-slim
+    steps:
+      - uses: actions/checkout@v4
+      - name: src/collector.py parses under Python 2.7
+        run: python -c "import ast; ast.parse(open('src/collector.py', 'rb').read())"
