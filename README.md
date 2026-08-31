@@ -192,6 +192,10 @@ python build/stitch.py     # rebuild health.py after changing src/
 python -m pytest tests/    # ~220 tests, all offline
 ```
 
+You don't have to remember that first line. Push a change to `src/` and GitHub rebuilds
+`health.py` and commits it back to the branch - merging a PR does it too. So `git pull`
+after a push that touched `src/`.
+
   ## Example Output
 
 ![Alt text](example-output.png)
