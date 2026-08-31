@@ -223,6 +223,17 @@ def lacp(host):
     return ok("LACP Negotiation Issues", "No")
 
 
+def tap_status(host):
+    """A timed-out 'tap-ctl list' means blktap itself is wedged - distinct from every
+    other failure of that call, so it gets its own message rather than a generic Unknown."""
+    f = host.fact("tap_status")
+    if f.ok:
+        return ok("Tapdisk Status", "OK")
+    if "timed out" in (f.error or ""):
+        return unknown("Tapdisk Status", "Timeout issues, unable to determine tap status")
+    return unknown("Tapdisk Status", "Unknown (%s)" % f.error)
+
+
 def _maps(count):
     """'1 map' / '3 maps'. Each count gets its own word: pluralising every phrase off the
     total once printed 'no usable path on 1 maps'."""
@@ -754,6 +765,31 @@ def xostor_controller(pool):
     if not value.strip():
         return flag("XOSTOR Controller IP", "None")
     return ok("XOSTOR Controller IP", value)
+
+
+def xostor_pref_nic(pool):
+    """XOSTOR replication should run over the same dedicated NIC/bond on every node - a
+    node missing PrefNic falls back to the default route, and nodes disagreeing means
+    replication traffic for the same resource takes different paths depending on which
+    node initiates it. Neither is visible from any single node's own report."""
+    f = pool.fact("linstor_pref_nics")
+    if not f.ok:
+        return unknown("XOSTOR PrefNic", "Unknown (%s)" % f.error)
+    nics = f.value or {}
+    if not nics:
+        return unknown("XOSTOR PrefNic", "Unknown (no linstor nodes found)")
+    missing = sorted(name for name, nic in nics.items() if not nic)
+    values = set(nic for nic in nics.values() if nic)
+    if missing:
+        detail = "\n".join("%s: %s" % (name, nics[name] or "(not set)")
+                           for name in sorted(nics))
+        return flag("XOSTOR PrefNic", "Not set on: %s" % ", ".join(missing)).with_detail(
+            "---xostor prefnic---", detail)
+    if len(values) > 1:
+        detail = "\n".join("%s: %s" % (name, nics[name]) for name in sorted(nics))
+        return flag("XOSTOR PrefNic", "Inconsistent Across Nodes, See Below").with_detail(
+            "---xostor prefnic---", detail)
+    return ok("XOSTOR PrefNic", "%s (all nodes)" % values.pop())
 
 
 def xostor_qcow2(pool):

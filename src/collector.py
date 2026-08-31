@@ -416,6 +416,20 @@ def collect_multipath(opts):
     return fact(out)
 
 
+TAP_CTL_TIMEOUT = 20
+
+def collect_tap_status():
+    """'tap-ctl list' talks to blktap over its control socket - a wedged tapdisk answers
+    nothing and hangs the call, which is exactly the failure this exists to surface as its
+    own fact rather than as a blank/missing one."""
+    r = run(["tap-ctl", "list"], timeout=TAP_CTL_TIMEOUT)
+    if r.timed_out:
+        return err("tap-ctl list timed out after %ds" % TAP_CTL_TIMEOUT)
+    if not r.ok:
+        return err("tap-ctl list failed (%s)" % r.why())
+    return fact(r.out)
+
+
 def collect_crash_count(ignore_name):
     """Files under /var/crash, two levels deep - crash dumps live in subdirectories."""
     root = "/var/crash"
@@ -896,6 +910,71 @@ def _linstor(controllers, args):
     return fact(r.out)
 
 
+def _linstor_node_names(text):
+    """Node names out of 'linstor n l's ASCII table (see LINSTOR_NODES in the tests).
+
+    The header row is located by its 'Node' cell rather than assumed to be row one, since
+    a faulty-nodes or resource table uses the same box-drawing style with different columns.
+    """
+    name_col = None
+    names = []
+    for line in text.splitlines():
+        if not line.startswith("|") or line.startswith("|="):
+            continue
+        cells = [c.strip() for c in line.split("|")[1:-1]]
+        if name_col is None:
+            if "Node" in cells:
+                name_col = cells.index("Node")
+            continue
+        if name_col < len(cells) and cells[name_col]:
+            names.append(cells[name_col])
+    return names
+
+
+def _linstor_pref_nics(controllers, node_names):
+    """PrefNic for every node, one 'linstor -m n lp <node>' call each - list-properties has
+    no all-nodes form, unlike 'n l'. {node_name: nic_or_None}; a node whose properties
+    could not be read or parsed is left out rather than guessed at.
+
+    -m (machine-readable JSON) is used here rather than the plain-text property table:
+    that table's border style depends on whether linstor thinks it has a terminal - piped
+    through subprocess as this always is, it prints the same ASCII '+'/'|' borders as the
+    'n l' node table, not the Unicode box the interactive CLI shows. Parsing JSON sidesteps
+    having to track which glyph set a given linstor version/mode falls back to.
+    """
+    out = {}
+    for name in node_names:
+        r = _linstor(controllers, ["-m", "n", "lp", name])
+        if not r["ok"]:
+            continue
+        nic = parse_linstor_pref_nic(r["value"])
+        if nic is not False:
+            out[name] = nic
+    return out
+
+
+def parse_linstor_pref_nic(text):
+    """PrefNic out of 'linstor -m node list-properties' JSON.
+
+    The real shape (verified against 8.3.0, 2026-08-30) is a list wrapping ONE list of
+    {"key", "value"} property objects - [[{...}, {...}]] - not a bare property list.
+    None means the node has no PrefNic property set (linstor omits it rather than
+    printing an empty value); False means the JSON itself could not be parsed, which the
+    caller treats as 'skip this node' rather than 'not set' - different facts that must
+    not collapse into the same flag.
+    """
+    try:
+        outer = json.loads(text)
+    except ValueError:
+        return False
+    if not isinstance(outer, list) or not outer or not isinstance(outer[0], list):
+        return False
+    for entry in outer[0]:
+        if isinstance(entry, dict) and entry.get("key") == "PrefNic":
+            return entry.get("value")
+    return None
+
+
 def _qcow2_vdis(sr_uuids, cap):
     """qcow2-format VDIs on XOSTOR SRs.
 
@@ -998,9 +1077,15 @@ def collect_pool(spec, self_uuid):
 
     if sr_uuids:
         controllers = spec.get("controllers") or []
-        out["linstor_nodes"] = _linstor(controllers, ["n", "l"])
+        nodes_r = _linstor(controllers, ["n", "l"])
+        out["linstor_nodes"] = nodes_r
         out["linstor_faulty"] = _linstor(controllers, ["r", "l", "--faulty"])
         out["linstor_controller"] = _linstor(controllers, ["c", "which"])
+        if nodes_r["ok"]:
+            names = _linstor_node_names(nodes_r["value"])
+            out["linstor_pref_nics"] = fact(_linstor_pref_nics(controllers, names))
+        else:
+            out["linstor_pref_nics"] = err("could not list linstor nodes")
         rows, total = _qcow2_vdis(sr_uuids, spec.get("qcow2_max") or 0)
         out["qcow2"] = rows
         out["qcow2_total"] = fact(total)
@@ -1044,6 +1129,7 @@ def collect(spec):
         out["ipaddr"] = collect_ipaddr()
         out["lacp"] = collect_lacp()
         out["multipath"] = collect_multipath(spec.get("multipath"))
+        out["tap_status"] = collect_tap_status()
         out["crash_count"] = collect_crash_count(spec.get("crash_ignore_file") or "")
         out["coredumps"] = collect_coredumps(spec.get("coredump_dir") or "")
         out["task_timeout"] = collect_task_timeout_override()

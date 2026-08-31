@@ -39,9 +39,19 @@ def _first_token(text):
     return ""
 
 
+def _service_active(name):
+    rc, out, _err = transport.run_local_cmd(["systemctl", "is-active", name],
+                                            timeout=config.LOCAL_CMD_TIMEOUT)
+    return rc == 0 and out.strip() == "active"
+
+
 def collect_xoa():
     """Everything the section needs, gathered before anything is printed."""
     data = {}
+    data["updater_service_down"] = not _service_active("xoa-updater")
+    if data["updater_service_down"]:
+        return data
+
     rc, out = _updater()
     data["updater_timeout"] = (rc == 124)
     if rc == 124:
@@ -119,7 +129,10 @@ def lines():
     out = []
     data = collect_xoa()
 
-    if data.get("updater_timeout"):
+    if data.get("updater_service_down"):
+        out.append(unknown("XOA-Updater",
+                           "Service not running, unable to determine XOA status"))
+    elif data.get("updater_timeout"):
         out.append(unknown("XOA-Updater",
                            "Timeout issues, unable to determine XOA status"))
     else:

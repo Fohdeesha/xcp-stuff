@@ -109,6 +109,7 @@ POOL_RUN = {
     "oom_events": True,
     "crash_logs_present": True,
     "coredumps_present": True,
+    "tap_ctl_list": True,
     "task_timeout_override": True,
     "lacp_negotiation": True,
     "multipath_health": True,

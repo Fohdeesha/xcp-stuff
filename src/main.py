@@ -607,6 +607,7 @@ def pool_status_section(run, rep):
         rep.check("XOSTOR Faulty Resources", checks.xostor_faulty_resources, run.pool)
         rep.check("XOSTOR Faulty Nodes", checks.xostor_nodes, run.pool)
         rep.check("XOSTOR Controller IP", checks.xostor_controller, run.pool)
+        rep.check("XOSTOR PrefNic", checks.xostor_pref_nic, run.pool)
         rep.check("XOSTOR QCOW2 VDIs", checks.xostor_qcow2, run.pool)
 
     rep.check("VLAN 0 Check", checks.vlan0, run.pool)
@@ -654,8 +655,8 @@ def per_host_checks():
         ("oom_events", "OOM Events", checks.oom_events),
         ("crash_logs_present", "Crash Logs Present", checks.crash_logs),
         ("coredumps_present", "Coredumps Present", checks.coredumps),
-        ("task_timeout_override", "XAPI Task Timeout Override",
-         checks.task_timeout_override),
+        ("tap_ctl_list", "Tapdisk Status", checks.tap_status),
+        ("task_timeout_override", "XAPI Task Timeout Override", checks.task_timeout_override),
         ("lacp_negotiation", "LACP Negotiation Issues", checks.lacp),
         ("multipath_health", "Multipath Path Health", checks.multipath_health),
         ("multipath_events", "Multipath Path Events", checks.multipath_events),

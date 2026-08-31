@@ -6,6 +6,8 @@ whatever the dev machine has, so they only cover the parts that do no I/O. The 2
 is exercised for real by every run against an 8.2.1 pool, which has no python3.
 """
 
+import json
+
 import collector
 
 
@@ -161,3 +163,70 @@ def test_fact_envelope_shape():
 def test_decode_never_raises_on_non_utf8():
     # a single mojibake line in a log must never abort a health check
     assert collector._decode(b"ok \xff\xfe bytes").startswith("ok ")
+
+
+LINSTOR_NODES = """+----------------------------------+
+| Node       | NodeType | State   |
+|==================================|
+| xen-sec-01 | COMBINED | Online  |
+| xen-sec-02 | COMBINED | OFFLINE |
++----------------------------------+
+"""
+
+
+def test_linstor_node_names_reads_the_node_column():
+    assert collector._linstor_node_names(LINSTOR_NODES) == ["xen-sec-01", "xen-sec-02"]
+
+
+def test_linstor_node_names_on_a_table_with_no_node_column():
+    # the faulty-resources table shares the box-drawing style but has no 'Node' header
+    other = "+------+\n| ResourceName |\n|======|\n| res1 |\n+------+\n"
+    assert collector._linstor_node_names(other) == []
+
+
+# verified against 8.3.0, 2026-08-30: the outer list wraps ONE list of property objects
+LINSTOR_PREFNIC_JSON = json.dumps([[
+    {"key": "CurStltConnName", "value": "default"},
+    {"key": "NodeUname", "value": "sltxxxxx3"},
+    {"key": "PrefNic", "value": "bond0"},
+]])
+
+
+def test_parse_linstor_pref_nic_reads_the_value_cell():
+    assert collector.parse_linstor_pref_nic(LINSTOR_PREFNIC_JSON) == "bond0"
+
+
+def test_parse_linstor_pref_nic_missing_property_is_none():
+    no_prefnic = json.dumps([[{"key": "NodeUname", "value": "sltxxxxx3"}]])
+    assert collector.parse_linstor_pref_nic(no_prefnic) is None
+
+
+def test_parse_linstor_pref_nic_unparseable_json_is_false():
+    # distinct from 'property not set': the caller must not report a parse failure as
+    # a missing PrefNic, since those two facts need different handling
+    assert collector.parse_linstor_pref_nic("not json") is False
+    assert collector.parse_linstor_pref_nic('{"unexpected": "shape"}') is False
+    assert collector.parse_linstor_pref_nic("[]") is False
+    # a bare (non-nested) property list is not the real shape and must not be guessed at
+    assert collector.parse_linstor_pref_nic(
+        json.dumps([{"key": "PrefNic", "value": "bond0"}])) is False
+
+
+def test_linstor_pref_nics_skips_nodes_that_could_not_be_queried_or_parsed(monkeypatch):
+    calls = []
+
+    def fake(controllers, args):
+        calls.append(args)
+        if args[-1] == "bad-node":
+            return collector.err("linstor failed")
+        if args[-1] == "unparseable-node":
+            return collector.fact("not json")
+        return collector.fact(LINSTOR_PREFNIC_JSON)
+
+    monkeypatch.setattr(collector, "_linstor", fake)
+    result = collector._linstor_pref_nics(
+        [], ["good-node", "bad-node", "unparseable-node"])
+    assert result == {"good-node": "bond0"}
+    # -m: parsing depends on JSON, not on which border glyphs a non-interactive
+    # linstor call happens to fall back to
+    assert all(a[:3] == ["-m", "n", "lp"] for a in calls)

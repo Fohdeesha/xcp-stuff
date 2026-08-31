@@ -75,6 +75,38 @@ def drive(monkeypatch, tmp_path, argv, lines_fn=xoa_lines, addresses=("10.0.0.1"
 
 
 # --------------------------------------------------------------------------------------
+# the updater service gate
+# --------------------------------------------------------------------------------------
+
+def test_service_active_reads_systemctl_is_active(monkeypatch):
+    calls = []
+
+    def fake(argv, timeout, env=None, stdin_text=None):
+        calls.append(argv)
+        return (0, "active\n", "")
+
+    monkeypatch.setattr(transport, "run_local_cmd", fake)
+    assert xoa._service_active("xoa-updater") is True
+    assert calls == [["systemctl", "is-active", "xoa-updater"]]
+
+
+def test_service_active_false_on_inactive_or_failed_status(monkeypatch):
+    def fake(argv, timeout, env=None, stdin_text=None):
+        return (3, "inactive\n", "")
+
+    monkeypatch.setattr(transport, "run_local_cmd", fake)
+    assert xoa._service_active("xoa-updater") is False
+
+
+def test_service_active_false_when_the_command_itself_fails(monkeypatch):
+    def fake(argv, timeout, env=None, stdin_text=None):
+        return (127, "", "systemctl: command not found")
+
+    monkeypatch.setattr(transport, "run_local_cmd", fake)
+    assert xoa._service_active("xoa-updater") is False
+
+
+# --------------------------------------------------------------------------------------
 # the background worker itself
 # --------------------------------------------------------------------------------------
 
