@@ -865,11 +865,16 @@ def find_phrase_lines(text, phrase):
     return [i for i, line in enumerate(text.splitlines(), 1) if low in line.lower()]
 
 
-def context_block(text, line_numbers, ctx=3):
+def context_block(text, line_numbers, ctx=3, rollup=False):
     """+/- ctx lines around each hit, overlapping ranges merged, each line indented by 2.
 
     Merged ranges are separated by a blank line, which is what makes a block with several
     distant hits readable.
+
+    With rollup=True, each merged range is passed through rollup_repeats() first, so a
+    range covering thousands of copies of one message prints as that message and a count.
+    The ranges themselves are unchanged: the rollup is a rendering of the same lines, so
+    nothing a hit pointed at is dropped.
     """
     if not line_numbers:
         return ""
@@ -889,11 +894,71 @@ def context_block(text, line_numbers, ctx=3):
     out = []
     for i, (s, e) in enumerate(merged):
         e = min(e, total)
-        for k in range(s, e + 1):
-            out.append("  " + lines[k - 1])
+        block = ["  " + lines[k - 1] for k in range(s, e + 1)]
+        out.extend(rollup_repeats(block) if rollup else block)
         if i != len(merged) - 1:
             out.append("")
     return "\n".join(out)
+
+
+# The dmesg ring is a ring: one stuck NFS server or one flapping path writes the SAME line
+# thousands of times, and context_block then faithfully prints all of them. A real R630
+# pool produced 24,689 dmesg lines across seven hosts that were 22 distinct messages - one
+# of them repeated 24,668 times. The repetition is not the finding; the message, how many
+# times, and over what window are.
+DMESG_ROLLUP_MIN = 3             # runs shorter than this are cheaper to print in full
+
+_TS_RE = re.compile(r"^(\s*)(\[[^]]*\])\s?(.*)$")
+
+
+def split_timestamp(line):
+    """('  ', '[Mon Jun  1 17:55:16 2026]', 'nfs: server ... timed out') for a dmesg -T
+    line; ('', '', line) for anything else.
+
+    Only the leading `dmesg -T` bracket counts. A kernel line may carry brackets of its
+    own ("[<ffffffff81234567>]"), but never in front, so anchoring here is enough.
+    """
+    m = _TS_RE.match(line)
+    if not m:
+        return ("", "", line)
+    return (m.group(1), m.group(2), m.group(3))
+
+
+def rollup_repeats(lines, threshold=DMESG_ROLLUP_MIN):
+    """Collapse each run of consecutive lines with the same message into one summary.
+
+    Identity is the message with its `dmesg -T` timestamp removed, so lines that differ
+    only in when they were printed are one run. Runs are consecutive only: an interleaved
+    log keeps its order, and a message that returns after something else is a second run,
+    which is what makes "it started again at 18:00" visible.
+
+    A run of `threshold` or more prints its first line, then a count and the span:
+
+        [Mon Jun  1 17:55:16 2026] nfs: server 172.21.203.251 not responding, timed out
+        ... repeated 24668 times, through [Mon Jun  1 22:41:03 2026]
+
+    Shorter runs print verbatim - a summary of two lines is longer than the two lines.
+    """
+    out = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        indent, _ts, msg = split_timestamp(lines[i])
+        j = i + 1
+        while j < n and split_timestamp(lines[j])[2] == msg:
+            j += 1
+        run = j - i
+        out.append(lines[i])
+        if run >= threshold:
+            first_ts = split_timestamp(lines[i])[1]
+            last_ts = split_timestamp(lines[j - 1])[1]
+            # a whole run inside one second spans nothing worth printing
+            tail = ", through %s" % last_ts if last_ts and last_ts != first_ts else ""
+            out.append("%s... repeated %d times%s" % (indent, run, tail))
+        else:
+            out.extend(lines[i + 1:j])
+        i = j
+    return out
 
 
 # --------------------------------------------------------------------------------------
@@ -3063,7 +3128,7 @@ def dmesg_content(host):
     if not hits:
         return ok("Dmesg Content", "Clean")
     return flag("Dmesg Content", "Issues Found, See Output Below").with_detail(
-        "Dmesg Issues", parsers.context_block(f.value, hits))
+        "Dmesg Issues", parsers.context_block(f.value, hits, rollup=True))
 
 
 def oom_events(host):
@@ -4038,7 +4103,7 @@ def lines():
                                          config.DMESG_IGNORE_RULES)
         if hits:
             out.append(flag("Dmesg Content", "Issues Found, See Output Below").with_detail(
-                "Dmesg Issues", parsers.context_block(dmesg_text, hits)))
+                "Dmesg Issues", parsers.context_block(dmesg_text, hits, rollup=True)))
         else:
             out.append(ok("Dmesg Content", "Clean"))
     return out
@@ -5214,7 +5279,7 @@ def _module(name, exported):
 config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'REMOTE_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_QCOW2_MAX_LINES'])
 colors = _module('colors', ['CYAN', 'GREEN', 'RESET', 'YELLOW', 'cyan', 'green', 'init', 'strip_ansi', 'yellow'])
 result = _module('result', ['FLAG', 'Fact', 'INFO', 'Line', 'MISSING', 'OK', 'UNKNOWN', 'flag', 'guard', 'info', 'ok', 'raw', 'unknown', 'wrap'])
-parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', '_LINK_RE', '_MTU_RE', '_PARAM_RE', '_cidr_range', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'cap_lines', 'classify_multipath_path', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'has_overlapping_subnets', 'manifest_diff', 'manifest_versions', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pool_conf', 'parse_timedatectl', 'parse_xe_records', 'round_1dp'])
+parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'DMESG_ROLLUP_MIN', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', '_LINK_RE', '_MTU_RE', '_PARAM_RE', '_TS_RE', '_cidr_range', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'cap_lines', 'classify_multipath_path', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'has_overlapping_subnets', 'manifest_diff', 'manifest_versions', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pool_conf', 'parse_timedatectl', 'parse_xe_records', 'rollup_repeats', 'round_1dp', 'split_timestamp'])
 model = _module('model', ['Host', 'Pool', 'ntp_match', 'ram_match'])
 collectorsrc = _module('collectorsrc', ['EMBEDDED', 'collector_source'])
 transport = _module('transport', ['BEGIN_MARKER', 'CollectError', 'END_MARKER', 'Transport', '_DEBUG_LOCK', '_LIVE', '_LIVE_LOCK', '_REMOTE_LAUNCH', '_REMOTE_LAUNCH_PINNED', '_kill_tree', '_remote_launch', 'cleanup_work_dir', 'debug', 'ensure_sshpass', 'have', 'kill_all_children', 'make_work_dir', 'run_local_cmd'])
