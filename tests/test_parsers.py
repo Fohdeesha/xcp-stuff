@@ -269,6 +269,93 @@ def test_context_block_empty_when_nothing_matched():
 
 # --------------------------------------------------------------------------------------
 
+def test_split_timestamp_pulls_off_the_dmesg_t_bracket():
+    assert parsers.split_timestamp("  [Mon Jun  1 17:55:16 2026] nfs: timed out") == (
+        "  ", "[Mon Jun  1 17:55:16 2026]", "nfs: timed out")
+
+
+def test_split_timestamp_keeps_brackets_that_are_not_leading():
+    # a stack trace line carries its own brackets; only the leading one is the timestamp
+    indent, ts, msg = parsers.split_timestamp("[Mon Jun  1 00:00:00 2026] [<ffff01>] oops")
+    assert (ts, msg) == ("[Mon Jun  1 00:00:00 2026]", "[<ffff01>] oops")
+
+
+def test_split_timestamp_leaves_untimestamped_lines_alone():
+    assert parsers.split_timestamp("no timestamp here") == ("", "", "no timestamp here")
+
+
+def test_rollup_collapses_a_run_that_differs_only_in_timestamp():
+    lines = ["[t%d] nfs: timed out" % i for i in range(1, 6)]
+    assert parsers.rollup_repeats(lines) == [
+        "[t1] nfs: timed out",
+        "... repeated 5 times, through [t5]",
+    ]
+
+
+def test_rollup_leaves_short_runs_verbatim():
+    # summarising two lines costs two lines, so it is not done
+    lines = ["[t1] x", "[t2] x"]
+    assert parsers.rollup_repeats(lines, threshold=3) == lines
+
+
+def test_rollup_only_collapses_consecutive_runs():
+    """A message that returns after something else is a second run - that is the point.
+
+    Counting per-message instead would print one total and hide that it started again.
+    """
+    lines = ["[t1] a", "[t2] a", "[t3] a", "[t4] b", "[t5] a", "[t6] a", "[t7] a"]
+    assert parsers.rollup_repeats(lines) == [
+        "[t1] a",
+        "... repeated 3 times, through [t3]",
+        "[t4] b",
+        "[t5] a",
+        "... repeated 3 times, through [t7]",
+    ]
+
+
+def test_rollup_omits_the_span_when_the_run_is_inside_one_timestamp():
+    lines = ["[t1] x"] * 4
+    assert parsers.rollup_repeats(lines) == ["[t1] x", "... repeated 4 times"]
+
+
+def test_rollup_handles_lines_with_no_timestamp():
+    assert parsers.rollup_repeats(["x", "x", "x"]) == ["x", "... repeated 3 times"]
+
+
+def test_rollup_preserves_indentation():
+    lines = ["  [t%d] x" % i for i in range(1, 4)]
+    assert parsers.rollup_repeats(lines) == ["  [t1] x", "  ... repeated 3 times, through [t3]"]
+
+
+def test_rollup_of_empty_input():
+    assert parsers.rollup_repeats([]) == []
+
+
+def test_context_block_rollup_collapses_a_flooded_ring():
+    text = "\n".join("[t%d] nfs: server 1.2.3.4 not responding, timed out" % i
+                     for i in range(1, 501))
+    hits = list(range(1, 501))
+    assert len(parsers.context_block(text, hits, 3).splitlines()) == 500
+    assert parsers.context_block(text, hits, 3, rollup=True).splitlines() == [
+        "  [t1] nfs: server 1.2.3.4 not responding, timed out",
+        "  ... repeated 500 times, through [t500]",
+    ]
+
+
+def test_context_block_rollup_keeps_distinct_messages_and_range_separators():
+    text = "\n".join(["[t1] a", "[t2] a", "[t3] a", "[t4] a"] +
+                     ["filler%d" % i for i in range(20)] +
+                     ["[t9] b"])
+    block = parsers.context_block(text, [1, 4, 25], 1, rollup=True)
+    lines = block.splitlines()
+    assert lines[0] == "  [t1] a"
+    assert lines[1] == "  ... repeated 4 times, through [t4]"
+    assert "" in lines                    # the two distant ranges stay separated
+    assert lines[-1] == "  [t9] b"
+
+
+# --------------------------------------------------------------------------------------
+
 def test_manifest_versions_keeps_duplicate_names():
     # gpg-pubkey is installed twice on every dom0 here, and a host carries two kernels
     # between an update and the reboot that activates it

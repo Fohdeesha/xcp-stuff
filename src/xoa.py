@@ -239,7 +239,7 @@ def lines():
                                          config.DMESG_IGNORE_RULES)
         if hits:
             out.append(flag("Dmesg Content", "Issues Found, See Output Below").with_detail(
-                "Dmesg Issues", parsers.context_block(dmesg_text, hits)))
+                "Dmesg Issues", parsers.context_block(dmesg_text, hits, rollup=True)))
         else:
             out.append(ok("Dmesg Content", "Clean"))
     return out
