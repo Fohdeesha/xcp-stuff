@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Every threshold, list and toggle, in one place. Same names and values as health.sh."""
 
-SCRIPT_VERSION = "3.5"
+SCRIPT_VERSION = "3.6"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
@@ -98,6 +98,10 @@ COREDUMP_DIR = "/var/lib/systemd/coredump"          # anything here means a dom0
 COREDUMP_MAX_LINES = 50          # coredumps listed in the detail block (newest first)
 PKG_DIFF_MAX_LINES = 100         # mismatched yum packages listed
 XOSTOR_QCOW2_MAX_LINES = 50      # qcow2 VDIs on XOSTOR listed
+DMESG_MAX_LINES = 80             # lines of a dmesg detail block (Dmesg Content, OOM Events);
+                                 # the newest are kept, and the rollup runs first
+DMESG_ROLLUP_MIN = 3             # consecutive copies of one dmesg message folded into a
+                                 # 'repeated N times' line from this many; fewer print in full
 
 # Which per-host checks run on SLAVES in pool mode. The master always runs everything, and
 # so does single mode / a solo host run; these toggles exist only to keep a sweep short.

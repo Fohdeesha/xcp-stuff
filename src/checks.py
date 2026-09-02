@@ -6,6 +6,7 @@ them answers that with UNKNOWN rather than with a pass. That is the invariant th
 tool is built around, and here it is the only way the code is shaped.
 """
 
+import colors
 import config
 import parsers
 import result
@@ -140,16 +141,35 @@ def mtu_issues(host):
     return flag("MTU Issues", "Detected (%s), check output from dmesg -T" % listed)
 
 
-def dmesg_content(host):
-    f = host.fact("dmesg")
-    if not f.ok:
-        return unknown("Dmesg Content", "Unknown (could not read dmesg)")
-    hits = parsers.dmesg_issue_lines(f.value, config.DMESG_ISSUE_WORDS,
+def dmesg_block(text, hits, rollup=True):
+    """Every detail block cut from the dmesg ring is rendered one way: LOG_ERROR_CONTEXT
+    lines of context, the rollup of repeated lines, and the cap - rolled up AND bounded,
+    because the rollup folds a ring full of one message and the cap is for a ring full of
+    thousands of different ones (see parsers.truncate_block). Both settings live in config
+    and reach every line that reads the ring through here."""
+    return parsers.context_block(text, hits, config.LOG_ERROR_CONTEXT, rollup=rollup,
+                                 max_lines=config.DMESG_MAX_LINES,
+                                 rollup_min=config.DMESG_ROLLUP_MIN)
+
+
+def dmesg_content_of(text):
+    """The 'Dmesg Content' line for a ring already in hand.
+
+    The XOA section reads the appliance's own ring and used to carry a copy of this - one
+    reading and one wording for the host line and the appliance line."""
+    hits = parsers.dmesg_issue_lines(text, config.DMESG_ISSUE_WORDS,
                                      config.DMESG_ISSUE_PHRASES, config.DMESG_IGNORE_RULES)
     if not hits:
         return ok("Dmesg Content", "Clean")
     return flag("Dmesg Content", "Issues Found, See Output Below").with_detail(
-        "Dmesg Issues", parsers.context_block(f.value, hits, rollup=True))
+        "Dmesg Issues", dmesg_block(text, hits))
+
+
+def dmesg_content(host):
+    f = host.fact("dmesg")
+    if not f.ok:
+        return unknown("Dmesg Content", "Unknown (could not read dmesg)")
+    return dmesg_content_of(f.value)
 
 
 def oom_events(host):
@@ -159,8 +179,11 @@ def oom_events(host):
     hits = parsers.find_phrase_lines(f.value, config.OOM_PHRASE)
     if not hits:
         return ok("OOM Events", "No")
+    # the same ring, so the same bound: a host that has been killing processes all week
+    # shows its most recent kills, not every one of them. No rollup: every kill names its
+    # own pid, so there is nothing to fold
     return flag("OOM Events", "Yes, See Below").with_detail(
-        "OOM Events", parsers.context_block(f.value, hits))
+        "OOM Events", dmesg_block(f.value, hits, rollup=False))
 
 
 def crash_logs(host):
@@ -716,43 +739,61 @@ def xostor_ram(pool, memory):
     return ok("XOSTOR RAM", "%.1fG" % total_gb)
 
 
+def _linstor_unknown(label, f):
+    """One wording for a linstor fact that did not come back, whichever line asked."""
+    if "not found" in (f.error or ""):
+        return unknown(label, "Unknown (linstor CLI not found)")
+    return unknown(label, "Unknown (%s)" % f.error)
+
+
 def _linstor_line(pool, key, label, predicate, detail_title):
     f = pool.fact(key)
     if not f.ok:
-        if "not found" in (f.error or ""):
-            return unknown(label, "Unknown (linstor CLI not found)")
-        return unknown(label, "Unknown (%s)" % f.error)
+        return _linstor_unknown(label, f)
     if predicate(f.value):
         return flag(label, "Yes, See Below").with_detail(detail_title, f.value)
     return ok(label, "No")
 
 
-def _linstor_node_offline(text):
-    """The State column of 'linstor n l'. Deliberate twin of collector.linstor_table_column,
-    which reads the Node column of this same table on the hypervisor: one runs where the
-    report is built and one runs where linstor is, so they cannot be shared. Keep the
-    header location, the cell splitting and the ANSI stripping identical in both.
+def _linstor_table(text):
+    """(header cells, [row cells, ...]) of one of linstor's ASCII tables, ANSI stripped.
+
+    Deliberate twin of collector.linstor_table_column, which reads the Node column of the
+    same 'n l' table on the hypervisor: one runs where the report is built and one where
+    linstor is, so they cannot be shared. Keep the rule-row test, the cell splitting and
+    the ANSI stripping identical in both. The first row that is not a rule is the header.
     """
-    state_col = None
-    for line in text.splitlines():
-        if line.startswith("+") or line.startswith("|="):
+    header, rows = None, []
+    for text_line in text.splitlines():
+        line = colors.strip_ansi(text_line)
+        if not line.startswith("|") or not set(line) - set("|-=+ "):
             continue
-        cells = [c.strip() for c in line.split("|")]
-        if "Node" in cells and "State" in cells:
-            state_col = cells.index("State")
-            continue
-        if line.startswith("|") and state_col is not None and state_col < len(cells):
-            import colors
-            if colors.strip_ansi(cells[state_col]).strip() != "Online":
-                return True
-    return False
+        cells = [c.strip() for c in line.split("|")[1:-1]]
+        if header is None:
+            header = cells
+        else:
+            rows.append(cells)
+    return header or [], rows
+
+
+def _linstor_column(text, name):
+    """The values under one header, in row order; [] when the table has no such column."""
+    header, rows = _linstor_table(text)
+    if name not in header:
+        return []
+    col = header.index(name)
+    return [row[col] for row in rows if col < len(row)]
+
+
+def _linstor_node_offline(text):
+    """Any node whose State column of 'linstor n l' says something other than Online."""
+    return any(state != "Online" for state in _linstor_column(text, "State"))
 
 
 def _linstor_has_rows(text):
-    for line in text.splitlines():
-        if line.startswith("| ") and "ResourceName" not in line:
-            return True
-    return False
+    """'r l --faulty' prints its header whether or not anything is faulty; rows are the
+    finding."""
+    return bool(_linstor_table(text)[1])
 
 
 def xostor_faulty_resources(pool):
@@ -765,17 +806,51 @@ def xostor_nodes(pool):
                          _linstor_node_offline, "---xostor node status---")
 
 
-def xostor_controller(pool):
+def _linstor_node_addresses(text):
+    """{address: node} out of the Addresses column of 'linstor n l'.
+
+    A cell reads '172.16.210.84:3366 (PLAIN)' - the satellite's address, its port and the
+    connection type. An older table without an Addresses column simply names nobody.
+    """
+    header, rows = _linstor_table(text)
+    if "Node" not in header or "Addresses" not in header:
+        return {}
+    node_col, addr_col = header.index("Node"), header.index("Addresses")
+    out = {}
+    for row in rows:
+        if max(node_col, addr_col) >= len(row) or not row[node_col]:
+            continue
+        for token in row[addr_col].replace(",", " ").split():
+            if not token.startswith("("):        # '(PLAIN)' is the connection type
+                out.setdefault(parsers.split_host_port(token)[0], row[node_col])
+    return out
+
+
+def xostor_controller(pool, host_names=None):
+    """Where the linstor controller is - the address, and which host that is.
+
+    The name comes from the pool's own xapi host list first: those are the names the host
+    blocks carry, and the addresses the collector asked linstor through are those same
+    management addresses. Then from the Addresses column of 'linstor n l', which names
+    every node - a solo host run only knows its own name from xapi, and the controller may
+    well be a host it never looks at. Neither answering leaves the address on its own: the
+    line is about where the controller is, and a name is a convenience that must not turn
+    a known address into an Unknown.
+    """
     f = pool.fact("linstor_controller")
     if not f.ok:
-        if "not found" in (f.error or ""):
-            return unknown("XOSTOR Controller IP", "Unknown (linstor CLI not found)")
-        return unknown("XOSTOR Controller IP", "Unknown (%s)" % f.error)
+        return _linstor_unknown("XOSTOR Controller IP", f)
+    names = dict(host_names or {})
+    nodes = pool.fact("linstor_nodes")
+    node_names = _linstor_node_addresses(nodes.value) if nodes.ok else {}
     text = []
     for line in f.value.splitlines():
         if line.startswith("Error:"):
             continue
-        text.append(line[len("linstor://"):] if line.startswith("linstor://") else line)
+        address = line[len("linstor://"):] if line.startswith("linstor://") else line
+        key = parsers.split_host_port(address)[0]
+        name = names.get(key) or node_names.get(key)
+        text.append("%s (%s)" % (address, name) if name else address)
     value = "\n".join(text)
     if not value.strip():
         return flag("XOSTOR Controller IP", "None")

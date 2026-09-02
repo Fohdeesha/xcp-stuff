@@ -24,6 +24,7 @@ import unicodedata
 
 import colors
 import config
+import parsers
 import transport
 
 QUOTES = "'\"`"
@@ -159,14 +160,41 @@ def have_xo_server_db():
 
 
 _ALL_SERVERS = None     # the one `xo-server-db ls server` scan; None until it is read
+_READ_ERROR = ""        # why that scan failed, when it did; "" while it has not
+
+
+def _describe_failure(rc, err):
+    """One line saying why xo-server-db answered nothing, for the messages that used to
+    say 'no enabled hosts' instead.
+
+    The stderr of a permission failure is a node error object spread over several lines,
+    of which the first is the one that says what happened:
+        [Error: EACCES: permission denied, lstat '/etc/xo-server/config.toml'] {
+    """
+    if rc == 124:
+        return "timed out after %ds" % (config.LOCAL_CMD_TIMEOUT * 3)
+    first = ""
+    for line in err.splitlines():
+        line = line.strip()
+        if line:
+            first = line
+            break
+    if first.endswith(" {"):
+        first = first[:-2]
+    if first.startswith("[") and first.endswith("]"):
+        first = first[1:-1]
+    if first:
+        return "exit code %d: %s" % (rc, first)
+    return "exit code %d" % rc
 
 
 def _ls(args):
+    """(output, "") or (None, why-not). rc 127 is the transport's own 'not found'."""
     rc, out, err = transport.run_local_cmd(["xo-server-db", "ls"] + list(args),
                                            timeout=config.LOCAL_CMD_TIMEOUT * 3)
     if rc != 0:
-        return None
-    return out
+        return None, _describe_failure(rc, err)
+    return out, ""
 
 
 def all_servers():
@@ -186,20 +214,31 @@ def all_servers():
     Read from the main thread only, before any host is contacted; nothing else in a run
     touches it, so the cache needs no lock.
     """
-    global _ALL_SERVERS
+    global _ALL_SERVERS, _READ_ERROR
     if _ALL_SERVERS is None:
-        out = _ls(["server"])
-        # a db that could not be read is cached as empty: every caller already treats
-        # "no such record" and "could not ask" the same way, and asking again would cost
-        # another 3.3s to fail again
+        out, why = _ls(["server"])
+        # a db that could not be read is cached as empty, with the reason kept beside it:
+        # asking again would cost another 3.3s to fail again, and every lookup answers
+        # 'nothing' either way - but the messages built on that answer must not. Run as a
+        # non-root user, xo-server-db cannot even stat /etc/xo-server/config.toml, and
+        # 'no enabled hosts found in xo-db' was what an appliance with five pools said.
         _ALL_SERVERS = scan_records(out) if out is not None else []
+        _READ_ERROR = why
     return _ALL_SERVERS
+
+
+def read_error():
+    """Why the scan produced nothing, or '' when it was read - so a caller holding an empty
+    answer can tell an empty db from one it never got to see. Reads the db if needed."""
+    all_servers()
+    return _READ_ERROR
 
 
 def reset_cache():
     """Forget the scan. For tests - a real run reads the db once and then exits."""
-    global _ALL_SERVERS
+    global _ALL_SERVERS, _READ_ERROR
     _ALL_SERVERS = None
+    _READ_ERROR = ""
 
 
 def enabled_servers():
@@ -249,15 +288,16 @@ def pool_name_for_host(want):
         return ""
     for row in enabled_servers():
         # a db host may carry the ':port' XO connects to xapi on
-        if row.host == want or row.host.rsplit(":", 1)[0] == want:
+        if row.host == want or parsers.split_host_port(row.host)[0] == want:
             return row.name
     return ""
 
 
 SELECT_OK = 0
-SELECT_NONE = 1
+SELECT_NONE = 1         # the db was read and lists no enabled pool
 SELECT_QUIT = 2
 SELECT_NO_MATCH = 3
+SELECT_UNREADABLE = 4   # the db could not be read at all - read_error() says why
 
 
 def select_pool(name_filter, stdin=None, stderr=None):
@@ -272,7 +312,8 @@ def select_pool(name_filter, stdin=None, stderr=None):
 
     rows = enabled_servers()
     if not rows:
-        return (SELECT_NONE, None)
+        # an empty answer is two different facts, and only one of them is 'no pools'
+        return (SELECT_UNREADABLE if read_error() else SELECT_NONE, None)
 
     if name_filter:
         needle = name_filter.lower()

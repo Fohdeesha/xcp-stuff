@@ -42,7 +42,7 @@ import unicodedata
 # ======================================================================================
 # --- config ----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "3.5"
+SCRIPT_VERSION = "3.6"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
@@ -139,6 +139,10 @@ COREDUMP_DIR = "/var/lib/systemd/coredump"          # anything here means a dom0
 COREDUMP_MAX_LINES = 50          # coredumps listed in the detail block (newest first)
 PKG_DIFF_MAX_LINES = 100         # mismatched yum packages listed
 XOSTOR_QCOW2_MAX_LINES = 50      # qcow2 VDIs on XOSTOR listed
+DMESG_MAX_LINES = 80             # lines of a dmesg detail block (Dmesg Content, OOM Events);
+                                 # the newest are kept, and the rollup runs first
+DMESG_ROLLUP_MIN = 3             # consecutive copies of one dmesg message folded into a
+                                 # 'repeated N times' line from this many; fewer print in full
 
 # Which per-host checks run on SLAVES in pool mode. The master always runs everything, and
 # so does single mode / a solo host run; these toggles exist only to keep a sweep short.
@@ -368,6 +372,27 @@ def parse_xe_records(text, start_key="uuid"):
     if current is not None:
         records.append(current)
     return records
+
+
+def split_host_port(text):
+    """'10.0.0.5:3366' -> ('10.0.0.5', 3366); '[fd00::1]:3366' -> ('fd00::1', 3366);
+    anything else -> (text, None).
+
+    The one reading of 'address, maybe with a port' - a host argument's ssh port, the
+    ':443' XO keeps on a server record, a linstor satellite's ':3366'. A bare IPv6 address
+    has more than one colon and is left whole.
+    """
+    text = text.strip()
+    if text.startswith("["):
+        host, _, rest = text[1:].partition("]")
+        if rest.startswith(":") and rest[1:].isdigit():
+            return host, int(rest[1:])
+        return host, None
+    if text.count(":") == 1:
+        host, port = text.split(":")
+        if host and port.isdigit():
+            return host, int(port)
+    return text, None
 
 
 def parse_host_list(text):
@@ -865,16 +890,20 @@ def find_phrase_lines(text, phrase):
     return [i for i, line in enumerate(text.splitlines(), 1) if low in line.lower()]
 
 
-def context_block(text, line_numbers, ctx=3, rollup=False):
+def context_block(text, line_numbers, ctx=3, rollup=False, max_lines=None, rollup_min=3):
     """+/- ctx lines around each hit, overlapping ranges merged, each line indented by 2.
 
     Merged ranges are separated by a blank line, which is what makes a block with several
     distant hits readable.
 
     With rollup=True, each merged range is passed through rollup_repeats() first, so a
-    range covering thousands of copies of one message prints as that message and a count.
-    The ranges themselves are unchanged: the rollup is a rendering of the same lines, so
-    nothing a hit pointed at is dropped.
+    range covering thousands of copies of one message prints as that message and a count
+    (runs of rollup_min or more). The ranges themselves are unchanged: the rollup is a
+    rendering of the same lines, so nothing a hit pointed at is dropped.
+
+    With max_lines set, a rendered block longer than that keeps only its newest max_lines,
+    under a line saying how much was cut - see truncate_block for why the rollup alone is
+    not enough.
     """
     if not line_numbers:
         return ""
@@ -895,18 +924,45 @@ def context_block(text, line_numbers, ctx=3, rollup=False):
     for i, (s, e) in enumerate(merged):
         e = min(e, total)
         block = ["  " + lines[k - 1] for k in range(s, e + 1)]
-        out.extend(rollup_repeats(block) if rollup else block)
+        out.extend(rollup_repeats(block, rollup_min) if rollup else block)
         if i != len(merged) - 1:
             out.append("")
-    return "\n".join(out)
+    return "\n".join(truncate_block(out, max_lines))
+
+
+def truncate_block(lines, max_lines):
+    """The newest max_lines of a rendered block, under a line saying what was cut.
+
+    The rollup folds a ring full of ONE message. It does nothing for a ring full of
+    thousands of DIFFERENT lines: a DRBD volume renegotiating its role every few minutes
+    prints a fresh state-change id each time, and one host's block ran to thousands of
+    lines and pushed the report itself out of the terminal's scrollback. So the block is
+    bounded after rendering, and the newest lines are the ones kept - dmesg is
+    chronological, and the current state of the storm is at the bottom. The note carries
+    the whole block's size, so the scale of what was cut is still on the page.
+
+    A cut can land inside a range: on its blank separator, or on a '... repeated N times'
+    line whose first line was just cut away. Both belong to what came before, so the cut
+    moves forward past them rather than leaving an orphan at the top.
+    """
+    if not max_lines or len(lines) <= max_lines:
+        return list(lines)
+    kept = lines[-max_lines:]
+    while kept and (not kept[0].strip() or kept[0].lstrip().startswith("... repeated ")):
+        kept = kept[1:]
+    omitted = len(lines) - len(kept)
+    note = "  ... %d earlier %s of this block not shown (%d in total; the newest %d follow)" % (
+        omitted, "line" if omitted == 1 else "lines", len(lines), len(kept))
+    return [note] + kept
 
 
 # The dmesg ring is a ring: one stuck NFS server or one flapping path writes the SAME line
 # thousands of times, and context_block then faithfully prints all of them. A real R630
 # pool produced 24,689 dmesg lines across seven hosts that were 22 distinct messages - one
 # of them repeated 24,668 times. The repetition is not the finding; the message, how many
-# times, and over what window are.
-DMESG_ROLLUP_MIN = 3             # runs shorter than this are cheaper to print in full
+# times, and over what window are. How many copies it takes is config.DMESG_ROLLUP_MIN,
+# passed in by the checks; the default below mirrors it the way ctx mirrors
+# LOG_ERROR_CONTEXT.
 
 _TS_RE = re.compile(r"^(\s*)(\[[^]]*\])\s?(.*)$")
 
@@ -924,7 +980,7 @@ def split_timestamp(line):
     return (m.group(1), m.group(2), m.group(3))
 
 
-def rollup_repeats(lines, threshold=DMESG_ROLLUP_MIN):
+def rollup_repeats(lines, threshold=3):
     """Collapse each run of consecutive lines with the same message into one summary.
 
     Identity is the message with its `dmesg -T` timestamp removed, so lines that differ
@@ -2835,14 +2891,41 @@ def have_xo_server_db():
 
 
 _ALL_SERVERS = None     # the one `xo-server-db ls server` scan; None until it is read
+_READ_ERROR = ""        # why that scan failed, when it did; "" while it has not
+
+
+def _describe_failure(rc, err):
+    """One line saying why xo-server-db answered nothing, for the messages that used to
+    say 'no enabled hosts' instead.
+
+    The stderr of a permission failure is a node error object spread over several lines,
+    of which the first is the one that says what happened:
+        [Error: EACCES: permission denied, lstat '/etc/xo-server/config.toml'] {
+    """
+    if rc == 124:
+        return "timed out after %ds" % (config.LOCAL_CMD_TIMEOUT * 3)
+    first = ""
+    for line in err.splitlines():
+        line = line.strip()
+        if line:
+            first = line
+            break
+    if first.endswith(" {"):
+        first = first[:-2]
+    if first.startswith("[") and first.endswith("]"):
+        first = first[1:-1]
+    if first:
+        return "exit code %d: %s" % (rc, first)
+    return "exit code %d" % rc
 
 
 def _ls(args):
+    """(output, "") or (None, why-not). rc 127 is the transport's own 'not found'."""
     rc, out, err = transport.run_local_cmd(["xo-server-db", "ls"] + list(args),
                                            timeout=config.LOCAL_CMD_TIMEOUT * 3)
     if rc != 0:
-        return None
-    return out
+        return None, _describe_failure(rc, err)
+    return out, ""
 
 
 def all_servers():
@@ -2862,20 +2945,31 @@ def all_servers():
     Read from the main thread only, before any host is contacted; nothing else in a run
     touches it, so the cache needs no lock.
     """
-    global _ALL_SERVERS
+    global _ALL_SERVERS, _READ_ERROR
     if _ALL_SERVERS is None:
-        out = _ls(["server"])
-        # a db that could not be read is cached as empty: every caller already treats
-        # "no such record" and "could not ask" the same way, and asking again would cost
-        # another 3.3s to fail again
+        out, why = _ls(["server"])
+        # a db that could not be read is cached as empty, with the reason kept beside it:
+        # asking again would cost another 3.3s to fail again, and every lookup answers
+        # 'nothing' either way - but the messages built on that answer must not. Run as a
+        # non-root user, xo-server-db cannot even stat /etc/xo-server/config.toml, and
+        # 'no enabled hosts found in xo-db' was what an appliance with five pools said.
         _ALL_SERVERS = scan_records(out) if out is not None else []
+        _READ_ERROR = why
     return _ALL_SERVERS
+
+
+def read_error():
+    """Why the scan produced nothing, or '' when it was read - so a caller holding an empty
+    answer can tell an empty db from one it never got to see. Reads the db if needed."""
+    all_servers()
+    return _READ_ERROR
 
 
 def reset_cache():
     """Forget the scan. For tests - a real run reads the db once and then exits."""
-    global _ALL_SERVERS
+    global _ALL_SERVERS, _READ_ERROR
     _ALL_SERVERS = None
+    _READ_ERROR = ""
 
 
 def enabled_servers():
@@ -2925,15 +3019,16 @@ def pool_name_for_host(want):
         return ""
     for row in enabled_servers():
         # a db host may carry the ':port' XO connects to xapi on
-        if row.host == want or row.host.rsplit(":", 1)[0] == want:
+        if row.host == want or parsers.split_host_port(row.host)[0] == want:
             return row.name
     return ""
 
 
 SELECT_OK = 0
-SELECT_NONE = 1
+SELECT_NONE = 1         # the db was read and lists no enabled pool
 SELECT_QUIT = 2
 SELECT_NO_MATCH = 3
+SELECT_UNREADABLE = 4   # the db could not be read at all - read_error() says why
 
 
 def select_pool(name_filter, stdin=None, stderr=None):
@@ -2948,7 +3043,8 @@ def select_pool(name_filter, stdin=None, stderr=None):
 
     rows = enabled_servers()
     if not rows:
-        return (SELECT_NONE, None)
+        # an empty answer is two different facts, and only one of them is 'no pools'
+        return (SELECT_UNREADABLE if read_error() else SELECT_NONE, None)
 
     if name_filter:
         needle = name_filter.lower()
@@ -3119,16 +3215,35 @@ def mtu_issues(host):
     return flag("MTU Issues", "Detected (%s), check output from dmesg -T" % listed)
 
 
-def dmesg_content(host):
-    f = host.fact("dmesg")
-    if not f.ok:
-        return unknown("Dmesg Content", "Unknown (could not read dmesg)")
-    hits = parsers.dmesg_issue_lines(f.value, config.DMESG_ISSUE_WORDS,
+def dmesg_block(text, hits, rollup=True):
+    """Every detail block cut from the dmesg ring is rendered one way: LOG_ERROR_CONTEXT
+    lines of context, the rollup of repeated lines, and the cap - rolled up AND bounded,
+    because the rollup folds a ring full of one message and the cap is for a ring full of
+    thousands of different ones (see parsers.truncate_block). Both settings live in config
+    and reach every line that reads the ring through here."""
+    return parsers.context_block(text, hits, config.LOG_ERROR_CONTEXT, rollup=rollup,
+                                 max_lines=config.DMESG_MAX_LINES,
+                                 rollup_min=config.DMESG_ROLLUP_MIN)
+
+
+def dmesg_content_of(text):
+    """The 'Dmesg Content' line for a ring already in hand.
+
+    The XOA section reads the appliance's own ring and used to carry a copy of this - one
+    reading and one wording for the host line and the appliance line."""
+    hits = parsers.dmesg_issue_lines(text, config.DMESG_ISSUE_WORDS,
                                      config.DMESG_ISSUE_PHRASES, config.DMESG_IGNORE_RULES)
     if not hits:
         return ok("Dmesg Content", "Clean")
     return flag("Dmesg Content", "Issues Found, See Output Below").with_detail(
-        "Dmesg Issues", parsers.context_block(f.value, hits, rollup=True))
+        "Dmesg Issues", dmesg_block(text, hits))
+
+
+def dmesg_content(host):
+    f = host.fact("dmesg")
+    if not f.ok:
+        return unknown("Dmesg Content", "Unknown (could not read dmesg)")
+    return dmesg_content_of(f.value)
 
 
 def oom_events(host):
@@ -3138,8 +3253,11 @@ def oom_events(host):
     hits = parsers.find_phrase_lines(f.value, config.OOM_PHRASE)
     if not hits:
         return ok("OOM Events", "No")
+    # the same ring, so the same bound: a host that has been killing processes all week
+    # shows its most recent kills, not every one of them. No rollup: every kill names its
+    # own pid, so there is nothing to fold
     return flag("OOM Events", "Yes, See Below").with_detail(
-        "OOM Events", parsers.context_block(f.value, hits))
+        "OOM Events", dmesg_block(f.value, hits, rollup=False))
 
 
 def crash_logs(host):
@@ -3695,43 +3813,61 @@ def xostor_ram(pool, memory):
     return ok("XOSTOR RAM", "%.1fG" % total_gb)
 
 
+def _linstor_unknown(label, f):
+    """One wording for a linstor fact that did not come back, whichever line asked."""
+    if "not found" in (f.error or ""):
+        return unknown(label, "Unknown (linstor CLI not found)")
+    return unknown(label, "Unknown (%s)" % f.error)
+
+
 def _linstor_line(pool, key, label, predicate, detail_title):
     f = pool.fact(key)
     if not f.ok:
-        if "not found" in (f.error or ""):
-            return unknown(label, "Unknown (linstor CLI not found)")
-        return unknown(label, "Unknown (%s)" % f.error)
+        return _linstor_unknown(label, f)
     if predicate(f.value):
         return flag(label, "Yes, See Below").with_detail(detail_title, f.value)
     return ok(label, "No")
 
 
-def _linstor_node_offline(text):
-    """The State column of 'linstor n l'. Deliberate twin of collector.linstor_table_column,
-    which reads the Node column of this same table on the hypervisor: one runs where the
-    report is built and one runs where linstor is, so they cannot be shared. Keep the
-    header location, the cell splitting and the ANSI stripping identical in both.
+def _linstor_table(text):
+    """(header cells, [row cells, ...]) of one of linstor's ASCII tables, ANSI stripped.
+
+    Deliberate twin of collector.linstor_table_column, which reads the Node column of the
+    same 'n l' table on the hypervisor: one runs where the report is built and one where
+    linstor is, so they cannot be shared. Keep the rule-row test, the cell splitting and
+    the ANSI stripping identical in both. The first row that is not a rule is the header.
     """
-    state_col = None
-    for line in text.splitlines():
-        if line.startswith("+") or line.startswith("|="):
+    header, rows = None, []
+    for text_line in text.splitlines():
+        line = colors.strip_ansi(text_line)
+        if not line.startswith("|") or not set(line) - set("|-=+ "):
             continue
-        cells = [c.strip() for c in line.split("|")]
-        if "Node" in cells and "State" in cells:
-            state_col = cells.index("State")
-            continue
-        if line.startswith("|") and state_col is not None and state_col < len(cells):
-            import colors
-            if colors.strip_ansi(cells[state_col]).strip() != "Online":
-                return True
-    return False
+        cells = [c.strip() for c in line.split("|")[1:-1]]
+        if header is None:
+            header = cells
+        else:
+            rows.append(cells)
+    return header or [], rows
+
+
+def _linstor_column(text, name):
+    """The values under one header, in row order; [] when the table has no such column."""
+    header, rows = _linstor_table(text)
+    if name not in header:
+        return []
+    col = header.index(name)
+    return [row[col] for row in rows if col < len(row)]
+
+
+def _linstor_node_offline(text):
+    """Any node whose State column of 'linstor n l' says something other than Online."""
+    return any(state != "Online" for state in _linstor_column(text, "State"))
 
 
 def _linstor_has_rows(text):
-    for line in text.splitlines():
-        if line.startswith("| ") and "ResourceName" not in line:
-            return True
-    return False
+    """'r l --faulty' prints its header whether or not anything is faulty; rows are the
+    finding."""
+    return bool(_linstor_table(text)[1])
 
 
 def xostor_faulty_resources(pool):
@@ -3744,17 +3880,51 @@ def xostor_nodes(pool):
                          _linstor_node_offline, "---xostor node status---")
 
 
-def xostor_controller(pool):
+def _linstor_node_addresses(text):
+    """{address: node} out of the Addresses column of 'linstor n l'.
+
+    A cell reads '172.16.210.84:3366 (PLAIN)' - the satellite's address, its port and the
+    connection type. An older table without an Addresses column simply names nobody.
+    """
+    header, rows = _linstor_table(text)
+    if "Node" not in header or "Addresses" not in header:
+        return {}
+    node_col, addr_col = header.index("Node"), header.index("Addresses")
+    out = {}
+    for row in rows:
+        if max(node_col, addr_col) >= len(row) or not row[node_col]:
+            continue
+        for token in row[addr_col].replace(",", " ").split():
+            if not token.startswith("("):        # '(PLAIN)' is the connection type
+                out.setdefault(parsers.split_host_port(token)[0], row[node_col])
+    return out
+
+
+def xostor_controller(pool, host_names=None):
+    """Where the linstor controller is - the address, and which host that is.
+
+    The name comes from the pool's own xapi host list first: those are the names the host
+    blocks carry, and the addresses the collector asked linstor through are those same
+    management addresses. Then from the Addresses column of 'linstor n l', which names
+    every node - a solo host run only knows its own name from xapi, and the controller may
+    well be a host it never looks at. Neither answering leaves the address on its own: the
+    line is about where the controller is, and a name is a convenience that must not turn
+    a known address into an Unknown.
+    """
     f = pool.fact("linstor_controller")
     if not f.ok:
-        if "not found" in (f.error or ""):
-            return unknown("XOSTOR Controller IP", "Unknown (linstor CLI not found)")
-        return unknown("XOSTOR Controller IP", "Unknown (%s)" % f.error)
+        return _linstor_unknown("XOSTOR Controller IP", f)
+    names = dict(host_names or {})
+    nodes = pool.fact("linstor_nodes")
+    node_names = _linstor_node_addresses(nodes.value) if nodes.ok else {}
     text = []
     for line in f.value.splitlines():
         if line.startswith("Error:"):
             continue
-        text.append(line[len("linstor://"):] if line.startswith("linstor://") else line)
+        address = line[len("linstor://"):] if line.startswith("linstor://") else line
+        key = parsers.split_host_port(address)[0]
+        name = names.get(key) or node_names.get(key)
+        text.append("%s (%s)" % (address, name) if name else address)
     value = "\n".join(text)
     if not value.strip():
         return flag("XOSTOR Controller IP", "None")
@@ -4098,14 +4268,9 @@ def lines():
     if dmesg_text is None:
         out.append(unknown("Dmesg Content", "Unknown (could not read dmesg)"))
     else:
-        hits = parsers.dmesg_issue_lines(dmesg_text, config.DMESG_ISSUE_WORDS,
-                                         config.DMESG_ISSUE_PHRASES,
-                                         config.DMESG_IGNORE_RULES)
-        if hits:
-            out.append(flag("Dmesg Content", "Issues Found, See Output Below").with_detail(
-                "Dmesg Issues", parsers.context_block(dmesg_text, hits, rollup=True)))
-        else:
-            out.append(ok("Dmesg Content", "Clean"))
+        # the appliance's ring, read the same way as a host's: same words, same rollup,
+        # same cap, same wording - it used to be a second copy of that check
+        out.append(checks.dmesg_content_of(dmesg_text))
     return out
 
 
@@ -4465,15 +4630,6 @@ def detect_run_env():
     return "xoa"
 
 
-def parse_host_port(target):
-    """host[:port]. Rough IPv6 avoidance: more than one colon is left alone."""
-    if target.count(":") == 1 and "[" not in target:
-        host, port = target.rsplit(":", 1)
-        if port.isdigit() and host:
-            return host, int(port)
-    return target, 22
-
-
 def _host_spec(with_smapi):
     return {
         "want": ["host"],
@@ -4531,6 +4687,7 @@ class Run(object):
         self.pool_cmd_host = ""
         self.pool_size = 0
         self.all_addresses = []
+        self.host_names = {}      # address -> xapi hostname, for EVERY pool member
 
     def host_solo(self):
         """On a hypervisor with nothing else reachable. This, not the run environment, is
@@ -4596,6 +4753,47 @@ def print_banner(run, host, name):
     notice(run, "\n")
 
 
+def require_root(run_env):
+    """Both environments need root, for different reasons - and say which.
+
+    On a hypervisor, xe / dmesg / the logs would otherwise fail one at a time and the run
+    would blame the toolstack for what is really a missing sudo.
+
+    On XOA the appliance's own login user is 'xoa', not root, so this is the FIRST thing a
+    new user hits. Measured on the appliance (Debian 12): xo-server-db cannot stat
+    /etc/xo-server/config.toml (EACCES - the directory has no execute bit for others), so
+    every lookup answers nothing and the run used to conclude 'no enabled hosts found in
+    xo-db' on an XOA with five pools; a bare host argument read as 'not in xo-db'; and
+    with a host AND a password the pool was checked but the XOA section printed sudo's
+    own 'a terminal is required' as an 'XOA Check' finding and could not read dmesg
+    (kernel.dmesg_restrict), so no non-root run could ever be clean. Nothing here can be
+    established without root, so nothing is attempted.
+
+    'sudo python3 <(curl ...)' is not the fix, and the message says so: sudo closes the
+    descriptor the process substitution opens, and python3 reports /dev/fd/63 as missing.
+    """
+    if xoa.running_as_root():
+        return True
+    if run_env == "host":
+        sys.stderr.write("ERROR: this must run as root on an XCP-ng host (it reads dom0 "
+                         "logs and talks to xapi).\n")
+    else:
+        sys.stderr.write(
+            "ERROR: this must run as root on XOA: the pool list and root passwords come out of\n"
+            "       xo-server-db, and 'xoa check' and dmesg need root too. Become root first\n"
+            "       (sudo -i) and run it again - note that 'sudo python3 <(curl ...)' does not\n"
+            "       work, because sudo closes the descriptor the <( ) opens.\n")
+    return False
+
+
+def _xodb_unreadable(consequence):
+    """xo-server-db answered nothing and said why: report THAT - never 'no pools' or 'not
+    in xo-db', which are claims about a db nobody read. Exits 1."""
+    sys.stderr.write("ERROR: could not read xo-server-db (%s), so %s\n"
+                     % (xodb.read_error(), consequence))
+    sys.exit(1)
+
+
 def resolve_target_xoa(run, args):
     """Pick a pool / take the host argument, then find a password for it."""
     if run.name_filter and len(args) > 1:
@@ -4626,17 +4824,20 @@ def resolve_target_xoa(run, args):
             sys.exit(0)
         if code == xodb.SELECT_NO_MATCH:
             sys.exit(1)
+        if code == xodb.SELECT_UNREADABLE:
+            _xodb_unreadable("there is no pool list to pick from.\n       Provide the pool "
+                             "master's IP and root password as arguments instead.")
         if code == xodb.SELECT_NONE:
             sys.stderr.write("No host IP provided and no enabled hosts found in xo-db, "
                              "please provide a host IP as an argument\n")
             sys.exit(1)
         args = [selected.host] + list(args)
 
-    host, port = parse_host_port(args[0])
+    host, port = parsers.split_host_port(args[0])
     run.seed = host
     # a picker-chosen host may carry ':port' - that is the XAPI HTTPS port XO connects on,
     # not an ssh port, so it is stripped for ssh and we stay on 22
-    run.transport.ssh_port = 22 if selected else port
+    run.transport.ssh_port = 22 if selected or not port else port
 
     run.pool_name = selected.name if selected else xodb.pool_name_for_host(host)
     print_banner(run, host, run.pool_name)
@@ -4654,6 +4855,11 @@ def resolve_target_xoa(run, args):
         password, has_backslash = xodb.password_for(db_host)
         run.pw_has_backslash = has_backslash
         if not password:
+            if xodb.read_error():
+                # the same distinction as the picker's: 'not found' is a statement about
+                # the db's contents, which were never seen
+                _xodb_unreadable("no password could be looked up for %s.\n       Provide "
+                                 "the root password as a second argument instead." % host)
             notice(run, "Host IP not found in xo-db, please manually provide a "
                         "password, or check that the IP is the master host and not "
                         "a slave\n")
@@ -4764,6 +4970,9 @@ def discover(run):
 
     run.pool_size = len(hosts)
     run.all_addresses = [h.address for h in hosts]
+    # every member's name while the whole pool is in hand: a solo run narrows the list
+    # to this machine, and the XOSTOR controller may be a host it never looks at
+    run.host_names = dict((h.address, h.hostname) for h in hosts if h.hostname)
 
     # the seed's own pool.conf names the master outright, whether we are it or not - and
     # it stays truthful when the toolstack is wedged, which is why it is read rather than
@@ -4956,7 +5165,7 @@ def pool_status_section(run, rep):
         rep.check("XOSTOR RAM", checks.xostor_ram, run.pool, memory)
         rep.check("XOSTOR Faulty Resources", checks.xostor_faulty_resources, run.pool)
         rep.check("XOSTOR Faulty Nodes", checks.xostor_nodes, run.pool)
-        rep.check("XOSTOR Controller IP", checks.xostor_controller, run.pool)
+        rep.check("XOSTOR Controller IP", checks.xostor_controller, run.pool, run.host_names)
         rep.check("XOSTOR PrefNic", checks.xostor_pref_nic, run.pool)
         rep.check("XOSTOR QCOW2 VDIs", checks.xostor_qcow2, run.pool)
 
@@ -5147,15 +5356,11 @@ def main(argv=None):
     atexit.register(transport.cleanup_work_dir, work_dir)
     run.transport = transport.Transport(run.run_env, work_dir)
 
+    if not require_root(run.run_env):
+        return 1
+
     argument_password = ""
     if run.run_env == "host":
-        # From XOA every command arrived as root over ssh, so this is new ground. Without
-        # the check, xe / dmesg / the logs fail one at a time and the run blames the
-        # toolstack for what is really a missing sudo.
-        if not xoa.running_as_root():
-            sys.stderr.write("ERROR: this must run as root on an XCP-ng host (it reads "
-                             "dom0 logs and talks to xapi).\n")
-            return 1
         argument_password = resolve_target_host_mode(run, args)
     else:
         resolve_target_xoa(run, args)
@@ -5287,15 +5492,15 @@ def _module(name, exported):
     return module
 
 
-config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'REMOTE_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_QCOW2_MAX_LINES'])
+config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DMESG_MAX_LINES', 'DMESG_ROLLUP_MIN', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'REMOTE_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_QCOW2_MAX_LINES'])
 colors = _module('colors', ['CYAN', 'GREEN', 'RESET', 'YELLOW', 'cyan', 'green', 'init', 'strip_ansi', 'yellow'])
 result = _module('result', ['FLAG', 'Fact', 'INFO', 'Line', 'MISSING', 'OK', 'UNKNOWN', 'flag', 'guard', 'info', 'ok', 'raw', 'unknown', 'wrap'])
-parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'DMESG_ROLLUP_MIN', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', '_LINK_RE', '_MTU_RE', '_PARAM_RE', '_TS_RE', '_cidr_range', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'cap_lines', 'classify_multipath_path', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'has_overlapping_subnets', 'manifest_diff', 'manifest_versions', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pool_conf', 'parse_timedatectl', 'parse_xe_records', 'rollup_repeats', 'round_1dp', 'split_timestamp'])
+parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', '_LINK_RE', '_MTU_RE', '_PARAM_RE', '_TS_RE', '_cidr_range', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'cap_lines', 'classify_multipath_path', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'has_overlapping_subnets', 'manifest_diff', 'manifest_versions', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pool_conf', 'parse_timedatectl', 'parse_xe_records', 'rollup_repeats', 'round_1dp', 'split_host_port', 'split_timestamp', 'truncate_block'])
 model = _module('model', ['Host', 'Pool', 'ntp_match', 'ram_match'])
 collectorsrc = _module('collectorsrc', ['EMBEDDED', 'collector_source'])
 transport = _module('transport', ['BEGIN_MARKER', 'CollectError', 'END_MARKER', 'Transport', '_DEBUG_LOCK', '_LIVE', '_LIVE_LOCK', '_REMOTE_LAUNCH', '_REMOTE_LAUNCH_PINNED', '_kill_tree', '_remote_launch', 'cleanup_work_dir', 'debug', 'ensure_sshpass', 'have', 'kill_all_children', 'make_work_dir', 'run_local_cmd'])
-xodb = _module('xodb', ['QUOTES', 'SELECT_NONE', 'SELECT_NO_MATCH', 'SELECT_OK', 'SELECT_QUIT', 'Server', '_ALL_SERVERS', '_ESCAPE_RE', '_KEY_RE', '_SIMPLE_ESCAPES', '_ls', '_sort_key', 'all_servers', 'clean', 'enabled_servers', 'have_xo_server_db', 'password_for', 'pool_name_for_host', 'reset_cache', 'scan_records', 'select_pool', 'unescape'])
-checks = _module('checks', ['_dmesg_phrase_blocks', '_linstor_has_rows', '_linstor_line', '_linstor_node_offline', '_maps', '_multipath_detail', '_multipath_read', '_network_line', '_render_scan_blocks', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_content', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'ntp', 'oom_events', 'overlapping_subnets', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'tap_status', 'task_timeout_override', 'vlan0', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_nodes', 'xostor_pref_nic', 'xostor_qcow2', 'xostor_ram', 'yum_patch_level'])
+xodb = _module('xodb', ['QUOTES', 'SELECT_NONE', 'SELECT_NO_MATCH', 'SELECT_OK', 'SELECT_QUIT', 'SELECT_UNREADABLE', 'Server', '_ALL_SERVERS', '_ESCAPE_RE', '_KEY_RE', '_READ_ERROR', '_SIMPLE_ESCAPES', '_describe_failure', '_ls', '_sort_key', 'all_servers', 'clean', 'enabled_servers', 'have_xo_server_db', 'password_for', 'pool_name_for_host', 'read_error', 'reset_cache', 'scan_records', 'select_pool', 'unescape'])
+checks = _module('checks', ['_dmesg_phrase_blocks', '_linstor_column', '_linstor_has_rows', '_linstor_line', '_linstor_node_addresses', '_linstor_node_offline', '_linstor_table', '_linstor_unknown', '_maps', '_multipath_detail', '_multipath_read', '_network_line', '_render_scan_blocks', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_block', 'dmesg_content', 'dmesg_content_of', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'ntp', 'oom_events', 'overlapping_subnets', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'tap_status', 'task_timeout_override', 'vlan0', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_nodes', 'xostor_pref_nic', 'xostor_qcow2', 'xostor_ram', 'yum_patch_level'])
 xoa = _module('xoa', ['_dmesg', '_first_token', '_max_old_space', '_meminfo', '_os_version', '_service_state', '_updater', 'collect_xoa', 'debian_version_ok', 'lines', 'ping_silent', 'running_as_root'])
 report = _module('report', ['Report', '_as_entry'])
 

@@ -126,15 +126,6 @@ def detect_run_env():
     return "xoa"
 
 
-def parse_host_port(target):
-    """host[:port]. Rough IPv6 avoidance: more than one colon is left alone."""
-    if target.count(":") == 1 and "[" not in target:
-        host, port = target.rsplit(":", 1)
-        if port.isdigit() and host:
-            return host, int(port)
-    return target, 22
-
-
 def _host_spec(with_smapi):
     return {
         "want": ["host"],
@@ -192,6 +183,7 @@ class Run(object):
         self.pool_cmd_host = ""
         self.pool_size = 0
         self.all_addresses = []
+        self.host_names = {}      # address -> xapi hostname, for EVERY pool member
 
     def host_solo(self):
         """On a hypervisor with nothing else reachable. This, not the run environment, is
@@ -257,6 +249,47 @@ def print_banner(run, host, name):
     notice(run, "\n")
 
 
+def require_root(run_env):
+    """Both environments need root, for different reasons - and say which.
+
+    On a hypervisor, xe / dmesg / the logs would otherwise fail one at a time and the run
+    would blame the toolstack for what is really a missing sudo.
+
+    On XOA the appliance's own login user is 'xoa', not root, so this is the FIRST thing a
+    new user hits. Measured on the appliance (Debian 12): xo-server-db cannot stat
+    /etc/xo-server/config.toml (EACCES - the directory has no execute bit for others), so
+    every lookup answers nothing and the run used to conclude 'no enabled hosts found in
+    xo-db' on an XOA with five pools; a bare host argument read as 'not in xo-db'; and
+    with a host AND a password the pool was checked but the XOA section printed sudo's
+    own 'a terminal is required' as an 'XOA Check' finding and could not read dmesg
+    (kernel.dmesg_restrict), so no non-root run could ever be clean. Nothing here can be
+    established without root, so nothing is attempted.
+
+    'sudo python3 <(curl ...)' is not the fix, and the message says so: sudo closes the
+    descriptor the process substitution opens, and python3 reports /dev/fd/63 as missing.
+    """
+    if xoa.running_as_root():
+        return True
+    if run_env == "host":
+        sys.stderr.write("ERROR: this must run as root on an XCP-ng host (it reads dom0 "
+                         "logs and talks to xapi).\n")
+    else:
+        sys.stderr.write(
+            "ERROR: this must run as root on XOA: the pool list and root passwords come out of\n"
+            "       xo-server-db, and 'xoa check' and dmesg need root too. Become root first\n"
+            "       (sudo -i) and run it again - note that 'sudo python3 <(curl ...)' does not\n"
+            "       work, because sudo closes the descriptor the <( ) opens.\n")
+    return False
+
+
+def _xodb_unreadable(consequence):
+    """xo-server-db answered nothing and said why: report THAT - never 'no pools' or 'not
+    in xo-db', which are claims about a db nobody read. Exits 1."""
+    sys.stderr.write("ERROR: could not read xo-server-db (%s), so %s\n"
+                     % (xodb.read_error(), consequence))
+    sys.exit(1)
+
+
 def resolve_target_xoa(run, args):
     """Pick a pool / take the host argument, then find a password for it."""
     if run.name_filter and len(args) > 1:
@@ -287,17 +320,20 @@ def resolve_target_xoa(run, args):
             sys.exit(0)
         if code == xodb.SELECT_NO_MATCH:
             sys.exit(1)
+        if code == xodb.SELECT_UNREADABLE:
+            _xodb_unreadable("there is no pool list to pick from.\n       Provide the pool "
+                             "master's IP and root password as arguments instead.")
         if code == xodb.SELECT_NONE:
             sys.stderr.write("No host IP provided and no enabled hosts found in xo-db, "
                              "please provide a host IP as an argument\n")
             sys.exit(1)
         args = [selected.host] + list(args)
 
-    host, port = parse_host_port(args[0])
+    host, port = parsers.split_host_port(args[0])
     run.seed = host
     # a picker-chosen host may carry ':port' - that is the XAPI HTTPS port XO connects on,
     # not an ssh port, so it is stripped for ssh and we stay on 22
-    run.transport.ssh_port = 22 if selected else port
+    run.transport.ssh_port = 22 if selected or not port else port
 
     run.pool_name = selected.name if selected else xodb.pool_name_for_host(host)
     print_banner(run, host, run.pool_name)
@@ -315,6 +351,11 @@ def resolve_target_xoa(run, args):
         password, has_backslash = xodb.password_for(db_host)
         run.pw_has_backslash = has_backslash
         if not password:
+            if xodb.read_error():
+                # the same distinction as the picker's: 'not found' is a statement about
+                # the db's contents, which were never seen
+                _xodb_unreadable("no password could be looked up for %s.\n       Provide "
+                                 "the root password as a second argument instead." % host)
             notice(run, "Host IP not found in xo-db, please manually provide a "
                         "password, or check that the IP is the master host and not "
                         "a slave\n")
@@ -425,6 +466,9 @@ def discover(run):
 
     run.pool_size = len(hosts)
     run.all_addresses = [h.address for h in hosts]
+    # every member's name while the whole pool is in hand: a solo run narrows the list
+    # to this machine, and the XOSTOR controller may be a host it never looks at
+    run.host_names = dict((h.address, h.hostname) for h in hosts if h.hostname)
 
     # the seed's own pool.conf names the master outright, whether we are it or not - and
     # it stays truthful when the toolstack is wedged, which is why it is read rather than
@@ -617,7 +661,7 @@ def pool_status_section(run, rep):
         rep.check("XOSTOR RAM", checks.xostor_ram, run.pool, memory)
         rep.check("XOSTOR Faulty Resources", checks.xostor_faulty_resources, run.pool)
         rep.check("XOSTOR Faulty Nodes", checks.xostor_nodes, run.pool)
-        rep.check("XOSTOR Controller IP", checks.xostor_controller, run.pool)
+        rep.check("XOSTOR Controller IP", checks.xostor_controller, run.pool, run.host_names)
         rep.check("XOSTOR PrefNic", checks.xostor_pref_nic, run.pool)
         rep.check("XOSTOR QCOW2 VDIs", checks.xostor_qcow2, run.pool)
 
@@ -808,15 +852,11 @@ def main(argv=None):
     atexit.register(transport.cleanup_work_dir, work_dir)
     run.transport = transport.Transport(run.run_env, work_dir)
 
+    if not require_root(run.run_env):
+        return 1
+
     argument_password = ""
     if run.run_env == "host":
-        # From XOA every command arrived as root over ssh, so this is new ground. Without
-        # the check, xe / dmesg / the logs fail one at a time and the run blames the
-        # toolstack for what is really a missing sudo.
-        if not xoa.running_as_root():
-            sys.stderr.write("ERROR: this must run as root on an XCP-ng host (it reads "
-                             "dom0 logs and talks to xapi).\n")
-            return 1
         argument_password = resolve_target_host_mode(run, args)
     else:
         resolve_target_xoa(run, args)
