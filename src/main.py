@@ -432,7 +432,18 @@ def discover(run):
     conf = result.wrap(payload, "pool_conf")
     role, master = parsers.parse_pool_conf(conf.value if conf.ok else "")
     if role == "master":
+        # pool.conf says only "master" - it carries no address - so the seed stands in for
+        # one. That address is whatever was dialled, which on a master with a secondary
+        # network need not be the address xapi publishes in host-list; every later
+        # comparison is against that published address, so resolve the seed to its own
+        # host record and prefer what xapi calls it.
         run.master_address = run.seed
+        self_uuid = result.wrap(payload, "self_uuid")
+        if self_uuid.ok and self_uuid.value:
+            for host in hosts:
+                if host.uuid == self_uuid.value:
+                    run.master_address = host.address
+                    break
     elif role == "slave":
         run.master_address = master
 
