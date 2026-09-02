@@ -14,6 +14,12 @@ looks at `/etc/os-release` to see where it is and adapts. See
 [Running it on an XCP-ng host](#running-it-on-an-xcp-ng-host-instead-of-xoa) below for what
 differs there (`-n` is the one flag that doesn't apply, it needs XOA's database).
 
+It has to be root in both places. On XOA the pool list and root passwords come out of
+`xo-server-db`, which only root can read, and `xoa check` needs root as well - so run as the
+`xoa` user it stops and says so rather than guessing. Become root first with `sudo -i`, then
+run the one-liner; `sudo python3 <(curl ...)` on its own does not work, because sudo closes
+the file descriptor the `<( )` opens.
+
 Run health.py on an XOA appliance with no arguments, it will pull pool/host information from XOA's database.
 
 - If XOA is connected to more than one pool, it lists the enabled pools and asks which one to check

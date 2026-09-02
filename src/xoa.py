@@ -15,6 +15,7 @@ import os
 import re
 import threading
 
+import checks
 import colors
 import config
 import parsers
@@ -234,14 +235,9 @@ def lines():
     if dmesg_text is None:
         out.append(unknown("Dmesg Content", "Unknown (could not read dmesg)"))
     else:
-        hits = parsers.dmesg_issue_lines(dmesg_text, config.DMESG_ISSUE_WORDS,
-                                         config.DMESG_ISSUE_PHRASES,
-                                         config.DMESG_IGNORE_RULES)
-        if hits:
-            out.append(flag("Dmesg Content", "Issues Found, See Output Below").with_detail(
-                "Dmesg Issues", parsers.context_block(dmesg_text, hits, rollup=True)))
-        else:
-            out.append(ok("Dmesg Content", "Clean"))
+        # the appliance's ring, read the same way as a host's: same words, same rollup,
+        # same cap, same wording - it used to be a second copy of that check
+        out.append(checks.dmesg_content_of(dmesg_text))
     return out
 
 

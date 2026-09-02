@@ -118,14 +118,15 @@ DB = (
 class FakeDb(object):
     """Stands in for the xo-server-db binary, counting how often it is really run."""
 
-    def __init__(self, text=DB, rc=0):
+    def __init__(self, text=DB, rc=0, err=""):
         self.text = text
         self.rc = rc
+        self.err = err
         self.calls = []
 
     def __call__(self, argv, timeout=None, env=None, stdin_text=None):
         self.calls.append(list(argv))
-        return (self.rc, self.text if self.rc == 0 else "", "")
+        return (self.rc, self.text if self.rc == 0 else "", self.err)
 
 
 @pytest.fixture(autouse=True)
@@ -176,16 +177,79 @@ def test_a_host_the_db_does_not_know_has_no_password(db):
     assert xodb.pool_name_for_host("10.9.9.9") == ""
 
 
+# what `xo-server-db ls server` writes to stderr as a non-root user on the appliance
+# (Debian 12): /etc/xo-server is mode 644, so even the stat of config.toml is refused
+EACCES = (
+    "[Error: EACCES: permission denied, lstat '/etc/xo-server/config.toml'] {\n"
+    "  errno: -13,\n"
+    "  code: 'EACCES',\n"
+    "  syscall: 'lstat',\n"
+    "  path: '/etc/xo-server/config.toml'\n"
+    "}\n"
+)
+
+
 def test_a_db_that_cannot_be_read_is_not_asked_twice(monkeypatch):
-    """Failure is cached like any other answer: every caller already treats 'no record'
-    and 'could not ask' alike, and asking again costs another 3.3s to fail again."""
-    fake = FakeDb(rc=1)
+    """Failure is cached like any other answer: every lookup answers 'nothing' either
+    way, and asking again costs another 3.3s to fail again. But it is cached WITH its
+    reason, and the picker reports that reason instead of an empty pool list."""
+    fake = FakeDb(rc=1, err=EACCES)
     monkeypatch.setattr(transport, "run_local_cmd", fake)
     monkeypatch.setattr(xodb, "have_xo_server_db", lambda: True)
     assert xodb.enabled_servers() == []
     assert xodb.password_for("192.168.1.13") == (None, False)
-    assert xodb.select_pool("")[0] == xodb.SELECT_NONE
+    assert xodb.select_pool("")[0] == xodb.SELECT_UNREADABLE
+    assert xodb.select_pool("sec")[0] == xodb.SELECT_UNREADABLE
+    assert xodb.read_error() == (
+        "exit code 1: Error: EACCES: permission denied, lstat '/etc/xo-server/config.toml'")
     assert len(fake.calls) == 1
+
+
+def test_an_unreadable_db_is_not_reported_as_an_empty_one():
+    """'No enabled hosts found in xo-db' was what a non-root run said on an appliance
+    with five pools. SELECT_NONE is a statement about the db's contents, so it needs the
+    db to have been read."""
+    assert xodb.SELECT_UNREADABLE != xodb.SELECT_NONE
+
+
+def test_a_db_with_no_enabled_server_is_still_none_and_not_an_error(monkeypatch):
+    fake = FakeDb(text="{ enabled: 'false', host: '10.0.0.1', label: 'off' }\n")
+    monkeypatch.setattr(transport, "run_local_cmd", fake)
+    monkeypatch.setattr(xodb, "have_xo_server_db", lambda: True)
+    assert xodb.select_pool("")[0] == xodb.SELECT_NONE
+    assert xodb.read_error() == ""
+
+
+def test_an_empty_db_is_none_too(monkeypatch):
+    fake = FakeDb(text="")
+    monkeypatch.setattr(transport, "run_local_cmd", fake)
+    assert xodb.select_pool("")[0] == xodb.SELECT_NONE
+    assert xodb.read_error() == ""
+
+
+def test_the_failure_description_names_the_cause():
+    # the transport's own 'could not exec' - the binary is not on PATH at all
+    assert xodb._describe_failure(127, "xo-server-db: [Errno 2] No such file or directory") \
+        == "exit code 127: xo-server-db: [Errno 2] No such file or directory"
+    # a timeout leaves no stderr behind, and 'exit code 124' would not say what happened
+    assert xodb._describe_failure(124, "") == "timed out after 30s"
+    # a failure that said nothing at all still reports as a failure, not as 'no pools'
+    assert xodb._describe_failure(3, "") == "exit code 3"
+    assert xodb._describe_failure(3, "\n  \n") == "exit code 3"
+    # the first line is the informative one; the node object dump after it is not
+    assert xodb._describe_failure(1, EACCES) == (
+        "exit code 1: Error: EACCES: permission denied, lstat '/etc/xo-server/config.toml'")
+    assert xodb._describe_failure(1, "  plain message  \nmore\n") == "exit code 1: plain message"
+
+
+def test_reset_cache_forgets_the_failure_as_well(monkeypatch):
+    fake = FakeDb(rc=1, err="boom")
+    monkeypatch.setattr(transport, "run_local_cmd", fake)
+    assert xodb.select_pool("")[0] == xodb.SELECT_UNREADABLE
+    xodb.reset_cache()
+    monkeypatch.setattr(transport, "run_local_cmd", FakeDb())
+    assert xodb.read_error() == ""
+    assert xodb.select_pool("")[0] == xodb.SELECT_OK
 
 
 def test_the_picker_order_is_the_sorted_one_the_cache_did_not_reorder(db):

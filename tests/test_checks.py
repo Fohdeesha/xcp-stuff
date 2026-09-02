@@ -327,6 +327,132 @@ def test_xostor_controller_none_is_a_failure():
     assert line.status == OK and "10.0.0.5" in line.text
 
 
+# 'linstor n l' as a current linstor prints it: the Addresses column names the satellite
+# connection, and the node names are the hosts' own
+LINSTOR_NODES_WITH_ADDRESSES = """+-------------------------------------------------------+
+| Node  | NodeType | Addresses                  | State  |
+|=======================================================|
+| xen12 | COMBINED | 172.16.210.84:3366 (PLAIN) | Online |
+| xen13 | COMBINED | 172.16.210.85:3366 (PLAIN) | Online |
++-------------------------------------------------------+
+"""
+
+
+def _plain(line):
+    import colors
+    return colors.strip_ansi(line.text)
+
+
+def test_xostor_controller_names_the_host_from_the_pool_host_list():
+    p = pool(linstor_controller=fact("linstor://172.16.210.84\n"))
+    line = checks.xostor_controller(p, {"172.16.210.84": "Xen12", "172.16.210.85": "Xen13"})
+    assert line.status == OK
+    assert _plain(line) == "172.16.210.84 (Xen12)"
+
+
+def test_xostor_controller_falls_back_to_the_linstor_node_list():
+    # a solo host run only knows its own name from xapi; linstor names every node
+    p = pool(linstor_controller=fact("linstor://172.16.210.85\n"),
+             linstor_nodes=fact(LINSTOR_NODES_WITH_ADDRESSES))
+    assert _plain(checks.xostor_controller(p, {})) == "172.16.210.85 (xen13)"
+    assert _plain(checks.xostor_controller(p)) == "172.16.210.85 (xen13)"
+
+
+def test_xostor_controller_prefers_the_name_the_host_blocks_use():
+    p = pool(linstor_controller=fact("linstor://172.16.210.84\n"),
+             linstor_nodes=fact(LINSTOR_NODES_WITH_ADDRESSES))
+    line = checks.xostor_controller(p, {"172.16.210.84": "Xen12"})
+    assert _plain(line) == "172.16.210.84 (Xen12)"
+
+
+def test_xostor_controller_with_no_name_to_give_prints_the_address_alone():
+    """A name is a convenience; not having one must not turn a known address Unknown."""
+    p = pool(linstor_controller=fact("linstor://10.0.0.5\n"),
+             linstor_nodes=err("could not list linstor nodes"))
+    line = checks.xostor_controller(p, {"10.0.0.9": "other"})
+    assert line.status == OK and _plain(line) == "10.0.0.5"
+    # the node table without an Addresses column (older output) names nobody either
+    line = checks.xostor_controller(pool(linstor_controller=fact("linstor://10.0.0.5\n"),
+                                         linstor_nodes=fact(LINSTOR_NODES)))
+    assert line.status == OK and _plain(line) == "10.0.0.5"
+
+
+def test_xostor_controller_matches_an_address_that_carries_a_port():
+    p = pool(linstor_controller=fact("linstor://172.16.210.84:3370\n"))
+    line = checks.xostor_controller(p, {"172.16.210.84": "Xen12"})
+    assert _plain(line) == "172.16.210.84:3370 (Xen12)"
+
+
+def test_linstor_node_addresses_reads_the_table():
+    assert checks._linstor_node_addresses(LINSTOR_NODES_WITH_ADDRESSES) == {
+        "172.16.210.84": "xen12", "172.16.210.85": "xen13"}
+    assert checks._linstor_node_addresses(LINSTOR_NODES) == {}
+    assert checks._linstor_node_addresses("") == {}
+
+
+LINSTOR_FAULTY_EMPTY = """+------------------------------------------------------+
+| ResourceName | Node | Port | Usage | Conns | State |
+|======================================================|
++------------------------------------------------------+
+"""
+
+LINSTOR_FAULTY_ONE = """+------------------------------------------------------------+
+| ResourceName | Node  | Port | Usage  | Conns | State       |
+|============================================================|
+| xcp-volume-1 | xen12 | 7000 | Unused | Ok    | Inconsistent |
++------------------------------------------------------------+
+"""
+
+
+def test_linstor_table_reader_is_one_reader_for_every_linstor_line():
+    """The State, Node and Addresses readers share one table walk; a rule row drawn with
+    any of the glyphs is not a row, and ANSI never reaches a cell."""
+    header, rows = checks._linstor_table(LINSTOR_NODES_WITH_ADDRESSES)
+    assert header == ["Node", "NodeType", "Addresses", "State"]
+    assert [r[0] for r in rows] == ["xen12", "xen13"]
+    assert checks._linstor_column(LINSTOR_NODES, "State") == ["Online", "OFFLINE"]
+    assert checks._linstor_column(LINSTOR_NODES, "Nope") == []
+    coloured = LINSTOR_NODES.replace("OFFLINE", "\x1b[31mOFFLINE\x1b[0m")
+    assert checks._linstor_column(coloured, "State") == ["Online", "OFFLINE"]
+    assert checks._linstor_table("")[0] == []
+    assert checks._linstor_table("|---|---|\n")[0] == []
+
+
+def test_faulty_resources_are_rows_not_a_header():
+    assert checks._linstor_has_rows(LINSTOR_FAULTY_EMPTY) is False
+    assert checks._linstor_has_rows(LINSTOR_FAULTY_ONE) is True
+    assert checks._linstor_has_rows("") is False
+    p = pool(linstor_faulty=fact(LINSTOR_FAULTY_ONE))
+    assert checks.xostor_faulty_resources(p).status == FLAG
+    assert checks.xostor_faulty_resources(pool(linstor_faulty=fact(LINSTOR_FAULTY_EMPTY))).status == OK
+
+
+def test_dmesg_content_detail_is_bounded():
+    """A ring of thousands of DIFFERENT matching lines - the case the rollup cannot fold -
+    prints its newest DMESG_MAX_LINES under a note, not all of them."""
+    import config
+    text = "\n".join("[t%d] nfs: server 10.0.0.%d not responding, timed out" % (i, i % 250)
+                     for i in range(1, 2001))
+    line = checks.dmesg_content(host(dmesg=fact(text)))
+    assert line.status == FLAG
+    block = line.detail_text.splitlines()
+    assert len(block) == config.DMESG_MAX_LINES + 1
+    assert block[0].startswith("  ... ")
+    assert "2000 in total" in block[0]
+    assert block[-1].startswith("  [t2000] ")
+
+
+def test_oom_events_detail_is_bounded():
+    import config
+    text = "\n".join("[t%d] Out of memory: Killed process %d (thing)" % (i, i)
+                     for i in range(1, 501))
+    line = checks.oom_events(host(dmesg=fact(text)))
+    assert line.status == FLAG
+    block = line.detail_text.splitlines()
+    assert len(block) == config.DMESG_MAX_LINES + 1
+    assert block[-1].startswith("  [t500] ")
+
+
 def _prefnic(nodes, nics):
     return pool(linstor_pref_nics=fact({"nodes": nodes, "nics": nics}))
 

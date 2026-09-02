@@ -43,6 +43,27 @@ def parse_xe_records(text, start_key="uuid"):
     return records
 
 
+def split_host_port(text):
+    """'10.0.0.5:3366' -> ('10.0.0.5', 3366); '[fd00::1]:3366' -> ('fd00::1', 3366);
+    anything else -> (text, None).
+
+    The one reading of 'address, maybe with a port' - a host argument's ssh port, the
+    ':443' XO keeps on a server record, a linstor satellite's ':3366'. A bare IPv6 address
+    has more than one colon and is left whole.
+    """
+    text = text.strip()
+    if text.startswith("["):
+        host, _, rest = text[1:].partition("]")
+        if rest.startswith(":") and rest[1:].isdigit():
+            return host, int(rest[1:])
+        return host, None
+    if text.count(":") == 1:
+        host, port = text.split(":")
+        if host and port.isdigit():
+            return host, int(port)
+    return text, None
+
+
 def parse_host_list(text):
     """xe host-list params=uuid,name-label,hostname,address,enabled,multipathing.
 
@@ -538,16 +559,20 @@ def find_phrase_lines(text, phrase):
     return [i for i, line in enumerate(text.splitlines(), 1) if low in line.lower()]
 
 
-def context_block(text, line_numbers, ctx=3, rollup=False):
+def context_block(text, line_numbers, ctx=3, rollup=False, max_lines=None, rollup_min=3):
     """+/- ctx lines around each hit, overlapping ranges merged, each line indented by 2.
 
     Merged ranges are separated by a blank line, which is what makes a block with several
     distant hits readable.
 
     With rollup=True, each merged range is passed through rollup_repeats() first, so a
-    range covering thousands of copies of one message prints as that message and a count.
-    The ranges themselves are unchanged: the rollup is a rendering of the same lines, so
-    nothing a hit pointed at is dropped.
+    range covering thousands of copies of one message prints as that message and a count
+    (runs of rollup_min or more). The ranges themselves are unchanged: the rollup is a
+    rendering of the same lines, so nothing a hit pointed at is dropped.
+
+    With max_lines set, a rendered block longer than that keeps only its newest max_lines,
+    under a line saying how much was cut - see truncate_block for why the rollup alone is
+    not enough.
     """
     if not line_numbers:
         return ""
@@ -568,18 +593,45 @@ def context_block(text, line_numbers, ctx=3, rollup=False):
     for i, (s, e) in enumerate(merged):
         e = min(e, total)
         block = ["  " + lines[k - 1] for k in range(s, e + 1)]
-        out.extend(rollup_repeats(block) if rollup else block)
+        out.extend(rollup_repeats(block, rollup_min) if rollup else block)
         if i != len(merged) - 1:
             out.append("")
-    return "\n".join(out)
+    return "\n".join(truncate_block(out, max_lines))
+
+
+def truncate_block(lines, max_lines):
+    """The newest max_lines of a rendered block, under a line saying what was cut.
+
+    The rollup folds a ring full of ONE message. It does nothing for a ring full of
+    thousands of DIFFERENT lines: a DRBD volume renegotiating its role every few minutes
+    prints a fresh state-change id each time, and one host's block ran to thousands of
+    lines and pushed the report itself out of the terminal's scrollback. So the block is
+    bounded after rendering, and the newest lines are the ones kept - dmesg is
+    chronological, and the current state of the storm is at the bottom. The note carries
+    the whole block's size, so the scale of what was cut is still on the page.
+
+    A cut can land inside a range: on its blank separator, or on a '... repeated N times'
+    line whose first line was just cut away. Both belong to what came before, so the cut
+    moves forward past them rather than leaving an orphan at the top.
+    """
+    if not max_lines or len(lines) <= max_lines:
+        return list(lines)
+    kept = lines[-max_lines:]
+    while kept and (not kept[0].strip() or kept[0].lstrip().startswith("... repeated ")):
+        kept = kept[1:]
+    omitted = len(lines) - len(kept)
+    note = "  ... %d earlier %s of this block not shown (%d in total; the newest %d follow)" % (
+        omitted, "line" if omitted == 1 else "lines", len(lines), len(kept))
+    return [note] + kept
 
 
 # The dmesg ring is a ring: one stuck NFS server or one flapping path writes the SAME line
 # thousands of times, and context_block then faithfully prints all of them. A real R630
 # pool produced 24,689 dmesg lines across seven hosts that were 22 distinct messages - one
 # of them repeated 24,668 times. The repetition is not the finding; the message, how many
-# times, and over what window are.
-DMESG_ROLLUP_MIN = 3             # runs shorter than this are cheaper to print in full
+# times, and over what window are. How many copies it takes is config.DMESG_ROLLUP_MIN,
+# passed in by the checks; the default below mirrors it the way ctx mirrors
+# LOG_ERROR_CONTEXT.
 
 _TS_RE = re.compile(r"^(\s*)(\[[^]]*\])\s?(.*)$")
 
@@ -597,7 +649,7 @@ def split_timestamp(line):
     return (m.group(1), m.group(2), m.group(3))
 
 
-def rollup_repeats(lines, threshold=DMESG_ROLLUP_MIN):
+def rollup_repeats(lines, threshold=3):
     """Collapse each run of consecutive lines with the same message into one summary.
 
     Identity is the message with its `dmesg -T` timestamp removed, so lines that differ

@@ -355,6 +355,120 @@ def test_context_block_rollup_keeps_distinct_messages_and_range_separators():
 
 
 # --------------------------------------------------------------------------------------
+# the cap: what the rollup cannot fold
+# --------------------------------------------------------------------------------------
+# A DRBD volume renegotiating its role every few minutes prints a fresh state-change id
+# each time, so no two lines are the same and the rollup folds nothing. One host's block
+# ran to thousands of lines and pushed the report itself out of the terminal's scrollback.
+
+def test_truncate_block_keeps_the_newest_lines_under_a_note():
+    lines = ["  l%d" % i for i in range(1, 11)]
+    out = parsers.truncate_block(lines, 4)
+    assert out[0] == ("  ... 6 earlier lines of this block not shown "
+                      "(10 in total; the newest 4 follow)")
+    assert out[1:] == ["  l7", "  l8", "  l9", "  l10"]
+
+
+def test_truncate_block_leaves_a_block_within_the_cap_alone():
+    lines = ["  a", "  b"]
+    assert parsers.truncate_block(lines, 2) == lines
+    assert parsers.truncate_block(lines, None) == lines
+    assert parsers.truncate_block([], 5) == []
+
+
+def test_truncate_block_says_line_not_lines_for_one():
+    assert parsers.truncate_block(["  a", "  b", "  c"], 2)[0].startswith(
+        "  ... 1 earlier line of this block")
+
+
+def test_truncate_block_never_starts_on_an_orphaned_continuation():
+    # the cut lands on the rollup's '... repeated' line; its first line is gone, so it goes
+    # too, and the note counts it among what was cut
+    lines = ["  [t1] a", "  ... repeated 9 times, through [t9]", "  [t10] b", "  [t11] c"]
+    out = parsers.truncate_block(lines, 3)
+    assert out[1:] == ["  [t10] b", "  [t11] c"]
+    assert out[0].startswith("  ... 2 earlier lines of this block not shown (4 in total")
+
+
+def test_truncate_block_never_starts_on_a_range_separator():
+    lines = ["  a", "", "  b", "  c"]
+    assert parsers.truncate_block(lines, 3)[1:] == ["  b", "  c"]
+
+
+def test_context_block_cap_bounds_a_storm_of_distinct_lines():
+    text = "\n".join("[t%d] drbd vol: Preparing state change %d" % (i, i)
+                     for i in range(1, 3001))
+    hits = list(range(1, 3001))
+    block = parsers.context_block(text, hits, 3, rollup=True, max_lines=80).splitlines()
+    assert len(block) == 81
+    assert block[0].startswith("  ... 2920 earlier lines of this block not shown (3000 in total")
+    assert block[-1] == "  [t3000] drbd vol: Preparing state change 3000"
+
+
+def test_context_block_cap_is_not_reached_when_the_rollup_did_its_job():
+    text = "\n".join("[t%d] nfs: timed out" % i for i in range(1, 3001))
+    block = parsers.context_block(text, list(range(1, 3001)), 3, rollup=True, max_lines=80)
+    assert block.splitlines() == ["  [t1] nfs: timed out",
+                                  "  ... repeated 3000 times, through [t3000]"]
+
+
+def test_context_block_cap_applies_after_the_rollup_not_before():
+    # 3000 identical lines then 100 distinct ones: the rollup leaves 102 lines, the cap
+    # keeps the newest 80 of THOSE - not the newest 80 of the 3100 raw lines
+    text = "\n".join(["[t%d] nfs: timed out" % i for i in range(1, 3001)] +
+                     ["[u%d] drbd: change %d" % (i, i) for i in range(1, 101)])
+    block = parsers.context_block(text, list(range(1, 3101)), 3, rollup=True,
+                                  max_lines=80).splitlines()
+    assert len(block) == 81
+    assert "102 in total" in block[0]
+    assert block[-1] == "  [u100] drbd: change 100"
+
+
+def test_context_block_without_a_cap_is_unchanged():
+    text = "\n".join("l%d" % i for i in range(1, 201))
+    assert len(parsers.context_block(text, list(range(1, 201)), 0).splitlines()) == 200
+
+
+def test_context_block_rollup_min_is_honoured():
+    text = "\n".join("[t%d] x" % i for i in range(1, 6))
+    hits = [1, 2, 3, 4, 5]
+    folded = parsers.context_block(text, hits, 0, rollup=True, rollup_min=3).splitlines()
+    assert folded == ["  [t1] x", "  ... repeated 5 times, through [t5]"]
+    # a threshold above the run length leaves the lines verbatim
+    assert len(parsers.context_block(text, hits, 0, rollup=True, rollup_min=6).splitlines()) == 5
+
+
+# --------------------------------------------------------------------------------------
+# one reading of 'address, maybe with a port'
+# --------------------------------------------------------------------------------------
+# A host argument's ssh port, the ':443' XO keeps on a server record and a linstor
+# satellite's ':3366' were three separate splits in three modules.
+
+def test_split_host_port_ipv4_with_and_without_a_port():
+    assert parsers.split_host_port("10.0.0.5:3366") == ("10.0.0.5", 3366)
+    assert parsers.split_host_port("10.0.0.5") == ("10.0.0.5", None)
+    assert parsers.split_host_port(" 10.0.0.5:22 ") == ("10.0.0.5", 22)
+
+
+def test_split_host_port_bracketed_ipv6():
+    assert parsers.split_host_port("[fd00::1]:3366") == ("fd00::1", 3366)
+    assert parsers.split_host_port("[fd00::1]") == ("fd00::1", None)
+
+
+def test_split_host_port_leaves_a_bare_ipv6_address_whole():
+    assert parsers.split_host_port("fd00::1") == ("fd00::1", None)
+
+
+def test_split_host_port_does_not_invent_a_port():
+    # not digits after the colon, or nothing before it: not a port
+    assert parsers.split_host_port("host:abc") == ("host:abc", None)
+    assert parsers.split_host_port("host:") == ("host:", None)
+    assert parsers.split_host_port(":22") == (":22", None)
+    assert parsers.split_host_port("http://192.168.1.229") == ("http://192.168.1.229", None)
+    assert parsers.split_host_port("") == ("", None)
+
+
+# --------------------------------------------------------------------------------------
 
 def test_manifest_versions_keeps_duplicate_names():
     # gpg-pubkey is installed twice on every dom0 here, and a host carries two kernels
