@@ -149,7 +149,7 @@ def dmesg_content(host):
     if not hits:
         return ok("Dmesg Content", "Clean")
     return flag("Dmesg Content", "Issues Found, See Output Below").with_detail(
-        "Dmesg Issues", parsers.context_block(f.value, hits))
+        "Dmesg Issues", parsers.context_block(f.value, hits, rollup=True))
 
 
 def oom_events(host):
