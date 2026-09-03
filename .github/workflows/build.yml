@@ -8,6 +8,10 @@ name: build
 #
 # A push made with GITHUB_TOKEN does not start another workflow run, so this cannot
 # loop.
+#
+# The release job below then tags main whenever SCRIPT_VERSION changes, so the release
+# page cannot fall behind the same way health.py could. Cutting them by hand is how 3.4,
+# 3.5 and 3.6 all ended up sitting behind a v3.3 release.
 
 on:
   push:
@@ -52,6 +56,79 @@ jobs:
           git pull --rebase origin "${GITHUB_REF_NAME}"
           git push origin "HEAD:${GITHUB_REF_NAME}"
           echo "::notice::health.py was stale and has been rebuilt and committed"
+
+  release:
+    # SCRIPT_VERSION is bumped with every change that ships and the script prints it as the
+    # last line of every run, so it is the only way to tell which build produced a report
+    # someone pasted into a ticket. That number is worth nothing if the release page says
+    # something else, so a bump IS the release trigger: one release per version, cut from
+    # main, with health.py attached.
+    #
+    # Needs both other jobs: nothing is released that did not build and pass its tests, and
+    # stitch may have pushed a rebuilt health.py that this job has to pick up.
+    needs: [stitch, collector-python27]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write            # to create the tag and the release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main    # NOT the triggering sha. If stitch found health.py stale it pushed a
+                       # rebuild, and that commit is the one to tag - tagging the sha that
+                       # started the run would attach the stale artifact and point the tag
+                       # at a tree the build rejected.
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: health.py at this commit really is the build of src/
+        # stitch proved it for the commit IT checked out; this proves it for the commit
+        # about to be tagged, which is a different one whenever a human pushed while stitch
+        # was running. A release whose asset is not the build of its own sources is the one
+        # outcome worth failing red for - the follow-up run would release the right thing,
+        # but silence here is how the stale artifact ships.
+        run: |
+          python build/stitch.py
+          if ! git diff --quiet -- health.py; then
+            echo "::error::health.py at $(git rev-parse HEAD) is not the build of src/ - a push landed mid-run. Re-run this job."
+            exit 1
+          fi
+
+      - name: Tag and release if SCRIPT_VERSION has moved
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(grep -oP '^SCRIPT_VERSION = "\K[^"]+' src/config.py)
+          if [ -z "$VERSION" ]; then
+            echo "::error::could not read SCRIPT_VERSION from src/config.py"
+            exit 1
+          fi
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            echo "v$VERSION is already released - nothing to do"
+            exit 0
+          fi
+          # A missing RELEASE does not mean a missing TAG, and gh honours --target only
+          # when it creates the tag itself: an existing tag anchors the release wherever
+          # that tag already points, which need not be the tree whose health.py is being
+          # attached. Ask GitHub rather than the clone, which is shallow and has no tags.
+          # Stop rather than publish a mismatch - once published, a release, its tag and
+          # its assets cannot be edited or deleted, only superseded by another bump.
+          TAG_SHA=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$VERSION" \
+                      --jq '.object.sha' 2>/dev/null || true)
+          if [ -n "$TAG_SHA" ] && [ "$TAG_SHA" != "$(git rev-parse HEAD)" ]; then
+            echo "::error::tag v$VERSION already exists at $TAG_SHA, not $(git rev-parse HEAD) - releasing would attach this build under a tag pointing somewhere else. Sort the tag out by hand."
+            exit 1
+          fi
+          # --target takes a branch or a FULL sha; a short one is rejected as
+          # "Release.target_commitish is invalid".
+          gh release create "v$VERSION" \
+            --target "$(git rev-parse HEAD)" \
+            --title "v$VERSION" \
+            --generate-notes \
+            health.py
+          echo "::notice::released v$VERSION"
 
   collector-python27:
     # src/collector.py is the one file that must also parse under Python 2.7: XCP-ng
