@@ -34,6 +34,7 @@ MODULES = [
     "model",
     "collectorsrc",
     "transport",
+    "xoredis",
     "xodb",
     "checks",
     "xoa",
@@ -81,6 +82,42 @@ def module_toplevel_names(tree):
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             continue
     return names
+
+
+def import_time_sibling_refs(tree, siblings):
+    """Sibling-module names dereferenced while the module BODY runs.
+
+    The alias objects (`config`, `transport`, ...) are built after every module body has
+    executed, so any such reference is a NameError on the artifact and works perfectly
+    from src/ - which means no unit test can see it. A default argument is how it gets in:
+    `def f(timeout=config.X)` evaluates config.X when the `def` runs, not when f is called.
+    Decorators and a class body are import-time too; a function body is not.
+    """
+    found = set()
+
+    def visit(node, deferred):
+        if isinstance(node, ast.Name) and node.id in siblings and not deferred:
+            found.add("%s (line %d)" % (node.id, node.lineno))
+            return
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            args = node.args
+            for expr in (list(getattr(node, "decorator_list", []))
+                         + [d for d in args.defaults if d is not None]
+                         + [d for d in args.kw_defaults if d is not None]):
+                visit(expr, deferred)
+            for stmt in (node.body if isinstance(node.body, list) else [node.body]):
+                visit(stmt, True)
+            return
+        for child in ast.iter_child_nodes(node):
+            visit(child, deferred)
+
+    for stmt in tree.body:
+        # split_module drops the module's own `if __name__ == "__main__":`, so whatever it
+        # says never reaches the artifact
+        if isinstance(stmt, ast.If) and ast.dump(stmt.test).find("__main__") >= 0:
+            continue
+        visit(stmt, False)
+    return found
 
 
 def split_module(source, siblings):
@@ -164,6 +201,18 @@ def main():
     if clashes:
         sys.stderr.write("stitch: name collisions in the flattened namespace:\n  %s\n"
                          % "\n  ".join(clashes))
+        return 1
+
+    # ...and no module body may reach into another module: the aliases do not exist yet
+    early = []
+    for name in MODULES:
+        # a module's own name always resolves - it is the flat namespace's own function
+        others = siblings - {name}
+        for ref in sorted(import_time_sibling_refs(ast.parse(sources[name]), others)):
+            early.append("%s: %s used at module level" % (name, ref))
+    if early:
+        sys.stderr.write("stitch: sibling module used before the aliases exist:\n  %s\n"
+                         % "\n  ".join(early))
         return 1
 
     collector = read(os.path.join(SRC, "collector.py"))

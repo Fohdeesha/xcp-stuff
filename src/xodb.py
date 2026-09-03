@@ -26,6 +26,7 @@ import colors
 import config
 import parsers
 import transport
+import xoredis
 
 QUOTES = "'\"`"
 
@@ -197,33 +198,53 @@ def _ls(args):
     return out, ""
 
 
+def _read_servers():
+    """(records, why-it-failed). Redis directly when that can be trusted, else the CLI.
+
+    The fast path is in xoredis and declines loudly: anything it cannot establish raises
+    RedisError and we spend the 3.3s. Its reason is a debug trace and never a health
+    finding - a decline is not a failure, it is this code choosing not to guess.
+    """
+    cli_path = transport.which("xo-server-db")
+    if cli_path:
+        try:
+            records = xoredis.read_server_records(cli_path)
+            transport.debug("xo-db: %d record(s) read straight from redis" % len(records))
+            return records, ""
+        except xoredis.RedisError as exc:
+            transport.debug("xo-db: redis declined (%s); asking xo-server-db" % exc)
+    out, why = _ls(["server"])
+    return (scan_records(out) if out is not None else [], why)
+
+
 def all_servers():
     """Every server record in the db, read once per run.
 
     One `xo-server-db ls server` costs ~3.3s on the test appliance, and a narrower query
-    costs exactly the same: it is node starting up, loading xo-server's app-conf and
-    opening a redis connection, not the query. It also answers with WHOLE records -
-    password field included, disabled servers as well as enabled ones. Measured against
-    the indexed `host=` lookup on the live db: 7/7 records, every field equal, passwords
-    equal.
+    costs exactly the same: it is node starting up, importing xo.mjs and running
+    `xo.hooks.startCore()`, not the query. It also answers with WHOLE records - password
+    field included, disabled servers as well as enabled ones. Measured against the indexed
+    `host=` lookup on the live db: 7/7 records, every field equal, passwords equal.
 
     So the second call the password lookup used to make spent 3.3s re-reading what was
     already in hand, and a run that also had to name its pool made a third. That was
     ~55% of the wall clock of a whole health check.
+
+    That 3.3s is now itself avoidable: none of it is redis. See xoredis - when the
+    endpoint and the plaintext can both be established, the same records come back in
+    0.03s, and this drops from the biggest item in a run to nothing at all.
 
     Read from the main thread only, before any host is contacted; nothing else in a run
     touches it, so the cache needs no lock.
     """
     global _ALL_SERVERS, _READ_ERROR
     if _ALL_SERVERS is None:
-        out, why = _ls(["server"])
         # a db that could not be read is cached as empty, with the reason kept beside it:
         # asking again would cost another 3.3s to fail again, and every lookup answers
         # 'nothing' either way - but the messages built on that answer must not. Run as a
         # non-root user, xo-server-db cannot even stat /etc/xo-server/config.toml, and
         # 'no enabled hosts found in xo-db' was what an appliance with five pools said.
-        _ALL_SERVERS = scan_records(out) if out is not None else []
-        _READ_ERROR = why
+        _ALL_SERVERS, _READ_ERROR = _read_servers()
     return _ALL_SERVERS
 
 

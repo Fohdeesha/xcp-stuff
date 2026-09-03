@@ -48,6 +48,9 @@ def gate_run(monkeypatch, tmp_path, argv, run_env, root):
     monkeypatch.setattr(xoa, "running_as_root", lambda: root)
     monkeypatch.setattr(transport, "make_work_dir", lambda: str(tmp_path))
     monkeypatch.setattr(transport, "cleanup_work_dir", lambda path: None)
+    # PATH above is the real one, so on an appliance xodb's redis fast path would find a
+    # real xo-server-db and a real redis: 'attempted' has to mean attempted, everywhere
+    monkeypatch.setattr(transport, "which", lambda binary: "")
 
     def record(name):
         def stand_in(*args, **kwargs):

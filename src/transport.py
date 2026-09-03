@@ -270,11 +270,20 @@ def cleanup_work_dir(path):
         shutil.rmtree(path, ignore_errors=True)
 
 
-def have(binary):
+def which(binary):
+    """Full path to `binary` on PATH, or "". The path matters as well as the answer:
+    xo-server's application directory is derived from where xo-server-db really lives."""
     for part in (os.environ.get("PATH") or "").split(os.pathsep):
-        if part and os.access(os.path.join(part, binary), os.X_OK):
-            return True
-    return False
+        if not part:
+            continue
+        candidate = os.path.join(part, binary)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return ""
+
+
+def have(binary):
+    return bool(which(binary))
 
 
 def ensure_sshpass(run_env):

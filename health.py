@@ -30,6 +30,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -42,12 +43,14 @@ import unicodedata
 # ======================================================================================
 # --- config ----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "3.6"
+SCRIPT_VERSION = "3.7"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
 MAX_PARALLEL_HOSTS = 8           # hosts collected at once (HEALTH_MAX_PARALLEL overrides)
 LOCAL_CMD_TIMEOUT = 10           # max seconds a local command may run (hung xoa-updater etc)
+XO_REDIS_TIMEOUT = 2             # reading xo's server records straight from redis: 0.002s
+                                 # measured, so this is only here to bound a wedged socket
 XOA_CHECK_TIMEOUT = 60           # 'xoa check' does real network probes, so it gets longer
 
 DOM0_MAX_USED = 75               # dom0 disk use % allowed before flagging
@@ -2717,11 +2720,20 @@ def cleanup_work_dir(path):
         shutil.rmtree(path, ignore_errors=True)
 
 
-def have(binary):
+def which(binary):
+    """Full path to `binary` on PATH, or "". The path matters as well as the answer:
+    xo-server's application directory is derived from where xo-server-db really lives."""
     for part in (os.environ.get("PATH") or "").split(os.pathsep):
-        if part and os.access(os.path.join(part, binary), os.X_OK):
-            return True
-    return False
+        if not part:
+            continue
+        candidate = os.path.join(part, binary)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return ""
+
+
+def have(binary):
+    return bool(which(binary))
 
 
 def ensure_sshpass(run_env):
@@ -2753,6 +2765,230 @@ def ensure_sshpass(run_env):
     run_local_cmd(["apt-get", "update", "-y"], timeout=300)
     run_local_cmd(["apt-get", "install", "-y", "sshpass"], timeout=300)
     return have("sshpass")
+
+
+# ======================================================================================
+# --- xoredis ---------------------------------------------------------------------------
+
+DEFAULT_ADDR = ("127.0.0.1", 6379)   # node-redis' default, used when [redis] is unset
+ENCRYPTION_PREFIX = "enc:"           # xo-server/src/xo-mixins/crypto-credentials.mjs
+IDS_KEY = "xo:server_ids"
+RECORD_PREFIX = "xo:server:"
+
+
+class RedisError(Exception):
+    """The fast path declined, with the reason. Never a health finding: the caller falls
+    back to xo-server-db and the run continues exactly as it did before."""
+
+
+# --------------------------------------------------------------------------------------
+# is the default endpoint the right endpoint?
+# --------------------------------------------------------------------------------------
+
+def _config_dirs(cli_path):
+    """The directories app-conf searches for xo-server's config, in its own order.
+
+    From its entries.js: the application directory first, then /etc/<appName>, then the
+    XDG config dir. `cli_path` is <appDir>/dist/db-cli.mjs, and app-conf is handed
+    `new URL('..', import.meta.url)` - so the app dir is two levels up from the real file,
+    symlinks resolved (/usr/local/bin/xo-server-db is one).
+
+    app-conf has a fourth entry, `.xo-server.*` in every directory from the cwd upwards.
+    That is for running xo-server out of a source tree, it cannot exist on an appliance,
+    and scanning it would mean walking to / on every health check. Not searched.
+    """
+    app_dir = os.path.dirname(os.path.dirname(os.path.realpath(cli_path)))
+    xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return [app_dir, os.path.join("/etc", "xo-server"), os.path.join(xdg, "xo-server")]
+
+
+def _config_files(directory):
+    """Everything app-conf would glob as `config.*` there. Raises rather than returning an
+    empty list for a directory that exists but cannot be listed - unreadable is not empty."""
+    try:
+        names = os.listdir(directory)
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise RedisError("cannot list %s: %s" % (directory, exc))
+    return [os.path.join(directory, n) for n in sorted(names) if n.startswith("config.")]
+
+
+def _mentions_redis(cli_path):
+    """Does any config XO loads mention redis at all?
+
+    A substring test over the raw bytes, deliberately, and not a parse: app-conf reads
+    config.* as toml, json, json5, ini or yaml depending on the extension, and this has one
+    yes/no question to answer - "could this install point redis somewhere other than the
+    default, or turn on credential encryption?". A mention for any reason declines the fast
+    path, which is the safe direction, and `encryptCredentialDatabase` is itself a mention.
+
+    The appliance ships /etc/xo-server/config.toml, <appDir>/config.toml and
+    <appDir>/config.xoa.json with no occurrence of the word.
+    """
+    for directory in _config_dirs(cli_path):
+        for path in _config_files(directory):
+            try:
+                with open(path, "rb") as handle:
+                    blob = handle.read()
+            except OSError as exc:
+                # a config we cannot read is a config we cannot rule out
+                raise RedisError("cannot read %s: %s" % (path, exc))
+            if b"redis" in blob.lower():
+                return True
+    return False
+
+
+# --------------------------------------------------------------------------------------
+# just enough RESP to ask two questions
+# --------------------------------------------------------------------------------------
+
+def _encode(args):
+    """One command, as a RESP array of bulk strings."""
+    out = [b"*%d\r\n" % len(args)]
+    for arg in args:
+        raw = arg.encode("utf-8")
+        out.append(b"$%d\r\n" % len(raw))
+        out.append(raw + b"\r\n")
+    return b"".join(out)
+
+
+def _read_reply(handle):
+    """One RESP reply. Bulk strings decode strictly: a password decoded with 'replace'
+    would be a password that authenticates nowhere, reported as a login failure a long way
+    from its cause."""
+    line = handle.readline()
+    if not line:
+        raise RedisError("connection closed by redis")
+    tag, body = line[:1], line[1:-2]
+    if tag == b"+":
+        return body.decode("utf-8", "replace")
+    if tag == b"-":
+        raise RedisError("redis refused the command: %s" % body.decode("utf-8", "replace"))
+    if tag == b":":
+        return int(body)
+    if tag == b"$":
+        length = int(body)
+        if length < 0:
+            return None
+        data = handle.read(length + 2)
+        if len(data) != length + 2:
+            raise RedisError("short read from redis")
+        return data[:-2].decode("utf-8")
+    if tag == b"*":
+        count = int(body)
+        if count < 0:
+            return None
+        return [_read_reply(handle) for _ in range(count)]
+    raise RedisError("unexpected reply from redis: %r" % line[:40])
+
+
+# --------------------------------------------------------------------------------------
+# the records
+# --------------------------------------------------------------------------------------
+
+def _flatten(record, ident):
+    """The same dict xodb.scan_records builds out of `xo-server-db ls server`.
+
+    XO stores every field of a server record as a JSON string today - `enabled` is the
+    string 'true', not a boolean - so the coercions below are a no-op on every record on
+    the test appliance. They are here because the two paths have to stay interchangeable
+    whatever XO does next: node's util.inspect prints a bare `true` / `null` / `42`, which
+    the scanner records as those words, and prints an object or an array in a form the
+    scanner skips outright.
+
+    `id` is not stored in the record - it is the key - and XO's own RedisCollection mixes
+    it back in the same way, so `xo-server-db` prints it too.
+    """
+    out = {}
+    for key, value in record.items():
+        if isinstance(value, str):
+            out[key] = value
+        elif value is True:
+            out[key] = "true"
+        elif value is False:
+            out[key] = "false"
+        elif value is None:
+            out[key] = "null"
+        elif isinstance(value, (int, float)):
+            out[key] = str(value)
+        # an object or an array is skipped, which is what the scanner does with one
+    out["id"] = ident
+    return out
+
+
+def _fetch(addr, timeout):
+    """SMEMBERS then one MGET, against an already-vetted endpoint."""
+    sock = socket.create_connection(addr, timeout=timeout)
+    try:
+        handle = sock.makefile("rb")
+        try:
+            sock.sendall(_encode(["SMEMBERS", IDS_KEY]))
+            ids = _read_reply(handle)
+            if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+                raise RedisError("%s is not a set of ids" % IDS_KEY)
+            if not ids:
+                # An appliance with no server registered is a real state - and so is
+                # "this is not the redis xo-server uses". Nothing here can tell them
+                # apart, and only one of them is safe to act on, so the CLI answers it.
+                raise RedisError("%s is empty" % IDS_KEY)
+
+            sock.sendall(_encode(["MGET"] + [RECORD_PREFIX + i for i in ids]))
+            blobs = _read_reply(handle)
+            if not isinstance(blobs, list) or len(blobs) != len(ids):
+                # `len(blobs or [])` would be a TypeError on an integer reply, and a
+                # TypeError is not a decline - xodb catches RedisError and nothing else,
+                # so it would take the run down instead of costing it 3.3s
+                got = len(blobs) if isinstance(blobs, list) else "a non-list of"
+                raise RedisError("MGET answered %s value(s) for %d id(s)"
+                                 % (got, len(ids)))
+        finally:
+            handle.close()
+    finally:
+        sock.close()
+
+    records = []
+    for ident, blob in zip(ids, blobs):
+        if blob is None:
+            raise RedisError("%s%s disappeared between the two calls" % (RECORD_PREFIX, ident))
+        if blob.startswith(ENCRYPTION_PREFIX):
+            raise RedisError("credential db is encrypted (%s%s is %s...)"
+                             % (RECORD_PREFIX, ident, ENCRYPTION_PREFIX))
+        record = json.loads(blob)
+        if not isinstance(record, dict):
+            raise RedisError("%s%s is not an object" % (RECORD_PREFIX, ident))
+        records.append(_flatten(record, ident))
+    return records
+
+
+def read_server_records(cli_path, addr=DEFAULT_ADDR, timeout=None):
+    """Every xo `server` record, in the shape xodb.scan_records produces.
+
+    Raises RedisError - with a reason fit for the HEALTH_DEBUG trace - for every reason
+    not to trust the answer. It never returns a partial one.
+
+    `timeout` defaults inside the body and not in the signature: a default argument is
+    evaluated when the `def` runs, and in the stitched health.py that is module-body time,
+    before the `config` alias object exists. DEFAULT_ADDR is fine - same module, already
+    bound - but `config.XO_REDIS_TIMEOUT` there is a NameError on the real artifact and
+    nowhere else. build/stitch.py now fails the build on it.
+    """
+    if timeout is None:
+        timeout = config.XO_REDIS_TIMEOUT
+    if _mentions_redis(cli_path):
+        raise RedisError("xo-server config mentions redis; not assuming %s:%d"
+                         % DEFAULT_ADDR)
+    try:
+        return _fetch(addr, timeout)
+    except OSError as exc:
+        # connection refused, timeout, a socket that is not redis at all
+        raise RedisError("%s:%d: %s" % (addr[0], addr[1], exc))
+    except UnicodeDecodeError as exc:
+        # before ValueError, which it subclasses
+        raise RedisError("undecodable answer from redis: %s" % exc)
+    except ValueError as exc:
+        # json.loads on a record, or int() on a malformed RESP length prefix
+        raise RedisError("unreadable answer from redis: %s" % exc)
 
 
 # ======================================================================================
@@ -2928,33 +3164,53 @@ def _ls(args):
     return out, ""
 
 
+def _read_servers():
+    """(records, why-it-failed). Redis directly when that can be trusted, else the CLI.
+
+    The fast path is in xoredis and declines loudly: anything it cannot establish raises
+    RedisError and we spend the 3.3s. Its reason is a debug trace and never a health
+    finding - a decline is not a failure, it is this code choosing not to guess.
+    """
+    cli_path = transport.which("xo-server-db")
+    if cli_path:
+        try:
+            records = xoredis.read_server_records(cli_path)
+            transport.debug("xo-db: %d record(s) read straight from redis" % len(records))
+            return records, ""
+        except xoredis.RedisError as exc:
+            transport.debug("xo-db: redis declined (%s); asking xo-server-db" % exc)
+    out, why = _ls(["server"])
+    return (scan_records(out) if out is not None else [], why)
+
+
 def all_servers():
     """Every server record in the db, read once per run.
 
     One `xo-server-db ls server` costs ~3.3s on the test appliance, and a narrower query
-    costs exactly the same: it is node starting up, loading xo-server's app-conf and
-    opening a redis connection, not the query. It also answers with WHOLE records -
-    password field included, disabled servers as well as enabled ones. Measured against
-    the indexed `host=` lookup on the live db: 7/7 records, every field equal, passwords
-    equal.
+    costs exactly the same: it is node starting up, importing xo.mjs and running
+    `xo.hooks.startCore()`, not the query. It also answers with WHOLE records - password
+    field included, disabled servers as well as enabled ones. Measured against the indexed
+    `host=` lookup on the live db: 7/7 records, every field equal, passwords equal.
 
     So the second call the password lookup used to make spent 3.3s re-reading what was
     already in hand, and a run that also had to name its pool made a third. That was
     ~55% of the wall clock of a whole health check.
+
+    That 3.3s is now itself avoidable: none of it is redis. See xoredis - when the
+    endpoint and the plaintext can both be established, the same records come back in
+    0.03s, and this drops from the biggest item in a run to nothing at all.
 
     Read from the main thread only, before any host is contacted; nothing else in a run
     touches it, so the cache needs no lock.
     """
     global _ALL_SERVERS, _READ_ERROR
     if _ALL_SERVERS is None:
-        out, why = _ls(["server"])
         # a db that could not be read is cached as empty, with the reason kept beside it:
         # asking again would cost another 3.3s to fail again, and every lookup answers
         # 'nothing' either way - but the messages built on that answer must not. Run as a
         # non-root user, xo-server-db cannot even stat /etc/xo-server/config.toml, and
         # 'no enabled hosts found in xo-db' was what an appliance with five pools said.
-        _ALL_SERVERS = scan_records(out) if out is not None else []
-        _READ_ERROR = why
+        _ALL_SERVERS, _READ_ERROR = _read_servers()
     return _ALL_SERVERS
 
 
@@ -5492,14 +5748,15 @@ def _module(name, exported):
     return module
 
 
-config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DMESG_MAX_LINES', 'DMESG_ROLLUP_MIN', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'REMOTE_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_QCOW2_MAX_LINES'])
+config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DMESG_MAX_LINES', 'DMESG_ROLLUP_MIN', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'REMOTE_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_QCOW2_MAX_LINES', 'XO_REDIS_TIMEOUT'])
 colors = _module('colors', ['CYAN', 'GREEN', 'RESET', 'YELLOW', 'cyan', 'green', 'init', 'strip_ansi', 'yellow'])
 result = _module('result', ['FLAG', 'Fact', 'INFO', 'Line', 'MISSING', 'OK', 'UNKNOWN', 'flag', 'guard', 'info', 'ok', 'raw', 'unknown', 'wrap'])
 parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', '_LINK_RE', '_MTU_RE', '_PARAM_RE', '_TS_RE', '_cidr_range', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'cap_lines', 'classify_multipath_path', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'has_overlapping_subnets', 'manifest_diff', 'manifest_versions', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pool_conf', 'parse_timedatectl', 'parse_xe_records', 'rollup_repeats', 'round_1dp', 'split_host_port', 'split_timestamp', 'truncate_block'])
 model = _module('model', ['Host', 'Pool', 'ntp_match', 'ram_match'])
 collectorsrc = _module('collectorsrc', ['EMBEDDED', 'collector_source'])
-transport = _module('transport', ['BEGIN_MARKER', 'CollectError', 'END_MARKER', 'Transport', '_DEBUG_LOCK', '_LIVE', '_LIVE_LOCK', '_REMOTE_LAUNCH', '_REMOTE_LAUNCH_PINNED', '_kill_tree', '_remote_launch', 'cleanup_work_dir', 'debug', 'ensure_sshpass', 'have', 'kill_all_children', 'make_work_dir', 'run_local_cmd'])
-xodb = _module('xodb', ['QUOTES', 'SELECT_NONE', 'SELECT_NO_MATCH', 'SELECT_OK', 'SELECT_QUIT', 'SELECT_UNREADABLE', 'Server', '_ALL_SERVERS', '_ESCAPE_RE', '_KEY_RE', '_READ_ERROR', '_SIMPLE_ESCAPES', '_describe_failure', '_ls', '_sort_key', 'all_servers', 'clean', 'enabled_servers', 'have_xo_server_db', 'password_for', 'pool_name_for_host', 'read_error', 'reset_cache', 'scan_records', 'select_pool', 'unescape'])
+transport = _module('transport', ['BEGIN_MARKER', 'CollectError', 'END_MARKER', 'Transport', '_DEBUG_LOCK', '_LIVE', '_LIVE_LOCK', '_REMOTE_LAUNCH', '_REMOTE_LAUNCH_PINNED', '_kill_tree', '_remote_launch', 'cleanup_work_dir', 'debug', 'ensure_sshpass', 'have', 'kill_all_children', 'make_work_dir', 'run_local_cmd', 'which'])
+xoredis = _module('xoredis', ['DEFAULT_ADDR', 'ENCRYPTION_PREFIX', 'IDS_KEY', 'RECORD_PREFIX', 'RedisError', '_config_dirs', '_config_files', '_encode', '_fetch', '_flatten', '_mentions_redis', '_read_reply', 'read_server_records'])
+xodb = _module('xodb', ['QUOTES', 'SELECT_NONE', 'SELECT_NO_MATCH', 'SELECT_OK', 'SELECT_QUIT', 'SELECT_UNREADABLE', 'Server', '_ALL_SERVERS', '_ESCAPE_RE', '_KEY_RE', '_READ_ERROR', '_SIMPLE_ESCAPES', '_describe_failure', '_ls', '_read_servers', '_sort_key', 'all_servers', 'clean', 'enabled_servers', 'have_xo_server_db', 'password_for', 'pool_name_for_host', 'read_error', 'reset_cache', 'scan_records', 'select_pool', 'unescape'])
 checks = _module('checks', ['_dmesg_phrase_blocks', '_linstor_column', '_linstor_has_rows', '_linstor_line', '_linstor_node_addresses', '_linstor_node_offline', '_linstor_table', '_linstor_unknown', '_maps', '_multipath_detail', '_multipath_read', '_network_line', '_render_scan_blocks', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_block', 'dmesg_content', 'dmesg_content_of', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'ntp', 'oom_events', 'overlapping_subnets', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'tap_status', 'task_timeout_override', 'vlan0', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_nodes', 'xostor_pref_nic', 'xostor_qcow2', 'xostor_ram', 'yum_patch_level'])
 xoa = _module('xoa', ['_dmesg', '_first_token', '_max_old_space', '_meminfo', '_os_version', '_service_state', '_updater', 'collect_xoa', 'debian_version_ok', 'lines', 'ping_silent', 'running_as_root'])
 report = _module('report', ['Report', '_as_entry'])

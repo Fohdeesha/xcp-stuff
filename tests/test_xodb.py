@@ -8,6 +8,7 @@ import pytest
 
 import transport
 import xodb
+import xoredis
 
 
 def test_plain_single_quoted():
@@ -137,6 +138,16 @@ def fresh_cache():
     xodb.reset_cache()
 
 
+@pytest.fixture(autouse=True)
+def no_redis_fast_path(monkeypatch):
+    """No xo-server-db on PATH, so these tests are about the CLI path wherever they run.
+
+    Without this the suite would behave differently on an appliance, where the fast path
+    in xoredis finds a real binary and a real redis and answers before the fake is asked.
+    """
+    monkeypatch.setattr(transport, "which", lambda binary: "")
+
+
 @pytest.fixture
 def db(monkeypatch):
     fake = FakeDb()
@@ -264,3 +275,110 @@ def test_reset_cache_really_forgets(db):
     xodb.reset_cache()
     xodb.enabled_servers()
     assert len(db.calls) == 2
+
+
+# --------------------------------------------------------------------------------------
+# the redis fast path, and falling back off it
+# --------------------------------------------------------------------------------------
+# Same records, same answers, ~0.03s instead of ~3.3s. What is pinned here is that the
+# callers cannot tell which path answered, and that a decline costs nothing but the time
+# it was trying to save.
+
+# what `xo-server-db ls server` prints for DB above, as the records redis holds
+REDIS_RECORDS = [
+    {"enabled": "true", "host": "192.168.1.13", "label": "sec-01",
+     "poolNameLabel": "XEN-SECONDARY", "password": "p13", "id": "a"},
+    {"enabled": "true", "host": "192.168.4.16", "label": "east-01",
+     "poolNameLabel": "2028 East", "password": "p16", "id": "b"},
+    {"host": "http://192.168.1.229", "label": "never-connected", "password": "p229",
+     "id": "c"},
+    {"enabled": "false", "host": "192.168.1.99", "label": "switched-off",
+     "poolNameLabel": "OFF", "password": "p" + chr(92) + "99", "id": "d"},
+]
+
+
+def _decline(cli_path, *args, **kwargs):
+    raise xoredis.RedisError("declined for the test")
+
+
+@pytest.fixture
+def fast(monkeypatch):
+    """xo-server-db is on PATH and redis answers. The CLI fake is still installed, so a
+    call to it would show up in db.calls."""
+    calls = []
+
+    def read(cli_path, *args, **kwargs):
+        calls.append(cli_path)
+        return [dict(r) for r in REDIS_RECORDS]
+
+    monkeypatch.setattr(transport, "which",
+                        lambda binary: "/usr/local/bin/" + binary if binary == "xo-server-db" else "")
+    monkeypatch.setattr(xoredis, "read_server_records", read)
+    return calls
+
+
+def test_the_fast_path_answers_and_the_cli_is_never_started(db, fast):
+    assert [r.name for r in xodb.enabled_servers()] == ["2028 East", "XEN-SECONDARY"]
+    assert xodb.password_for("192.168.1.13") == ("p13", False)
+    assert db.calls == []
+    assert fast == ["/usr/local/bin/xo-server-db"]
+
+
+def test_both_paths_give_the_callers_the_same_answers(db, fast, monkeypatch):
+    """The property that makes the optimisation safe to have at all."""
+    def answers():
+        return ([(r.name, r.host) for r in xodb.enabled_servers()],
+                xodb.password_for("192.168.1.13"),
+                xodb.password_for("192.168.1.99"),
+                xodb.pool_name_for_host("192.168.4.16"),
+                xodb.select_pool("")[1].name,
+                xodb.read_error())
+
+    from_redis = answers()
+    xodb.reset_cache()
+    monkeypatch.setattr(xoredis, "read_server_records", _decline)
+    assert answers() == from_redis
+    assert db.calls == [["xo-server-db", "ls", "server"]]
+
+
+def test_a_decline_falls_back_to_the_cli(db, monkeypatch, fast):
+    monkeypatch.setattr(xoredis, "read_server_records", _decline)
+    assert [r.name for r in xodb.enabled_servers()] == ["2028 East", "XEN-SECONDARY"]
+    assert db.calls == [["xo-server-db", "ls", "server"]]
+
+
+def test_a_decline_is_not_reported_as_a_db_failure(db, monkeypatch, fast):
+    """Declining is this code choosing not to guess, not the db being unreadable. The
+    user-visible reason must stay the CLI's - here, that there was none."""
+    monkeypatch.setattr(xoredis, "read_server_records", _decline)
+    xodb.enabled_servers()
+    assert xodb.read_error() == ""
+
+
+def test_a_decline_still_surfaces_a_real_cli_failure(monkeypatch):
+    """Fast path declines, CLI then fails: the CLI's reason is what the picker reports."""
+    fake = FakeDb(rc=1, err=EACCES)
+    monkeypatch.setattr(transport, "run_local_cmd", fake)
+    monkeypatch.setattr(transport, "which", lambda binary: "/usr/local/bin/" + binary)
+    monkeypatch.setattr(xoredis, "read_server_records", _decline)
+    assert xodb.select_pool("")[0] == xodb.SELECT_UNREADABLE
+    assert xodb.read_error().startswith("exit code 1: Error: EACCES")
+
+
+def test_no_xo_server_db_on_path_skips_the_fast_path_too(db, monkeypatch):
+    """The fast path needs the CLI's real location to find xo-server's config dir, so
+    with no CLI there is nothing to check the endpoint against."""
+    called = []
+    monkeypatch.setattr(xoredis, "read_server_records",
+                        lambda *a, **k: called.append(a) or [])
+    monkeypatch.setattr(transport, "which", lambda binary: "")
+    xodb.enabled_servers()
+    assert called == []
+    assert db.calls == [["xo-server-db", "ls", "server"]]
+
+
+def test_the_fast_path_is_also_read_only_once(db, fast):
+    xodb.enabled_servers()
+    xodb.password_for("192.168.1.13")
+    xodb.select_pool("sec")
+    assert len(fast) == 1
