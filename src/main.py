@@ -36,7 +36,7 @@ import xoa
 import xodb
 
 USAGE_XOA = """Usage:
-  %(prog)s [-f] [-s] [-n name] [pool_master_or_host[:ssh_port] [root_password]]
+  %(prog)s [-f] [-s] [-n name] [-c 'command'] [pool_master_or_host[:ssh_port] [root_password]]
 
   - All parameters are optional
   - If a host is not supplied, the enabled pools in xo-server-db are listed to pick from
@@ -48,6 +48,8 @@ USAGE_XOA = """Usage:
   - Use '-n' to pick a pool from xo-server-db by name instead of being prompted:
     the first pool whose name contains the text is used, matched anywhere in the
     name and ignoring case, so '-n sec' matches 'XEN-SECONDARY'
+  - Use '-c command' to run an arbitrary command on every reachable pool host
+    instead of the health report, and print each host's output
   - Use '--json' to print the results as a JSON document instead of a report, for
     cron and monitoring. Same checks, same exit code; '-f' narrows it the same way,
     and everything that is not the document goes to stderr
@@ -58,6 +60,7 @@ USAGE_XOA = """Usage:
   %(prog)s -s 192.168.1.7 'mypass'
   %(prog)s -n sec
   %(prog)s -f -n 'xen-main'
+  %(prog)s -c 'cat /etc/resolv.conf'
   %(prog)s --json -n sec
 """
 
@@ -169,6 +172,7 @@ class Run(object):
         self.filter_output = False
         self.pool_mode = True
         self.name_filter = ""
+        self.run_cmd = ""         # -c: a command to run on every host INSTEAD of the report
         self.json_output = False
         self.seed = ""
         self.password = ""
@@ -206,7 +210,8 @@ class Run(object):
     def parse_args(self, argv):
         try:
             opts, args = getopt.gnu_getopt(
-                argv, "fhsn:", ["filter", "help", "single", "name=", "json"])
+                argv, "fhsn:c:",
+                ["filter", "help", "single", "name=", "command=", "json"])
         except getopt.GetoptError as exc:
             sys.stderr.write("%s\n" % exc)
             usage(self.run_env)
@@ -219,9 +224,22 @@ class Run(object):
                 self.pool_mode = False
             elif opt in ("-n", "--name"):
                 self.name_filter = value
+            elif opt in ("-c", "--command"):
+                self.run_cmd = value
             elif opt == "--json":
                 self.json_output = True
         if len(args) > 2:
+            usage(self.run_env)
+        if self.run_cmd and self.json_output:
+            # The document is a health check's shape: every entry is a Line with a status
+            # and an explicit 'flags', and doc['flagged']/'exit_code' are summed from them.
+            # -c reports no verdict by design, so it has nothing to put there - and a
+            # consumer reading 'flagged': false off a document that judged nothing would
+            # conclude the pool was healthy. Refuse rather than emit that.
+            sys.stderr.write(
+                "ERROR: --json describes a health check, and -c/--command runs a command "
+                "and reaches\n       no verdict, so there is nothing for the document to "
+                "report. Use -c on its own.\n")
             usage(self.run_env)
         return args
 
@@ -371,6 +389,17 @@ def resolve_target_host_mode(run, args):
     if run.name_filter:
         sys.stderr.write("ERROR: -n/--name picks a pool out of xo-server-db, which only "
                          "exists on XOA.\n")
+        usage(run.run_env)
+    if run.run_cmd:
+        # XOA-only, like -n. There it earns its place by carrying the pool selection and
+        # the root password out of xo-server-db, so a sweep needs no inventory and no
+        # credentials. On a hypervisor neither exists: the command would run on this one
+        # host, or on the others only if a password were typed at the prompt - which is
+        # an ssh loop with extra steps, from a machine that already has a root shell.
+        sys.stderr.write("ERROR: -c/--command is an XOA feature: it runs a command across "
+                         "a pool using the\n       host list and root password from "
+                         "xo-server-db, neither of which exists here.\n"
+                         "       You already have a root shell on this host.\n")
         usage(run.run_env)
     if len(args) > 1:
         sys.stderr.write("ERROR: running on an XCP-ng host, so the host to check is this "
@@ -604,6 +633,74 @@ def _collect_pool_elsewhere(run, pool_spec):
         run.pool_cmd_host = host.address
         return
     run.pool.error = "no reachable pool member to ask"
+
+
+def _run_command_one(run, host):
+    """Run the -c command on one host. Returns (rc, out, err); nothing is printed here.
+
+    Same reason _collect_one returns its note instead of writing it: this is called from
+    worker threads, and a thread printing as it finishes would interleave the hosts in
+    whatever order they happened to answer.
+    """
+    try:
+        return run.transport.run_command(host.address, run.run_cmd)
+    except Exception as exc:                      # a transport that could not even start
+        return (255, "", str(exc))
+
+
+def run_command_on_all_hosts(run):
+    """-c/--command: run one command on every host being checked and print what each said.
+
+    A reporting helper, not a check. It takes no part in the exit code and none in -f:
+    the caller asked for raw output, not a pass/fail verdict, so this always exits 0 -
+    with several hosts there is no single code that could mean anything, and 1 and 2 are
+    already spoken for ('a check flagged' and 'you typed it wrong').
+
+    Hosts are labelled by address and not by name: the name is a fact this mode never
+    collects, and fetching it would be a second round trip per host for a label.
+
+    The host list is whatever the run settled on, so -s and a host run with no password
+    narrow this exactly as they narrow the report.
+    """
+    workers = parallel_workers(len(run.hosts))
+    transport.debug("running -c on %d host(s), %d at a time" % (len(run.hosts), workers))
+    if workers > 1:
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
+            futures = [pool.submit(_run_command_one, run, host) for host in run.hosts]
+            try:
+                results = [f.result() for f in futures]
+            except BaseException:
+                # the workers are blocked in communicate() and never see the ctrl-C
+                transport.kill_all_children()
+                raise
+        finally:
+            pool.shutdown(wait=True)
+    else:
+        results = [_run_command_one(run, host) for host in run.hosts]
+
+    # printed in host order, whatever order they finished in
+    for host, (rc, out, err) in zip(run.hosts, results):
+        sys.stdout.write(colors.cyan("== %s ==" % host.address) + "\n")
+        if rc == 0:
+            if out:
+                sys.stdout.write(out if out.endswith("\n") else out + "\n")
+        else:
+            # stdout first: a command that failed part way through still said something,
+            # and bash printed it too rather than throwing it away
+            if out:
+                sys.stdout.write(out if out.endswith("\n") else out + "\n")
+            if rc == 124:
+                sys.stdout.write(colors.yellow(
+                    "Command timed out after %ds" % config.RUN_CMD_TIMEOUT) + "\n")
+            else:
+                sys.stdout.write(colors.yellow("Command failed (exit code %d)" % rc) + "\n")
+            # the reason goes to stderr, where every other transport failure goes, so it
+            # cannot contaminate output being piped somewhere
+            if err.strip():
+                sys.stderr.write(err if err.endswith("\n") else err + "\n")
+        sys.stdout.write("\n")
+    return 0
 
 
 def _now():
@@ -898,6 +995,17 @@ def main(argv=None):
         # the pool_run_* toggles exist to keep a pool SWEEP short, and there is no sweep
         # here. It may well be a slave, which is why this is not master detection.
         hosts[0].is_master = True
+
+    # -c/--command: run the given command on every host and stop there. This is a raw
+    # diagnostic dump, not the health report, so nothing below it runs - no collection,
+    # no checks, and not the XOA section either: xoa_worker is a daemon thread with its
+    # cleanup already registered with atexit, so it is simply never read.
+    #
+    # Here, and not earlier, so -c inherits the whole target-selection path exactly as the
+    # report has it: the pool picked by -n or the picker, the password from xo-db, the
+    # host list from discovery, and -s / a password-less host run narrowing that list.
+    if run.run_cmd:
+        return run_command_on_all_hosts(run)
 
     run.pool_cmd_host = run.seed if run.run_env == "host" else run.master_address
     if run.pool_cmd_host not in [h.address for h in run.hosts]:
