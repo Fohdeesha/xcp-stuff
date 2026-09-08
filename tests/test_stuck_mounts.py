@@ -253,3 +253,54 @@ def test_the_collector_is_asked_for_what_the_checks_read():
     assert spec["stuck"]["recheck_delay"] == config.STUCK_RECHECK_DELAY
     assert spec["mount_probe"]["types"] == config.NETWORK_FS_TYPES
     assert spec["mount_stall_scan"]["phrases"] == config.MOUNT_STALL_PHRASES
+
+
+def test_the_userspace_tally_counts_every_process_not_just_the_listed_ones():
+    """Straight off a real report: 589 stuck, 25 listed, and the block said "24 of them
+    userspace" - a count taken from the sample and printed as if it described the whole.
+    The collector counts before it caps, and the check must use that number."""
+    line = checks.stuck_processes(host(stuck_procs=fact({
+        "total": 589,
+        "userspace": 24,
+        "rows": [stuck_row(1000 + n, 300000 - n, "sadc") for n in range(25)],
+    })))
+    assert "589 process(es)" in line.detail_text
+    assert "24 of them userspace" in line.detail_text
+    # and the listing says outright that it is a slice
+    assert "(oldest 25 of 589 shown)" in line.detail_text
+
+
+def test_an_uncapped_listing_does_not_claim_to_be_a_slice():
+    line = checks.stuck_processes(host(stuck_procs=fact({
+        "total": 2, "userspace": 2,
+        "rows": [stuck_row(1, 300, "df -hP"), stuck_row(2, 200, "lsof")],
+    })))
+    assert "shown)" not in line.detail_text
+    assert "(listed oldest first)" in line.detail_text
+
+
+def test_a_collector_that_did_not_send_a_tally_says_nothing_about_one():
+    """An older collector, or one that stopped early - the block must drop the sentence
+    rather than guess a number for it."""
+    line = checks.stuck_processes(host(stuck_procs=fact({
+        "total": 3, "rows": [stuck_row(1, 300, "df -hP")]})))
+    assert "userspace" not in line.detail_text
+    assert "3 process(es) in uninterruptible sleep." in line.detail_text
+
+
+def test_the_collector_counts_userspace_before_it_caps(monkeypatch):
+    """The other half of the same rule, at the source."""
+    monkeypatch.setattr(collector, "DEADLINE", [None])
+    monkeypatch.setattr(collector, "_proc_pids", lambda: list(range(1, 31)))
+    monkeypatch.setattr(collector, "_d_state_pids", lambda: dict((n, 100) for n in range(1, 31)))
+    monkeypatch.setattr(collector, "_proc_cmdline",
+                        lambda pid: "cmd %d" % pid if pid % 2 else "")
+    monkeypatch.setattr(collector, "read_file",
+                        lambda path: "999999.0 0.0" if path == "/proc/uptime" else "")
+
+    out = collector.collect_stuck_processes({"recheck_delay": 0, "min_age": 0,
+                                             "max_lines": 5})
+    assert out["ok"]
+    assert out["value"]["total"] == 30
+    assert out["value"]["userspace"] == 15      # counted over all 30, not the 5 kept
+    assert len(out["value"]["rows"]) == 5

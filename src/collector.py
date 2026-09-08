@@ -578,7 +578,12 @@ def collect_stuck_processes(spec):
             "frame": (stack.splitlines() or [""])[0].strip()[:120],
         })
     rows.sort(key=lambda row: row["age"], reverse=True)
-    return fact({"total": len(rows), "rows": rows[:cap] if cap else rows})
+    # counted here, over ALL of them, because the cap below is what the report sees: a
+    # tally taken from the sample would be printed as if it described the whole, and on
+    # the host this was built for that is 24 of 25 shown being reported as 24 of 589
+    return fact({"total": len(rows),
+                 "userspace": len([row for row in rows if row["cmd"]]),
+                 "rows": rows[:cap] if cap else rows})
 
 
 def collect_network_mounts(spec, skip_reason):

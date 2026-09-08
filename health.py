@@ -43,7 +43,7 @@ import unicodedata
 # ======================================================================================
 # --- config ----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "3.10"
+SCRIPT_VERSION = "3.11"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
@@ -136,10 +136,18 @@ MULTIPATH_EVENT_FILES = [
 # failure: it took a pool master out of every report for days, and the script said nothing,
 # because nothing it ran ever came back to say anything.
 #
-# The kernel has its own detector for this and it is NOT enough on its own. Measured on
-# 8.3.0: hung_task_timeout_secs=120 with CONFIG_DETECT_HUNG_TASK=y, but
-# kernel.hung_task_warnings defaults to 10 and COUNTS DOWN - after ten warnings the kernel
-# goes quiet for the rest of the uptime. A host wedged for days logs nothing at all.
+# The kernel has its own detector for this and it is NOT enough on its own, which is why
+# the D-state scan leads rather than a dmesg phrase. Measured twice over:
+#
+#   * It is enabled on 8.3.0 - hung_task_timeout_secs=120, CONFIG_DETECT_HUNG_TASK=y - but
+#     kernel.hung_task_warnings defaults to 10 and COUNTS DOWN, so it stops logging for
+#     the rest of the uptime after ten.
+#   * On the host this was built for it never fired AT ALL. 589 processes had been in D
+#     state for nearly four days, and there was not one "blocked for more than" line in
+#     the dmesg ring, the live kern.log, or any of its 30 rotated archives. Inference, not
+#     measurement, for the why: khungtaskd counts only a task that has not been scheduled
+#     since its last sweep, and a CIFS reconnect loop wakes its waiters periodically - so
+#     the failure this check exists for is one the kernel is structurally quiet about.
 NETWORK_FS_TYPES = [             # the ones that can hang forever waiting on a server
     "nfs", "nfs4", "cifs", "smb3", "smbfs", "ceph", "glusterfs", "fuse.glusterfs",
     "afs", "9p", "ncpfs", "lustre", "beegfs",
@@ -151,10 +159,20 @@ MOUNT_PROBE_TIMEOUT = 10         # seconds a stat() of one mount point may take
 
 # Both halves of the same event, from the two sources that keep it - see the multipath
 # event phrases above for why neither contains the other.
+#
+# These name the SERVER, which the process scan cannot. They also age out, and on the host
+# above they already had: the only copies left were in kern.log.4.gz and .5.gz, four days
+# back, with the ring wrapped clean past them (`dmesg | grep -i cifs` returned nothing at
+# all). Reading the .gz archives was considered for exactly that case and declined - it is
+# a zgrep of ~30 files on every host of every run to recover a server name that Network
+# Mounts already prints from /proc/mounts, for a condition Stuck Processes already reports.
 MOUNT_STALL_PHRASES = [
+    # verbatim from a live 8.3.0 dom0 whose SMB server had stopped answering:
+    # "CIFS VFS: Server 10.10.10.11 has not responded in 120 seconds. Reconnecting..."
+    "has not responded in",
     "not responding",            # nfs: "server X not responding, still trying"
-    "has not responded in",      # cifs: "Server X has not responded in 120 seconds"
-    "blocked for more than",     # the kernel's own hung-task detector, first 10 only
+    "blocked for more than",     # the kernel's hung-task detector - see the note above on
+                                 # why this one cannot be relied on, and is kept anyway
 ]
 MOUNT_STALL_FILES = [
     "/var/log/kern.log",
@@ -1856,7 +1874,12 @@ def collect_stuck_processes(spec):
             "frame": (stack.splitlines() or [""])[0].strip()[:120],
         })
     rows.sort(key=lambda row: row["age"], reverse=True)
-    return fact({"total": len(rows), "rows": rows[:cap] if cap else rows})
+    # counted here, over ALL of them, because the cap below is what the report sees: a
+    # tally taken from the sample would be printed as if it described the whole, and on
+    # the host this was built for that is 24 of 25 shown being reported as 24 of 589
+    return fact({"total": len(rows),
+                 "userspace": len([row for row in rows if row["cmd"]]),
+                 "rows": rows[:cap] if cap else rows})
 
 
 def collect_network_mounts(spec, skip_reason):
@@ -4834,20 +4857,25 @@ def stuck_processes(host):
     if not total:
         return ok("Stuck Processes", "None")
 
-    user_rows = [row for row in rows if row.get("cmd")]
     modules = sorted(set(row.get("module") or "" for row in rows) - set([""]))
     oldest = max((row.get("age") or 0) for row in rows)
 
     summary = "%d stuck (oldest %s)" % (total, parsers.format_age(oldest))
     if modules:
         summary += " in " + ", ".join(modules)
+    # the userspace tally comes from the collector, which counted every one of them.
+    # Counting it here would count only the capped sample and print that as the whole
     return flag("Stuck Processes", "Yes - " + summary).with_detail(
-        "Stuck Processes", _stuck_detail(rows, total, len(user_rows)))
+        "Stuck Processes", _stuck_detail(rows, total, facts.value.get("userspace")))
 
 
 def _stuck_detail(rows, total, user_count):
-    lines = ["%d process(es) in uninterruptible sleep; %d of them userspace."
-             % (total, user_count),
+    if user_count is None:
+        head = "%d process(es) in uninterruptible sleep." % total
+    else:
+        head = ("%d process(es) in uninterruptible sleep; %d of them userspace, the rest "
+                "kernel threads." % (total, user_count))
+    lines = [head,
              "None of these can be killed - not even with SIGKILL - until whatever they "
              "are waiting on answers.",
              ""]
@@ -4856,7 +4884,15 @@ def _stuck_detail(rows, total, user_count):
                      % (row.get("pid"), parsers.format_age(row.get("age") or 0),
                         row.get("module") or "-",
                         row.get("cmd") or "[kernel thread] " + (row.get("frame") or "")))
-    return "\n".join(lines) + ("\n\n(listed oldest first)" if len(rows) > 1 else "")
+    if len(rows) < total:
+        # never a silent cut: 25 rows under a heading saying 589 still reads as "here they
+        # are" unless the block says outright that it is showing a slice
+        lines.append("")
+        lines.append("(oldest %d of %d shown)" % (len(rows), total))
+    elif len(rows) > 1:
+        lines.append("")
+        lines.append("(listed oldest first)")
+    return "\n".join(lines)
 
 
 def mount_stalls(host):

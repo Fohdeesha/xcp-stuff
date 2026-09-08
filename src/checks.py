@@ -1006,20 +1006,25 @@ def stuck_processes(host):
     if not total:
         return ok("Stuck Processes", "None")
 
-    user_rows = [row for row in rows if row.get("cmd")]
     modules = sorted(set(row.get("module") or "" for row in rows) - set([""]))
     oldest = max((row.get("age") or 0) for row in rows)
 
     summary = "%d stuck (oldest %s)" % (total, parsers.format_age(oldest))
     if modules:
         summary += " in " + ", ".join(modules)
+    # the userspace tally comes from the collector, which counted every one of them.
+    # Counting it here would count only the capped sample and print that as the whole
     return flag("Stuck Processes", "Yes - " + summary).with_detail(
-        "Stuck Processes", _stuck_detail(rows, total, len(user_rows)))
+        "Stuck Processes", _stuck_detail(rows, total, facts.value.get("userspace")))
 
 
 def _stuck_detail(rows, total, user_count):
-    lines = ["%d process(es) in uninterruptible sleep; %d of them userspace."
-             % (total, user_count),
+    if user_count is None:
+        head = "%d process(es) in uninterruptible sleep." % total
+    else:
+        head = ("%d process(es) in uninterruptible sleep; %d of them userspace, the rest "
+                "kernel threads." % (total, user_count))
+    lines = [head,
              "None of these can be killed - not even with SIGKILL - until whatever they "
              "are waiting on answers.",
              ""]
@@ -1028,7 +1033,15 @@ def _stuck_detail(rows, total, user_count):
                      % (row.get("pid"), parsers.format_age(row.get("age") or 0),
                         row.get("module") or "-",
                         row.get("cmd") or "[kernel thread] " + (row.get("frame") or "")))
-    return "\n".join(lines) + ("\n\n(listed oldest first)" if len(rows) > 1 else "")
+    if len(rows) < total:
+        # never a silent cut: 25 rows under a heading saying 589 still reads as "here they
+        # are" unless the block says outright that it is showing a slice
+        lines.append("")
+        lines.append("(oldest %d of %d shown)" % (len(rows), total))
+    elif len(rows) > 1:
+        lines.append("")
+        lines.append("(listed oldest first)")
+    return "\n".join(lines)
 
 
 def mount_stalls(host):
