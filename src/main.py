@@ -143,6 +143,14 @@ def _host_spec(with_smapi):
                            "context": config.LOG_ERROR_CONTEXT},
         "multipath": {"transient": config.MULTIPATH_TRANSIENT_CHK_STATES,
                       "recheck_delay": config.MULTIPATH_RECHECK_DELAY},
+        "mount_stall_scan": {"files": config.MOUNT_STALL_FILES,
+                             "phrases": config.MOUNT_STALL_PHRASES,
+                             "context": config.LOG_ERROR_CONTEXT},
+        "stuck": {"recheck_delay": config.STUCK_RECHECK_DELAY,
+                  "min_age": config.STUCK_MIN_AGE,
+                  "max_lines": config.STUCK_MAX_LINES},
+        "mount_probe": {"types": config.NETWORK_FS_TYPES,
+                        "probe_timeout": config.MOUNT_PROBE_TIMEOUT},
     }
 
 
@@ -784,6 +792,9 @@ def per_host_checks():
         ("lacp_negotiation", "LACP Negotiation Issues", checks.lacp),
         ("multipath_health", "Multipath Path Health", checks.multipath_health),
         ("multipath_events", "Multipath Path Events", checks.multipath_events),
+        ("stuck_processes", "Stuck Processes", checks.stuck_processes),
+        ("mount_stalls", "Mount Stalls", checks.mount_stalls),
+        ("network_mounts", "Network Mounts", checks.network_mounts),
         ("silly_mtus", "Silly MTUs", checks.silly_mtus),
         ("dns_gw_non_mgmt_pifs", "DNS/GW on Non-Mgmt PIFs", checks.dns_gw_non_mgmt_pifs),
         ("overlapping_subnets", "Overlapping Subnets", checks.overlapping_subnets),

@@ -977,3 +977,138 @@ def backup_network(pool, run_env, pinger):
     # what was tested and nothing more
     return flag("Backup Network", "Configured but not fully reachable",
                 " - No ping answer from XOA for: " + ", ".join(silent))
+
+
+# --------------------------------------------------------------------------------------
+# stuck mounts
+# --------------------------------------------------------------------------------------
+
+def stuck_processes(host):
+    """Processes wedged in uninterruptible sleep - the consequence, whatever the cause.
+
+    This is the primary signal for a mount that has stopped answering, and it is primary
+    because it costs nothing and cannot itself hang: every input is served out of kernel
+    memory by procfs. It is also filesystem-agnostic, which is the point - a dead NFS
+    server, a dead SMB share, a dropped iSCSI LUN and a failing local disk all arrive
+    here identically, and none of them needed to be anticipated by name.
+
+    Kernel threads are reported separately from userspace processes. Some kernel threads
+    sit in D quite normally, so they are not counted towards the finding on their own -
+    but a kworker parked in a filesystem's work queue corroborates the rest, and dropping
+    it would throw away the clearest evidence of which subsystem is stuck.
+    """
+    facts = host.fact("stuck_procs")
+    if not facts.ok:
+        return unknown("Stuck Processes", "Unknown (%s)" % facts.error)
+
+    rows = facts.value.get("rows") or []
+    total = facts.value.get("total") or 0
+    if not total:
+        return ok("Stuck Processes", "None")
+
+    user_rows = [row for row in rows if row.get("cmd")]
+    modules = sorted(set(row.get("module") or "" for row in rows) - set([""]))
+    oldest = max((row.get("age") or 0) for row in rows)
+
+    summary = "%d stuck (oldest %s)" % (total, parsers.format_age(oldest))
+    if modules:
+        summary += " in " + ", ".join(modules)
+    return flag("Stuck Processes", "Yes - " + summary).with_detail(
+        "Stuck Processes", _stuck_detail(rows, total, len(user_rows)))
+
+
+def _stuck_detail(rows, total, user_count):
+    lines = ["%d process(es) in uninterruptible sleep; %d of them userspace."
+             % (total, user_count),
+             "None of these can be killed - not even with SIGKILL - until whatever they "
+             "are waiting on answers.",
+             ""]
+    for row in rows:
+        lines.append("  %-8s %-9s %-10s %s"
+                     % (row.get("pid"), parsers.format_age(row.get("age") or 0),
+                        row.get("module") or "-",
+                        row.get("cmd") or "[kernel thread] " + (row.get("frame") or "")))
+    return "\n".join(lines) + ("\n\n(listed oldest first)" if len(rows) > 1 else "")
+
+
+def mount_stalls(host):
+    """The server-side half: what the kernel said when a mount stopped answering.
+
+    Read from kern.log and the dmesg ring for the same reason Multipath Path Events reads
+    both - neither contains the other. It names the SERVER, which the process scan cannot:
+    a stuck process says a mount is wedged, this says which one and since when.
+
+    It cannot be relied on alone, and the reason is worth writing down. The kernel's own
+    hung-task detector is enabled on 8.3 (hung_task_timeout_secs=120) but
+    kernel.hung_task_warnings defaults to 10 and counts DOWN - after ten it stops logging
+    for the rest of the uptime. A host wedged for days can therefore be completely silent
+    here while dozens of processes pile up, which is why the process scan leads.
+    """
+    scan = host.fact("mount_stall_scan")
+    dmesg = host.fact("dmesg")
+
+    blocks = list(scan.value) if (scan.ok and scan.value) else []
+    if dmesg.ok:
+        blocks = blocks + _dmesg_phrase_blocks(dmesg.value, config.MOUNT_STALL_PHRASES,
+                                               config.LOG_ERROR_CONTEXT)
+    if blocks:
+        return flag("Mount Stalls", "Yes, See Error Output").with_detail(
+            "Mount Stalls", _render_scan_blocks(blocks))
+    if not scan.ok:
+        return unknown("Mount Stalls", "Unknown (%s)" % scan.error)
+    if not dmesg.ok:
+        return unknown("Mount Stalls", "Unknown (could not read dmesg)")
+    return ok("Mount Stalls", "None")
+
+
+def network_mounts(host):
+    """Does each network mount still answer a stat()?
+
+    The only one of the three that can name a mount nothing has touched yet - and the only
+    one with a cost, since the probe of a dead mount becomes a stuck process itself. So it
+    is not run at all on a host that already has stuck processes: there the mounts are
+    listed unprobed, which claims nothing, and the finding is already being made by
+    Stuck Processes rather than twice over here.
+    """
+    facts = host.fact("network_mounts")
+    if not facts.ok:
+        return unknown("Network Mounts", "Unknown (%s)" % facts.error)
+
+    rows = facts.value
+    if not rows:
+        return ok("Network Mounts", "None")
+
+    dead = [row for row in rows if row.get("state") == "no answer"]
+    unprobed = [row for row in rows if row.get("state") == "not probed"]
+    errored = [row for row in rows if row.get("state") == "error"]
+
+    if dead:
+        return flag("Network Mounts",
+                    "%d of %d not responding" % (len(dead), len(rows))).with_detail(
+            "Network Mounts", _mount_detail(rows))
+    if unprobed:
+        # not probed is not "fine": it is a question that was deliberately not asked, and
+        # the reason it was not asked is itself already flagged by Stuck Processes
+        return unknown("Network Mounts",
+                       "Unknown - %d mount(s) not probed (%s)"
+                       % (len(unprobed), unprobed[0].get("why") or "no reason given")
+                       ).with_detail("Network Mounts", _mount_detail(rows))
+    if errored:
+        return flag("Network Mounts",
+                    "%d of %d could not be checked" % (len(errored), len(rows))).with_detail(
+            "Network Mounts", _mount_detail(rows))
+    return ok("Network Mounts", "%d responding" % len(rows))
+
+
+def _mount_detail(rows):
+    lines = []
+    for row in rows:
+        when = ""
+        if row.get("seconds") is not None:
+            when = "  %ss" % row["seconds"]
+        lines.append("  %-10s %-11s %s on %s%s"
+                     % (row.get("type") or "-", row.get("state") or "-",
+                        row.get("source") or "-", row.get("target") or "-", when))
+        if row.get("why"):
+            lines.append("               %s" % row["why"])
+    return "\n".join(lines)

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Every threshold, list and toggle, in one place. Same names and values as health.sh."""
 
-SCRIPT_VERSION = "3.9"
+SCRIPT_VERSION = "3.10"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
@@ -88,6 +88,36 @@ MULTIPATH_EVENT_FILES = [
     "/var/log/kern.log",
 ]
 
+# --- stuck mounts and the processes they take down -------------------------------------
+# A mount whose server stops answering parks anything that stats it in uninterruptible
+# sleep (D state), where no signal can reach it - SIGKILL included. It is not a niche
+# failure: it took a pool master out of every report for days, and the script said nothing,
+# because nothing it ran ever came back to say anything.
+#
+# The kernel has its own detector for this and it is NOT enough on its own. Measured on
+# 8.3.0: hung_task_timeout_secs=120 with CONFIG_DETECT_HUNG_TASK=y, but
+# kernel.hung_task_warnings defaults to 10 and COUNTS DOWN - after ten warnings the kernel
+# goes quiet for the rest of the uptime. A host wedged for days logs nothing at all.
+NETWORK_FS_TYPES = [             # the ones that can hang forever waiting on a server
+    "nfs", "nfs4", "cifs", "smb3", "smbfs", "ceph", "glusterfs", "fuse.glusterfs",
+    "afs", "9p", "ncpfs", "lustre", "beegfs",
+]
+STUCK_RECHECK_DELAY = 5          # seconds between the two D-state samples
+STUCK_MIN_AGE = 60               # a process must also have existed this long to count
+STUCK_MAX_LINES = 25             # stuck processes listed in the detail block, oldest first
+MOUNT_PROBE_TIMEOUT = 10         # seconds a stat() of one mount point may take
+
+# Both halves of the same event, from the two sources that keep it - see the multipath
+# event phrases above for why neither contains the other.
+MOUNT_STALL_PHRASES = [
+    "not responding",            # nfs: "server X not responding, still trying"
+    "has not responded in",      # cifs: "Server X has not responded in 120 seconds"
+    "blocked for more than",     # the kernel's own hung-task detector, first 10 only
+]
+MOUNT_STALL_FILES = [
+    "/var/log/kern.log",
+]
+
 # --- "LUN Assignments" check ----------------------------------------------------------
 LUN_CHANGE_PHRASES = [
     "Warning! Received an indication that the LUN assignments on this target have changed",
@@ -121,6 +151,9 @@ POOL_RUN = {
     "lacp_negotiation": True,
     "multipath_health": True,
     "multipath_events": True,
+    "stuck_processes": True,
+    "mount_stalls": True,
+    "network_mounts": True,
     "silly_mtus": True,
     "dns_gw_non_mgmt_pifs": True,
     "overlapping_subnets": True,

@@ -392,6 +392,236 @@ def collect_df():
     return fact(r.out)
 
 
+# --------------------------------------------------------------------------------------
+# stuck mounts, and the processes they take down with them
+# --------------------------------------------------------------------------------------
+
+def parse_proc_stat(text):
+    """(state, starttime_ticks) out of one /proc/PID/stat, or (None, None).
+
+    The comm field is the trap, and a real one rather than a hypothetical: it is the
+    executable name in parentheses, unescaped, and may contain both spaces and
+    parentheses - a process can genuinely be called `(foo) bar)`. Splitting on whitespace,
+    or on the FIRST ')', mis-numbers every field after it, and here that would silently
+    read some other number as the state. rfind(')') is the documented way round it: comm
+    is the only parenthesised field, and nothing after it can contain one.
+
+    Fields after that closing paren are 3..52, so state is [0] and starttime is [19].
+    """
+    close = text.rfind(")")
+    if close < 0:
+        return (None, None)
+    rest = text[close + 1:].split()
+    if len(rest) < 20:
+        return (None, None)
+    try:
+        return (rest[0], int(rest[19]))
+    except ValueError:
+        return (rest[0], None)
+
+
+_MOUNT_ESCAPES = {"040": " ", "011": "\t", "012": "\n", "134": "\\"}
+
+
+def _unescape_mount(field):
+    """Undo /proc/mounts' octal escaping - a mount point with a space in it is written
+    with a backslash and 040, and would otherwise arrive with the escape still in it."""
+    if "\\" not in field:
+        return field
+    out = []
+    i = 0
+    while i < len(field):
+        if field[i] == "\\" and field[i + 1:i + 4] in _MOUNT_ESCAPES:
+            out.append(_MOUNT_ESCAPES[field[i + 1:i + 4]])
+            i += 4
+        else:
+            out.append(field[i])
+            i += 1
+    return "".join(out)
+
+
+def parse_mounts(text, network_types):
+    """[(source, target, fstype)] for the network mounts in /proc/mounts, in file order.
+
+    /proc/mounts is served by the kernel out of its own mount table, so reading it cannot
+    block on a mount that has stopped answering - which stat() of the same path very much
+    can. That difference is the whole basis of this check.
+    """
+    wanted = set(network_types or [])
+    found = []
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) < 3 or parts[2] not in wanted:
+            continue
+        found.append((_unescape_mount(parts[0]), _unescape_mount(parts[1]), parts[2]))
+    return found
+
+
+def fs_module_of(stack_text):
+    """The module a kernel stack is blocked in, e.g. 'cifs' or 'nfs'; "" if none.
+
+    /proc/PID/stack prints module-owned frames as `symbol+0x1/0x2 [module]`, which turns
+    "something is stuck" into "stuck in the SMB client" without any guessing. The wchan
+    column is NOT a substitute: it resolves through a symbol table that can be wrong, and
+    was - naming one cifs symbol for every stuck process on a host, kernel threads that
+    never touch cifs included.
+    """
+    for line in (stack_text or "").splitlines():
+        text = line.strip()
+        # the module is a trailing [name]; every frame ALSO opens with an address column
+        # spelled [<0>], and taking the last '[' without this ends up returning that
+        if not text.endswith("]"):
+            continue
+        start = text.rfind("[")
+        if start < 0:
+            continue
+        module = text[start + 1:-1].strip()
+        if re.match(r"^\w+$", module):
+            return module
+    return ""
+
+
+def _proc_pids():
+    try:
+        return sorted(int(name) for name in os.listdir("/proc") if name.isdigit())
+    except (IOError, OSError):
+        return None
+
+
+def _d_state_pids():
+    """{pid: starttime} for every process in uninterruptible sleep, right now.
+
+    Everything read here is served out of kernel memory by procfs, so none of it can block
+    on the very mount being investigated - which is the whole reason this is the primary
+    signal rather than stat()ing mount points and seeing what hangs.
+    """
+    pids = _proc_pids()
+    if pids is None:
+        return None
+    found = {}
+    for pid in pids:
+        text = read_file("/proc/%d/stat" % pid)
+        if not text:
+            continue                      # exited between listdir and open: not an error
+        state, starttime = parse_proc_stat(text)
+        if state == "D" and starttime is not None:
+            found[pid] = starttime
+    return found
+
+
+def _proc_cmdline(pid):
+    """The command, or "" for a kernel thread - which is how kernel threads are told apart.
+
+    NUL-separated, and deliberately not /proc/PID/cmdline's neighbours cwd/exe/root: those
+    are symlinks INTO the filesystem, so resolving one belonging to a process stuck on a
+    dead mount blocks this collector in exactly the way it is here to detect.
+    """
+    raw = read_file("/proc/%d/cmdline" % pid)
+    if not raw:
+        return ""
+    return " ".join(part for part in raw.split("\0") if part).strip()
+
+
+def collect_stuck_processes(spec):
+    """Processes wedged in uninterruptible sleep, sampled twice so a busy disk cannot lie.
+
+    D state is normal in passing - any read from a real disk is briefly D - so a single
+    sample would flag a healthy host under load. Two samples separated by
+    STUCK_RECHECK_DELAY, intersected on (pid, starttime), leave only what has not moved;
+    the starttime pins the identity, since a pid freed and reused between samples is a
+    different process. The age floor drops anything too young to be worth reporting.
+
+    Kernel threads are counted separately rather than dropped: some sit in D quite
+    normally, but a kworker stuck in a filesystem's work queue is exactly the corroboration
+    that the mount, and not the process, is the problem.
+    """
+    settings = spec or {}
+    delay = settings.get("recheck_delay") or 0
+    min_age = settings.get("min_age") or 0
+    cap = settings.get("max_lines") or 0
+
+    first = _d_state_pids()
+    if first is None:
+        return err("could not read /proc")
+    if first and delay:
+        # nothing to wait for when the first sample is already clean, which is the
+        # overwhelmingly common case and keeps a healthy host at no cost at all
+        time.sleep(min(delay, max(1, budget_left() or delay)))
+    second = _d_state_pids() if first else {}
+    if second is None:
+        return err("could not read /proc")
+
+    ticks = 100.0
+    try:
+        ticks = float(os.sysconf("SC_CLK_TCK")) or 100.0
+    except (ValueError, OSError, AttributeError):
+        pass
+    uptime = read_file("/proc/uptime") or ""
+    try:
+        now = float(uptime.split()[0])
+    except (IndexError, ValueError):
+        return err("could not read /proc/uptime")
+
+    rows = []
+    for pid, starttime in second.items():
+        if first.get(pid) != starttime:
+            continue                      # moved on, or a reused pid: not the same wait
+        age = now - (starttime / ticks)
+        if age < min_age:
+            continue
+        stack = read_file("/proc/%d/stack" % pid) or ""
+        rows.append({
+            "pid": pid,
+            "age": int(age),
+            "cmd": _proc_cmdline(pid)[:120],
+            "module": fs_module_of(stack),
+            "frame": (stack.splitlines() or [""])[0].strip()[:120],
+        })
+    rows.sort(key=lambda row: row["age"], reverse=True)
+    return fact({"total": len(rows), "rows": rows[:cap] if cap else rows})
+
+
+def collect_network_mounts(spec, skip_reason):
+    """Whether each network mount still answers a stat(), or "" for why it was not asked.
+
+    The probe is a separate short-lived process precisely because it may never return: a
+    mount whose server has gone parks it in D state for good, and run() abandons it rather
+    than waiting. That does leave one unkillable process behind per dead mount, which is
+    the script adding to the mess it is reporting - so it is not done at all on a host that
+    already HAS stuck processes. There, the answer is already known and costs nothing, and
+    the mounts are listed unprobed instead.
+    """
+    settings = spec or {}
+    text = read_file("/proc/mounts")
+    if text is None:
+        return err("could not read /proc/mounts")
+    mounts = parse_mounts(text, settings.get("types") or [])
+
+    rows = []
+    for source, target, fstype in mounts:
+        row = {"source": source, "target": target, "type": fstype}
+        if skip_reason:
+            row["state"] = "not probed"
+            row["why"] = skip_reason
+        else:
+            started = time.time()
+            r = run(["stat", "-c", "%i", "--", target],
+                    timeout=settings.get("probe_timeout") or 10)
+            row["seconds"] = round(time.time() - started, 2)
+            if r.ok:
+                row["state"] = "ok"
+            elif r.timed_out:
+                row["state"] = "no answer"
+                row["why"] = r.err.strip()[:160]
+            else:
+                # a stat that FAILED is not a stat that hung: permission, a path that is
+                # gone. Reported as its own state rather than folded into either
+                row["state"] = "error"
+                row["why"] = r.why()[:160]
+        rows.append(row)
+    return fact(rows)
+
+
 def collect_iplink():
     r = run(["ip", "-o", "link", "show"], timeout=20)
     if not r.ok:
@@ -1321,6 +1551,26 @@ def collect(spec):
         out["multipath_scan"] = collect_log_scan(mps.get("files") or [],
                                                  mps.get("phrases") or [],
                                                  mps.get("context") or 3)
+        mstall = spec.get("mount_stall_scan") or {}
+        out["mount_stall_scan"] = collect_log_scan(mstall.get("files") or [],
+                                                   mstall.get("phrases") or [],
+                                                   mstall.get("context") or 3)
+
+        out["stuck_procs"] = collect_stuck_processes(spec.get("stuck"))
+        # The gate, and the order it depends on: a host that already has processes wedged
+        # in D state is not probed, because a probe of a dead mount becomes one more of
+        # them. Its mounts are listed unprobed instead, which is honest and free. A host
+        # with nothing stuck is safe to probe - if a probe does hang, it has just found a
+        # mount that was about to do this to something else anyway.
+        stuck = out["stuck_procs"]
+        if not stuck["ok"]:
+            skip = "could not tell whether this host already has stuck processes"
+        elif stuck["value"]["total"]:
+            skip = ("this host already has %d stuck process(es), and probing a dead mount "
+                    "leaves another one" % stuck["value"]["total"])
+        else:
+            skip = ""
+        out["network_mounts"] = collect_network_mounts(spec.get("mount_probe"), skip)
         if spec.get("smapi"):
             out["smapi"] = collect_smapi_hidden_leaves()
 

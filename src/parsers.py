@@ -741,3 +741,17 @@ def cap_lines(lines, limit, noun):
         shown.append("(plus %d %s not listed)" % (len(lines) - limit, noun))
         return shown
     return list(lines)
+
+
+def format_age(seconds):
+    """A duration a person can compare at a glance: 3d 4h, 1h 3m, 19m, 45s."""
+    seconds = int(seconds)
+    if seconds < 0:
+        seconds = 0
+    if seconds >= 86400:
+        return "%dd %dh" % (seconds // 86400, (seconds % 86400) // 3600)
+    if seconds >= 3600:
+        return "%dh %dm" % (seconds // 3600, (seconds % 3600) // 60)
+    if seconds >= 60:
+        return "%dm" % (seconds // 60)
+    return "%ds" % seconds

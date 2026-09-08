@@ -43,7 +43,7 @@ import unicodedata
 # ======================================================================================
 # --- config ----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "3.9"
+SCRIPT_VERSION = "3.10"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
@@ -130,6 +130,36 @@ MULTIPATH_EVENT_FILES = [
     "/var/log/kern.log",
 ]
 
+# --- stuck mounts and the processes they take down -------------------------------------
+# A mount whose server stops answering parks anything that stats it in uninterruptible
+# sleep (D state), where no signal can reach it - SIGKILL included. It is not a niche
+# failure: it took a pool master out of every report for days, and the script said nothing,
+# because nothing it ran ever came back to say anything.
+#
+# The kernel has its own detector for this and it is NOT enough on its own. Measured on
+# 8.3.0: hung_task_timeout_secs=120 with CONFIG_DETECT_HUNG_TASK=y, but
+# kernel.hung_task_warnings defaults to 10 and COUNTS DOWN - after ten warnings the kernel
+# goes quiet for the rest of the uptime. A host wedged for days logs nothing at all.
+NETWORK_FS_TYPES = [             # the ones that can hang forever waiting on a server
+    "nfs", "nfs4", "cifs", "smb3", "smbfs", "ceph", "glusterfs", "fuse.glusterfs",
+    "afs", "9p", "ncpfs", "lustre", "beegfs",
+]
+STUCK_RECHECK_DELAY = 5          # seconds between the two D-state samples
+STUCK_MIN_AGE = 60               # a process must also have existed this long to count
+STUCK_MAX_LINES = 25             # stuck processes listed in the detail block, oldest first
+MOUNT_PROBE_TIMEOUT = 10         # seconds a stat() of one mount point may take
+
+# Both halves of the same event, from the two sources that keep it - see the multipath
+# event phrases above for why neither contains the other.
+MOUNT_STALL_PHRASES = [
+    "not responding",            # nfs: "server X not responding, still trying"
+    "has not responded in",      # cifs: "Server X has not responded in 120 seconds"
+    "blocked for more than",     # the kernel's own hung-task detector, first 10 only
+]
+MOUNT_STALL_FILES = [
+    "/var/log/kern.log",
+]
+
 # --- "LUN Assignments" check ----------------------------------------------------------
 LUN_CHANGE_PHRASES = [
     "Warning! Received an indication that the LUN assignments on this target have changed",
@@ -163,6 +193,9 @@ POOL_RUN = {
     "lacp_negotiation": True,
     "multipath_health": True,
     "multipath_events": True,
+    "stuck_processes": True,
+    "mount_stalls": True,
+    "network_mounts": True,
     "silly_mtus": True,
     "dns_gw_non_mgmt_pifs": True,
     "overlapping_subnets": True,
@@ -1078,6 +1111,20 @@ def cap_lines(lines, limit, noun):
     return list(lines)
 
 
+def format_age(seconds):
+    """A duration a person can compare at a glance: 3d 4h, 1h 3m, 19m, 45s."""
+    seconds = int(seconds)
+    if seconds < 0:
+        seconds = 0
+    if seconds >= 86400:
+        return "%dd %dh" % (seconds // 86400, (seconds % 86400) // 3600)
+    if seconds >= 3600:
+        return "%dh %dm" % (seconds // 3600, (seconds % 3600) // 60)
+    if seconds >= 60:
+        return "%dm" % (seconds // 60)
+    return "%ds" % seconds
+
+
 # ======================================================================================
 # --- model -----------------------------------------------------------------------------
 
@@ -1621,6 +1668,236 @@ def collect_df():
     if not r.ok:
         return err("df failed (%s)" % r.why())
     return fact(r.out)
+
+
+# --------------------------------------------------------------------------------------
+# stuck mounts, and the processes they take down with them
+# --------------------------------------------------------------------------------------
+
+def parse_proc_stat(text):
+    """(state, starttime_ticks) out of one /proc/PID/stat, or (None, None).
+
+    The comm field is the trap, and a real one rather than a hypothetical: it is the
+    executable name in parentheses, unescaped, and may contain both spaces and
+    parentheses - a process can genuinely be called `(foo) bar)`. Splitting on whitespace,
+    or on the FIRST ')', mis-numbers every field after it, and here that would silently
+    read some other number as the state. rfind(')') is the documented way round it: comm
+    is the only parenthesised field, and nothing after it can contain one.
+
+    Fields after that closing paren are 3..52, so state is [0] and starttime is [19].
+    """
+    close = text.rfind(")")
+    if close < 0:
+        return (None, None)
+    rest = text[close + 1:].split()
+    if len(rest) < 20:
+        return (None, None)
+    try:
+        return (rest[0], int(rest[19]))
+    except ValueError:
+        return (rest[0], None)
+
+
+_MOUNT_ESCAPES = {"040": " ", "011": "\t", "012": "\n", "134": "\\"}
+
+
+def _unescape_mount(field):
+    """Undo /proc/mounts' octal escaping - a mount point with a space in it is written
+    with a backslash and 040, and would otherwise arrive with the escape still in it."""
+    if "\\" not in field:
+        return field
+    out = []
+    i = 0
+    while i < len(field):
+        if field[i] == "\\" and field[i + 1:i + 4] in _MOUNT_ESCAPES:
+            out.append(_MOUNT_ESCAPES[field[i + 1:i + 4]])
+            i += 4
+        else:
+            out.append(field[i])
+            i += 1
+    return "".join(out)
+
+
+def parse_mounts(text, network_types):
+    """[(source, target, fstype)] for the network mounts in /proc/mounts, in file order.
+
+    /proc/mounts is served by the kernel out of its own mount table, so reading it cannot
+    block on a mount that has stopped answering - which stat() of the same path very much
+    can. That difference is the whole basis of this check.
+    """
+    wanted = set(network_types or [])
+    found = []
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) < 3 or parts[2] not in wanted:
+            continue
+        found.append((_unescape_mount(parts[0]), _unescape_mount(parts[1]), parts[2]))
+    return found
+
+
+def fs_module_of(stack_text):
+    """The module a kernel stack is blocked in, e.g. 'cifs' or 'nfs'; "" if none.
+
+    /proc/PID/stack prints module-owned frames as `symbol+0x1/0x2 [module]`, which turns
+    "something is stuck" into "stuck in the SMB client" without any guessing. The wchan
+    column is NOT a substitute: it resolves through a symbol table that can be wrong, and
+    was - naming one cifs symbol for every stuck process on a host, kernel threads that
+    never touch cifs included.
+    """
+    for line in (stack_text or "").splitlines():
+        text = line.strip()
+        # the module is a trailing [name]; every frame ALSO opens with an address column
+        # spelled [<0>], and taking the last '[' without this ends up returning that
+        if not text.endswith("]"):
+            continue
+        start = text.rfind("[")
+        if start < 0:
+            continue
+        module = text[start + 1:-1].strip()
+        if re.match(r"^\w+$", module):
+            return module
+    return ""
+
+
+def _proc_pids():
+    try:
+        return sorted(int(name) for name in os.listdir("/proc") if name.isdigit())
+    except (IOError, OSError):
+        return None
+
+
+def _d_state_pids():
+    """{pid: starttime} for every process in uninterruptible sleep, right now.
+
+    Everything read here is served out of kernel memory by procfs, so none of it can block
+    on the very mount being investigated - which is the whole reason this is the primary
+    signal rather than stat()ing mount points and seeing what hangs.
+    """
+    pids = _proc_pids()
+    if pids is None:
+        return None
+    found = {}
+    for pid in pids:
+        text = read_file("/proc/%d/stat" % pid)
+        if not text:
+            continue                      # exited between listdir and open: not an error
+        state, starttime = parse_proc_stat(text)
+        if state == "D" and starttime is not None:
+            found[pid] = starttime
+    return found
+
+
+def _proc_cmdline(pid):
+    """The command, or "" for a kernel thread - which is how kernel threads are told apart.
+
+    NUL-separated, and deliberately not /proc/PID/cmdline's neighbours cwd/exe/root: those
+    are symlinks INTO the filesystem, so resolving one belonging to a process stuck on a
+    dead mount blocks this collector in exactly the way it is here to detect.
+    """
+    raw = read_file("/proc/%d/cmdline" % pid)
+    if not raw:
+        return ""
+    return " ".join(part for part in raw.split("\0") if part).strip()
+
+
+def collect_stuck_processes(spec):
+    """Processes wedged in uninterruptible sleep, sampled twice so a busy disk cannot lie.
+
+    D state is normal in passing - any read from a real disk is briefly D - so a single
+    sample would flag a healthy host under load. Two samples separated by
+    STUCK_RECHECK_DELAY, intersected on (pid, starttime), leave only what has not moved;
+    the starttime pins the identity, since a pid freed and reused between samples is a
+    different process. The age floor drops anything too young to be worth reporting.
+
+    Kernel threads are counted separately rather than dropped: some sit in D quite
+    normally, but a kworker stuck in a filesystem's work queue is exactly the corroboration
+    that the mount, and not the process, is the problem.
+    """
+    settings = spec or {}
+    delay = settings.get("recheck_delay") or 0
+    min_age = settings.get("min_age") or 0
+    cap = settings.get("max_lines") or 0
+
+    first = _d_state_pids()
+    if first is None:
+        return err("could not read /proc")
+    if first and delay:
+        # nothing to wait for when the first sample is already clean, which is the
+        # overwhelmingly common case and keeps a healthy host at no cost at all
+        time.sleep(min(delay, max(1, budget_left() or delay)))
+    second = _d_state_pids() if first else {}
+    if second is None:
+        return err("could not read /proc")
+
+    ticks = 100.0
+    try:
+        ticks = float(os.sysconf("SC_CLK_TCK")) or 100.0
+    except (ValueError, OSError, AttributeError):
+        pass
+    uptime = read_file("/proc/uptime") or ""
+    try:
+        now = float(uptime.split()[0])
+    except (IndexError, ValueError):
+        return err("could not read /proc/uptime")
+
+    rows = []
+    for pid, starttime in second.items():
+        if first.get(pid) != starttime:
+            continue                      # moved on, or a reused pid: not the same wait
+        age = now - (starttime / ticks)
+        if age < min_age:
+            continue
+        stack = read_file("/proc/%d/stack" % pid) or ""
+        rows.append({
+            "pid": pid,
+            "age": int(age),
+            "cmd": _proc_cmdline(pid)[:120],
+            "module": fs_module_of(stack),
+            "frame": (stack.splitlines() or [""])[0].strip()[:120],
+        })
+    rows.sort(key=lambda row: row["age"], reverse=True)
+    return fact({"total": len(rows), "rows": rows[:cap] if cap else rows})
+
+
+def collect_network_mounts(spec, skip_reason):
+    """Whether each network mount still answers a stat(), or "" for why it was not asked.
+
+    The probe is a separate short-lived process precisely because it may never return: a
+    mount whose server has gone parks it in D state for good, and run() abandons it rather
+    than waiting. That does leave one unkillable process behind per dead mount, which is
+    the script adding to the mess it is reporting - so it is not done at all on a host that
+    already HAS stuck processes. There, the answer is already known and costs nothing, and
+    the mounts are listed unprobed instead.
+    """
+    settings = spec or {}
+    text = read_file("/proc/mounts")
+    if text is None:
+        return err("could not read /proc/mounts")
+    mounts = parse_mounts(text, settings.get("types") or [])
+
+    rows = []
+    for source, target, fstype in mounts:
+        row = {"source": source, "target": target, "type": fstype}
+        if skip_reason:
+            row["state"] = "not probed"
+            row["why"] = skip_reason
+        else:
+            started = time.time()
+            r = run(["stat", "-c", "%i", "--", target],
+                    timeout=settings.get("probe_timeout") or 10)
+            row["seconds"] = round(time.time() - started, 2)
+            if r.ok:
+                row["state"] = "ok"
+            elif r.timed_out:
+                row["state"] = "no answer"
+                row["why"] = r.err.strip()[:160]
+            else:
+                # a stat that FAILED is not a stat that hung: permission, a path that is
+                # gone. Reported as its own state rather than folded into either
+                row["state"] = "error"
+                row["why"] = r.why()[:160]
+        rows.append(row)
+    return fact(rows)
 
 
 def collect_iplink():
@@ -2552,6 +2829,26 @@ def collect(spec):
         out["multipath_scan"] = collect_log_scan(mps.get("files") or [],
                                                  mps.get("phrases") or [],
                                                  mps.get("context") or 3)
+        mstall = spec.get("mount_stall_scan") or {}
+        out["mount_stall_scan"] = collect_log_scan(mstall.get("files") or [],
+                                                   mstall.get("phrases") or [],
+                                                   mstall.get("context") or 3)
+
+        out["stuck_procs"] = collect_stuck_processes(spec.get("stuck"))
+        # The gate, and the order it depends on: a host that already has processes wedged
+        # in D state is not probed, because a probe of a dead mount becomes one more of
+        # them. Its mounts are listed unprobed instead, which is honest and free. A host
+        # with nothing stuck is safe to probe - if a probe does hang, it has just found a
+        # mount that was about to do this to something else anyway.
+        stuck = out["stuck_procs"]
+        if not stuck["ok"]:
+            skip = "could not tell whether this host already has stuck processes"
+        elif stuck["value"]["total"]:
+            skip = ("this host already has %d stuck process(es), and probing a dead mount "
+                    "leaves another one" % stuck["value"]["total"])
+        else:
+            skip = ""
+        out["network_mounts"] = collect_network_mounts(spec.get("mount_probe"), skip)
         if spec.get("smapi"):
             out["smapi"] = collect_smapi_hidden_leaves()
 
@@ -4510,6 +4807,141 @@ def backup_network(pool, run_env, pinger):
                 " - No ping answer from XOA for: " + ", ".join(silent))
 
 
+# --------------------------------------------------------------------------------------
+# stuck mounts
+# --------------------------------------------------------------------------------------
+
+def stuck_processes(host):
+    """Processes wedged in uninterruptible sleep - the consequence, whatever the cause.
+
+    This is the primary signal for a mount that has stopped answering, and it is primary
+    because it costs nothing and cannot itself hang: every input is served out of kernel
+    memory by procfs. It is also filesystem-agnostic, which is the point - a dead NFS
+    server, a dead SMB share, a dropped iSCSI LUN and a failing local disk all arrive
+    here identically, and none of them needed to be anticipated by name.
+
+    Kernel threads are reported separately from userspace processes. Some kernel threads
+    sit in D quite normally, so they are not counted towards the finding on their own -
+    but a kworker parked in a filesystem's work queue corroborates the rest, and dropping
+    it would throw away the clearest evidence of which subsystem is stuck.
+    """
+    facts = host.fact("stuck_procs")
+    if not facts.ok:
+        return unknown("Stuck Processes", "Unknown (%s)" % facts.error)
+
+    rows = facts.value.get("rows") or []
+    total = facts.value.get("total") or 0
+    if not total:
+        return ok("Stuck Processes", "None")
+
+    user_rows = [row for row in rows if row.get("cmd")]
+    modules = sorted(set(row.get("module") or "" for row in rows) - set([""]))
+    oldest = max((row.get("age") or 0) for row in rows)
+
+    summary = "%d stuck (oldest %s)" % (total, parsers.format_age(oldest))
+    if modules:
+        summary += " in " + ", ".join(modules)
+    return flag("Stuck Processes", "Yes - " + summary).with_detail(
+        "Stuck Processes", _stuck_detail(rows, total, len(user_rows)))
+
+
+def _stuck_detail(rows, total, user_count):
+    lines = ["%d process(es) in uninterruptible sleep; %d of them userspace."
+             % (total, user_count),
+             "None of these can be killed - not even with SIGKILL - until whatever they "
+             "are waiting on answers.",
+             ""]
+    for row in rows:
+        lines.append("  %-8s %-9s %-10s %s"
+                     % (row.get("pid"), parsers.format_age(row.get("age") or 0),
+                        row.get("module") or "-",
+                        row.get("cmd") or "[kernel thread] " + (row.get("frame") or "")))
+    return "\n".join(lines) + ("\n\n(listed oldest first)" if len(rows) > 1 else "")
+
+
+def mount_stalls(host):
+    """The server-side half: what the kernel said when a mount stopped answering.
+
+    Read from kern.log and the dmesg ring for the same reason Multipath Path Events reads
+    both - neither contains the other. It names the SERVER, which the process scan cannot:
+    a stuck process says a mount is wedged, this says which one and since when.
+
+    It cannot be relied on alone, and the reason is worth writing down. The kernel's own
+    hung-task detector is enabled on 8.3 (hung_task_timeout_secs=120) but
+    kernel.hung_task_warnings defaults to 10 and counts DOWN - after ten it stops logging
+    for the rest of the uptime. A host wedged for days can therefore be completely silent
+    here while dozens of processes pile up, which is why the process scan leads.
+    """
+    scan = host.fact("mount_stall_scan")
+    dmesg = host.fact("dmesg")
+
+    blocks = list(scan.value) if (scan.ok and scan.value) else []
+    if dmesg.ok:
+        blocks = blocks + _dmesg_phrase_blocks(dmesg.value, config.MOUNT_STALL_PHRASES,
+                                               config.LOG_ERROR_CONTEXT)
+    if blocks:
+        return flag("Mount Stalls", "Yes, See Error Output").with_detail(
+            "Mount Stalls", _render_scan_blocks(blocks))
+    if not scan.ok:
+        return unknown("Mount Stalls", "Unknown (%s)" % scan.error)
+    if not dmesg.ok:
+        return unknown("Mount Stalls", "Unknown (could not read dmesg)")
+    return ok("Mount Stalls", "None")
+
+
+def network_mounts(host):
+    """Does each network mount still answer a stat()?
+
+    The only one of the three that can name a mount nothing has touched yet - and the only
+    one with a cost, since the probe of a dead mount becomes a stuck process itself. So it
+    is not run at all on a host that already has stuck processes: there the mounts are
+    listed unprobed, which claims nothing, and the finding is already being made by
+    Stuck Processes rather than twice over here.
+    """
+    facts = host.fact("network_mounts")
+    if not facts.ok:
+        return unknown("Network Mounts", "Unknown (%s)" % facts.error)
+
+    rows = facts.value
+    if not rows:
+        return ok("Network Mounts", "None")
+
+    dead = [row for row in rows if row.get("state") == "no answer"]
+    unprobed = [row for row in rows if row.get("state") == "not probed"]
+    errored = [row for row in rows if row.get("state") == "error"]
+
+    if dead:
+        return flag("Network Mounts",
+                    "%d of %d not responding" % (len(dead), len(rows))).with_detail(
+            "Network Mounts", _mount_detail(rows))
+    if unprobed:
+        # not probed is not "fine": it is a question that was deliberately not asked, and
+        # the reason it was not asked is itself already flagged by Stuck Processes
+        return unknown("Network Mounts",
+                       "Unknown - %d mount(s) not probed (%s)"
+                       % (len(unprobed), unprobed[0].get("why") or "no reason given")
+                       ).with_detail("Network Mounts", _mount_detail(rows))
+    if errored:
+        return flag("Network Mounts",
+                    "%d of %d could not be checked" % (len(errored), len(rows))).with_detail(
+            "Network Mounts", _mount_detail(rows))
+    return ok("Network Mounts", "%d responding" % len(rows))
+
+
+def _mount_detail(rows):
+    lines = []
+    for row in rows:
+        when = ""
+        if row.get("seconds") is not None:
+            when = "  %ss" % row["seconds"]
+        lines.append("  %-10s %-11s %s on %s%s"
+                     % (row.get("type") or "-", row.get("state") or "-",
+                        row.get("source") or "-", row.get("target") or "-", when))
+        if row.get("why"):
+            lines.append("               %s" % row["why"])
+    return "\n".join(lines)
+
+
 # ======================================================================================
 # --- xoa -------------------------------------------------------------------------------
 
@@ -5104,6 +5536,14 @@ def _host_spec(with_smapi):
                            "context": config.LOG_ERROR_CONTEXT},
         "multipath": {"transient": config.MULTIPATH_TRANSIENT_CHK_STATES,
                       "recheck_delay": config.MULTIPATH_RECHECK_DELAY},
+        "mount_stall_scan": {"files": config.MOUNT_STALL_FILES,
+                             "phrases": config.MOUNT_STALL_PHRASES,
+                             "context": config.LOG_ERROR_CONTEXT},
+        "stuck": {"recheck_delay": config.STUCK_RECHECK_DELAY,
+                  "min_age": config.STUCK_MIN_AGE,
+                  "max_lines": config.STUCK_MAX_LINES},
+        "mount_probe": {"types": config.NETWORK_FS_TYPES,
+                        "probe_timeout": config.MOUNT_PROBE_TIMEOUT},
     }
 
 
@@ -5745,6 +6185,9 @@ def per_host_checks():
         ("lacp_negotiation", "LACP Negotiation Issues", checks.lacp),
         ("multipath_health", "Multipath Path Health", checks.multipath_health),
         ("multipath_events", "Multipath Path Events", checks.multipath_events),
+        ("stuck_processes", "Stuck Processes", checks.stuck_processes),
+        ("mount_stalls", "Mount Stalls", checks.mount_stalls),
+        ("network_mounts", "Network Mounts", checks.network_mounts),
         ("silly_mtus", "Silly MTUs", checks.silly_mtus),
         ("dns_gw_non_mgmt_pifs", "DNS/GW on Non-Mgmt PIFs", checks.dns_gw_non_mgmt_pifs),
         ("overlapping_subnets", "Overlapping Subnets", checks.overlapping_subnets),
@@ -6034,16 +6477,16 @@ def _module(name, exported):
     return module
 
 
-config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DMESG_MAX_LINES', 'DMESG_ROLLUP_MIN', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'PROGRESS_INTERVAL', 'REMOTE_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_QCOW2_MAX_LINES', 'XO_REDIS_TIMEOUT'])
+config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DMESG_MAX_LINES', 'DMESG_ROLLUP_MIN', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MOUNT_PROBE_TIMEOUT', 'MOUNT_STALL_FILES', 'MOUNT_STALL_PHRASES', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'NETWORK_FS_TYPES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'PROGRESS_INTERVAL', 'REMOTE_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'STUCK_MAX_LINES', 'STUCK_MIN_AGE', 'STUCK_RECHECK_DELAY', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_QCOW2_MAX_LINES', 'XO_REDIS_TIMEOUT'])
 colors = _module('colors', ['CYAN', 'GREEN', 'RESET', 'YELLOW', 'cyan', 'green', 'init', 'strip_ansi', 'yellow'])
 result = _module('result', ['FLAG', 'Fact', 'INFO', 'Line', 'MISSING', 'OK', 'UNKNOWN', 'flag', 'guard', 'info', 'ok', 'raw', 'unknown', 'wrap'])
-parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', '_LINK_RE', '_MTU_RE', '_PARAM_RE', '_TS_RE', '_cidr_range', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'cap_lines', 'classify_multipath_path', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'has_overlapping_subnets', 'manifest_diff', 'manifest_versions', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pool_conf', 'parse_timedatectl', 'parse_xe_records', 'rollup_repeats', 'round_1dp', 'split_host_port', 'split_timestamp', 'truncate_block'])
+parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', '_LINK_RE', '_MTU_RE', '_PARAM_RE', '_TS_RE', '_cidr_range', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'cap_lines', 'classify_multipath_path', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'format_age', 'has_overlapping_subnets', 'manifest_diff', 'manifest_versions', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pool_conf', 'parse_timedatectl', 'parse_xe_records', 'rollup_repeats', 'round_1dp', 'split_host_port', 'split_timestamp', 'truncate_block'])
 model = _module('model', ['Host', 'Pool', 'ntp_match', 'ram_match'])
 collectorsrc = _module('collectorsrc', ['EMBEDDED', 'collector_source'])
 transport = _module('transport', ['BEGIN_MARKER', 'CollectError', 'END_MARKER', 'Transport', '_DEBUG_LOCK', '_LIVE', '_LIVE_LOCK', '_REMOTE_LAUNCH', '_REMOTE_LAUNCH_PINNED', '_kill_tree', '_remote_launch', 'cleanup_work_dir', 'debug', 'ensure_sshpass', 'have', 'kill_all_children', 'make_work_dir', 'run_local_cmd', 'which'])
 xoredis = _module('xoredis', ['DEFAULT_ADDR', 'ENCRYPTION_PREFIX', 'IDS_KEY', 'RECORD_PREFIX', 'RedisError', '_config_dirs', '_config_files', '_encode', '_fetch', '_flatten', '_mentions_redis', '_read_reply', 'read_server_records'])
 xodb = _module('xodb', ['QUOTES', 'SELECT_NONE', 'SELECT_NO_MATCH', 'SELECT_OK', 'SELECT_QUIT', 'SELECT_UNREADABLE', 'Server', '_ALL_SERVERS', '_ESCAPE_RE', '_KEY_RE', '_READ_ERROR', '_SIMPLE_ESCAPES', '_describe_failure', '_ls', '_read_servers', '_sort_key', 'all_servers', 'clean', 'enabled_servers', 'have_xo_server_db', 'password_for', 'pool_name_for_host', 'read_error', 'reset_cache', 'scan_records', 'select_pool', 'unescape'])
-checks = _module('checks', ['_dmesg_phrase_blocks', '_linstor_column', '_linstor_has_rows', '_linstor_line', '_linstor_node_addresses', '_linstor_node_offline', '_linstor_table', '_linstor_unknown', '_maps', '_multipath_detail', '_multipath_read', '_network_line', '_render_scan_blocks', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_block', 'dmesg_content', 'dmesg_content_of', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'ntp', 'oom_events', 'overlapping_subnets', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'tap_status', 'task_timeout_override', 'vlan0', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_nodes', 'xostor_pref_nic', 'xostor_qcow2', 'xostor_ram', 'yum_patch_level'])
+checks = _module('checks', ['_dmesg_phrase_blocks', '_linstor_column', '_linstor_has_rows', '_linstor_line', '_linstor_node_addresses', '_linstor_node_offline', '_linstor_table', '_linstor_unknown', '_maps', '_mount_detail', '_multipath_detail', '_multipath_read', '_network_line', '_render_scan_blocks', '_stuck_detail', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_block', 'dmesg_content', 'dmesg_content_of', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mount_stalls', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'network_mounts', 'ntp', 'oom_events', 'overlapping_subnets', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'stuck_processes', 'tap_status', 'task_timeout_override', 'vlan0', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_nodes', 'xostor_pref_nic', 'xostor_qcow2', 'xostor_ram', 'yum_patch_level'])
 xoa = _module('xoa', ['_dmesg', '_first_token', '_max_old_space', '_meminfo', '_os_version', '_service_state', '_updater', 'collect_xoa', 'debian_version_ok', 'lines', 'ping_silent', 'running_as_root'])
 report = _module('report', ['Report', '_as_entry'])
 
