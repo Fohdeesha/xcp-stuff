@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """Every threshold, list and toggle, in one place. Same names and values as health.sh."""
 
-SCRIPT_VERSION = "3.7"
+SCRIPT_VERSION = "3.8"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
 MAX_PARALLEL_HOSTS = 8           # hosts collected at once (HEALTH_MAX_PARALLEL overrides)
+PROGRESS_INTERVAL = 15           # seconds between 'still waiting on ...' lines, tty only
 LOCAL_CMD_TIMEOUT = 10           # max seconds a local command may run (hung xoa-updater etc)
 XO_REDIS_TIMEOUT = 2             # reading xo's server records straight from redis: 0.002s
                                  # measured, so this is only here to bound a wedged socket

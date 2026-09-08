@@ -165,6 +165,8 @@ class Transport(object):
         """Run the collector on `host` and return its document. Raises CollectError."""
         spec = dict(spec)
         spec.setdefault("budget", config.REMOTE_CMD_TIMEOUT - 60)
+        if os.environ.get("HEALTH_DEBUG") == "1":
+            spec["timings"] = True
         blob = base64.b64encode(json.dumps(spec).encode("utf-8")).decode("ascii")
         debug("collect %s want=%s" % (host, spec.get("want")))
 
@@ -191,6 +193,8 @@ class Transport(object):
             debug("stderr from %s:\n%s" % (host, err.strip()))
         info = payload.get("collector") or {}
         debug("%s answered from python %s" % (host, info.get("python", "?")))
+        for elapsed, command in (info.get("timings") or [])[:8]:
+            debug("%s   %6.2fs  %s" % (host, elapsed, command))
         return payload
 
     def collect_local(self, spec):
@@ -312,6 +316,21 @@ def ensure_sshpass(run_env):
         return True
 
     sys.stderr.write("sshpass not found. Installing via apt...\n")
-    run_local_cmd(["apt-get", "update", "-y"], timeout=300)
-    run_local_cmd(["apt-get", "install", "-y", "sshpass"], timeout=300)
-    return have("sshpass")
+    env = dict(os.environ)
+    # stdin is /dev/null here, so anything that stops to ask (dpkg's conffile prompt,
+    # needrestart) would read EOF part way through an install nobody can see
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+    rc, out, err = run_local_cmd(["apt-get", "update", "-y"], timeout=300, env=env)
+    if rc != 0:
+        # not fatal by itself: the package may well already be in the local index
+        sys.stderr.write("Warning: 'apt-get update' exited %d; trying the install anyway.\n" % rc)
+    rc, out, err = run_local_cmd(["apt-get", "install", "-y", "sshpass"], timeout=300, env=env)
+    if not have("sshpass"):
+        # the yum half has always said this much; the apt half said nothing at all, so a
+        # failure surfaced only as the caller's one-line 'sshpass is required'
+        sys.stderr.write("ERROR: could not install sshpass (apt-get exit code %d).\n" % rc)
+        for line in (out + err).splitlines()[-5:]:
+            sys.stderr.write(line + "\n")
+        return False
+    sys.stderr.write("sshpass installed.\n")
+    return True

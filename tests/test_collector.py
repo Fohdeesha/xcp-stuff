@@ -294,3 +294,82 @@ def test_collect_pool_pairs_the_asked_nodes_with_the_answers(monkeypatch):
     value = {"nodes": names, "nics": collector._linstor_pref_nics([], names)}
     assert value["nodes"] == ["xen-sec-01", "xen-sec-02"]
     assert value["nics"] == {"xen-sec-01": "bond0"}
+
+
+# --------------------------------------------------------------------------------------
+# where the time went
+# --------------------------------------------------------------------------------------
+
+def test_every_command_records_its_own_elapsed_time(monkeypatch):
+    """run() is the only way a command reaches a host, so this is complete by
+    construction rather than by remembering to instrument each caller."""
+    del collector.TIMINGS[:]
+    collector.run(["true"])
+    collector.run(["true", "again"])
+    assert len(collector.TIMINGS) == 2
+    assert [row[1] for row in collector.TIMINGS] == ["true", "true again"]
+    assert all(isinstance(row[0], float) for row in collector.TIMINGS)
+
+
+def test_a_command_the_budget_refused_is_still_recorded(monkeypatch):
+    """'run budget exhausted' at 0.0s is itself the finding: it says the budget was gone
+    before this command, which is what points at the ones before it."""
+    del collector.TIMINGS[:]
+    monkeypatch.setattr(collector, "DEADLINE", [0.0])
+    r = collector.run(["true"])
+    assert r.timed_out is True
+    assert [row[1] for row in collector.TIMINGS] == ["true"]
+
+
+def test_a_long_argv_keeps_the_path_at_the_end():
+    """The elision is in the middle for exactly this reason: 'a grep took 90 seconds' is
+    not an answer without the file it was reading, and the phrases come first."""
+    del collector.TIMINGS[:]
+    argv = ["grep", "-ainF"]
+    for i in range(6):
+        argv += ["-e", "a phrase long enough to need eliding %d" % i]
+    argv += ["--", "/var/log/xensource.log.1"]
+
+    collector.timed(argv, 0)
+    text = collector.TIMINGS[0][1]
+    assert text.startswith("grep -ainF -e a phrase")
+    assert text.endswith("/var/log/xensource.log.1")
+    assert " ... " in text
+
+
+def test_an_argv_carrying_newlines_stays_on_one_line():
+    """rpm's --qf formats end in a literal newline, which split the debug output across
+    lines and made the timing table unreadable."""
+    del collector.TIMINGS[:]
+    collector.timed(["rpm", "-qa", "--qf", "%{INSTALLTIME} %{NAME}\n"], 0)
+    assert collector.TIMINGS[0][1] == "rpm -qa --qf %{INSTALLTIME} %{NAME}"
+
+
+def test_timings_ride_along_only_when_the_spec_asks(monkeypatch):
+    """They are debug output, not part of any check, so a normal run does not carry them
+    across the wire at all."""
+    monkeypatch.setattr(collector, "collect_identity",
+                        lambda: {"self_uuid": collector.fact(""),
+                                 "hostname": collector.fact("h")})
+    del collector.TIMINGS[:]
+    collector.TIMINGS.append([1.5, "slow thing"])
+
+    assert "timings" not in collector.collect({"want": []})["collector"]
+    assert collector.collect({"want": [], "timings": True})["collector"]["timings"] \
+        == [[1.5, "slow thing"]]
+
+
+def test_the_slowest_commands_come_first_and_the_list_is_capped(monkeypatch):
+    """A host runs enough commands that the whole list would bury the answer, and the
+    answer is always at the slow end."""
+    monkeypatch.setattr(collector, "collect_identity",
+                        lambda: {"self_uuid": collector.fact(""),
+                                 "hostname": collector.fact("h")})
+    del collector.TIMINGS[:]
+    for i in range(30):
+        collector.TIMINGS.append([float(i), "cmd%d" % i])
+
+    ranked = collector.collect({"want": [], "timings": True})["collector"]["timings"]
+    assert len(ranked) == 15
+    assert ranked[0] == [29.0, "cmd29"]
+    assert ranked[-1] == [15.0, "cmd15"]

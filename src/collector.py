@@ -40,6 +40,31 @@ DEFAULT_CMD_TIMEOUT = 60
 # hanging until the transport gives up and the report loses the host entirely.
 DEADLINE = [None]
 
+# Where a host's time actually went. Every command run on a host goes through run() or
+# grep_scan(), so this is complete by construction rather than by remembering to
+# instrument each caller. It is returned only when the spec asks for it (HEALTH_DEBUG),
+# but it is always collected: a list append per command is nothing next to the command.
+#
+# The reason it exists: a host that takes four minutes used to be a host that took four
+# minutes, with nothing to say which of its ~60 commands took them. Working that out from
+# the outside costs one round trip per candidate, and a wrong guess looks exactly like a
+# right one until you have run it.
+TIMINGS = []
+
+
+def timed(argv, started):
+    """Record one command's elapsed seconds, with enough argv to identify it.
+
+    The argv rather than a description of it, so the slow one can be pasted straight into
+    a shell on the host. Whitespace is collapsed because rpm's --qf formats carry literal
+    newlines, and a long one is elided in the MIDDLE rather than the tail: the path is at
+    the end, and "a grep took 90 seconds" is not an answer without the file it was reading.
+    """
+    text = " ".join(" ".join(str(arg).split()) for arg in argv)
+    if len(text) > 110:
+        text = text[:60] + " ... " + text[-45:]
+    TIMINGS.append([round(time.time() - started, 2), text])
+
 
 def budget_left():
     if DEADLINE[0] is None:
@@ -126,12 +151,15 @@ def _kill(proc):
 
 def run(argv, timeout=DEFAULT_CMD_TIMEOUT):
     """Run argv (no shell, ever) and return a Ran. Reads to EOF - see the xe/EPIPE note."""
+    started = time.time()
     timeout = _clamp(timeout)
     if timeout is None:
+        timed(argv, started)
         return Ran(124, "", "run budget exhausted", True)
     try:
         proc, devnull = _popen(argv)
     except OSError as exc:
+        timed(argv, started)
         return Ran(127, "", "%s: %s" % (argv[0], exc), False)
 
     state = {"killed": False}
@@ -147,6 +175,7 @@ def run(argv, timeout=DEFAULT_CMD_TIMEOUT):
     finally:
         timer.cancel()
         devnull.close()
+        timed(argv, started)
     return Ran(proc.returncode, _decode(out), _decode(error), state["killed"])
 
 
@@ -785,6 +814,7 @@ def grep_scan(path, phrases, timeout=180):
         argv += ["-e", p]
     argv += ["--", path]
 
+    started = time.time()
     try:
         proc, devnull = _popen(argv)
     except OSError:
@@ -818,6 +848,9 @@ def grep_scan(path, phrases, timeout=180):
     finally:
         timer.cancel()
         devnull.close()
+        # the attribution loop above runs once per MATCHED line, so this is grep's time
+        # plus ours - which is the number that matters on a log full of hits
+        timed(argv, started)
     # rc 1 is grep's "no match", which is a real answer; 2+ means grep itself failed
     if state["killed"] or rc > 1:
         return None
@@ -1225,6 +1258,10 @@ def collect(spec):
     if "pool" in want:
         out["pool"] = collect_pool(spec, self_uuid)
 
+    if spec.get("timings"):
+        # slowest first: the question this answers is always "what took the time", and a
+        # host runs enough commands that the whole list would bury the answer
+        out["collector"]["timings"] = sorted(TIMINGS, reverse=True)[:15]
     return out
 
 

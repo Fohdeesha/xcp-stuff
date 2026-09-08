@@ -22,7 +22,7 @@
 
 
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 import atexit
 import base64
 import getopt
@@ -43,11 +43,12 @@ import unicodedata
 # ======================================================================================
 # --- config ----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "3.7"
+SCRIPT_VERSION = "3.8"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
 MAX_PARALLEL_HOSTS = 8           # hosts collected at once (HEALTH_MAX_PARALLEL overrides)
+PROGRESS_INTERVAL = 15           # seconds between 'still waiting on ...' lines, tty only
 LOCAL_CMD_TIMEOUT = 10           # max seconds a local command may run (hung xoa-updater etc)
 XO_REDIS_TIMEOUT = 2             # reading xo's server records straight from redis: 0.002s
                                  # measured, so this is only here to bound a wedged socket
@@ -1270,6 +1271,31 @@ DEFAULT_CMD_TIMEOUT = 60
 # hanging until the transport gives up and the report loses the host entirely.
 DEADLINE = [None]
 
+# Where a host's time actually went. Every command run on a host goes through run() or
+# grep_scan(), so this is complete by construction rather than by remembering to
+# instrument each caller. It is returned only when the spec asks for it (HEALTH_DEBUG),
+# but it is always collected: a list append per command is nothing next to the command.
+#
+# The reason it exists: a host that takes four minutes used to be a host that took four
+# minutes, with nothing to say which of its ~60 commands took them. Working that out from
+# the outside costs one round trip per candidate, and a wrong guess looks exactly like a
+# right one until you have run it.
+TIMINGS = []
+
+
+def timed(argv, started):
+    """Record one command's elapsed seconds, with enough argv to identify it.
+
+    The argv rather than a description of it, so the slow one can be pasted straight into
+    a shell on the host. Whitespace is collapsed because rpm's --qf formats carry literal
+    newlines, and a long one is elided in the MIDDLE rather than the tail: the path is at
+    the end, and "a grep took 90 seconds" is not an answer without the file it was reading.
+    """
+    text = " ".join(" ".join(str(arg).split()) for arg in argv)
+    if len(text) > 110:
+        text = text[:60] + " ... " + text[-45:]
+    TIMINGS.append([round(time.time() - started, 2), text])
+
 
 def budget_left():
     if DEADLINE[0] is None:
@@ -1356,12 +1382,15 @@ def _kill(proc):
 
 def run(argv, timeout=DEFAULT_CMD_TIMEOUT):
     """Run argv (no shell, ever) and return a Ran. Reads to EOF - see the xe/EPIPE note."""
+    started = time.time()
     timeout = _clamp(timeout)
     if timeout is None:
+        timed(argv, started)
         return Ran(124, "", "run budget exhausted", True)
     try:
         proc, devnull = _popen(argv)
     except OSError as exc:
+        timed(argv, started)
         return Ran(127, "", "%s: %s" % (argv[0], exc), False)
 
     state = {"killed": False}
@@ -1377,6 +1406,7 @@ def run(argv, timeout=DEFAULT_CMD_TIMEOUT):
     finally:
         timer.cancel()
         devnull.close()
+        timed(argv, started)
     return Ran(proc.returncode, _decode(out), _decode(error), state["killed"])
 
 
@@ -2015,6 +2045,7 @@ def grep_scan(path, phrases, timeout=180):
         argv += ["-e", p]
     argv += ["--", path]
 
+    started = time.time()
     try:
         proc, devnull = _popen(argv)
     except OSError:
@@ -2048,6 +2079,9 @@ def grep_scan(path, phrases, timeout=180):
     finally:
         timer.cancel()
         devnull.close()
+        # the attribution loop above runs once per MATCHED line, so this is grep's time
+        # plus ours - which is the number that matters on a log full of hits
+        timed(argv, started)
     # rc 1 is grep's "no match", which is a real answer; 2+ means grep itself failed
     if state["killed"] or rc > 1:
         return None
@@ -2455,6 +2489,10 @@ def collect(spec):
     if "pool" in want:
         out["pool"] = collect_pool(spec, self_uuid)
 
+    if spec.get("timings"):
+        # slowest first: the question this answers is always "what took the time", and a
+        # host runs enough commands that the whole list would bury the answer
+        out["collector"]["timings"] = sorted(TIMINGS, reverse=True)[:15]
     return out
 
 
@@ -2615,6 +2653,8 @@ class Transport(object):
         """Run the collector on `host` and return its document. Raises CollectError."""
         spec = dict(spec)
         spec.setdefault("budget", config.REMOTE_CMD_TIMEOUT - 60)
+        if os.environ.get("HEALTH_DEBUG") == "1":
+            spec["timings"] = True
         blob = base64.b64encode(json.dumps(spec).encode("utf-8")).decode("ascii")
         debug("collect %s want=%s" % (host, spec.get("want")))
 
@@ -2641,6 +2681,8 @@ class Transport(object):
             debug("stderr from %s:\n%s" % (host, err.strip()))
         info = payload.get("collector") or {}
         debug("%s answered from python %s" % (host, info.get("python", "?")))
+        for elapsed, command in (info.get("timings") or [])[:8]:
+            debug("%s   %6.2fs  %s" % (host, elapsed, command))
         return payload
 
     def collect_local(self, spec):
@@ -2762,9 +2804,24 @@ def ensure_sshpass(run_env):
         return True
 
     sys.stderr.write("sshpass not found. Installing via apt...\n")
-    run_local_cmd(["apt-get", "update", "-y"], timeout=300)
-    run_local_cmd(["apt-get", "install", "-y", "sshpass"], timeout=300)
-    return have("sshpass")
+    env = dict(os.environ)
+    # stdin is /dev/null here, so anything that stops to ask (dpkg's conffile prompt,
+    # needrestart) would read EOF part way through an install nobody can see
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+    rc, out, err = run_local_cmd(["apt-get", "update", "-y"], timeout=300, env=env)
+    if rc != 0:
+        # not fatal by itself: the package may well already be in the local index
+        sys.stderr.write("Warning: 'apt-get update' exited %d; trying the install anyway.\n" % rc)
+    rc, out, err = run_local_cmd(["apt-get", "install", "-y", "sshpass"], timeout=300, env=env)
+    if not have("sshpass"):
+        # the yum half has always said this much; the apt half said nothing at all, so a
+        # failure surfaced only as the caller's one-line 'sshpass is required'
+        sys.stderr.write("ERROR: could not install sshpass (apt-get exit code %d).\n" % rc)
+        for line in (out + err).splitlines()[-5:]:
+            sys.stderr.write(line + "\n")
+        return False
+    sys.stderr.write("sshpass installed.\n")
+    return True
 
 
 # ======================================================================================
@@ -4996,6 +5053,38 @@ def notice(run, text):
     (sys.stderr if run.json_output else sys.stdout).write(text)
 
 
+_PROGRESS_LOCK = threading.Lock()
+
+
+def progress_enabled():
+    """Live progress is for a person watching a terminal, and for nobody else.
+
+    stderr only, and only when it is a tty: stdout carries the report (or the --json
+    document) and does not change, and a captured, piped or cron run gets exactly the bytes
+    it got before - which is also what keeps the old-vs-new regression diffs honest.
+    """
+    try:
+        return bool(sys.stderr.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+def progress(text):
+    """One whole line at a time - every host worker writes here.
+
+    Between the banner and the first line of the report the run makes one ssh call to
+    discover the pool and then one per host, each of which may take REMOTE_CMD_TIMEOUT,
+    and the report cannot start until the last one is in. Printing nothing in the
+    meantime makes a slow host indistinguishable from a wedged script: it was read as one
+    and killed twice before the collectors had run out of their own budget.
+    """
+    if not progress_enabled():
+        return
+    with _PROGRESS_LOCK:
+        sys.stderr.write(text)
+        sys.stderr.flush()
+
+
 def print_banner(run, host, name):
     """Every run names what it is about to check, before any of the slow work.
 
@@ -5182,6 +5271,7 @@ def prepare_host_sweep(run, argument_password):
 def discover(run):
     """Phase A: one call to the seed for the pool's host list and our own identity."""
     spec = {"want": ["pool_hosts"]}
+    progress("Asking %s for the pool's host list...\n" % (run.seed or "this host"))
     try:
         if run.run_env == "host":
             payload = run.transport.collect_local(spec)
@@ -5274,12 +5364,17 @@ def _collect_one(run, host, pool_spec):
     if run.pool_mode and host.address == run.pool_cmd_host:
         spec = _merge(spec, pool_spec)
     note = ""
+    started = _now()
     try:
         host.payload = run.transport.collect(host.address, spec)
     except transport.CollectError as exc:
         host.error = str(exc)
         note = "Failed when trying to check %s: %s\n" % (host.address, exc)
     host.local_now = _now()
+    # whichever way it went, say so now: the note is held back until every host is in, and
+    # by then the thing worth knowing - which host the run was waiting on - has passed
+    progress("  %s %s (%.1fs)\n" % (host.address, "failed" if host.error else "answered",
+                                    host.local_now - started))
     return note
 
 
@@ -5299,16 +5394,44 @@ def parallel_workers(host_count):
     return max(1, min(limit, host_count))
 
 
+def _wait_with_progress(futures, addresses):
+    """Wait for the collectors, naming every so often the hosts that have not answered.
+
+    A host that is merely slow - a wedged 'yum check-update' against an unreachable
+    mirror is the usual one - holds the whole phase for up to REMOTE_CMD_TIMEOUT, and
+    'answered' lines only appear as each host finishes. This is what fills the gap in
+    between, so the run says what it is waiting for instead of appearing to hang.
+    """
+    if not progress_enabled():
+        return
+    started = _now()
+    while True:
+        _, not_done = futures_wait(futures, timeout=config.PROGRESS_INTERVAL)
+        if not not_done:
+            return
+        waiting = [addresses[i] for i, f in enumerate(futures) if f in not_done]
+        progress("  still waiting on %s (%ds)\n"
+                 % (", ".join(waiting), _now() - started))
+
+
 def _collect_in_parallel(run, pool_spec, workers):
     pool = ThreadPoolExecutor(max_workers=workers)
     try:
         futures = [pool.submit(_collect_one, run, host, pool_spec) for host in run.hosts]
         try:
+            _wait_with_progress(futures, [h.address for h in run.hosts])
             return [f.result() for f in futures]
         except BaseException:
             # named and immediately re-raised, so this is not a swallowed error: the
             # workers are blocked in communicate() and cannot see a ctrl-C, so without
-            # this the shutdown below would wait out every collector still running
+            # this the shutdown below would wait out every collector still running.
+            # The hosts still QUEUED have to be dropped as well - shutdown(wait=True) does
+            # not discard pending work, so with more hosts than workers a ctrl-C would
+            # start a brand new ssh for every host it had not reached yet and then wait
+            # out all of them. (shutdown(cancel_futures=True) is 3.9; the floor here is
+            # 3.6.) Cancel before killing, so nothing is launched into the gap.
+            for future in futures:
+                future.cancel()
             transport.kill_all_children()
             raise
     finally:
@@ -5328,6 +5451,9 @@ def collect_hosts(run):
 
     workers = parallel_workers(len(run.hosts))
     transport.debug("collecting %d host(s), %d at a time" % (len(run.hosts), workers))
+    progress("Collecting from %d host(s), %d at a time, up to %ds each: %s\n"
+             % (len(run.hosts), workers, config.REMOTE_CMD_TIMEOUT,
+                ", ".join(h.address for h in run.hosts)))
     if workers > 1:
         notes = _collect_in_parallel(run, pool_spec, workers)
     else:
@@ -5732,6 +5858,22 @@ def _narrow_to_seed(run, hosts):
     return [model.Host(run.seed)]
 
 
+def entry():
+    """The process's exit code, with a ctrl-C answered as one rather than as a crash.
+
+    Run the documented way - `python3 <(curl ...)` - the traceback an interrupt used to
+    print could not even show its own source lines: the file is a descriptor that is
+    already gone, so it was twenty lines of threading internals against a path called
+    /dev/fd/63. 130 is the shell's own convention for a SIGINT death, and the atexit
+    handlers still take the children and the work dir with them.
+    """
+    try:
+        return main()
+    except KeyboardInterrupt:
+        sys.stderr.write("\nInterrupted.\n")
+        return 130
+
+
 # ======================================================================================
 # --- module aliases --------------------------------------------------------------------
 
@@ -5748,7 +5890,7 @@ def _module(name, exported):
     return module
 
 
-config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DMESG_MAX_LINES', 'DMESG_ROLLUP_MIN', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'REMOTE_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_QCOW2_MAX_LINES', 'XO_REDIS_TIMEOUT'])
+config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DMESG_MAX_LINES', 'DMESG_ROLLUP_MIN', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'PROGRESS_INTERVAL', 'REMOTE_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_QCOW2_MAX_LINES', 'XO_REDIS_TIMEOUT'])
 colors = _module('colors', ['CYAN', 'GREEN', 'RESET', 'YELLOW', 'cyan', 'green', 'init', 'strip_ansi', 'yellow'])
 result = _module('result', ['FLAG', 'Fact', 'INFO', 'Line', 'MISSING', 'OK', 'UNKNOWN', 'flag', 'guard', 'info', 'ok', 'raw', 'unknown', 'wrap'])
 parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', '_LINK_RE', '_MTU_RE', '_PARAM_RE', '_TS_RE', '_cidr_range', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'cap_lines', 'classify_multipath_path', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'has_overlapping_subnets', 'manifest_diff', 'manifest_versions', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pool_conf', 'parse_timedatectl', 'parse_xe_records', 'rollup_repeats', 'round_1dp', 'split_host_port', 'split_timestamp', 'truncate_block'])
@@ -5764,4 +5906,4 @@ report = _module('report', ['Report', '_as_entry'])
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(entry())

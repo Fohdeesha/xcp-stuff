@@ -22,7 +22,7 @@ import getopt
 import os
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 
 import checks
 import colors
@@ -236,6 +236,38 @@ def notice(run, text):
     (sys.stderr if run.json_output else sys.stdout).write(text)
 
 
+_PROGRESS_LOCK = threading.Lock()
+
+
+def progress_enabled():
+    """Live progress is for a person watching a terminal, and for nobody else.
+
+    stderr only, and only when it is a tty: stdout carries the report (or the --json
+    document) and does not change, and a captured, piped or cron run gets exactly the bytes
+    it got before - which is also what keeps the old-vs-new regression diffs honest.
+    """
+    try:
+        return bool(sys.stderr.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+def progress(text):
+    """One whole line at a time - every host worker writes here.
+
+    Between the banner and the first line of the report the run makes one ssh call to
+    discover the pool and then one per host, each of which may take REMOTE_CMD_TIMEOUT,
+    and the report cannot start until the last one is in. Printing nothing in the
+    meantime makes a slow host indistinguishable from a wedged script: it was read as one
+    and killed twice before the collectors had run out of their own budget.
+    """
+    if not progress_enabled():
+        return
+    with _PROGRESS_LOCK:
+        sys.stderr.write(text)
+        sys.stderr.flush()
+
+
 def print_banner(run, host, name):
     """Every run names what it is about to check, before any of the slow work.
 
@@ -422,6 +454,7 @@ def prepare_host_sweep(run, argument_password):
 def discover(run):
     """Phase A: one call to the seed for the pool's host list and our own identity."""
     spec = {"want": ["pool_hosts"]}
+    progress("Asking %s for the pool's host list...\n" % (run.seed or "this host"))
     try:
         if run.run_env == "host":
             payload = run.transport.collect_local(spec)
@@ -514,12 +547,17 @@ def _collect_one(run, host, pool_spec):
     if run.pool_mode and host.address == run.pool_cmd_host:
         spec = _merge(spec, pool_spec)
     note = ""
+    started = _now()
     try:
         host.payload = run.transport.collect(host.address, spec)
     except transport.CollectError as exc:
         host.error = str(exc)
         note = "Failed when trying to check %s: %s\n" % (host.address, exc)
     host.local_now = _now()
+    # whichever way it went, say so now: the note is held back until every host is in, and
+    # by then the thing worth knowing - which host the run was waiting on - has passed
+    progress("  %s %s (%.1fs)\n" % (host.address, "failed" if host.error else "answered",
+                                    host.local_now - started))
     return note
 
 
@@ -539,16 +577,44 @@ def parallel_workers(host_count):
     return max(1, min(limit, host_count))
 
 
+def _wait_with_progress(futures, addresses):
+    """Wait for the collectors, naming every so often the hosts that have not answered.
+
+    A host that is merely slow - a wedged 'yum check-update' against an unreachable
+    mirror is the usual one - holds the whole phase for up to REMOTE_CMD_TIMEOUT, and
+    'answered' lines only appear as each host finishes. This is what fills the gap in
+    between, so the run says what it is waiting for instead of appearing to hang.
+    """
+    if not progress_enabled():
+        return
+    started = _now()
+    while True:
+        _, not_done = futures_wait(futures, timeout=config.PROGRESS_INTERVAL)
+        if not not_done:
+            return
+        waiting = [addresses[i] for i, f in enumerate(futures) if f in not_done]
+        progress("  still waiting on %s (%ds)\n"
+                 % (", ".join(waiting), _now() - started))
+
+
 def _collect_in_parallel(run, pool_spec, workers):
     pool = ThreadPoolExecutor(max_workers=workers)
     try:
         futures = [pool.submit(_collect_one, run, host, pool_spec) for host in run.hosts]
         try:
+            _wait_with_progress(futures, [h.address for h in run.hosts])
             return [f.result() for f in futures]
         except BaseException:
             # named and immediately re-raised, so this is not a swallowed error: the
             # workers are blocked in communicate() and cannot see a ctrl-C, so without
-            # this the shutdown below would wait out every collector still running
+            # this the shutdown below would wait out every collector still running.
+            # The hosts still QUEUED have to be dropped as well - shutdown(wait=True) does
+            # not discard pending work, so with more hosts than workers a ctrl-C would
+            # start a brand new ssh for every host it had not reached yet and then wait
+            # out all of them. (shutdown(cancel_futures=True) is 3.9; the floor here is
+            # 3.6.) Cancel before killing, so nothing is launched into the gap.
+            for future in futures:
+                future.cancel()
             transport.kill_all_children()
             raise
     finally:
@@ -568,6 +634,9 @@ def collect_hosts(run):
 
     workers = parallel_workers(len(run.hosts))
     transport.debug("collecting %d host(s), %d at a time" % (len(run.hosts), workers))
+    progress("Collecting from %d host(s), %d at a time, up to %ds each: %s\n"
+             % (len(run.hosts), workers, config.REMOTE_CMD_TIMEOUT,
+                ", ".join(h.address for h in run.hosts)))
     if workers > 1:
         notes = _collect_in_parallel(run, pool_spec, workers)
     else:
@@ -972,5 +1041,21 @@ def _narrow_to_seed(run, hosts):
     return [model.Host(run.seed)]
 
 
+def entry():
+    """The process's exit code, with a ctrl-C answered as one rather than as a crash.
+
+    Run the documented way - `python3 <(curl ...)` - the traceback an interrupt used to
+    print could not even show its own source lines: the file is a descriptor that is
+    already gone, so it was twenty lines of threading internals against a path called
+    /dev/fd/63. 130 is the shell's own convention for a SIGINT death, and the atexit
+    handlers still take the children and the work dir with them.
+    """
+    try:
+        return main()
+    except KeyboardInterrupt:
+        sys.stderr.write("\nInterrupted.\n")
+        return 130
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(entry())
