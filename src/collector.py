@@ -51,19 +51,47 @@ DEADLINE = [None]
 # right one until you have run it.
 TIMINGS = []
 
+# The command running right now, and the document as it is built. Both exist for the
+# watchdog: when a command cannot be killed, these are the only things left to answer with.
+# One-element lists and a module dict rather than plain globals, so every writer can set
+# them without a `global` statement (2.7 has no nonlocal).
+CURRENT = [""]
+PARTIAL = {}
 
-def timed(argv, started):
-    """Record one command's elapsed seconds, with enough argv to identify it.
+# Commands that outlived their own SIGKILL. Not a report line - the fact each one was
+# collecting already says Unknown with the reason, and the trap ledger is explicit about
+# not reporting one thing twice in different words. It rides along only in the watchdog's
+# payload, where "these had already been abandoned before the fatal one" is additive.
+ABANDONED = []
 
-    The argv rather than a description of it, so the slow one can be pasted straight into
-    a shell on the host. Whitespace is collapsed because rpm's --qf formats carry literal
+# How long to wait for a killed command to actually die before giving up on it. A child
+# that CAN be killed is gone in milliseconds; anything still there after this is in
+# uninterruptible sleep and is not coming back on any timescale worth waiting for.
+KILL_GRACE = 5
+
+# How long past the budget the watchdog waits before giving up on the main thread. The
+# transport allows REMOTE_CMD_TIMEOUT (300s) against a 240s budget, so this has to leave
+# the abandoned document time to travel.
+WATCHDOG_GRACE = 15
+
+
+def _argv_text(argv):
+    """Enough of an argv to identify it, on one line.
+
+    The argv rather than a description of it, so the command can be pasted straight into a
+    shell on the host. Whitespace is collapsed because rpm's --qf formats carry literal
     newlines, and a long one is elided in the MIDDLE rather than the tail: the path is at
     the end, and "a grep took 90 seconds" is not an answer without the file it was reading.
     """
     text = " ".join(" ".join(str(arg).split()) for arg in argv)
     if len(text) > 110:
         text = text[:60] + " ... " + text[-45:]
-    TIMINGS.append([round(time.time() - started, 2), text])
+    return text
+
+
+def timed(argv, started):
+    """Record one command's elapsed seconds, with enough argv to identify it."""
+    TIMINGS.append([round(time.time() - started, 2), _argv_text(argv)])
 
 
 def budget_left():
@@ -150,7 +178,26 @@ def _kill(proc):
 
 
 def run(argv, timeout=DEFAULT_CMD_TIMEOUT):
-    """Run argv (no shell, ever) and return a Ran. Reads to EOF - see the xe/EPIPE note."""
+    """Run argv (no shell, ever) and return a Ran. Reads to EOF - see the xe/EPIPE note.
+
+    A command that will not die is one we stop waiting for. The timeout used to be a
+    threading.Timer firing SIGKILL while the main thread sat in communicate(), which
+    assumes the signal lands: a process in uninterruptible sleep (D state) does NOT die on
+    SIGKILL - the signal stays pending until it leaves D, which may be never - so
+    communicate() never returned, the collector never finished, and the transport lost the
+    WHOLE HOST to its own timeout.
+
+    Measured: a dom0 with a dead CIFS mount parks `df -hP` in D state permanently (wchan
+    open_shroot / smb2_reconnect). Five health check runs left five stuck df processes and
+    not one of them produced a document; the host reported only "timed out after 300s",
+    naming neither the command nor the mount.
+
+    So communicate() happens on a daemon thread and this joins it with a deadline. When
+    the kill does not take, the thread and its pipes are abandoned deliberately - the child
+    cannot be reaped, so there is nothing to clean up - and the collector goes on to the
+    next fact. One line then reads Unknown with the reason, instead of every line about
+    that host disappearing.
+    """
     started = time.time()
     timeout = _clamp(timeout)
     if timeout is None:
@@ -162,21 +209,41 @@ def run(argv, timeout=DEFAULT_CMD_TIMEOUT):
         timed(argv, started)
         return Ran(127, "", "%s: %s" % (argv[0], exc), False)
 
-    state = {"killed": False}
+    # named before it can block, cleared after: if this one never returns, it is the only
+    # record of what the collector was doing when it stopped
+    CURRENT[0] = _argv_text(argv)
+    box = {}
 
-    def on_timeout():
-        state["killed"] = True
+    def reader():
+        try:
+            box["out"], box["err"] = proc.communicate()
+        except (IOError, OSError, ValueError) as exc:
+            # the pipes are ours and nobody else touches them, so this is a broken pipe or
+            # a closed file - never a command result, and never silently a success
+            box["failed"] = "%s: %s" % (argv[0], exc)
+
+    worker = threading.Thread(target=reader)
+    worker.daemon = True
+    worker.start()
+    worker.join(timeout)
+
+    killed = worker.is_alive()
+    if killed:
         _kill(proc)
+        worker.join(KILL_GRACE)      # a killable child dies here and the thread ends
 
-    timer = threading.Timer(timeout, on_timeout)
-    timer.start()
-    try:
-        out, error = proc.communicate()
-    finally:
-        timer.cancel()
-        devnull.close()
-        timed(argv, started)
-    return Ran(proc.returncode, _decode(out), _decode(error), state["killed"])
+    abandoned = worker.is_alive()
+    timed(argv, started)
+    CURRENT[0] = ""
+    devnull.close()
+
+    if abandoned:
+        ABANDONED.append(_argv_text(argv))
+        return Ran(124, "", "did not die when killed - uninterruptible, so the host's "
+                            "storage or a mount is most likely wedged", True)
+    if "failed" in box:
+        return Ran(127, "", box["failed"], False)
+    return Ran(proc.returncode, _decode(box.get("out")), _decode(box.get("err")), killed)
 
 
 def _clamp(timeout):
@@ -828,6 +895,7 @@ def grep_scan(path, phrases, timeout=180):
 
     timer = threading.Timer(timeout, on_timeout)
     timer.start()
+    CURRENT[0] = _argv_text(argv)
     lowered = [p.lower() for p in phrases]
     last = {}
     try:
@@ -851,6 +919,7 @@ def grep_scan(path, phrases, timeout=180):
         # the attribution loop above runs once per MATCHED line, so this is grep's time
         # plus ours - which is the number that matters on a log full of hits
         timed(argv, started)
+        CURRENT[0] = ""
     # rc 1 is grep's "no match", which is a real answer; 2+ means grep itself failed
     if state["killed"] or rc > 1:
         return None
@@ -1204,7 +1273,10 @@ def parse_other_config(text):
 
 def collect(spec):
     want = set(spec.get("want") or [])
-    out = {"collector": {"python": sys.version.split()[0], "pid": os.getpid()}}
+    # built in place, so the watchdog can hand back what was established if this call
+    # never returns
+    out = PARTIAL
+    out["collector"] = {"python": sys.version.split()[0], "pid": os.getpid()}
     ident = collect_identity()
     out.update(ident)
 
@@ -1265,20 +1337,81 @@ def collect(spec):
     return out
 
 
+_EMITTED = [False]
+_EMIT_LOCK = threading.Lock()
+
+
+def emit(payload):
+    """Write the document, once and whole. Answers whether this call was the one.
+
+    The watchdog and the normal path race only in the instant the last command returns,
+    but two documents on one stdout is not a document: _extract takes the first BEGIN and
+    the last END, so a second one would be read as a truncated first.
+    """
+    with _EMIT_LOCK:
+        if _EMITTED[0]:
+            return False
+        _EMITTED[0] = True
+    sys.stdout.write(BEGIN_MARKER + "\n")
+    sys.stdout.write(json.dumps(payload))
+    sys.stdout.write("\n" + END_MARKER + "\n")
+    sys.stdout.flush()
+    return True
+
+
+def watchdog(grace):
+    """Answer anyway when a command cannot be killed.
+
+    The whole-run budget works by SIGKILLing whatever is running when it expires. A
+    process in uninterruptible sleep - D state, anything blocked on wedged storage - does
+    NOT die on SIGKILL: the signal stays pending until it leaves D, which may be never.
+    communicate() then never returns, collect() never finishes, and the collector writes
+    nothing at all. The transport loses the whole host to its own timeout, and the report
+    can only say "timed out after 300s", which names neither the host's problem nor the
+    command that hit it.
+
+    Measured on a pool with 18 XOSTOR volumes stuck in DELETING: three hosts, two
+    answering in under 3s, the third producing no document at all across five runs and
+    nothing whatsoever to say why.
+
+    So this thread outlives the main one: at the deadline plus a grace period it emits
+    what was gathered, names the command still running, and leaves. os._exit rather than
+    sys.exit or a return, because the main thread is wedged in communicate() and any
+    orderly shutdown would wait for it - which is the whole problem.
+    """
+    while True:
+        left = budget_left()
+        if left is None:
+            return                      # no budget set: nothing to enforce
+        if left <= -grace:
+            break
+        time.sleep(min(5.0, max(0.5, left + grace)))
+
+    payload = dict(PARTIAL)
+    payload["__collector_stuck__"] = CURRENT[0] or "(no command was running)"
+    payload["collector"] = dict(payload.get("collector") or {})
+    payload["collector"]["timings"] = sorted(TIMINGS, reverse=True)[:15]
+    payload["collector"]["abandoned"] = list(ABANDONED)
+    emit(payload)
+    os._exit(0)
+
+
 def main(argv):
     spec = {}
     if len(argv) > 1 and argv[1]:
         spec = json.loads(base64.b64decode(argv[1].encode("ascii")).decode("utf-8"))
     DEADLINE[0] = time.time() + float(spec.get("budget") or 240)
+
+    guard = threading.Thread(target=watchdog, args=(WATCHDOG_GRACE,))
+    guard.daemon = True
+    guard.start()
+
     try:
         payload = collect(spec)
     except Exception:
         import traceback
         payload = {"__collector_error__": traceback.format_exc()}
-    sys.stdout.write(BEGIN_MARKER + "\n")
-    sys.stdout.write(json.dumps(payload))
-    sys.stdout.write("\n" + END_MARKER + "\n")
-    sys.stdout.flush()
+    emit(payload)
     return 0
 
 

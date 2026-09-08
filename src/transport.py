@@ -189,6 +189,17 @@ class Transport(object):
             raise CollectError("%s failed (exit %d)%s" % (what, rc, (": " + detail) if detail else ""))
         if "__collector_error__" in payload:
             raise CollectError("collector crashed on %s:\n%s" % (host, payload["__collector_error__"]))
+        if "__collector_stuck__" in payload:
+            # the host gave up on itself rather than being given up on: a command it could
+            # not kill, named. The old shape of this was the transport's own 300s timeout,
+            # which could say only that the host did not answer
+            debug("%s abandoned its run in: %s" % (host, payload["__collector_stuck__"]))
+            for elapsed, command in (payload.get("collector", {}).get("timings") or [])[:8]:
+                debug("%s   %6.2fs  %s" % (host, elapsed, command))
+            raise CollectError(
+                "gave up after %ds stuck in '%s' - that command cannot be killed, so the "
+                "host's storage or a driver is most likely wedged"
+                % (config.REMOTE_CMD_TIMEOUT - 60, payload["__collector_stuck__"]))
         if err.strip():
             debug("stderr from %s:\n%s" % (host, err.strip()))
         info = payload.get("collector") or {}
