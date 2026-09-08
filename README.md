@@ -71,13 +71,9 @@ Python 3 only - no pip, no modules to install, nothing outside the standard libr
 | XCP-ng hosts being *checked from XOA* | nothing - the collector runs under the `python` that every dom0 has, 8.2.1 included |
 
 **XCP-ng 8.2.1 dom0 has no `python3`**, so health.py cannot be run *on* an 8.2 host. Checking
-an 8.2.1 **pool from XOA** works exactly as it always has. For host mode on 8.2.1, use the
-frozen `health.sh` (v2.8) that lives beside it in this repo:
-
-```
-# on an 8.2.1 host only:
-bash <(curl -fsSL https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/health.sh)
-```
+an 8.2.1 **pool from XOA** works exactly as it always has, and that is the way to check one.
+The old bash `health.sh` that used to cover 8.2 host mode is **retired** - it now only prints
+a pointer back to health.py.
 
 ## Running it on an XCP-ng host instead of XOA
 
@@ -191,7 +187,7 @@ only `python` (2.7.5), 8.3 has both, and that is what keeps 8.2.1 pools checkabl
 | `src/` | the sources it is built from, one module per concern |
 | `build/stitch.py` | builds `health.py` from `src/`; fails the build on a name collision or a collector that does not round-trip |
 | `tests/` | pytest, no network or hosts needed |
-| `health.sh` | the previous bash implementation, frozen at v2.8. Kept as the 8.2.1 host-mode fallback and the rollback path |
+| `health.sh` | the previous bash implementation, **retired**. Prints a pointer to health.py and exits 1; the implementation itself is in the git history |
 
 ```
 python build/stitch.py     # rebuild health.py after changing src/
