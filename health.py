@@ -5681,24 +5681,30 @@ class Report(object):
 # first and the sentence after it, so the switches can be read down the left edge in one
 # glance. The prose that used to carry them ('Use -f to ...') read as a paragraph and had
 # to be searched.
-USAGE_XOA = """Usage:
-  %(prog)s [-f] [-s] [-n name] [pool_master_or_host[:ssh_port] [root_password]]
+USAGE_XOA = """Usage: %(prog)s [OPTION]... [pool_master_or_host[:ssh_port] [root_password]]
+Health-check every host of an XCP-ng pool, from a Xen Orchestra appliance.
 
-  - All parameters are optional
-  - If a host is not supplied, the enabled pools in xo-server-db are listed to pick from
-    (a single enabled pool, or non-interactive use, just takes the first one)
-  - If a password is not supplied, it will be looked up locally in xo-server-db
-  - By default, the script runs in pool mode (checks all hosts in the pool)
-  - Use '-f' flag to filter output to only show issues found
-  - Use '-s' flag to only check the specified host (do not check other pool members if present)
-  - Use '-n' to pick a pool from xo-server-db by name instead of being prompted:
-    the first pool whose name contains the text is used, matched anywhere in the
-    name and ignoring case, so '-n sec' matches 'XEN-SECONDARY'
-  - Use '--json' to print the results as a JSON document instead of a report, for
-    cron and monitoring. Same checks, same exit code; '-f' narrows it the same way,
-    and everything that is not the document goes to stderr
+All arguments are optional. With no host, the enabled pools in xo-server-db
+are listed to pick from - a single enabled pool, or a non-interactive run,
+takes the first. With no password, it is looked up in xo-server-db. Every host
+in the pool is checked unless -s says otherwise.
 
-  Examples:
+  -f, --filter          only print checks that flagged; passing and
+                        informational lines are hidden, sections included
+  -s, --single          check only the given host, not the other pool members
+  -n, --name=NAME       pick the pool from xo-server-db by name instead of
+                        being prompted: the first pool whose name contains
+                        NAME, matched anywhere and ignoring case, so
+                        '-n sec' matches 'XEN-SECONDARY'
+      --json            print the run as one JSON document instead of a
+                        report, for cron and monitoring: same checks, same
+                        exit code, -f narrows it the same way, and anything
+                        that is not the document goes to stderr
+  -h, --help            print this help and exit
+
+Exit status: 0 if every check passed, 1 if any flagged, 2 on a usage error.
+
+Examples:
   %(prog)s 192.168.1.5
   %(prog)s 192.168.1.6 'mypass'
   %(prog)s -s 192.168.1.7 'mypass'
@@ -5707,26 +5713,31 @@ USAGE_XOA = """Usage:
   %(prog)s --json -n sec
 """
 
-USAGE_HOST = """Usage (running on an XCP-ng host):
-  %(prog)s [-f] [-s] [root_password]
+USAGE_HOST = """Usage: %(prog)s [OPTION]... [root_password]
+Health-check this XCP-ng host, and the rest of its pool given a root password.
 
-  - This host is always checked, using local commands (no ssh, no password needed)
-  - The other pool members are checked too if a root password is given: they are
-    reached over ssh, and sshpass is installed from the stock 'extras' repo if missing.
-    Pool members share the master's root password, so one password covers the pool
-  - With no password and a terminal you are asked for one; blank, or no terminal
-    (cron, pipe), just checks this host and says so in the Pool Status section
-  - Prefer the prompt over the argument: an argument is visible in 'ps' and lands
-    in your shell history
-  - Pool-level results are reported either way, since xapi answers those from any
-    pool member, slave included
-  - Use '-f' flag to filter output to only show issues found
-  - Use '-s' flag to skip the pool-level section and only report on this host
-  - Use '--json' to print the results as a JSON document instead of a report, for
-    cron and monitoring. Same checks, same exit code; '-f' narrows it the same way,
-    and everything that is not the document goes to stderr
+This host is always checked, using local commands - no ssh and no password
+needed. The other pool members are checked too if a root password is given:
+they are reached over ssh, and sshpass is installed from the stock 'extras'
+repo if it is missing. Pool members share the master's root password, so one
+password covers the pool. With no password and a terminal you are asked for
+one; blank, or no terminal (cron, pipe), just checks this host and says so in
+the Pool Status section. Prefer the prompt over the argument - an argument is
+visible in 'ps' and lands in your shell history. Pool-level results are
+reported either way, since xapi answers those from any pool member.
 
-  Examples:
+  -f, --filter          only print checks that flagged; passing and
+                        informational lines are hidden, sections included
+  -s, --single          skip the pool-level section, report on this host alone
+      --json            print the run as one JSON document instead of a
+                        report, for cron and monitoring: same checks, same
+                        exit code, -f narrows it the same way, and anything
+                        that is not the document goes to stderr
+  -h, --help            print this help and exit
+
+Exit status: 0 if every check passed, 1 if any flagged, 2 on a usage error.
+
+Examples:
   %(prog)s
   %(prog)s -f
   %(prog)s 'mypass'

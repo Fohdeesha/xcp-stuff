@@ -30,24 +30,30 @@ Run health.py on an XOA appliance with no arguments, it will pull pool/host info
 - "-f" cuts the report down to the findings: passing checks, informational readings and any section left with nothing in it are all dropped, so a clean pool prints almost nothing
 ```
 [03:34 14] xoa:~$ ./health.py --help
-Usage:
-  health.py [-f] [-s] [-n name] [pool_master_or_host[:ssh_port] [root_password]]
+Usage: health.py [OPTION]... [pool_master_or_host[:ssh_port] [root_password]]
+Health-check every host of an XCP-ng pool, from a Xen Orchestra appliance.
 
-  - All parameters are optional
-  - If a host is not supplied, the enabled pools in xo-server-db are listed to pick from
-    (a single enabled pool, or non-interactive use, just takes the first one)
-  - If a password is not supplied, it will be looked up locally in xo-server-db
-  - By default, the script runs in pool mode (checks all hosts in the pool)
-  - Use '-f' flag to filter output to only show issues found
-  - Use '-s' flag to only check the specified host (do not check other pool members if present)
-  - Use '-n' to pick a pool from xo-server-db by name instead of being prompted:
-    the first pool whose name contains the text is used, matched anywhere in the
-    name and ignoring case, so '-n sec' matches 'XEN-SECONDARY'
-  - Use '--json' to print the results as a JSON document instead of a report, for
-    cron and monitoring. Same checks, same exit code; '-f' narrows it the same way,
-    and everything that is not the document goes to stderr
+All arguments are optional. With no host, the enabled pools in xo-server-db
+are listed to pick from - a single enabled pool, or a non-interactive run,
+takes the first. With no password, it is looked up in xo-server-db. Every host
+in the pool is checked unless -s says otherwise.
 
-  Examples:
+  -f, --filter          only print checks that flagged; passing and
+                        informational lines are hidden, sections included
+  -s, --single          check only the given host, not the other pool members
+  -n, --name=NAME       pick the pool from xo-server-db by name instead of
+                        being prompted: the first pool whose name contains
+                        NAME, matched anywhere and ignoring case, so
+                        '-n sec' matches 'XEN-SECONDARY'
+      --json            print the run as one JSON document instead of a
+                        report, for cron and monitoring: same checks, same
+                        exit code, -f narrows it the same way, and anything
+                        that is not the document goes to stderr
+  -h, --help            print this help and exit
+
+Exit status: 0 if every check passed, 1 if any flagged, 2 on a usage error.
+
+Examples:
   health.py 192.168.1.5
   health.py 192.168.1.6 'mypass'
   health.py -s 192.168.1.7 'mypass'
