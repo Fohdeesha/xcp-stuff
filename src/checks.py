@@ -993,9 +993,15 @@ def stuck_processes(host):
     here identically, and none of them needed to be anticipated by name.
 
     Kernel threads are reported separately from userspace processes. Some kernel threads
-    sit in D quite normally, so they are not counted towards the finding on their own -
-    but a kworker parked in a filesystem's work queue corroborates the rest, and dropping
-    it would throw away the clearest evidence of which subsystem is stuck.
+    sit in D quite normally, so the line says outright when that is all there is - but a
+    kworker parked in a filesystem's work queue corroborates the rest, and dropping it
+    would throw away the clearest evidence of which subsystem is stuck.
+
+    What the collector establishes is that each of these was in D and made no progress at
+    all for the whole window it watched. Age is NOT that: it is how long the process has
+    existed, an upper bound on how long it has been wedged, and the wording keeps the two
+    apart. They coincide for a `df` that wedged the moment it ran, and they are days apart
+    for a daemon that has been up since boot.
     """
     facts = host.fact("stuck_procs")
     if not facts.ok:
@@ -1006,19 +1012,27 @@ def stuck_processes(host):
     if not total:
         return ok("Stuck Processes", "None")
 
+    user_count = facts.value.get("userspace")
     modules = sorted(set(row.get("module") or "" for row in rows) - set([""]))
     oldest = max((row.get("age") or 0) for row in rows)
 
-    summary = "%d stuck (oldest %s)" % (total, parsers.format_age(oldest))
+    what = "%d stuck" % total
+    if user_count == 0:
+        # worth saying in the summary line rather than only in the block: it is the
+        # difference between "this host has lost commands" and "one kworker is parked"
+        what += ", all kernel threads"
+    summary = "%s (oldest started %s ago)" % (what, parsers.format_age(oldest))
     if modules:
         summary += " in " + ", ".join(modules)
     # the userspace tally comes from the collector, which counted every one of them.
     # Counting it here would count only the capped sample and print that as the whole
     return flag("Stuck Processes", "Yes - " + summary).with_detail(
-        "Stuck Processes", _stuck_detail(rows, total, facts.value.get("userspace")))
+        "Stuck Processes", _stuck_detail(rows, total, user_count,
+                                         facts.value.get("watched"),
+                                         facts.value.get("own_probes")))
 
 
-def _stuck_detail(rows, total, user_count):
+def _stuck_detail(rows, total, user_count, watched, own_probes):
     if user_count is None:
         head = "%d process(es) in uninterruptible sleep." % total
     else:
@@ -1026,8 +1040,21 @@ def _stuck_detail(rows, total, user_count):
                 "kernel threads." % (total, user_count))
     lines = [head,
              "None of these can be killed - not even with SIGKILL - until whatever they "
-             "are waiting on answers.",
-             ""]
+             "are waiting on answers."]
+    if watched:
+        # the measured claim, and the one that says this is not just a busy disk
+        lines.append("Each of them consumed no CPU and completed no I/O for the whole %s "
+                     "it was watched." % parsers.format_age(watched))
+    lines.append("Age is how long the process has existed, which is an upper bound on how "
+                 "long it has been stuck, not a measurement of it.")
+    if own_probes:
+        # named rather than hidden, and counted rather than dropped: they are genuinely
+        # stuck, and a reader who does not know where they came from would read a growing
+        # count as the host getting worse on its own
+        lines.append("%d of them are this script's own mount probes, parked by earlier "
+                     "runs on a mount that stopped answering. Each one names the mount "
+                     "it was asking about." % own_probes)
+    lines.append("")
     for row in rows:
         lines.append("  %-8s %-9s %-10s %s"
                      % (row.get("pid"), parsers.format_age(row.get("age") or 0),
@@ -1078,10 +1105,13 @@ def network_mounts(host):
     """Does each network mount still answer a stat()?
 
     The only one of the three that can name a mount nothing has touched yet - and the only
-    one with a cost, since the probe of a dead mount becomes a stuck process itself. So it
-    is not run at all on a host that already has stuck processes: there the mounts are
-    listed unprobed, which claims nothing, and the finding is already being made by
-    Stuck Processes rather than twice over here.
+    one with a cost, since the probe of a dead mount becomes a stuck process itself. It is
+    run anyway, on every host, including one that is already full of stuck processes: this
+    is the line that says WHICH mount to go and fix, and on a host in that state the cost
+    it was once spared has already been paid many times over.
+
+    A mount is left unprobed only when the run budget has no room to wait for an answer,
+    and that reads Unknown rather than green - nothing was established about it.
     """
     facts = host.fact("network_mounts")
     if not facts.ok:

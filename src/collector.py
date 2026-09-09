@@ -397,7 +397,7 @@ def collect_df():
 # --------------------------------------------------------------------------------------
 
 def parse_proc_stat(text):
-    """(state, starttime_ticks) out of one /proc/PID/stat, or (None, None).
+    """(state, starttime_ticks, cpu_ticks) from one /proc/PID/stat, or (None, None, None).
 
     The comm field is the trap, and a real one rather than a hypothetical: it is the
     executable name in parentheses, unescaped, and may contain both spaces and
@@ -406,18 +406,24 @@ def parse_proc_stat(text):
     read some other number as the state. rfind(')') is the documented way round it: comm
     is the only parenthesised field, and nothing after it can contain one.
 
-    Fields after that closing paren are 3..52, so state is [0] and starttime is [19].
+    Fields after that closing paren are 3..52, so state is [0], utime and stime are [11]
+    and [12], and starttime is [19]. The CPU pair is read here rather than by a second
+    reader because it has to come from the SAME line as the state: two reads would let the
+    process move between them, and the entire value of the number is that it did not.
+
+    starttime and cpu are answered together or not at all, so a caller that has a
+    starttime always has a cpu figure to go with it.
     """
     close = text.rfind(")")
     if close < 0:
-        return (None, None)
+        return (None, None, None)
     rest = text[close + 1:].split()
     if len(rest) < 20:
-        return (None, None)
+        return (None, None, None)
     try:
-        return (rest[0], int(rest[19]))
+        return (rest[0], int(rest[19]), int(rest[11]) + int(rest[12]))
     except ValueError:
-        return (rest[0], None)
+        return (rest[0], None, None)
 
 
 _MOUNT_ESCAPES = {"040": " ", "011": "\t", "012": "\n", "134": "\\"}
@@ -488,24 +494,65 @@ def _proc_pids():
         return None
 
 
-def _d_state_pids():
-    """{pid: starttime} for every process in uninterruptible sleep, right now.
+def _clock_ticks():
+    """USER_HZ - the unit /proc/PID/stat counts both of its times in. 100 on everything
+    this runs on, but asked for rather than assumed, and defaulted rather than raising."""
+    try:
+        return float(os.sysconf("SC_CLK_TCK")) or 100.0
+    except (ValueError, OSError, AttributeError):
+        return 100.0
+
+
+def _uptime():
+    """Seconds since boot, the clock /proc/PID/stat's starttime is measured against."""
+    text = read_file("/proc/uptime") or ""
+    try:
+        return float(text.split()[0])
+    except (IndexError, ValueError):
+        return None
+
+
+def _proc_io(pid):
+    """/proc/PID/io as it stands, or "" - the byte and syscall counters, unparsed.
+
+    Compared verbatim against a later reading, so there is nothing to parse: every counter
+    in it only ever grows, and it grows only when the process gets somewhere. It is the
+    half of the progress test that CPU time cannot cover, since a process can be almost
+    purely I/O-bound and tick over a hundredth of a second of CPU in ten.
+
+    "" when the kernel was built without CONFIG_TASK_IO_ACCOUNTING, which is not an error:
+    it then contributes no evidence in either direction and the CPU figure decides alone.
+    """
+    return read_file("/proc/%d/io" % pid) or ""
+
+
+def _d_state_procs(pids=None):
+    """{pid: (starttime, cpu_ticks, io)} for the processes in uninterruptible sleep now.
 
     Everything read here is served out of kernel memory by procfs, so none of it can block
     on the very mount being investigated - which is the whole reason this is the primary
     signal rather than stat()ing mount points and seeing what hangs.
+
+    The value carries the identity AND the progress evidence, so two samples compare with
+    a single ==: the same process (starttime pins it - a pid freed and reused in between
+    is a different process and must not inherit the first one's history), which has not
+    consumed a tick of CPU or completed a byte of I/O since the last look.
+
+    `pids` narrows the scan to a set already under suspicion, which is all the later
+    samples need and saves re-reading every process on the host.
     """
-    pids = _proc_pids()
     if pids is None:
-        return None
+        pids = _proc_pids()
+        if pids is None:
+            return None
     found = {}
     for pid in pids:
         text = read_file("/proc/%d/stat" % pid)
         if not text:
             continue                      # exited between listdir and open: not an error
-        state, starttime = parse_proc_stat(text)
+        state, starttime, cpu = parse_proc_stat(text)
         if state == "D" and starttime is not None:
-            found[pid] = starttime
+            found[pid] = (starttime, cpu, _proc_io(pid))
     return found
 
 
@@ -522,14 +569,36 @@ def _proc_cmdline(pid):
     return " ".join(part for part in raw.split("\0") if part).strip()
 
 
-def collect_stuck_processes(spec):
-    """Processes wedged in uninterruptible sleep, sampled twice so a busy disk cannot lie.
+# The mount probe never returns on a dead mount, so it is left parked in D state and the
+# NEXT run finds it - and would count the script's own leavings as if the host had
+# degraded further on its own. stat's format string is part of its argv, so putting a mark
+# in it makes those processes identifiable in /proc with certainty, rather than by
+# guessing at what a bare `stat` in D state belongs to. Only stat's exit status is read,
+# so the mark changes nothing else.
+MOUNT_PROBE_MARK = "health-mount-probe"
 
-    D state is normal in passing - any read from a real disk is briefly D - so a single
-    sample would flag a healthy host under load. Two samples separated by
-    STUCK_RECHECK_DELAY, intersected on (pid, starttime), leave only what has not moved;
-    the starttime pins the identity, since a pid freed and reused between samples is a
-    different process. The age floor drops anything too young to be worth reporting.
+
+def collect_stuck_processes(spec):
+    """Processes wedged in uninterruptible sleep, watched long enough to tell them apart
+    from processes doing work.
+
+    D state is where a process waits on storage, so a healthy host is full of it in
+    passing: every disk read, every coalesce, every backup is in D for some of its life.
+    Two facts separate a wedge from work and BOTH are required.
+
+    Persistence: the same process must be in D at every sample across the window.
+
+    Progress: it must have got nowhere in that time - not one tick of CPU, not one byte
+    through /proc/PID/io. That is a fact rather than a heuristic, and it is the one that
+    matters: a process parked in D executes no instructions and completes no I/O, while
+    anything making progress is being woken constantly to hand off the next buffer. Read
+    live as a false positive (issue #70) before this existed: a vhd-util coalesce one
+    minute into its run, in D at both samples, reported as stuck.
+
+    The age floor is a noise filter and nothing more - a process's age is how long it has
+    existed, an upper bound on how long it has been stuck. It is applied here, before the
+    first wait, rather than at the end: whatever is in D on the usual host is a disk read
+    a second old, and dropping it up front means that host pays no wall clock at all.
 
     Kernel threads are counted separately rather than dropped: some sit in D quite
     normally, but a kworker stuck in a filesystem's work queue is exactly the corroboration
@@ -537,42 +606,49 @@ def collect_stuck_processes(spec):
     """
     settings = spec or {}
     delay = settings.get("recheck_delay") or 0
+    rounds = max(1, (settings.get("samples") or 2) - 1)
     min_age = settings.get("min_age") or 0
     cap = settings.get("max_lines") or 0
 
-    first = _d_state_pids()
-    if first is None:
-        return err("could not read /proc")
-    if first and delay:
-        # nothing to wait for when the first sample is already clean, which is the
-        # overwhelmingly common case and keeps a healthy host at no cost at all
-        time.sleep(min(delay, max(1, budget_left() or delay)))
-    second = _d_state_pids() if first else {}
-    if second is None:
+    ticks = _clock_ticks()
+    started = _uptime()
+    if started is None:
+        return err("could not read /proc/uptime")
+    procs = _d_state_procs()
+    if procs is None:
         return err("could not read /proc")
 
-    ticks = 100.0
-    try:
-        ticks = float(os.sysconf("SC_CLK_TCK")) or 100.0
-    except (ValueError, OSError, AttributeError):
-        pass
-    uptime = read_file("/proc/uptime") or ""
-    try:
-        now = float(uptime.split()[0])
-    except (IndexError, ValueError):
+    # "old enough by the END of the window", so the floor is applied exactly once and a
+    # process on the boundary is not dropped for being seen a few seconds too early
+    floor = min_age - (delay * rounds)
+    watching = dict((pid, seen) for pid, seen in procs.items()
+                    if started - (seen[0] / ticks) >= floor)
+
+    watched = 0.0
+    for _ in range(rounds):
+        if not watching:
+            break                         # nothing left to watch: stop paying for looks
+        pause = min(delay, max(1, budget_left() or delay))
+        time.sleep(pause)
+        watched += pause
+        again = _d_state_procs(sorted(watching))
+        if again is None:
+            return err("could not read /proc")
+        # one == over the whole tuple: still in D, still the same process, and not a tick
+        # of CPU or a byte of I/O since the last sample
+        watching = dict((pid, seen) for pid, seen in watching.items()
+                        if again.get(pid) == seen)
+
+    now = _uptime()
+    if now is None:
         return err("could not read /proc/uptime")
 
     rows = []
-    for pid, starttime in second.items():
-        if first.get(pid) != starttime:
-            continue                      # moved on, or a reused pid: not the same wait
-        age = now - (starttime / ticks)
-        if age < min_age:
-            continue
+    for pid, seen in watching.items():
         stack = read_file("/proc/%d/stack" % pid) or ""
         rows.append({
             "pid": pid,
-            "age": int(age),
+            "age": int(now - (seen[0] / ticks)),
             "cmd": _proc_cmdline(pid)[:120],
             "module": fs_module_of(stack),
             "frame": (stack.splitlines() or [""])[0].strip()[:120],
@@ -583,20 +659,39 @@ def collect_stuck_processes(spec):
     # the host this was built for that is 24 of 25 shown being reported as 24 of 589
     return fact({"total": len(rows),
                  "userspace": len([row for row in rows if row["cmd"]]),
+                 # the script's own probes from earlier runs, counted rather than hidden:
+                 # they really are stuck, and they really were left by this tool
+                 "own_probes": len([row for row in rows
+                                    if MOUNT_PROBE_MARK in (row["cmd"] or "")]),
+                 "watched": int(watched),
                  "rows": rows[:cap] if cap else rows})
 
 
-def collect_network_mounts(spec, skip_reason):
-    """Whether each network mount still answers a stat(), or "" for why it was not asked.
+def collect_network_mounts(spec):
+    """Whether each network mount still answers a stat().
 
     The probe is a separate short-lived process precisely because it may never return: a
     mount whose server has gone parks it in D state for good, and run() abandons it rather
-    than waiting. That does leave one unkillable process behind per dead mount, which is
-    the script adding to the mess it is reporting - so it is not done at all on a host that
-    already HAS stuck processes. There, the answer is already known and costs nothing, and
-    the mounts are listed unprobed instead.
+    than waiting. That leaves one unkillable process behind per dead mount, and it is done
+    knowingly. Until v3.12 it was skipped entirely on a host that already had stuck
+    processes, so as not to add to the mess being reported - but by then the mess is made,
+    one more parked stat changes nothing about a host in that state, and this is the only
+    check that can say WHICH mount is the one to go and fix. That is worth a process.
+    The probes mark themselves, so a later run reports them as what they are.
+
+    The one question still not asked is the one there is no time left to answer. run()
+    clamps a command's timeout to what remains of the whole-run budget, so a probe started
+    with a second left would report a mount that was merely slow as one that never
+    answered. That is a claim, and the mount is listed unprobed instead.
+
+    The reserve is the other half of that: each dead mount costs a full probe_timeout, so
+    a host with several of them could spend the entire run parked here and leave yum and
+    the pool questions to time out behind it. Probing stops with the reserve intact and
+    the rest of the mounts say they were not asked.
     """
     settings = spec or {}
+    timeout = settings.get("probe_timeout") or 10
+    reserve = settings.get("probe_reserve") or 0
     text = read_file("/proc/mounts")
     if text is None:
         return err("could not read /proc/mounts")
@@ -605,13 +700,15 @@ def collect_network_mounts(spec, skip_reason):
     rows = []
     for source, target, fstype in mounts:
         row = {"source": source, "target": target, "type": fstype}
-        if skip_reason:
+        left = budget_left()
+        if left is not None and left < timeout + reserve:
             row["state"] = "not probed"
-            row["why"] = skip_reason
+            row["why"] = ("not enough of the run budget left to wait %ds for an answer"
+                          % timeout)
         else:
             started = time.time()
-            r = run(["stat", "-c", "%i", "--", target],
-                    timeout=settings.get("probe_timeout") or 10)
+            r = run(["stat", "-c", MOUNT_PROBE_MARK + " %i", "--", target],
+                    timeout=timeout)
             row["seconds"] = round(time.time() - started, 2)
             if r.ok:
                 row["state"] = "ok"
@@ -1561,21 +1658,12 @@ def collect(spec):
                                                    mstall.get("phrases") or [],
                                                    mstall.get("context") or 3)
 
+        # The order matters and is the only thing left of the old gate: the process scan
+        # runs FIRST, so a probe this run parks on a dead mount is not then reported by
+        # this same run as a process that was already stuck. It shows up on the next run,
+        # marked, and counted as what it is.
         out["stuck_procs"] = collect_stuck_processes(spec.get("stuck"))
-        # The gate, and the order it depends on: a host that already has processes wedged
-        # in D state is not probed, because a probe of a dead mount becomes one more of
-        # them. Its mounts are listed unprobed instead, which is honest and free. A host
-        # with nothing stuck is safe to probe - if a probe does hang, it has just found a
-        # mount that was about to do this to something else anyway.
-        stuck = out["stuck_procs"]
-        if not stuck["ok"]:
-            skip = "could not tell whether this host already has stuck processes"
-        elif stuck["value"]["total"]:
-            skip = ("this host already has %d stuck process(es), and probing a dead mount "
-                    "leaves another one" % stuck["value"]["total"])
-        else:
-            skip = ""
-        out["network_mounts"] = collect_network_mounts(spec.get("mount_probe"), skip)
+        out["network_mounts"] = collect_network_mounts(spec.get("mount_probe"))
         if spec.get("smapi"):
             out["smapi"] = collect_smapi_hidden_leaves()
 

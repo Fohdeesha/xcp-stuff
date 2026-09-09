@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Every threshold, list and toggle, in one place. Same names and values as health.sh."""
 
-SCRIPT_VERSION = "3.11"
+SCRIPT_VERSION = "3.12"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
@@ -110,10 +110,37 @@ NETWORK_FS_TYPES = [             # the ones that can hang forever waiting on a s
     "nfs", "nfs4", "cifs", "smb3", "smbfs", "ceph", "glusterfs", "fuse.glusterfs",
     "afs", "9p", "ncpfs", "lustre", "beegfs",
 ]
-STUCK_RECHECK_DELAY = 5          # seconds between the two D-state samples
+# D state on its own is NOT a fault, and reading it as one was a false positive in the
+# field (issue #70, v3.11): a `vhd-util coalesce` a minute into its run was reported as
+# stuck, because it was in D at two samples 5s apart - which is exactly what a process
+# copying data between VHDs looks like. Every disk read is in D for some of its life.
+#
+# So a finding needs a second, positive fact: that the process got NOWHERE while it was
+# watched. Its CPU ticks and its I/O counters must not move at all across the whole
+# window - a process parked in D executes no instructions and completes no I/O, while
+# anything doing real work is being woken constantly to hand off the next buffer.
+#
+# Age is not that fact and never was. It is how long the process has EXISTED, an upper
+# bound on how long it has been wedged, so raising the floor would only have moved the
+# same false positive to longer-running commands - and a backup can coalesce for an hour.
+# The floor stays where it is, as a noise filter, and the report says what age means.
+#
+# Excluding vhd-util (or tapdisk, or dd) by name was considered and declined: a coalesce
+# wedged on a dead SR is precisely the thing worth reporting, and a name list would hide
+# it. The progress test keeps that case - a wedged coalesce burns no CPU.
+STUCK_RECHECK_DELAY = 5          # seconds between D-state samples
+STUCK_SAMPLES = 3                # samples that must ALL show it wedged, so a 10s window.
+                                 # Only the first wait is paid by a host that is merely
+                                 # busy: one look at its CPU counter drops it
 STUCK_MIN_AGE = 60               # a process must also have existed this long to count
 STUCK_MAX_LINES = 25             # stuck processes listed in the detail block, oldest first
 MOUNT_PROBE_TIMEOUT = 10         # seconds a stat() of one mount point may take
+MOUNT_PROBE_RESERVE = 60         # run-budget seconds kept back for everything that comes
+                                 # after the probes. Every mount is probed now, dead ones
+                                 # included, and each dead one costs the full timeout
+                                 # above - so a host with several would leave yum and the
+                                 # pool questions to time out behind it. Past this line
+                                 # the rest read "not probed", which claims nothing
 
 # Both halves of the same event, from the two sources that keep it - see the multipath
 # event phrases above for why neither contains the other.
