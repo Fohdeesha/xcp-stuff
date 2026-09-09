@@ -29,7 +29,8 @@ def build(rep):
     rep.begin_section("pool")
     rep.add(result.info("Pool Master", "alpha (10.0.0.1)"))
     rep.add(result.flag("Unreachable Hosts", "10.0.0.2"))
-    rep.add(result.info("XOSTOR In Use", "Yes"))       # yellow, but NOT a finding
+    rep.add(result.info("XOSTOR In Use", "Yes"))       # a fact, NOT a finding
+    rep.add(result.info("Root Password", "Contains Backslash", "yellow"))  # a warning
     rep.end_section()
 
     rep.begin_section("host", host_a)
@@ -95,9 +96,13 @@ def test_f_narrows_both_the_same_way():
     # passing lines are gone from both
     assert "Dom0 Disk Usage" not in keys and "Dom0 Disk Usage" not in text
     assert "Registration" not in keys and "Registration" not in text
-    # findings, unknowns and info lines survive in both
-    for key in ("XOA Status", "Unreachable Hosts", "XOSTOR In Use", "Log Errors",
-                "Dmesg Content", "Pool Master"):
+    # and so are the informational ones, in both: -f is asked for when only the findings
+    # are wanted, and a reading is not a finding in either mode
+    for key in ("Pool Master", "XOSTOR In Use"):
+        assert key not in keys and key not in text, key
+    # findings, unknowns and yellow warnings survive in both
+    for key in ("XOA Status", "Unreachable Hosts", "Root Password", "Log Errors",
+                "Dmesg Content"):
         assert key in keys and key in text, key
 
 

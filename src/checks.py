@@ -11,7 +11,7 @@ import config
 import parsers
 import result
 from parsers import round_1dp
-from result import flag, info, ok, raw, unknown
+from result import flag, info, ok, pinned, raw, unknown
 
 
 # --------------------------------------------------------------------------------------
@@ -35,12 +35,12 @@ def hypervisor_version(host):
     if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
         major, minor = int(parts[0]), int(parts[1])
         if major > 8 or (major == 8 and minor >= 3):
-            # deliberately always printed, -f included, even though this line CAN flag:
-            # under -f it is the identity anchor for the host block, and every other
-            # always-printed line there (Last Booted, Multipathing, NTP) is info-only.
-            # Suppressing it would leave a findings-only report that does not say which
-            # version produced them.
-            return info("Hypervisor Version", "%s %s" % (name, version))
+            # pinned, so -f prints it even though this branch cannot flag: it is the
+            # identity anchor for the host block, and under -f every other line in that
+            # block is a finding. Without it a findings-only report would not say which
+            # version produced them - and now that -f hides informational lines
+            # (Last Booted, Multipathing, NTP), it is the ONLY line that would.
+            return pinned(info("Hypervisor Version", "%s %s" % (name, version)))
     # 8.2 reached end of life on 2025-09-16 and receives no security updates at all
     return flag("Hypervisor Version", "%s %s" % (name, version))
 
@@ -91,7 +91,10 @@ def ntp(host):
     if enabled == "no" or synced == "no":
         line.status = result.FLAG
     elif enabled != "yes" or synced != "yes":
+        # neither half was established, which -f must not hide: the yellow in the text is
+        # the same warning info(..., "yellow") carries, so it keeps its line the same way
         line.status = result.INFO
+        line.keep = True
     return line
 
 

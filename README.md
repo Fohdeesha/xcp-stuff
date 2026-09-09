@@ -27,6 +27,7 @@ Run health.py on an XOA appliance with no arguments, it will pull pool/host info
 - Providing the password is not necessary, it will be pulled from XOA
 - If the host/pool is not in XOA, you can manually specify the pool master IP and password
 - If the host it's checking is part of a pool, it will health check every pool member, unless you provide "-s" for single host check only
+- "-f" cuts the report down to the findings: passing checks, informational readings and any section left with nothing in it are all dropped, so a clean pool prints almost nothing
 ```
 [03:34 14] xoa:~$ ./health.py --help
 Usage:
@@ -144,9 +145,10 @@ Worth knowing:
 - **The three host counts are all reported** because they routinely differ: how many
   members the pool has, how many this run put in scope (`-s`, a solo host run), and how
   many actually answered.
-- **`-f` narrows the document exactly as it narrows the report** - so it still contains the
-  always-printed informational lines. For findings only, filter on `flags`, which is
-  cheaper and does not depend on how the run was invoked.
+- **`-f` narrows the document exactly as it narrows the report**, and since v3.13 that
+  means findings only: passing lines and informational readings are gone from both. The
+  one exception is `Hypervisor Version`, which stays as the host block's identity anchor.
+  `flags` is still the cheaper filter, and does not depend on how the run was invoked.
 - **There is no timestamp in the document**, deliberately: two runs of an unchanged pool
   produce identical output, so diffing one against the last one says something.
 - On a usage error nothing is written to stdout at all, so stdout is always either a whole

@@ -213,7 +213,8 @@ def lines():
         avail_gb = avail_mb / 1024.0
         used_gb = total_gb - avail_gb
         pct = (used_gb / total_gb) * 100 if total_gb > 0 else 0.0
-        # an info line with no threshold behind it, so it prints under -f like uptime does
+        # a reading with no threshold behind it, so it can never flag - and -f hides it,
+        # the same as every other reading. The heap cap below is the line with a rule
         out.append(Line("Memory Usage",
                         "%s GB used of %s GB (%s%%)" % (colors.green("%.1f" % used_gb),
                                                         colors.green("%.1f" % total_gb),

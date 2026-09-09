@@ -43,7 +43,7 @@ import unicodedata
 # ======================================================================================
 # --- config ----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "3.12"
+SCRIPT_VERSION = "3.13"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
@@ -325,7 +325,7 @@ INFO = "info"
 class Line(object):
     """One 'Key: value' line of the report, plus any detail blob it wants printed."""
 
-    __slots__ = ("key", "text", "status", "detail_title", "detail_text", "label")
+    __slots__ = ("key", "text", "status", "detail_title", "detail_text", "label", "keep")
 
     def __init__(self, key, text, status, detail_title=None, detail_text=None):
         self.key = key
@@ -334,6 +334,7 @@ class Line(object):
         self.detail_title = detail_title
         self.detail_text = detail_text
         self.label = key + ":"      # a couple of lines pad this for alignment
+        self.keep = False           # an INFO line that survives -f anyway; see pinned()
 
     @property
     def flags(self):
@@ -341,7 +342,8 @@ class Line(object):
 
     @property
     def always_print(self):
-        return self.status in (FLAG, UNKNOWN, INFO)
+        """Printed even under -f. A finding always is; an INFO line only if it says so."""
+        return self.flags or self.keep
 
     def render(self):
         return "%s %s" % (self.label, self.text)
@@ -367,15 +369,32 @@ def unknown(key, text):
 
 
 def info(key, text, color="green"):
-    """A fact with no threshold behind it, so it can never flag and always prints."""
+    """A fact with no threshold behind it, so it can never flag.
+
+    Yellow is the caller saying 'this one is worth a look' - a state that was not
+    established, or one that is unusual without being wrong. Those survive -f; the green
+    ones are just readings, and -f is not asking for readings.
+    """
     painted = colors.yellow(text) if color == "yellow" else (
         colors.green(text) if color == "green" else text)
-    return Line(key, painted, INFO)
+    line = Line(key, painted, INFO)
+    line.keep = (color == "yellow")
+    return line
 
 
 def raw(key, text):
-    """Uncoloured, exit-code neutral, always printed."""
+    """Uncoloured, exit-code neutral, hidden by -f."""
     return Line(key, text, INFO)
+
+
+def pinned(line):
+    """Print this line under -f even though it is not a finding.
+
+    Deliberately rare, and every use has to earn it: a line that survives -f while
+    claiming nothing is padding in a report someone asked to have narrowed.
+    """
+    line.keep = True
+    return line
 
 
 def guard(key, fn, *args, **kwargs):
@@ -4001,12 +4020,12 @@ def hypervisor_version(host):
     if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
         major, minor = int(parts[0]), int(parts[1])
         if major > 8 or (major == 8 and minor >= 3):
-            # deliberately always printed, -f included, even though this line CAN flag:
-            # under -f it is the identity anchor for the host block, and every other
-            # always-printed line there (Last Booted, Multipathing, NTP) is info-only.
-            # Suppressing it would leave a findings-only report that does not say which
-            # version produced them.
-            return info("Hypervisor Version", "%s %s" % (name, version))
+            # pinned, so -f prints it even though this branch cannot flag: it is the
+            # identity anchor for the host block, and under -f every other line in that
+            # block is a finding. Without it a findings-only report would not say which
+            # version produced them - and now that -f hides informational lines
+            # (Last Booted, Multipathing, NTP), it is the ONLY line that would.
+            return pinned(info("Hypervisor Version", "%s %s" % (name, version)))
     # 8.2 reached end of life on 2025-09-16 and receives no security updates at all
     return flag("Hypervisor Version", "%s %s" % (name, version))
 
@@ -4057,7 +4076,10 @@ def ntp(host):
     if enabled == "no" or synced == "no":
         line.status = result.FLAG
     elif enabled != "yes" or synced != "yes":
+        # neither half was established, which -f must not hide: the yellow in the text is
+        # the same warning info(..., "yellow") carries, so it keeps its line the same way
         line.status = result.INFO
+        line.keep = True
     return line
 
 
@@ -5316,7 +5338,8 @@ def lines():
         avail_gb = avail_mb / 1024.0
         used_gb = total_gb - avail_gb
         pct = (used_gb / total_gb) * 100 if total_gb > 0 else 0.0
-        # an info line with no threshold behind it, so it prints under -f like uptime does
+        # a reading with no threshold behind it, so it can never flag - and -f hides it,
+        # the same as every other reading. The heap cap below is the line with a rule
         out.append(Line("Memory Usage",
                         "%s GB used of %s GB (%s%%)" % (colors.green("%.1f" % used_gb),
                                                         colors.green("%.1f" % total_gb),
@@ -5422,13 +5445,21 @@ class Report(object):
         self.host_label = None   # which detail bucket the current section writes into
         self._sections = []      # json only: the buckets, in the order the report makes them
         self._section = None
+        self._pending = []       # headings and blanks no line has earned yet
+        self._written = 0        # body lines out so far, so a section can tell if it said anything
+        self._section_mark = 0
 
     # -- raw output ---------------------------------------------------------------
     def write(self, text=""):
-        """--json puts the document on stdout and nothing else, so the rendered report is
-        suppressed at the single point that produces it rather than at every caller."""
+        """One piece of report BODY. Anything held waiting for it goes out first.
+
+        --json puts the document on stdout and nothing else, so the rendered report is
+        suppressed at the single point that produces it rather than at every caller.
+        """
         if self.json_mode:
             return
+        self._flush_pending()
+        self._written += 1
         self.stream.write(text + "\n")
 
     def write_raw(self, text):
@@ -5436,7 +5467,29 @@ class Report(object):
         spacing, and putting it through write() would silently reshape the report."""
         if self.json_mode:
             return
+        self._flush_pending()
+        self._written += 1
         self.stream.write(text)
+
+    def _structural(self, text):
+        """A heading or a separator: it describes body rather than being body.
+
+        Printed straight out in a full report, held back under -f until a line justifies
+        it. See the module docstring for why an empty section may not keep its heading.
+        """
+        if self.json_mode:
+            return
+        if self.filter_output:
+            self._pending.append(text)
+        else:
+            self.stream.write(text + "\n")
+
+    def _flush_pending(self):
+        if not self._pending:
+            return
+        held, self._pending = self._pending, []
+        for text in held:
+            self.stream.write(text + "\n")
 
     # -- sections -----------------------------------------------------------------
     def begin_section(self, kind, host=None):
@@ -5447,6 +5500,10 @@ class Report(object):
         disagree.
         """
         self.host_label = "XOA" if kind == "xoa" else (host.label if host is not None else None)
+        # where this section starts, so end_section can tell whether it printed anything.
+        # The heading is already pending by now - it is written before the section opens -
+        # which is exactly what makes it droppable along with the rest.
+        self._section_mark = self._written
         if not self.json_mode:
             return
         section = {"kind": kind}
@@ -5460,6 +5517,10 @@ class Report(object):
         self._section = section
 
     def end_section(self):
+        if self.filter_output and self._written == self._section_mark:
+            # nothing in it printed, so its heading and its separator go with it rather
+            # than being flushed by whatever section prints next
+            self._pending = []
         self.host_label = None
         self._section = None
 
@@ -5478,11 +5539,11 @@ class Report(object):
                                "error": host.error or "not collected"})
 
     def heading(self, text):
-        """Section headings always print: -f hides passing results, not structure."""
-        self.write(colors.cyan(text))
+        """A heading prints when the section under it has something to say."""
+        self._structural(colors.cyan(text))
 
     def blank(self):
-        self.write("")
+        self._structural("")
 
     # -- lines --------------------------------------------------------------------
     def add(self, line, host_label=None):
@@ -5533,6 +5594,10 @@ class Report(object):
 
     # -- tail ---------------------------------------------------------------------
     def print_poolconf_section(self):
+        """Every host's role, verbatim. -f drops the block whole: it is a reading of every
+        host in the pool and there is no state of it that is a finding."""
+        if self.filter_output:
+            return
         self.blank()
         self.heading("---pool.conf contents---")
         self.write_raw("".join(self._poolconf))
@@ -5584,6 +5649,9 @@ class Report(object):
             self.stream.write(
                 json.dumps(self.document(), indent=2, ensure_ascii=True) + "\n")
             return 1 if self.flagged else 0
+        # the last section may have printed nothing and left its heading held; the version
+        # line is not what earns it, so drop it before anything below flushes
+        self._pending = []
         for blob in (self._pool_details, self._host_details):
             text = "".join(blob)
             if text.strip():
@@ -5609,6 +5677,10 @@ class Report(object):
 # ======================================================================================
 # --- main ------------------------------------------------------------------------------
 
+# Laid out the way every other command-line tool on these boxes lays it out: the flag
+# first and the sentence after it, so the switches can be read down the left edge in one
+# glance. The prose that used to carry them ('Use -f to ...') read as a paragraph and had
+# to be searched.
 USAGE_XOA = """Usage:
   %(prog)s [-f] [-s] [-n name] [pool_master_or_host[:ssh_port] [root_password]]
 
@@ -5862,7 +5934,10 @@ def print_banner(run, host, name):
         notice(run, "Checking pool: %s\n" % colors.green("%s (%s)" % (name, host)))
     else:
         notice(run, "Checking host: %s\n" % colors.green(host))
-    notice(run, "\n")
+    # -f is asked for when the answer is wanted in as few lines as possible, and the very
+    # next thing it prints is a heading; a full report keeps the separator
+    if not run.filter_output:
+        notice(run, "\n")
 
 
 def require_root(run_env):
@@ -6322,8 +6397,10 @@ def pool_status_section(run, rep):
     rep.check("Migration Network", checks.migration_network, run.pool)
     rep.check("Backup Network", checks.backup_network, run.pool, run.run_env,
               xoa.ping_silent)
-    rep.end_section()
+    # inside the section, so that under -f a pool with nothing to report takes its own
+    # separator with it instead of leaving a blank line where the section was
     rep.blank()
+    rep.end_section()
 
 
 def run_meta(run):
@@ -6601,9 +6678,9 @@ def main(argv=None):
     # that was asked about, so it has no business standing in front of the host results -
     # and by here it has almost always finished on its thread, making it free.
     if xoa_worker is not None:
-        if not run.pool_mode:
+        if not run.pool_mode or run.filter_output:
             # every section is preceded by exactly one blank line; in pool mode the
-            # pool.conf block already ends in one
+            # pool.conf block already ends in one - except under -f, which drops it
             rep.blank()
         rep.begin_section("xoa")
         rep.heading("== XOA Status ==")
@@ -6662,7 +6739,7 @@ def _module(name, exported):
 
 config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DMESG_MAX_LINES', 'DMESG_ROLLUP_MIN', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MOUNT_PROBE_RESERVE', 'MOUNT_PROBE_TIMEOUT', 'MOUNT_STALL_FILES', 'MOUNT_STALL_PHRASES', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'NETWORK_FS_TYPES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'PROGRESS_INTERVAL', 'REMOTE_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'STUCK_MAX_LINES', 'STUCK_MIN_AGE', 'STUCK_RECHECK_DELAY', 'STUCK_SAMPLES', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_QCOW2_MAX_LINES', 'XO_REDIS_TIMEOUT'])
 colors = _module('colors', ['CYAN', 'GREEN', 'RESET', 'YELLOW', 'cyan', 'green', 'init', 'strip_ansi', 'yellow'])
-result = _module('result', ['FLAG', 'Fact', 'INFO', 'Line', 'MISSING', 'OK', 'UNKNOWN', 'flag', 'guard', 'info', 'ok', 'raw', 'unknown', 'wrap'])
+result = _module('result', ['FLAG', 'Fact', 'INFO', 'Line', 'MISSING', 'OK', 'UNKNOWN', 'flag', 'guard', 'info', 'ok', 'pinned', 'raw', 'unknown', 'wrap'])
 parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', '_LINK_RE', '_MTU_RE', '_PARAM_RE', '_TS_RE', '_cidr_range', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'cap_lines', 'classify_multipath_path', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'format_age', 'has_overlapping_subnets', 'manifest_diff', 'manifest_versions', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pool_conf', 'parse_timedatectl', 'parse_xe_records', 'rollup_repeats', 'round_1dp', 'split_host_port', 'split_timestamp', 'truncate_block'])
 model = _module('model', ['Host', 'Pool', 'ntp_match', 'ram_match'])
 collectorsrc = _module('collectorsrc', ['EMBEDDED', 'collector_source'])

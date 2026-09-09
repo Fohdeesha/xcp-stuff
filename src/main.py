@@ -35,6 +35,10 @@ import transport
 import xoa
 import xodb
 
+# Laid out the way every other command-line tool on these boxes lays it out: the flag
+# first and the sentence after it, so the switches can be read down the left edge in one
+# glance. The prose that used to carry them ('Use -f to ...') read as a paragraph and had
+# to be searched.
 USAGE_XOA = """Usage:
   %(prog)s [-f] [-s] [-n name] [pool_master_or_host[:ssh_port] [root_password]]
 
@@ -288,7 +292,10 @@ def print_banner(run, host, name):
         notice(run, "Checking pool: %s\n" % colors.green("%s (%s)" % (name, host)))
     else:
         notice(run, "Checking host: %s\n" % colors.green(host))
-    notice(run, "\n")
+    # -f is asked for when the answer is wanted in as few lines as possible, and the very
+    # next thing it prints is a heading; a full report keeps the separator
+    if not run.filter_output:
+        notice(run, "\n")
 
 
 def require_root(run_env):
@@ -748,8 +755,10 @@ def pool_status_section(run, rep):
     rep.check("Migration Network", checks.migration_network, run.pool)
     rep.check("Backup Network", checks.backup_network, run.pool, run.run_env,
               xoa.ping_silent)
-    rep.end_section()
+    # inside the section, so that under -f a pool with nothing to report takes its own
+    # separator with it instead of leaving a blank line where the section was
     rep.blank()
+    rep.end_section()
 
 
 def run_meta(run):
@@ -1027,9 +1036,9 @@ def main(argv=None):
     # that was asked about, so it has no business standing in front of the host results -
     # and by here it has almost always finished on its thread, making it free.
     if xoa_worker is not None:
-        if not run.pool_mode:
+        if not run.pool_mode or run.filter_output:
             # every section is preceded by exactly one blank line; in pool mode the
-            # pool.conf block already ends in one
+            # pool.conf block already ends in one - except under -f, which drops it
             rep.blank()
         rep.begin_section("xoa")
         rep.heading("== XOA Status ==")

@@ -8,10 +8,17 @@ no constructor that produces a green line without a value behind it, and a check
 raises is turned into a yellow Unknown by the runner rather than being skipped.
 
   OK       green, suppressed by -f, exit-code neutral
-  FLAG     yellow, always printed, flags the exit code
-  UNKNOWN  yellow, always printed, flags the exit code  (we could not look)
-  INFO     always printed, exit-code neutral, colour chosen by the caller
+  FLAG     yellow, survives -f, flags the exit code
+  UNKNOWN  yellow, survives -f, flags the exit code  (we could not look)
+  INFO     exit-code neutral, colour chosen by the caller
            - for lines with no threshold behind them: Last Booted, Multipathing, ...
+
+-f is "show me what is wrong", so it hides every INFO line the same way it hides a green
+one: a report of findings should be findings. The exceptions are marked, not guessed at.
+A yellow INFO is a warning - 'Multipathing: Unknown' is a fact this run failed to
+establish, and hiding it under -f would be the silent green this whole module exists to
+prevent - so info(..., "yellow") keeps its line. pinned() is the one other way in, and
+one line uses it: Hypervisor Version, which is the identity anchor of a host block.
 """
 
 import traceback
@@ -27,7 +34,7 @@ INFO = "info"
 class Line(object):
     """One 'Key: value' line of the report, plus any detail blob it wants printed."""
 
-    __slots__ = ("key", "text", "status", "detail_title", "detail_text", "label")
+    __slots__ = ("key", "text", "status", "detail_title", "detail_text", "label", "keep")
 
     def __init__(self, key, text, status, detail_title=None, detail_text=None):
         self.key = key
@@ -36,6 +43,7 @@ class Line(object):
         self.detail_title = detail_title
         self.detail_text = detail_text
         self.label = key + ":"      # a couple of lines pad this for alignment
+        self.keep = False           # an INFO line that survives -f anyway; see pinned()
 
     @property
     def flags(self):
@@ -43,7 +51,8 @@ class Line(object):
 
     @property
     def always_print(self):
-        return self.status in (FLAG, UNKNOWN, INFO)
+        """Printed even under -f. A finding always is; an INFO line only if it says so."""
+        return self.flags or self.keep
 
     def render(self):
         return "%s %s" % (self.label, self.text)
@@ -69,15 +78,32 @@ def unknown(key, text):
 
 
 def info(key, text, color="green"):
-    """A fact with no threshold behind it, so it can never flag and always prints."""
+    """A fact with no threshold behind it, so it can never flag.
+
+    Yellow is the caller saying 'this one is worth a look' - a state that was not
+    established, or one that is unusual without being wrong. Those survive -f; the green
+    ones are just readings, and -f is not asking for readings.
+    """
     painted = colors.yellow(text) if color == "yellow" else (
         colors.green(text) if color == "green" else text)
-    return Line(key, painted, INFO)
+    line = Line(key, painted, INFO)
+    line.keep = (color == "yellow")
+    return line
 
 
 def raw(key, text):
-    """Uncoloured, exit-code neutral, always printed."""
+    """Uncoloured, exit-code neutral, hidden by -f."""
     return Line(key, text, INFO)
+
+
+def pinned(line):
+    """Print this line under -f even though it is not a finding.
+
+    Deliberately rare, and every use has to earn it: a line that survives -f while
+    claiming nothing is padding in a report someone asked to have narrowed.
+    """
+    line.keep = True
+    return line
 
 
 def guard(key, fn, *args, **kwargs):
