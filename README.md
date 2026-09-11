@@ -197,6 +197,7 @@ only `python` (2.7.5), 8.3 has both, and that is what keeps 8.2.1 pools checkabl
 | `src/` | the sources it is built from, one module per concern |
 | `build/stitch.py` | builds `health.py` from `src/`; fails the build on a name collision or a collector that does not round-trip |
 | `tests/` | pytest, no network or hosts needed |
+| `xo-config-recover.py` | exports XO's configuration when xo-server is dead - see [below](#xo-config-recover) |
 | `health.sh` | the previous bash implementation, **retired**. Prints a pointer to health.py and exits 1; the implementation itself is in the git history |
 
 ```
@@ -208,6 +209,44 @@ You don't have to remember that first line. Push a change to `src/` and GitHub r
 `health.py` and commits it back to the branch - merging a PR does it too. So `git pull`
 after a push that touched `src/`.
 
-  ## Example Output
+## Example Output
 
 ![Alt text](example-output.png)
+
+---
+
+# xo-config-recover
+
+Exports Xen Orchestra's configuration from the command line - the same file as
+*Settings → Config → Export* in the web UI - without needing xo-server. For when an update
+has broken XOA and the UI you would normally export from is dead.
+
+```
+# on the XOA, as root
+python3 <(curl -fsSL https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/xo-config-recover.py)
+```
+
+That writes `XO-config_<UTC>.json.gz` in the current directory. Restore it later with
+*Settings → Config → Import*, exactly like a web UI export.
+
+It reads the two places xo-server keeps its config, redis and a small leveldb, straight
+from the stores. Nothing has to be running except redis, and if redis is down too it reads
+the last saved `dump.rdb` and tells you how old that is. One file, Python 3 standard
+library only, read-only: the only thing it writes is the output.
+
+| | |
+|---|---|
+| `--check` | show what would be exported and from where, write nothing |
+| `--bundle` | also write a `.tar.gz` with a fresh redis dump, a copy of the leveldb and the config files - everything a rebuild might want |
+| `--passphrase-file FILE` | encrypt the export like the web UI's passphrase option (imports the same way) |
+| `--entries a,b` | only some sections, dependencies added like the API does |
+| `-o FILE` / `-o -` | name the file, or stream it to stdout |
+
+Exit code is **0** when the file was written, **1** with `--partial` when a section had to
+be left out, **2** when nothing could be written. The export contains every pool's root
+password, the same as the web UI's does - treat the file accordingly.
+
+Verified against a real web UI export with xo-server running, with xo-server and
+xoa-updater stopped, and with redis stopped: same records in every section. If XO's
+credential database is encrypted (`redis.encryptCredentialDatabase`) the tool stops and
+says so; decrypting it is not implemented yet.
