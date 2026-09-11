@@ -106,6 +106,10 @@ def test_prepare_host_sweep_never_reads_the_db(monkeypatch, tripwires):
     to reach for a lookup that only exists on an appliance.
     """
     monkeypatch.setattr(transport, "ensure_sshpass", lambda run_env: True)
+    # the askpass helper runs one local command of its own - proving itself before it is
+    # trusted - and the tripwire above cannot tell that from a db lookup, so it is stood
+    # in for here. Establishing a way to authenticate is exactly what this step is for.
+    monkeypatch.setattr(transport, "write_askpass", lambda work_dir: "/tmp/askpass")
     for pool_size, password in ((1, ""), (1, "pw"), (3, ""), (3, "pw")):
         run = main.Run()
         run.run_env = "host"
