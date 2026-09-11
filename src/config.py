@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Every threshold, list and toggle, in one place. Same names and values as health.sh."""
 
-SCRIPT_VERSION = "3.13"
+SCRIPT_VERSION = "3.14"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
@@ -169,6 +169,59 @@ LUN_CHANGE_PHRASES = [
 ]
 LUN_CHANGE_FILES = [
     "/var/log/kern.log",
+]
+
+# --- "XOA Plugins" check ---------------------------------------------------------------
+# Where xo-server looks for plugins, and what it accepts as one. Mirrors
+# packages/xo-server/config.toml's `plugins.lookupPaths` and registerPlugins() in
+# index.mjs: for every lookup path it takes each entry of `<path>/@xen-orchestra` starting
+# `server-` and each entry of `<path>` starting `xo-server-`, and the remainder of the
+# entry name IS the plugin's name. First path that has a name wins.
+#
+# Two of the three shipped lookup paths are relative to the process' cwd, which for a
+# systemd unit with no WorkingDirectory - and xo-server.service sets none - is "/". Hence
+# /node_modules and / here: neither holds a plugin on a stock appliance, and both are a
+# place somebody could put one. Listing "/" is one readdir.
+XO_PLUGIN_LOOKUP_PATHS = ["/usr/local/lib/node_modules", "/node_modules", "/"]
+XO_PLUGIN_PREFIX = "xo-server-"
+XO_PLUGIN_SCOPE_DIR = "@xen-orchestra"
+XO_PLUGIN_SCOPE_PREFIX = "server-"
+
+# The plugin names Vates ships, as a FALLBACK and not as the answer. A run reads
+# xoa-updater's own `getLocalManifest` first and unions those names in, so a plugin Vates
+# adds after this list was written is not reported as somebody else's; this list is what
+# is left when the updater is down, unregistered or timing out.
+#
+# Read off a stock appliance (XOA 6.7.1, xo-server 5.207.2, 2026-09-11) and cross-checked
+# against packages/xo-server-* in vatesfr/xen-orchestra. `cloud` is a retired Vates plugin
+# that is no longer installed but still leaves an `xo:plugin-metadata:cloud` record
+# behind. `test-plugin` is deliberately absent: it is a development fixture in Vates' repo
+# that XOA does not ship, so an appliance carrying it has had something done to it.
+XOA_STOCK_PLUGINS = [
+    "audit",
+    "auth-github",
+    "auth-google",
+    "auth-ldap",
+    "auth-oidc",
+    "auth-saml",
+    "backup-reports",
+    "cloud",
+    "ipmi-sensors",
+    "load-balancer",
+    "netbox",
+    "netdata",
+    "openmetrics",
+    "perf-alert",
+    "sdn-controller",
+    "telemetry",
+    "transport-email",
+    "transport-icinga2",
+    "transport-nagios",
+    "transport-slack",
+    "transport-xmpp",
+    "usage-report",
+    "web-hooks",
+    "xoa",
 ]
 
 CRASH_IGNORE_FILE = ".sacrificial-space-for-logs"   # file in /var/crash that is not a crash

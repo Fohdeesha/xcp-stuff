@@ -39,6 +39,8 @@ DEFAULT_ADDR = ("127.0.0.1", 6379)   # node-redis' default, used when [redis] is
 ENCRYPTION_PREFIX = "enc:"           # xo-server/src/xo-mixins/crypto-credentials.mjs
 IDS_KEY = "xo:server_ids"
 RECORD_PREFIX = "xo:server:"
+PLUGIN_IDS_KEY = "xo:plugin-metadata_ids"
+PLUGIN_RECORD_PREFIX = "xo:plugin-metadata:"
 
 
 class RedisError(Exception):
@@ -254,3 +256,75 @@ def read_server_records(cli_path, addr=DEFAULT_ADDR, timeout=None):
     except ValueError as exc:
         # json.loads on a record, or int() on a malformed RESP length prefix
         raise RedisError("unreadable answer from redis: %s" % exc)
+
+
+# --------------------------------------------------------------------------------------
+# plugin metadata - an annotation, never a finding
+# --------------------------------------------------------------------------------------
+
+def read_plugin_autoload(cli_path, addr=DEFAULT_ADDR, timeout=None):
+    """{plugin name: autoload bool} from xo's own `plugin-metadata` records.
+
+    This is the only place XO records whether a plugin is switched on, and it is a
+    RECORD OF WHAT XO HAS SEEN, not of what is installed: a plugin that was loaded once
+    and then removed keeps its record (the appliance still carries `cloud`, retired
+    years ago), and a plugin installed but never loaded has none. So it can annotate the
+    `XOA Plugins` finding and it must never be the thing that produces one - the
+    directory scan is what establishes installation.
+
+    Raises RedisError on anything doubtful, exactly like read_server_records, and the
+    caller degrades to saying autoload is unknown. There is deliberately no fallback to
+    `xo-server-db` here: 3.3s of node for an annotation is not a trade worth making.
+    """
+    if timeout is None:
+        timeout = config.XO_REDIS_TIMEOUT
+    if _mentions_redis(cli_path):
+        raise RedisError("xo-server config mentions redis; not assuming %s:%d" % DEFAULT_ADDR)
+    try:
+        return _fetch_autoload(addr, timeout)
+    except OSError as exc:
+        raise RedisError("%s:%d: %s" % (addr[0], addr[1], exc))
+    except UnicodeDecodeError as exc:
+        raise RedisError("undecodable answer from redis: %s" % exc)
+    except ValueError as exc:
+        raise RedisError("unreadable answer from redis: %s" % exc)
+
+
+def _fetch_autoload(addr, timeout):
+    sock = socket.create_connection(addr, timeout=timeout)
+    try:
+        handle = sock.makefile("rb")
+        try:
+            sock.sendall(_encode(["SMEMBERS", PLUGIN_IDS_KEY]))
+            ids = _read_reply(handle)
+            if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+                raise RedisError("%s is not a set of ids" % PLUGIN_IDS_KEY)
+            if not ids:
+                # unlike the server ids, empty is a real and harmless answer here: an
+                # appliance xo-server has never started on has no metadata yet
+                return {}
+            sock.sendall(_encode(["MGET"] + [PLUGIN_RECORD_PREFIX + i for i in ids]))
+            blobs = _read_reply(handle)
+            if not isinstance(blobs, list) or len(blobs) != len(ids):
+                got = len(blobs) if isinstance(blobs, list) else "a non-list of"
+                raise RedisError("MGET answered %s value(s) for %d id(s)" % (got, len(ids)))
+        finally:
+            handle.close()
+    finally:
+        sock.close()
+
+    out = {}
+    for ident, blob in zip(ids, blobs):
+        if blob is None:
+            continue                      # deleted between the two calls; not our record
+        if blob.startswith(ENCRYPTION_PREFIX):
+            raise RedisError("plugin metadata is encrypted (%s%s)"
+                             % (PLUGIN_RECORD_PREFIX, ident))
+        record = json.loads(blob)
+        if not isinstance(record, dict):
+            raise RedisError("%s%s is not an object" % (PLUGIN_RECORD_PREFIX, ident))
+        # XO stores every field as a JSON string, so autoload is 'true'/'false' and not a
+        # boolean; both spellings are accepted so this keeps working if that changes
+        value = record.get("autoload")
+        out[ident] = (value is True) or (value == "true")
+    return out

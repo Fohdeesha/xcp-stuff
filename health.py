@@ -43,7 +43,7 @@ import unicodedata
 # ======================================================================================
 # --- config ----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "3.13"
+SCRIPT_VERSION = "3.14"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
@@ -211,6 +211,59 @@ LUN_CHANGE_PHRASES = [
 ]
 LUN_CHANGE_FILES = [
     "/var/log/kern.log",
+]
+
+# --- "XOA Plugins" check ---------------------------------------------------------------
+# Where xo-server looks for plugins, and what it accepts as one. Mirrors
+# packages/xo-server/config.toml's `plugins.lookupPaths` and registerPlugins() in
+# index.mjs: for every lookup path it takes each entry of `<path>/@xen-orchestra` starting
+# `server-` and each entry of `<path>` starting `xo-server-`, and the remainder of the
+# entry name IS the plugin's name. First path that has a name wins.
+#
+# Two of the three shipped lookup paths are relative to the process' cwd, which for a
+# systemd unit with no WorkingDirectory - and xo-server.service sets none - is "/". Hence
+# /node_modules and / here: neither holds a plugin on a stock appliance, and both are a
+# place somebody could put one. Listing "/" is one readdir.
+XO_PLUGIN_LOOKUP_PATHS = ["/usr/local/lib/node_modules", "/node_modules", "/"]
+XO_PLUGIN_PREFIX = "xo-server-"
+XO_PLUGIN_SCOPE_DIR = "@xen-orchestra"
+XO_PLUGIN_SCOPE_PREFIX = "server-"
+
+# The plugin names Vates ships, as a FALLBACK and not as the answer. A run reads
+# xoa-updater's own `getLocalManifest` first and unions those names in, so a plugin Vates
+# adds after this list was written is not reported as somebody else's; this list is what
+# is left when the updater is down, unregistered or timing out.
+#
+# Read off a stock appliance (XOA 6.7.1, xo-server 5.207.2, 2026-09-11) and cross-checked
+# against packages/xo-server-* in vatesfr/xen-orchestra. `cloud` is a retired Vates plugin
+# that is no longer installed but still leaves an `xo:plugin-metadata:cloud` record
+# behind. `test-plugin` is deliberately absent: it is a development fixture in Vates' repo
+# that XOA does not ship, so an appliance carrying it has had something done to it.
+XOA_STOCK_PLUGINS = [
+    "audit",
+    "auth-github",
+    "auth-google",
+    "auth-ldap",
+    "auth-oidc",
+    "auth-saml",
+    "backup-reports",
+    "cloud",
+    "ipmi-sensors",
+    "load-balancer",
+    "netbox",
+    "netdata",
+    "openmetrics",
+    "perf-alert",
+    "sdn-controller",
+    "telemetry",
+    "transport-email",
+    "transport-icinga2",
+    "transport-nagios",
+    "transport-slack",
+    "transport-xmpp",
+    "usage-report",
+    "web-hooks",
+    "xoa",
 ]
 
 CRASH_IGNORE_FILE = ".sacrificial-space-for-logs"   # file in /var/crash that is not a crash
@@ -1187,6 +1240,85 @@ def format_age(seconds):
     if seconds >= 60:
         return "%dm" % (seconds // 60)
     return "%ds" % seconds
+
+
+# --------------------------------------------------------------------------------------
+# XOA plugins
+# --------------------------------------------------------------------------------------
+
+# The manifest is node's util.inspect, so its npm map reads
+#     'xo-server-audit-premium': '0.15.1',
+# The prefix is spelled out here rather than built from config.XO_PLUGIN_PREFIX because a
+# module body in the stitched health.py runs before the sibling aliases exist.
+_MANIFEST_PKG_RE = re.compile(r"'(xo-server-[A-Za-z0-9._-]+)'\s*:")
+_PREMIUM_SUFFIX = "-premium"
+
+
+def manifest_plugin_names(text):
+    """Plugin names out of `xoa-updater raw-api-call getLocalManifest`.
+
+    This is what makes the check self-updating: the manifest is the appliance's own record
+    of what Vates offers it on its channel and plan, so a plugin added to XOA after this
+    script was written is recognised as Vates' without a code change.
+
+    The registry package name is not the installed directory name - most carry a
+    `-premium` suffix that `npm install -g` strips off (`xo-server-audit-premium` lands in
+    `/usr/local/lib/node_modules/xo-server-audit`), so the suffix is stripped here and the
+    two sides are compared by the plugin name xo-server itself uses.
+
+    A set, possibly empty: the updater being down is not an error here, it just means the
+    built-in list is all there is.
+    """
+    names = set()
+    for package in _MANIFEST_PKG_RE.findall(text or ""):
+        name = package[len("xo-server-"):]
+        if name.endswith(_PREMIUM_SUFFIX):
+            name = name[:-len(_PREMIUM_SUFFIX)]
+        if name:
+            names.add(name)
+    return names
+
+
+def classify_xo_plugins(found, vates_names):
+    """Split the plugins found on disk into (vates, third_party), order preserved.
+
+    `found` is scan_plugins()' list of dicts; `vates_names` the union of the manifest and
+    the built-in list. Deliberately a whitelist and not a blacklist: an unrecognised name
+    is reported, so the failure mode of a stale list is a plugin named for review rather
+    than a plugin waved through.
+    """
+    vates, third_party = [], []
+    for plugin in found:
+        (vates if plugin["name"] in vates_names else third_party).append(plugin)
+    return vates, third_party
+
+
+def plugin_block(third_party, autoload, autoload_known):
+    """The detail block under a `XOA Plugins` finding.
+
+    `autoload` maps plugin name -> bool from xo's own metadata records. It is an
+    annotation and nothing more: when it could not be read every plugin says `unknown`
+    rather than the block quietly implying they are all inert.
+    """
+    out = []
+    for plugin in third_party:
+        version = plugin["version"] or "version unknown"
+        if not autoload_known:
+            state = "autoload unknown"
+        elif plugin["name"] in autoload:
+            state = "autoload on" if autoload[plugin["name"]] else "autoload off"
+        else:
+            state = "never loaded by XO"
+        out.append("%s  (%s, %s)" % (plugin["name"], version, state))
+        out.append("    %s" % plugin["path"])
+        if plugin["link"]:
+            out.append("    -> %s" % plugin["link"])
+    out.append("")
+    out.append("xo-server registers any directory named xo-server-* under its plugin lookup")
+    out.append("paths, so one of these can be installed, loaded and running without ever")
+    out.append("appearing in an XOA upgrade. Checked against this appliance's own")
+    out.append("xoa-updater manifest as well as the list built into this script.")
+    return "\n".join(out)
 
 
 # ======================================================================================
@@ -3429,6 +3561,8 @@ DEFAULT_ADDR = ("127.0.0.1", 6379)   # node-redis' default, used when [redis] is
 ENCRYPTION_PREFIX = "enc:"           # xo-server/src/xo-mixins/crypto-credentials.mjs
 IDS_KEY = "xo:server_ids"
 RECORD_PREFIX = "xo:server:"
+PLUGIN_IDS_KEY = "xo:plugin-metadata_ids"
+PLUGIN_RECORD_PREFIX = "xo:plugin-metadata:"
 
 
 class RedisError(Exception):
@@ -3644,6 +3778,78 @@ def read_server_records(cli_path, addr=DEFAULT_ADDR, timeout=None):
     except ValueError as exc:
         # json.loads on a record, or int() on a malformed RESP length prefix
         raise RedisError("unreadable answer from redis: %s" % exc)
+
+
+# --------------------------------------------------------------------------------------
+# plugin metadata - an annotation, never a finding
+# --------------------------------------------------------------------------------------
+
+def read_plugin_autoload(cli_path, addr=DEFAULT_ADDR, timeout=None):
+    """{plugin name: autoload bool} from xo's own `plugin-metadata` records.
+
+    This is the only place XO records whether a plugin is switched on, and it is a
+    RECORD OF WHAT XO HAS SEEN, not of what is installed: a plugin that was loaded once
+    and then removed keeps its record (the appliance still carries `cloud`, retired
+    years ago), and a plugin installed but never loaded has none. So it can annotate the
+    `XOA Plugins` finding and it must never be the thing that produces one - the
+    directory scan is what establishes installation.
+
+    Raises RedisError on anything doubtful, exactly like read_server_records, and the
+    caller degrades to saying autoload is unknown. There is deliberately no fallback to
+    `xo-server-db` here: 3.3s of node for an annotation is not a trade worth making.
+    """
+    if timeout is None:
+        timeout = config.XO_REDIS_TIMEOUT
+    if _mentions_redis(cli_path):
+        raise RedisError("xo-server config mentions redis; not assuming %s:%d" % DEFAULT_ADDR)
+    try:
+        return _fetch_autoload(addr, timeout)
+    except OSError as exc:
+        raise RedisError("%s:%d: %s" % (addr[0], addr[1], exc))
+    except UnicodeDecodeError as exc:
+        raise RedisError("undecodable answer from redis: %s" % exc)
+    except ValueError as exc:
+        raise RedisError("unreadable answer from redis: %s" % exc)
+
+
+def _fetch_autoload(addr, timeout):
+    sock = socket.create_connection(addr, timeout=timeout)
+    try:
+        handle = sock.makefile("rb")
+        try:
+            sock.sendall(_encode(["SMEMBERS", PLUGIN_IDS_KEY]))
+            ids = _read_reply(handle)
+            if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+                raise RedisError("%s is not a set of ids" % PLUGIN_IDS_KEY)
+            if not ids:
+                # unlike the server ids, empty is a real and harmless answer here: an
+                # appliance xo-server has never started on has no metadata yet
+                return {}
+            sock.sendall(_encode(["MGET"] + [PLUGIN_RECORD_PREFIX + i for i in ids]))
+            blobs = _read_reply(handle)
+            if not isinstance(blobs, list) or len(blobs) != len(ids):
+                got = len(blobs) if isinstance(blobs, list) else "a non-list of"
+                raise RedisError("MGET answered %s value(s) for %d id(s)" % (got, len(ids)))
+        finally:
+            handle.close()
+    finally:
+        sock.close()
+
+    out = {}
+    for ident, blob in zip(ids, blobs):
+        if blob is None:
+            continue                      # deleted between the two calls; not our record
+        if blob.startswith(ENCRYPTION_PREFIX):
+            raise RedisError("plugin metadata is encrypted (%s%s)"
+                             % (PLUGIN_RECORD_PREFIX, ident))
+        record = json.loads(blob)
+        if not isinstance(record, dict):
+            raise RedisError("%s%s is not an object" % (PLUGIN_RECORD_PREFIX, ident))
+        # XO stores every field as a JSON string, so autoload is 'true'/'false' and not a
+        # boolean; both spellings are accepted so this keeps working if that changes
+        value = record.get("autoload")
+        out[ident] = (value is True) or (value == "true")
+    return out
 
 
 # ======================================================================================
@@ -5186,9 +5392,95 @@ def _service_state(name):
     return state
 
 
+def _plugin_scan_targets():
+    """Every (directory, prefix) pair xo-server would look in, in its own order."""
+    pairs = []
+    for path in config.XO_PLUGIN_LOOKUP_PATHS:
+        pairs.append((os.path.join(path, config.XO_PLUGIN_SCOPE_DIR),
+                      config.XO_PLUGIN_SCOPE_PREFIX))
+        pairs.append((path, config.XO_PLUGIN_PREFIX))
+    return pairs
+
+
+def _plugin_version(directory):
+    """The version out of the package's own package.json, or "".
+
+    Best effort by design - a third-party plugin with no package.json, or a broken one, is
+    still a third-party plugin, and the finding must not depend on it parsing.
+    """
+    try:
+        with open(os.path.join(directory, "package.json"), "r") as handle:
+            data = json.load(handle)
+    except (IOError, OSError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    version = data.get("version")
+    return version if isinstance(version, str) else ""
+
+
+def scan_plugins():
+    """Every plugin installed on this appliance, whether or not XO ever loaded it.
+
+    Returns (plugins, errors). The filesystem is the source of truth here and redis is
+    not, because the question is "what is installed", and a plugin that is installed,
+    present and switched off in the UI is exactly the case this check exists for. XO's
+    own metadata records answer a different question - what it has loaded at some point -
+    and they go stale in both directions.
+
+    A directory it could not list goes in `errors` and turns the line Unknown. A
+    directory that is not there is an answer, not an error: two of the three lookup paths
+    do not exist on a stock appliance.
+    """
+    plugins, errors, seen = [], [], set()
+    for directory, prefix in _plugin_scan_targets():
+        try:
+            entries = sorted(os.listdir(directory))
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            errors.append("%s: %s" % (directory, exc))
+            continue
+        for entry in entries:
+            if not entry.startswith(prefix) or entry == prefix:
+                continue
+            name = entry[len(prefix):]
+            if name in seen:
+                continue          # xo-server keeps the first path that has the name
+            seen.add(name)
+            full = os.path.join(directory, entry)
+            plugins.append({
+                "name": name,
+                "package": entry,
+                "path": full,
+                "version": _plugin_version(full),
+                # an npm-linked or hand-symlinked plugin is worth naming outright: the
+                # directory says nothing about where its code actually came from
+                "link": os.path.realpath(full) if os.path.islink(full) else "",
+            })
+    return plugins, errors
+
+
+def _plugin_autoload():
+    """(autoload map, was it established). Annotation only - never a finding of its own."""
+    cli_path = transport.which("xo-server-db")
+    if not cli_path:
+        return {}, False
+    try:
+        return xoredis.read_plugin_autoload(cli_path), True
+    except xoredis.RedisError:
+        return {}, False
+
+
 def collect_xoa():
     """Everything the section needs, gathered before anything is printed."""
     data = {}
+    # Local reads, so they happen whatever state the updater is in - the plugin scan has
+    # to survive an appliance whose updater is down, which is one of the states somebody
+    # investigating odd behaviour is most likely to be in
+    data["plugins"], data["plugin_errors"] = scan_plugins()
+    data["plugin_autoload"], data["plugin_autoload_known"] = _plugin_autoload()
+
     # Asked before the updater is, because every xoa-updater call below talks to this
     # daemon: with it down they fail, and a failed call used to read as 'Unregistered' and
     # 'Updates available' - findings invented by the tool rather than found by it.
@@ -5221,6 +5513,9 @@ def collect_xoa():
             version = parts[3]
             break
     data["version"] = version
+    # the same call already paid for, read twice: it also lists every npm package Vates
+    # offers this appliance, which is the golden list the plugin scan is judged against
+    data["manifest_plugins"] = parsers.manifest_plugin_names(manifest)
 
     _, plan = _updater("raw-api-call", "getXoaPlan")
     data["plan"] = _first_token(plan)
@@ -5266,6 +5561,37 @@ def _max_old_space():
 def _dmesg():
     rc, out, _err = transport.run_local_cmd(["dmesg", "-T"], timeout=60)
     return out if rc == 0 else None
+
+
+def _plugins_line(data):
+    """Is anything installed here that Vates did not ship?
+
+    A plugin runs inside xo-server with xo-server's access to the pool, and nothing in
+    XOA's own tooling ever mentions one it did not install - so an appliance behaving
+    oddly can be carrying one with no sign of it anywhere else. That is the whole reason
+    for the line, and it is why an unrecognised name is reported rather than assumed
+    benign: the list is a whitelist, so a stale list names a plugin for a human to look at
+    instead of waving one through.
+
+    Vates' set is the union of two sources. This appliance's own xoa-updater manifest is
+    the live one and covers whatever Vates ships next; config.XOA_STOCK_PLUGINS is what is
+    left when the updater is down, unregistered or timing out - which are states this
+    check has to keep working in.
+    """
+    if data.get("plugin_errors"):
+        return unknown("XOA Plugins",
+                       "Unknown (could not read %s)" % "; ".join(data["plugin_errors"]))
+    found = data.get("plugins") or []
+    vates_names = set(config.XOA_STOCK_PLUGINS) | set(data.get("manifest_plugins") or ())
+    _stock, third_party = parsers.classify_xo_plugins(found, vates_names)
+    if not third_party:
+        return ok("XOA Plugins", "%d installed, all shipped with XOA" % len(found))
+    return flag("XOA Plugins",
+                "%d of %d Not Shipped With XOA, See Below"
+                % (len(third_party), len(found))).with_detail(
+        "Plugins Not Shipped With XOA",
+        parsers.plugin_block(third_party, data.get("plugin_autoload") or {},
+                             bool(data.get("plugin_autoload_known"))))
 
 
 def lines():
@@ -5323,6 +5649,8 @@ def lines():
         else:
             out.append(flag("XOA Check", "Issues Found, See Output Below").with_detail(
                 "XOA Check Issues", data["check_output"]))
+
+    out.append(_plugins_line(data))
 
     osv = _os_version()
     out.append(ok("OS Version", osv) if osv else unknown("OS Version", "Unknown"))
@@ -6748,17 +7076,17 @@ def _module(name, exported):
     return module
 
 
-config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DMESG_MAX_LINES', 'DMESG_ROLLUP_MIN', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MOUNT_PROBE_RESERVE', 'MOUNT_PROBE_TIMEOUT', 'MOUNT_STALL_FILES', 'MOUNT_STALL_PHRASES', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'NETWORK_FS_TYPES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'PROGRESS_INTERVAL', 'REMOTE_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'STUCK_MAX_LINES', 'STUCK_MIN_AGE', 'STUCK_RECHECK_DELAY', 'STUCK_SAMPLES', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_QCOW2_MAX_LINES', 'XO_REDIS_TIMEOUT'])
+config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DMESG_MAX_LINES', 'DMESG_ROLLUP_MIN', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MOUNT_PROBE_RESERVE', 'MOUNT_PROBE_TIMEOUT', 'MOUNT_STALL_FILES', 'MOUNT_STALL_PHRASES', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'NETWORK_FS_TYPES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'PROGRESS_INTERVAL', 'REMOTE_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'STUCK_MAX_LINES', 'STUCK_MIN_AGE', 'STUCK_RECHECK_DELAY', 'STUCK_SAMPLES', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOA_STOCK_PLUGINS', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_QCOW2_MAX_LINES', 'XO_PLUGIN_LOOKUP_PATHS', 'XO_PLUGIN_PREFIX', 'XO_PLUGIN_SCOPE_DIR', 'XO_PLUGIN_SCOPE_PREFIX', 'XO_REDIS_TIMEOUT'])
 colors = _module('colors', ['CYAN', 'GREEN', 'RESET', 'YELLOW', 'cyan', 'green', 'init', 'strip_ansi', 'yellow'])
 result = _module('result', ['FLAG', 'Fact', 'INFO', 'Line', 'MISSING', 'OK', 'UNKNOWN', 'flag', 'guard', 'info', 'ok', 'pinned', 'raw', 'unknown', 'wrap'])
-parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', '_LINK_RE', '_MTU_RE', '_PARAM_RE', '_TS_RE', '_cidr_range', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'cap_lines', 'classify_multipath_path', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'format_age', 'has_overlapping_subnets', 'manifest_diff', 'manifest_versions', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pool_conf', 'parse_timedatectl', 'parse_xe_records', 'rollup_repeats', 'round_1dp', 'split_host_port', 'split_timestamp', 'truncate_block'])
+parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', '_LINK_RE', '_MANIFEST_PKG_RE', '_MTU_RE', '_PARAM_RE', '_PREMIUM_SUFFIX', '_TS_RE', '_cidr_range', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'cap_lines', 'classify_multipath_path', 'classify_xo_plugins', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'format_age', 'has_overlapping_subnets', 'manifest_diff', 'manifest_plugin_names', 'manifest_versions', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pool_conf', 'parse_timedatectl', 'parse_xe_records', 'plugin_block', 'rollup_repeats', 'round_1dp', 'split_host_port', 'split_timestamp', 'truncate_block'])
 model = _module('model', ['Host', 'Pool', 'ntp_match', 'ram_match'])
 collectorsrc = _module('collectorsrc', ['EMBEDDED', 'collector_source'])
 transport = _module('transport', ['BEGIN_MARKER', 'CollectError', 'END_MARKER', 'Transport', '_DEBUG_LOCK', '_LIVE', '_LIVE_LOCK', '_REMOTE_LAUNCH', '_REMOTE_LAUNCH_PINNED', '_kill_tree', '_remote_launch', 'cleanup_work_dir', 'debug', 'ensure_sshpass', 'have', 'kill_all_children', 'make_work_dir', 'run_local_cmd', 'which'])
-xoredis = _module('xoredis', ['DEFAULT_ADDR', 'ENCRYPTION_PREFIX', 'IDS_KEY', 'RECORD_PREFIX', 'RedisError', '_config_dirs', '_config_files', '_encode', '_fetch', '_flatten', '_mentions_redis', '_read_reply', 'read_server_records'])
+xoredis = _module('xoredis', ['DEFAULT_ADDR', 'ENCRYPTION_PREFIX', 'IDS_KEY', 'PLUGIN_IDS_KEY', 'PLUGIN_RECORD_PREFIX', 'RECORD_PREFIX', 'RedisError', '_config_dirs', '_config_files', '_encode', '_fetch', '_fetch_autoload', '_flatten', '_mentions_redis', '_read_reply', 'read_plugin_autoload', 'read_server_records'])
 xodb = _module('xodb', ['QUOTES', 'SELECT_NONE', 'SELECT_NO_MATCH', 'SELECT_OK', 'SELECT_QUIT', 'SELECT_UNREADABLE', 'Server', '_ALL_SERVERS', '_ESCAPE_RE', '_KEY_RE', '_READ_ERROR', '_SIMPLE_ESCAPES', '_describe_failure', '_ls', '_read_servers', '_sort_key', 'all_servers', 'clean', 'enabled_servers', 'have_xo_server_db', 'password_for', 'pool_name_for_host', 'read_error', 'reset_cache', 'scan_records', 'select_pool', 'unescape'])
 checks = _module('checks', ['_dmesg_phrase_blocks', '_linstor_column', '_linstor_has_rows', '_linstor_line', '_linstor_node_addresses', '_linstor_node_offline', '_linstor_table', '_linstor_unknown', '_maps', '_mount_detail', '_multipath_detail', '_multipath_read', '_network_line', '_render_scan_blocks', '_stuck_detail', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_block', 'dmesg_content', 'dmesg_content_of', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mount_stalls', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'network_mounts', 'ntp', 'oom_events', 'overlapping_subnets', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'stuck_processes', 'tap_status', 'task_timeout_override', 'vlan0', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_nodes', 'xostor_pref_nic', 'xostor_qcow2', 'xostor_ram', 'yum_patch_level'])
-xoa = _module('xoa', ['_dmesg', '_first_token', '_max_old_space', '_meminfo', '_os_version', '_service_state', '_updater', 'collect_xoa', 'debian_version_ok', 'lines', 'ping_silent', 'running_as_root'])
+xoa = _module('xoa', ['_dmesg', '_first_token', '_max_old_space', '_meminfo', '_os_version', '_plugin_autoload', '_plugin_scan_targets', '_plugin_version', '_plugins_line', '_service_state', '_updater', 'collect_xoa', 'debian_version_ok', 'lines', 'ping_silent', 'running_as_root', 'scan_plugins'])
 report = _module('report', ['Report', '_as_entry'])
 
 

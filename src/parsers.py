@@ -755,3 +755,82 @@ def format_age(seconds):
     if seconds >= 60:
         return "%dm" % (seconds // 60)
     return "%ds" % seconds
+
+
+# --------------------------------------------------------------------------------------
+# XOA plugins
+# --------------------------------------------------------------------------------------
+
+# The manifest is node's util.inspect, so its npm map reads
+#     'xo-server-audit-premium': '0.15.1',
+# The prefix is spelled out here rather than built from config.XO_PLUGIN_PREFIX because a
+# module body in the stitched health.py runs before the sibling aliases exist.
+_MANIFEST_PKG_RE = re.compile(r"'(xo-server-[A-Za-z0-9._-]+)'\s*:")
+_PREMIUM_SUFFIX = "-premium"
+
+
+def manifest_plugin_names(text):
+    """Plugin names out of `xoa-updater raw-api-call getLocalManifest`.
+
+    This is what makes the check self-updating: the manifest is the appliance's own record
+    of what Vates offers it on its channel and plan, so a plugin added to XOA after this
+    script was written is recognised as Vates' without a code change.
+
+    The registry package name is not the installed directory name - most carry a
+    `-premium` suffix that `npm install -g` strips off (`xo-server-audit-premium` lands in
+    `/usr/local/lib/node_modules/xo-server-audit`), so the suffix is stripped here and the
+    two sides are compared by the plugin name xo-server itself uses.
+
+    A set, possibly empty: the updater being down is not an error here, it just means the
+    built-in list is all there is.
+    """
+    names = set()
+    for package in _MANIFEST_PKG_RE.findall(text or ""):
+        name = package[len("xo-server-"):]
+        if name.endswith(_PREMIUM_SUFFIX):
+            name = name[:-len(_PREMIUM_SUFFIX)]
+        if name:
+            names.add(name)
+    return names
+
+
+def classify_xo_plugins(found, vates_names):
+    """Split the plugins found on disk into (vates, third_party), order preserved.
+
+    `found` is scan_plugins()' list of dicts; `vates_names` the union of the manifest and
+    the built-in list. Deliberately a whitelist and not a blacklist: an unrecognised name
+    is reported, so the failure mode of a stale list is a plugin named for review rather
+    than a plugin waved through.
+    """
+    vates, third_party = [], []
+    for plugin in found:
+        (vates if plugin["name"] in vates_names else third_party).append(plugin)
+    return vates, third_party
+
+
+def plugin_block(third_party, autoload, autoload_known):
+    """The detail block under a `XOA Plugins` finding.
+
+    `autoload` maps plugin name -> bool from xo's own metadata records. It is an
+    annotation and nothing more: when it could not be read every plugin says `unknown`
+    rather than the block quietly implying they are all inert.
+    """
+    out = []
+    for plugin in third_party:
+        version = plugin["version"] or "version unknown"
+        if not autoload_known:
+            state = "autoload unknown"
+        elif plugin["name"] in autoload:
+            state = "autoload on" if autoload[plugin["name"]] else "autoload off"
+        else:
+            state = "never loaded by XO"
+        out.append("%s  (%s, %s)" % (plugin["name"], version, state))
+        out.append("    %s" % plugin["path"])
+        if plugin["link"]:
+            out.append("    -> %s" % plugin["link"])
+    out.append("")
+    out.append("xo-server registers any directory named xo-server-* under its plugin lookup")
+    out.append("paths, so one of these can be installed, loaded and running without ever")
+    out.append("appearing in an XOA upgrade. Checked against this appliance's own")
+    out.append("xoa-updater manifest as well as the list built into this script.")
+    return "\n".join(out)
