@@ -76,8 +76,8 @@ Health-check this XCP-ng host, and the rest of its pool given a root password.
 
 This host is always checked, using local commands - no ssh and no password
 needed. The other pool members are checked too if a root password is given:
-they are reached over ssh, and sshpass is installed from the stock 'extras'
-repo if it is missing. Pool members share the master's root password, so one
+they are reached over ssh, which needs nothing installed to be handed a
+password. Pool members share the master's root password, so one
 password covers the pool. With no password and a terminal you are asked for
 one; blank, or no terminal (cron, pipe), just checks this host and says so in
 the Pool Status section. Prefer the prompt over the argument - an argument is
@@ -351,7 +351,11 @@ def _xodb_unreadable(consequence):
 
 
 def resolve_target_xoa(run, args):
-    """Pick a pool / take the host argument, then find a password for it."""
+    """Pick a pool / take the host argument, then find a password for it.
+
+    False if there is no way to give ssh a password at all, which is not fatal: the
+    appliance's own section is still worth printing, and is still the truth.
+    """
     if run.name_filter and len(args) > 1:
         sys.stderr.write("ERROR: -n/--name looks the host up in xo-server-db, so it takes "
                          "at most a password after it.\n")
@@ -398,9 +402,11 @@ def resolve_target_xoa(run, args):
     run.pool_name = selected.name if selected else xodb.pool_name_for_host(host)
     print_banner(run, host, run.pool_name)
 
-    if not transport.ensure_sshpass(run.run_env):
-        sys.stderr.write("ERROR: sshpass is required to reach the pool over ssh.\n")
-        sys.exit(1)
+    if not run.transport.enable_password_auth(run.run_env):
+        # not an exit: the appliance's own section needs no pool access, and on the
+        # offline XOA this fires on it is the half of the report that can still be
+        # produced. main() takes it from here - see xoa_only_report().
+        return False
 
     if len(args) == 2:
         run.password = args[1]
@@ -422,6 +428,7 @@ def resolve_target_xoa(run, args):
             sys.exit(1)
         run.password = password
     run.transport.password = run.password
+    return True
 
 
 def resolve_target_host_mode(run, args):
@@ -471,7 +478,8 @@ def prepare_host_sweep(run, argument_password):
             sys.stderr.write("\n")
     if not password:
         return
-    if not transport.ensure_sshpass(run.run_env):
+    if not run.transport.enable_password_auth(run.run_env):
+        sys.stderr.write("ERROR: %s.\n" % run.transport.auth_error)
         sys.stderr.write("Continuing with this host only.\n")
         return
     run.password = password
@@ -772,6 +780,67 @@ def pool_status_section(run, rep):
     rep.end_section()
 
 
+_NO_POOL_ACCESS_HELP = """\
+%(reason)s.
+
+Every check except the XOA section logs into the pool hosts over ssh as root, and ssh
+takes a password only from a terminal or from a helper program - so this run could report
+on the appliance and on nothing else.
+
+The helper is written into the run's temporary directory, so the fix that needs nothing
+installed and no internet access is to point the run at one it may execute from:
+
+    TMPDIR=/root python3 health.py %(args)s
+
+Failing that, 'apt-get install sshpass' is used instead when it is there. An XCP-ng 8.3
+host can also be checked by running health.py on the host itself, which needs no
+credentials at all for the machine it is running on."""
+
+
+def _target_hint(run):
+    """How this run named its target, for the suggested command line.
+
+    Rebuilt rather than taken from sys.argv, because the argv of a run given its password
+    on the command line contains that password, and this text is printed.
+    """
+    if run.name_filter:
+        name = run.name_filter
+        return "-n %s" % (("'%s'" % name) if " " in name else name)
+    return run.seed or ""
+
+
+def xoa_only_report(run, rep_meta, xoa_worker):
+    """Everything still establishable when the pool cannot be logged into at all.
+
+    The appliance's own section shares nothing with the pool - version, updates, services,
+    disk, plugins, backup networks - so it is a whole answer to half the question, and
+    printing it beats the single line about sshpass that an appliance with no internet
+    access used to get in place of a report.
+
+    The pool is reported Unknown rather than left out: a run that could not look at the
+    pool it was asked about must not exit 0, and a section that is simply absent reads as
+    one that passed.
+    """
+    rep = report.Report(run.filter_output, json_mode=run.json_output, meta=rep_meta)
+    rep.heading("== Pool Status ==")
+    rep.begin_section("pool")
+    reason = run.transport.auth_error or "the pool could not be reached over ssh"
+    shown = run.pool_name or run.seed or "the pool"
+    rep.add(result.unknown("Pool Access", "Unknown - %s was not checked: %s"
+                           % (shown, reason))
+            .with_detail("Pool Access",
+                         _NO_POOL_ACCESS_HELP % {"reason": reason,
+                                                 "args": _target_hint(run)}))
+    rep.blank()
+    rep.end_section()
+
+    rep.begin_section("xoa")
+    rep.heading("== XOA Status ==")
+    rep.add_all(xoa_worker.result(), "XOA")
+    rep.end_section()
+    return rep.finish()
+
+
 def run_meta(run):
     """What the run itself was, for the head of a --json document.
 
@@ -958,10 +1027,11 @@ def main(argv=None):
         return 1
 
     argument_password = ""
+    pool_reachable = True
     if run.run_env == "host":
         argument_password = resolve_target_host_mode(run, args)
     else:
-        resolve_target_xoa(run, args)
+        pool_reachable = resolve_target_xoa(run, args)
 
     # The appliance's own section starts here and is not looked at again until the report
     # has nothing left to say about the pool. Here, and not at the top of main(), on
@@ -977,11 +1047,17 @@ def main(argv=None):
     # cores - whereas from here it runs against the host collection, which is waiting on
     # ssh and leaves the CPU idle. It also leaves every exit above untouched: a pool name
     # that matched nothing, an unreadable xo-db, the interactive picker, the sshpass
-    # install. Those cost the run nothing, exactly as before.
+    # fallback. Those cost the run nothing, exactly as before.
     #
     # The one case it loses is a single fast host, where there is under 2s of collection
     # to hide 2.9s of appliance behind. Do not move it back without re-measuring all five.
+    #
+    # It is also started BEFORE the no-password-mechanism exit below, which is the one
+    # case where this section is the entire report: there is nothing else left to overlap.
     xoa_worker = _Background(xoa.lines) if run.run_env != "host" else None
+
+    if not pool_reachable:
+        return xoa_only_report(run, rep_meta=run_meta(run), xoa_worker=xoa_worker)
 
     hosts = discover(run)
 

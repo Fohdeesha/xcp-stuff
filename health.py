@@ -43,7 +43,7 @@ import unicodedata
 # ======================================================================================
 # --- config ----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "3.14"
+SCRIPT_VERSION = "3.15"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
@@ -3257,6 +3257,24 @@ _REMOTE_LAUNCH_PINNED = 'exec %s - %%s'
 BEGIN_MARKER = "<<<HEALTHPY-JSON-BEGIN>>>"
 END_MARKER = "<<<HEALTHPY-JSON-END>>>"
 
+AUTH_ASKPASS = "askpass"
+AUTH_SSHPASS = "sshpass"
+
+# The variable the helper prints. Deliberately not SSHPASS: the two mechanisms are
+# mutually exclusive and reading one variable in a run that chose the other mechanism is
+# the kind of half-configured state that authenticates with an empty password.
+ASKPASS_ENV = "HEALTH_SSH_PASSWORD"
+
+# Four lines of sh, written into the run's own work dir (mode 700, deleted at exit). It
+# prints what is in the environment, so the password still never reaches a file or an
+# argv - the same guarantee sshpass -e gives.
+ASKPASS_SCRIPT = (
+    "#!/bin/sh\n"
+    "# health.py: hands ssh the root password it was already given, from the\n"
+    "# environment only. Written per run into a temporary directory and deleted with it.\n"
+    "printf '%s\\n' \"${" + ASKPASS_ENV + "}\"\n"
+)
+
 
 class CollectError(Exception):
     """Could not get a document out of a host. Never confused with 'the host is fine'."""
@@ -3360,6 +3378,9 @@ class Transport(object):
         self.password = ""
         self.ssh_port = 22
         self.source = collectorsrc.collector_source()
+        self.auth = ""            # AUTH_ASKPASS / AUTH_SSHPASS, once one is established
+        self.askpass = ""         # path to the helper, when that is the chosen one
+        self.auth_error = ""      # why there is no way to authenticate, for the report
 
     def is_local(self, host):
         """Host mode runs its own commands locally: nothing is gained by logging into
@@ -3442,15 +3463,15 @@ class Transport(object):
                              stdin_text=self.source)
 
     def _run_ssh_collector(self, host, blob):
-        env = dict(os.environ)
-        env["SSHPASS"] = self.password
-        argv = [
-            "sshpass", "-e", "ssh",
+        env, prefix = self._auth_env()
+        argv = prefix + [
+            "ssh",
             "-p", str(self.ssh_port),
             "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null",
             "-o", "LogLevel=ERROR",
             "-o", "ConnectTimeout=%d" % config.SSH_TIMEOUT,
+            "-o", "NumberOfPasswordPrompts=1",
             "-o", "ControlMaster=auto",
             "-o", "ControlPath=%s" % os.path.join(self.work_dir, "cm-%r@%h:%p"),
             "-o", "ControlPersist=60",
@@ -3460,6 +3481,76 @@ class Transport(object):
         ]
         return run_local_cmd(argv, timeout=config.REMOTE_CMD_TIMEOUT,
                              env=env, stdin_text=self.source)
+
+    def _auth_env(self):
+        """The environment and the argv prefix that hand ssh the password.
+
+        Two variables for the askpass helper, because two generations of OpenSSH decide
+        differently whether to use one. SSH_ASKPASS_REQUIRE is 8.4 and later (XOA's 9.2)
+        and settles it outright. 7.4 - which is what both dom0 releases ship, so it is the
+        host-mode sweep - consults the helper only when there is no controlling terminal
+        AND DISPLAY is set: the first is already true of every child here (they are all
+        started with start_new_session=True, so open("/dev/tty") fails in them), and the
+        second is why a DISPLAY nothing will ever connect to is set. An existing DISPLAY
+        is left alone; it is only ever read as a flag.
+        """
+        env = dict(os.environ)
+        if self.auth == AUTH_ASKPASS:
+            env[ASKPASS_ENV] = self.password
+            env["SSH_ASKPASS"] = self.askpass
+            env["SSH_ASKPASS_REQUIRE"] = "force"
+            if not env.get("DISPLAY"):
+                env["DISPLAY"] = ":0"
+            return env, []
+        env["SSHPASS"] = self.password
+        return env, ["sshpass", "-e"]
+
+    def enable_password_auth(self, run_env):
+        """Find a way to give ssh a password, or record why there is none. True if found.
+
+        The helper is tried FIRST because it needs nothing installed and nothing from the
+        network. That is not a corner: health.py is routinely pasted onto a customer's
+        appliance over ssh precisely because the appliance has no internet access, and
+        there 'apt-get install sshpass' cannot work - the run used to die on that before
+        printing a line, including the whole XOA section, which needs no pool access at
+        all. It also means the path that runs in the field is the path the lab runs on
+        every test, rather than a fallback nothing exercises until it matters.
+
+        sshpass remains the fallback for the one thing the helper depends on that can be
+        missing: a work dir it is allowed to execute from (a noexec /tmp).
+
+        HEALTH_SSH_AUTH=askpass|sshpass pins the choice, which is how each is regression
+        tested against the other on hosts that have both.
+        """
+        pinned = os.environ.get("HEALTH_SSH_AUTH", "")
+        if pinned not in ("", AUTH_ASKPASS, AUTH_SSHPASS):
+            sys.stderr.write("Warning: ignoring HEALTH_SSH_AUTH=%s (expected %s or %s).\n"
+                             % (pinned, AUTH_ASKPASS, AUTH_SSHPASS))
+            pinned = ""
+
+        tried = []
+        if pinned != AUTH_SSHPASS:
+            path = write_askpass(self.work_dir)
+            if path:
+                self.auth = AUTH_ASKPASS
+                self.askpass = path
+                debug("password auth: ssh askpass helper at %s" % path)
+                return True
+            tried.append("the askpass helper would not run from %s" % self.work_dir)
+            debug("askpass helper unusable")
+
+        if pinned != AUTH_ASKPASS:
+            if ensure_sshpass(run_env):
+                self.auth = AUTH_SSHPASS
+                debug("password auth: sshpass")
+                return True
+            tried.append("sshpass is not installed and could not be installed")
+
+        # named individually: 'no way to authenticate' with no reason is the kind of
+        # message that gets read as 'wrong password' and sends someone after the pool
+        self.auth_error = ("ssh needs a password and there is no way to hand it one (%s)"
+                           % " and ".join(tried))
+        return False
 
     @staticmethod
     def _extract(text):
@@ -3508,8 +3599,43 @@ def have(binary):
     return bool(which(binary))
 
 
+def write_askpass(work_dir):
+    """Write the askpass helper and PROVE it runs. Returns its path, or "" if it does not.
+
+    The proof is the point. Everything that can go wrong here - a noexec /tmp, a work dir
+    on a filesystem that drops the execute bit, no /bin/sh - fails silently at the far
+    end otherwise: ssh gets an empty password back and reports an authentication failure,
+    which reads as a wrong root password and sends someone off to check xo-server-db.
+    A probe value, never the real password, so the check costs nothing to be wrong about.
+    """
+    path = os.path.join(work_dir, "askpass")
+    try:
+        handle = open(path, "w")
+        try:
+            handle.write(ASKPASS_SCRIPT)
+        finally:
+            handle.close()
+        os.chmod(path, 0o700)
+    except (IOError, OSError) as exc:
+        debug("askpass helper could not be written to %s: %s" % (path, exc))
+        return ""
+    probe = "health-askpass-probe"
+    env = dict(os.environ)
+    env[ASKPASS_ENV] = probe
+    rc, out, err = run_local_cmd([path], timeout=config.LOCAL_CMD_TIMEOUT, env=env)
+    if rc != 0 or out.strip() != probe:
+        debug("askpass helper did not run (exit %d): %s"
+              % (rc, ((err or out).strip() or "no output")[:200]))
+        return ""
+    return path
+
+
 def ensure_sshpass(run_env):
     """Make sshpass available, or say why it is not.
+
+    The fallback since v3.15, reached only when the askpass helper could not be run - see
+    enable_password_auth(). A run that gets here is on a machine where the work dir cannot
+    be executed from, so the install is the one way left to reach another host.
 
     On a hypervisor it comes from 'extras', a stock XCP-ng repo that ships in
     CentOS-Base.repo pointing at Vates' own mirror and is merely disabled by default.
@@ -6046,8 +6172,8 @@ Health-check this XCP-ng host, and the rest of its pool given a root password.
 
 This host is always checked, using local commands - no ssh and no password
 needed. The other pool members are checked too if a root password is given:
-they are reached over ssh, and sshpass is installed from the stock 'extras'
-repo if it is missing. Pool members share the master's root password, so one
+they are reached over ssh, which needs nothing installed to be handed a
+password. Pool members share the master's root password, so one
 password covers the pool. With no password and a terminal you are asked for
 one; blank, or no terminal (cron, pipe), just checks this host and says so in
 the Pool Status section. Prefer the prompt over the argument - an argument is
@@ -6321,7 +6447,11 @@ def _xodb_unreadable(consequence):
 
 
 def resolve_target_xoa(run, args):
-    """Pick a pool / take the host argument, then find a password for it."""
+    """Pick a pool / take the host argument, then find a password for it.
+
+    False if there is no way to give ssh a password at all, which is not fatal: the
+    appliance's own section is still worth printing, and is still the truth.
+    """
     if run.name_filter and len(args) > 1:
         sys.stderr.write("ERROR: -n/--name looks the host up in xo-server-db, so it takes "
                          "at most a password after it.\n")
@@ -6368,9 +6498,11 @@ def resolve_target_xoa(run, args):
     run.pool_name = selected.name if selected else xodb.pool_name_for_host(host)
     print_banner(run, host, run.pool_name)
 
-    if not transport.ensure_sshpass(run.run_env):
-        sys.stderr.write("ERROR: sshpass is required to reach the pool over ssh.\n")
-        sys.exit(1)
+    if not run.transport.enable_password_auth(run.run_env):
+        # not an exit: the appliance's own section needs no pool access, and on the
+        # offline XOA this fires on it is the half of the report that can still be
+        # produced. main() takes it from here - see xoa_only_report().
+        return False
 
     if len(args) == 2:
         run.password = args[1]
@@ -6392,6 +6524,7 @@ def resolve_target_xoa(run, args):
             sys.exit(1)
         run.password = password
     run.transport.password = run.password
+    return True
 
 
 def resolve_target_host_mode(run, args):
@@ -6441,7 +6574,8 @@ def prepare_host_sweep(run, argument_password):
             sys.stderr.write("\n")
     if not password:
         return
-    if not transport.ensure_sshpass(run.run_env):
+    if not run.transport.enable_password_auth(run.run_env):
+        sys.stderr.write("ERROR: %s.\n" % run.transport.auth_error)
         sys.stderr.write("Continuing with this host only.\n")
         return
     run.password = password
@@ -6742,6 +6876,67 @@ def pool_status_section(run, rep):
     rep.end_section()
 
 
+_NO_POOL_ACCESS_HELP = """\
+%(reason)s.
+
+Every check except the XOA section logs into the pool hosts over ssh as root, and ssh
+takes a password only from a terminal or from a helper program - so this run could report
+on the appliance and on nothing else.
+
+The helper is written into the run's temporary directory, so the fix that needs nothing
+installed and no internet access is to point the run at one it may execute from:
+
+    TMPDIR=/root python3 health.py %(args)s
+
+Failing that, 'apt-get install sshpass' is used instead when it is there. An XCP-ng 8.3
+host can also be checked by running health.py on the host itself, which needs no
+credentials at all for the machine it is running on."""
+
+
+def _target_hint(run):
+    """How this run named its target, for the suggested command line.
+
+    Rebuilt rather than taken from sys.argv, because the argv of a run given its password
+    on the command line contains that password, and this text is printed.
+    """
+    if run.name_filter:
+        name = run.name_filter
+        return "-n %s" % (("'%s'" % name) if " " in name else name)
+    return run.seed or ""
+
+
+def xoa_only_report(run, rep_meta, xoa_worker):
+    """Everything still establishable when the pool cannot be logged into at all.
+
+    The appliance's own section shares nothing with the pool - version, updates, services,
+    disk, plugins, backup networks - so it is a whole answer to half the question, and
+    printing it beats the single line about sshpass that an appliance with no internet
+    access used to get in place of a report.
+
+    The pool is reported Unknown rather than left out: a run that could not look at the
+    pool it was asked about must not exit 0, and a section that is simply absent reads as
+    one that passed.
+    """
+    rep = report.Report(run.filter_output, json_mode=run.json_output, meta=rep_meta)
+    rep.heading("== Pool Status ==")
+    rep.begin_section("pool")
+    reason = run.transport.auth_error or "the pool could not be reached over ssh"
+    shown = run.pool_name or run.seed or "the pool"
+    rep.add(result.unknown("Pool Access", "Unknown - %s was not checked: %s"
+                           % (shown, reason))
+            .with_detail("Pool Access",
+                         _NO_POOL_ACCESS_HELP % {"reason": reason,
+                                                 "args": _target_hint(run)}))
+    rep.blank()
+    rep.end_section()
+
+    rep.begin_section("xoa")
+    rep.heading("== XOA Status ==")
+    rep.add_all(xoa_worker.result(), "XOA")
+    rep.end_section()
+    return rep.finish()
+
+
 def run_meta(run):
     """What the run itself was, for the head of a --json document.
 
@@ -6928,10 +7123,11 @@ def main(argv=None):
         return 1
 
     argument_password = ""
+    pool_reachable = True
     if run.run_env == "host":
         argument_password = resolve_target_host_mode(run, args)
     else:
-        resolve_target_xoa(run, args)
+        pool_reachable = resolve_target_xoa(run, args)
 
     # The appliance's own section starts here and is not looked at again until the report
     # has nothing left to say about the pool. Here, and not at the top of main(), on
@@ -6947,11 +7143,17 @@ def main(argv=None):
     # cores - whereas from here it runs against the host collection, which is waiting on
     # ssh and leaves the CPU idle. It also leaves every exit above untouched: a pool name
     # that matched nothing, an unreadable xo-db, the interactive picker, the sshpass
-    # install. Those cost the run nothing, exactly as before.
+    # fallback. Those cost the run nothing, exactly as before.
     #
     # The one case it loses is a single fast host, where there is under 2s of collection
     # to hide 2.9s of appliance behind. Do not move it back without re-measuring all five.
+    #
+    # It is also started BEFORE the no-password-mechanism exit below, which is the one
+    # case where this section is the entire report: there is nothing else left to overlap.
     xoa_worker = _Background(xoa.lines) if run.run_env != "host" else None
+
+    if not pool_reachable:
+        return xoa_only_report(run, rep_meta=run_meta(run), xoa_worker=xoa_worker)
 
     hosts = discover(run)
 
@@ -7082,7 +7284,7 @@ result = _module('result', ['FLAG', 'Fact', 'INFO', 'Line', 'MISSING', 'OK', 'UN
 parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', '_LINK_RE', '_MANIFEST_PKG_RE', '_MTU_RE', '_PARAM_RE', '_PREMIUM_SUFFIX', '_TS_RE', '_cidr_range', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'cap_lines', 'classify_multipath_path', 'classify_xo_plugins', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'format_age', 'has_overlapping_subnets', 'manifest_diff', 'manifest_plugin_names', 'manifest_versions', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pool_conf', 'parse_timedatectl', 'parse_xe_records', 'plugin_block', 'rollup_repeats', 'round_1dp', 'split_host_port', 'split_timestamp', 'truncate_block'])
 model = _module('model', ['Host', 'Pool', 'ntp_match', 'ram_match'])
 collectorsrc = _module('collectorsrc', ['EMBEDDED', 'collector_source'])
-transport = _module('transport', ['BEGIN_MARKER', 'CollectError', 'END_MARKER', 'Transport', '_DEBUG_LOCK', '_LIVE', '_LIVE_LOCK', '_REMOTE_LAUNCH', '_REMOTE_LAUNCH_PINNED', '_kill_tree', '_remote_launch', 'cleanup_work_dir', 'debug', 'ensure_sshpass', 'have', 'kill_all_children', 'make_work_dir', 'run_local_cmd', 'which'])
+transport = _module('transport', ['ASKPASS_ENV', 'ASKPASS_SCRIPT', 'AUTH_ASKPASS', 'AUTH_SSHPASS', 'BEGIN_MARKER', 'CollectError', 'END_MARKER', 'Transport', '_DEBUG_LOCK', '_LIVE', '_LIVE_LOCK', '_REMOTE_LAUNCH', '_REMOTE_LAUNCH_PINNED', '_kill_tree', '_remote_launch', 'cleanup_work_dir', 'debug', 'ensure_sshpass', 'have', 'kill_all_children', 'make_work_dir', 'run_local_cmd', 'which', 'write_askpass'])
 xoredis = _module('xoredis', ['DEFAULT_ADDR', 'ENCRYPTION_PREFIX', 'IDS_KEY', 'PLUGIN_IDS_KEY', 'PLUGIN_RECORD_PREFIX', 'RECORD_PREFIX', 'RedisError', '_config_dirs', '_config_files', '_encode', '_fetch', '_fetch_autoload', '_flatten', '_mentions_redis', '_read_reply', 'read_plugin_autoload', 'read_server_records'])
 xodb = _module('xodb', ['QUOTES', 'SELECT_NONE', 'SELECT_NO_MATCH', 'SELECT_OK', 'SELECT_QUIT', 'SELECT_UNREADABLE', 'Server', '_ALL_SERVERS', '_ESCAPE_RE', '_KEY_RE', '_READ_ERROR', '_SIMPLE_ESCAPES', '_describe_failure', '_ls', '_read_servers', '_sort_key', 'all_servers', 'clean', 'enabled_servers', 'have_xo_server_db', 'password_for', 'pool_name_for_host', 'read_error', 'reset_cache', 'scan_records', 'select_pool', 'unescape'])
 checks = _module('checks', ['_dmesg_phrase_blocks', '_linstor_column', '_linstor_has_rows', '_linstor_line', '_linstor_node_addresses', '_linstor_node_offline', '_linstor_table', '_linstor_unknown', '_maps', '_mount_detail', '_multipath_detail', '_multipath_read', '_network_line', '_render_scan_blocks', '_stuck_detail', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_block', 'dmesg_content', 'dmesg_content_of', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mount_stalls', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'network_mounts', 'ntp', 'oom_events', 'overlapping_subnets', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'stuck_processes', 'tap_status', 'task_timeout_override', 'vlan0', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_nodes', 'xostor_pref_nic', 'xostor_qcow2', 'xostor_ram', 'yum_patch_level'])

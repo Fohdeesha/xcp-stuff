@@ -61,6 +61,7 @@ def drive(monkeypatch, tmp_path, argv, lines_fn=xoa_lines, addresses=("10.0.0.1"
         run.password = "x"
         run.master_address = addresses[0]
         run.pool_name = "P"
+        return True      # 'there is a way to log into the pool' - see xoa_only_report
 
     def fake_discover(run):
         hosts = [model.Host(a, "uuid-" + a, "h-" + a.replace(".", "-")) for a in addresses]

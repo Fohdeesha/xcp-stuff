@@ -14,6 +14,11 @@ Contract, unchanged from the bash run_remote it replaces:
   * ControlMaster/ControlPersist so one real connection per host serves the whole run
   * the password lives in the child's environment only - never argv, never a file
 
+The password reaches ssh through its own SSH_ASKPASS helper, which needs nothing
+installed and nothing from the network - see enable_password_auth(). sshpass is the
+fallback now, not the requirement it used to be: an appliance with no internet access
+could not install it, and the run died before printing a single line.
+
 Several hosts are collected at once, so everything here is called from worker threads.
 Nothing in Transport is mutated during a collection - the password, port and collector
 source are all set before the first call - and the one piece of shared state that is
@@ -49,6 +54,24 @@ _REMOTE_LAUNCH_PINNED = 'exec %s - %%s'
 
 BEGIN_MARKER = "<<<HEALTHPY-JSON-BEGIN>>>"
 END_MARKER = "<<<HEALTHPY-JSON-END>>>"
+
+AUTH_ASKPASS = "askpass"
+AUTH_SSHPASS = "sshpass"
+
+# The variable the helper prints. Deliberately not SSHPASS: the two mechanisms are
+# mutually exclusive and reading one variable in a run that chose the other mechanism is
+# the kind of half-configured state that authenticates with an empty password.
+ASKPASS_ENV = "HEALTH_SSH_PASSWORD"
+
+# Four lines of sh, written into the run's own work dir (mode 700, deleted at exit). It
+# prints what is in the environment, so the password still never reaches a file or an
+# argv - the same guarantee sshpass -e gives.
+ASKPASS_SCRIPT = (
+    "#!/bin/sh\n"
+    "# health.py: hands ssh the root password it was already given, from the\n"
+    "# environment only. Written per run into a temporary directory and deleted with it.\n"
+    "printf '%s\\n' \"${" + ASKPASS_ENV + "}\"\n"
+)
 
 
 class CollectError(Exception):
@@ -153,6 +176,9 @@ class Transport(object):
         self.password = ""
         self.ssh_port = 22
         self.source = collectorsrc.collector_source()
+        self.auth = ""            # AUTH_ASKPASS / AUTH_SSHPASS, once one is established
+        self.askpass = ""         # path to the helper, when that is the chosen one
+        self.auth_error = ""      # why there is no way to authenticate, for the report
 
     def is_local(self, host):
         """Host mode runs its own commands locally: nothing is gained by logging into
@@ -235,15 +261,15 @@ class Transport(object):
                              stdin_text=self.source)
 
     def _run_ssh_collector(self, host, blob):
-        env = dict(os.environ)
-        env["SSHPASS"] = self.password
-        argv = [
-            "sshpass", "-e", "ssh",
+        env, prefix = self._auth_env()
+        argv = prefix + [
+            "ssh",
             "-p", str(self.ssh_port),
             "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null",
             "-o", "LogLevel=ERROR",
             "-o", "ConnectTimeout=%d" % config.SSH_TIMEOUT,
+            "-o", "NumberOfPasswordPrompts=1",
             "-o", "ControlMaster=auto",
             "-o", "ControlPath=%s" % os.path.join(self.work_dir, "cm-%r@%h:%p"),
             "-o", "ControlPersist=60",
@@ -253,6 +279,76 @@ class Transport(object):
         ]
         return run_local_cmd(argv, timeout=config.REMOTE_CMD_TIMEOUT,
                              env=env, stdin_text=self.source)
+
+    def _auth_env(self):
+        """The environment and the argv prefix that hand ssh the password.
+
+        Two variables for the askpass helper, because two generations of OpenSSH decide
+        differently whether to use one. SSH_ASKPASS_REQUIRE is 8.4 and later (XOA's 9.2)
+        and settles it outright. 7.4 - which is what both dom0 releases ship, so it is the
+        host-mode sweep - consults the helper only when there is no controlling terminal
+        AND DISPLAY is set: the first is already true of every child here (they are all
+        started with start_new_session=True, so open("/dev/tty") fails in them), and the
+        second is why a DISPLAY nothing will ever connect to is set. An existing DISPLAY
+        is left alone; it is only ever read as a flag.
+        """
+        env = dict(os.environ)
+        if self.auth == AUTH_ASKPASS:
+            env[ASKPASS_ENV] = self.password
+            env["SSH_ASKPASS"] = self.askpass
+            env["SSH_ASKPASS_REQUIRE"] = "force"
+            if not env.get("DISPLAY"):
+                env["DISPLAY"] = ":0"
+            return env, []
+        env["SSHPASS"] = self.password
+        return env, ["sshpass", "-e"]
+
+    def enable_password_auth(self, run_env):
+        """Find a way to give ssh a password, or record why there is none. True if found.
+
+        The helper is tried FIRST because it needs nothing installed and nothing from the
+        network. That is not a corner: health.py is routinely pasted onto a customer's
+        appliance over ssh precisely because the appliance has no internet access, and
+        there 'apt-get install sshpass' cannot work - the run used to die on that before
+        printing a line, including the whole XOA section, which needs no pool access at
+        all. It also means the path that runs in the field is the path the lab runs on
+        every test, rather than a fallback nothing exercises until it matters.
+
+        sshpass remains the fallback for the one thing the helper depends on that can be
+        missing: a work dir it is allowed to execute from (a noexec /tmp).
+
+        HEALTH_SSH_AUTH=askpass|sshpass pins the choice, which is how each is regression
+        tested against the other on hosts that have both.
+        """
+        pinned = os.environ.get("HEALTH_SSH_AUTH", "")
+        if pinned not in ("", AUTH_ASKPASS, AUTH_SSHPASS):
+            sys.stderr.write("Warning: ignoring HEALTH_SSH_AUTH=%s (expected %s or %s).\n"
+                             % (pinned, AUTH_ASKPASS, AUTH_SSHPASS))
+            pinned = ""
+
+        tried = []
+        if pinned != AUTH_SSHPASS:
+            path = write_askpass(self.work_dir)
+            if path:
+                self.auth = AUTH_ASKPASS
+                self.askpass = path
+                debug("password auth: ssh askpass helper at %s" % path)
+                return True
+            tried.append("the askpass helper would not run from %s" % self.work_dir)
+            debug("askpass helper unusable")
+
+        if pinned != AUTH_ASKPASS:
+            if ensure_sshpass(run_env):
+                self.auth = AUTH_SSHPASS
+                debug("password auth: sshpass")
+                return True
+            tried.append("sshpass is not installed and could not be installed")
+
+        # named individually: 'no way to authenticate' with no reason is the kind of
+        # message that gets read as 'wrong password' and sends someone after the pool
+        self.auth_error = ("ssh needs a password and there is no way to hand it one (%s)"
+                           % " and ".join(tried))
+        return False
 
     @staticmethod
     def _extract(text):
@@ -301,8 +397,43 @@ def have(binary):
     return bool(which(binary))
 
 
+def write_askpass(work_dir):
+    """Write the askpass helper and PROVE it runs. Returns its path, or "" if it does not.
+
+    The proof is the point. Everything that can go wrong here - a noexec /tmp, a work dir
+    on a filesystem that drops the execute bit, no /bin/sh - fails silently at the far
+    end otherwise: ssh gets an empty password back and reports an authentication failure,
+    which reads as a wrong root password and sends someone off to check xo-server-db.
+    A probe value, never the real password, so the check costs nothing to be wrong about.
+    """
+    path = os.path.join(work_dir, "askpass")
+    try:
+        handle = open(path, "w")
+        try:
+            handle.write(ASKPASS_SCRIPT)
+        finally:
+            handle.close()
+        os.chmod(path, 0o700)
+    except (IOError, OSError) as exc:
+        debug("askpass helper could not be written to %s: %s" % (path, exc))
+        return ""
+    probe = "health-askpass-probe"
+    env = dict(os.environ)
+    env[ASKPASS_ENV] = probe
+    rc, out, err = run_local_cmd([path], timeout=config.LOCAL_CMD_TIMEOUT, env=env)
+    if rc != 0 or out.strip() != probe:
+        debug("askpass helper did not run (exit %d): %s"
+              % (rc, ((err or out).strip() or "no output")[:200]))
+        return ""
+    return path
+
+
 def ensure_sshpass(run_env):
     """Make sshpass available, or say why it is not.
+
+    The fallback since v3.15, reached only when the askpass helper could not be run - see
+    enable_password_auth(). A run that gets here is on a machine where the work dir cannot
+    be executed from, so the install is the one way left to reach another host.
 
     On a hypervisor it comes from 'extras', a stock XCP-ng repo that ships in
     CentOS-Base.repo pointing at Vates' own mirror and is merely disabled by default.

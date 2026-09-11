@@ -64,8 +64,12 @@ Examples:
 
 Exit code is **0** when everything passed, **1** when any check flagged, **2** for a usage
 error - so a wrapper or cron job can tell "you typed the flag wrong" from "the pool has a
-problem". Nothing is installed and nothing is written on the hosts; the only exception is
-`sshpass`, and only in the one case described below.
+problem". Nothing is installed and nothing is written on the hosts. Reaching a host over
+ssh with a password needs no package either: the password is handed to `ssh` by a helper
+the script writes into its own temporary directory and deletes when it exits, so an
+appliance with no internet access is checked exactly like one with it. If there is no way
+to authenticate at all, the run still prints everything about the appliance itself and
+reports the pool as `Unknown` - it never exits with one line and no report.
 
 ## Requirements
 
@@ -96,10 +100,8 @@ python3 <(curl -fsSL https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/
 - **The rest of the pool is checked too if you give a root password.** Pool members share
   the master's root password, so one covers the pool. With a terminal you are simply asked
   for it; you can also pass it as an argument, though the prompt is preferable since an
-  argument is visible in `ps` and lands in your shell history. dom0 has no `sshpass`, so
-  the script installs it the same way it does on XOA - from the stock `extras` repo
-  (Vates' own mirror, already configured, just disabled), a 21KB package with no
-  dependencies. `--enablerepo` is one-shot, so the host's yum config is left as it was.
+  argument is visible in `ps` and lands in your shell history. dom0 needs no package for
+  this either - the same helper that hands `ssh` the password on XOA is used here.
 - **With no password it checks this host alone and says so** - a `Hosts in Pool` line
   reports how much of the pool the run covered. Cron and piped runs take this path rather
   than hanging on a prompt.
