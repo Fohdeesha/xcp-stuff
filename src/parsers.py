@@ -828,9 +828,4 @@ def plugin_block(third_party, autoload, autoload_known):
         out.append("    %s" % plugin["path"])
         if plugin["link"]:
             out.append("    -> %s" % plugin["link"])
-    out.append("")
-    out.append("xo-server registers any directory named xo-server-* under its plugin lookup")
-    out.append("paths, so one of these can be installed, loaded and running without ever")
-    out.append("appearing in an XOA upgrade. Checked against this appliance's own")
-    out.append("xoa-updater manifest as well as the list built into this script.")
     return "\n".join(out)
