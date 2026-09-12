@@ -39,6 +39,7 @@ MODULES = [
     "checks",
     "xoa",
     "report",
+    "runcmd",
     "main",
 ]
 
@@ -213,6 +214,26 @@ def main():
     if early:
         sys.stderr.write("stitch: sibling module used before the aliases exist:\n  %s\n"
                          % "\n  ".join(early))
+        return 1
+
+    # ...and nothing may import `main`. It gets no alias object - the name belongs to the
+    # function main() in the flat namespace - so `import main` survives the build (the
+    # import line is dropped like any other sibling import) and then `main.anything` is an
+    # AttributeError on the artifact alone. Every test runs against src/, where main IS a
+    # module, so nothing else can see this.
+    importers = []
+    for name in MODULES:
+        if name == "main":
+            continue
+        for node in ast.walk(ast.parse(sources[name])):
+            if isinstance(node, ast.Import) and any(a.name == "main" for a in node.names):
+                importers.append("%s (line %d)" % (name, node.lineno))
+            elif isinstance(node, ast.ImportFrom) and node.module == "main":
+                importers.append("%s (line %d)" % (name, node.lineno))
+    if importers:
+        sys.stderr.write("stitch: main is a function in the flattened namespace, not a "
+                         "module, so it cannot be imported:\n  %s\n"
+                         % "\n  ".join(sorted(importers)))
         return 1
 
     collector = read(os.path.join(SRC, "collector.py"))

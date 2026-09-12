@@ -260,9 +260,17 @@ class Transport(object):
                              timeout=config.REMOTE_CMD_TIMEOUT,
                              stdin_text=self.source)
 
-    def _run_ssh_collector(self, host, blob):
+    def _ssh_argv(self, host, remote_command):
+        """The ssh invocation and the environment that authenticates it, in one place.
+
+        Returns (argv, env). Both the collector and -c/--command go over it, and the
+        options are the whole reason a run behaves the same on every host - one real
+        connection per host, no host-key prompt, a bounded connect, and whichever
+        password mechanism _auth_env() settled on. Built here so the two callers cannot
+        drift apart on any of that; only the trailing command differs.
+        """
         env, prefix = self._auth_env()
-        argv = prefix + [
+        return prefix + [
             "ssh",
             "-p", str(self.ssh_port),
             "-o", "StrictHostKeyChecking=no",
@@ -275,10 +283,41 @@ class Transport(object):
             "-o", "ControlPersist=60",
             "-o", "BatchMode=no",
             "root@" + host,
-            _remote_launch(blob),
-        ]
+            remote_command,
+        ], env
+
+    def _run_ssh_collector(self, host, blob):
+        argv, env = self._ssh_argv(host, _remote_launch(blob))
         return run_local_cmd(argv, timeout=config.REMOTE_CMD_TIMEOUT,
                              env=env, stdin_text=self.source)
+
+    def run_command(self, host, cmd, timeout=None):
+        """-c/--command: run the user's own command on `host`. Returns (rc, out, err).
+
+        Always over ssh, with no local branch: -c is XOA-only (main rejects it on a
+        hypervisor), and an XOA reaches every host including the master that way. If it
+        ever gains a host mode, this needs an is_local() arm that runs the command
+        through a shell - there would be no ssh to interpret it.
+
+        Deliberately NOT a collector spec. The collector answers with a JSON document of
+        facts between markers, which is the wrong shape for raw output: it would be
+        base64'd in, JSON-encoded out, and clamped against a health sweep's budget, for
+        no gain whatsoever. This is the path bash's run_remote took - the same ssh
+        options, the same process-group timeout, the command handed over whole - and it
+        is why nothing had to be added to the collector for this.
+
+        Nothing here composes a command, so the no-shell rule the collector states does
+        not apply: the string is the user's, it arrives whole, it leaves whole as the
+        last argv element, and the remote login shell is the only thing that reads it -
+        exactly as it was for bash.
+
+        stdin is closed by run_local_cmd, which matters more here than anywhere: a
+        command that tried to read it (an unguarded 'yum update') would otherwise be
+        eating this script's own stdin.
+        """
+        timeout = config.RUN_CMD_TIMEOUT if timeout is None else timeout
+        argv, env = self._ssh_argv(host, cmd)
+        return run_local_cmd(argv, timeout=timeout, env=env)
 
     def _auth_env(self):
         """The environment and the argv prefix that hand ssh the password.

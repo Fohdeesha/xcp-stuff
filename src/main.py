@@ -31,6 +31,7 @@ import model
 import parsers
 import report
 import result
+import runcmd
 import transport
 import xoa
 import xodb
@@ -54,6 +55,10 @@ in the pool is checked unless -s says otherwise.
                         being prompted: the first pool whose name contains
                         NAME, matched anywhere and ignoring case, so
                         '-n sec' matches 'XEN-SECONDARY'
+  -c, --command=CMD     run CMD on every reachable pool host and print what
+                        each one said, instead of the health report: no
+                        checks are run and no verdict is reached, so the
+                        exit status is always 0. Cannot be used with --json
       --json            print the run as one JSON document instead of a
                         report, for cron and monitoring: same checks, same
                         exit code, -f narrows it the same way, and anything
@@ -68,6 +73,7 @@ Examples:
   %(prog)s -s 192.168.1.7 'mypass'
   %(prog)s -n sec
   %(prog)s -f -n 'xen-main'
+  %(prog)s -c 'cat /etc/resolv.conf'
   %(prog)s --json -n sec
 """
 
@@ -194,6 +200,7 @@ class Run(object):
         self.filter_output = False
         self.pool_mode = True
         self.name_filter = ""
+        self.run_cmd = ""         # -c: a command to run on every host INSTEAD of the report
         self.json_output = False
         self.seed = ""
         self.password = ""
@@ -231,7 +238,8 @@ class Run(object):
     def parse_args(self, argv):
         try:
             opts, args = getopt.gnu_getopt(
-                argv, "fhsn:", ["filter", "help", "single", "name=", "json"])
+                argv, "fhsn:c:",
+                ["filter", "help", "single", "name=", "command=", "json"])
         except getopt.GetoptError as exc:
             sys.stderr.write("%s\n" % exc)
             usage(self.run_env)
@@ -244,9 +252,22 @@ class Run(object):
                 self.pool_mode = False
             elif opt in ("-n", "--name"):
                 self.name_filter = value
+            elif opt in ("-c", "--command"):
+                self.run_cmd = value
             elif opt == "--json":
                 self.json_output = True
         if len(args) > 2:
+            usage(self.run_env)
+        if self.run_cmd and self.json_output:
+            # The document is a health check's shape: every entry is a Line with a status
+            # and an explicit 'flags', and doc['flagged']/'exit_code' are summed from them.
+            # -c reports no verdict by design, so it has nothing to put there - and a
+            # consumer reading 'flagged': false off a document that judged nothing would
+            # conclude the pool was healthy. Refuse rather than emit that.
+            sys.stderr.write(
+                "ERROR: --json describes a health check, and -c/--command runs a command "
+                "and reaches\n       no verdict, so there is nothing for the document to "
+                "report. Use -c on its own.\n")
             usage(self.run_env)
         return args
 
@@ -438,6 +459,17 @@ def resolve_target_host_mode(run, args):
     if run.name_filter:
         sys.stderr.write("ERROR: -n/--name picks a pool out of xo-server-db, which only "
                          "exists on XOA.\n")
+        usage(run.run_env)
+    if run.run_cmd:
+        # XOA-only, like -n. There it earns its place by carrying the pool selection and
+        # the root password out of xo-server-db, so a sweep needs no inventory and no
+        # credentials. On a hypervisor neither exists: the command would run on this one
+        # host, or on the others only if a password were typed at the prompt - which is
+        # an ssh loop with extra steps, from a machine that already has a root shell.
+        sys.stderr.write("ERROR: -c/--command is an XOA feature: it runs a command across "
+                         "a pool using the\n       host list and root password from "
+                         "xo-server-db, neither of which exists here.\n"
+                         "       You already have a root shell on this host.\n")
         usage(run.run_env)
     if len(args) > 1:
         sys.stderr.write("ERROR: running on an XCP-ng host, so the host to check is this "
@@ -1076,6 +1108,17 @@ def main(argv=None):
         # the pool_run_* toggles exist to keep a pool SWEEP short, and there is no sweep
         # here. It may well be a slave, which is why this is not master detection.
         hosts[0].is_master = True
+
+    # -c/--command: run the given command on every host and stop there. This is a raw
+    # diagnostic dump, not the health report, so nothing below it runs - no collection,
+    # no checks, and not the XOA section either: xoa_worker is a daemon thread with its
+    # cleanup already registered with atexit, so it is simply never read.
+    #
+    # Here, and not earlier, so -c inherits the whole target-selection path exactly as the
+    # report has it: the pool picked by -n or the picker, the password from xo-db, the
+    # host list from discovery, and -s / a password-less host run narrowing that list.
+    if run.run_cmd:
+        return runcmd.execute(run, parallel_workers(len(run.hosts)))
 
     run.pool_cmd_host = run.seed if run.run_env == "host" else run.master_address
     if run.pool_cmd_host not in [h.address for h in run.hosts]:

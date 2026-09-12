@@ -22,6 +22,7 @@
 
 
 
+from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 import atexit
 import base64
@@ -43,7 +44,7 @@ import unicodedata
 # ======================================================================================
 # --- config ----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "3.16"
+SCRIPT_VERSION = "3.17"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
@@ -53,6 +54,13 @@ LOCAL_CMD_TIMEOUT = 10           # max seconds a local command may run (hung xoa
 XO_REDIS_TIMEOUT = 2             # reading xo's server records straight from redis: 0.002s
                                  # measured, so this is only here to bound a wedged socket
 XOA_CHECK_TIMEOUT = 60           # 'xoa check' does real network probes, so it gets longer
+RUN_CMD_TIMEOUT = 120            # -c: max seconds one arbitrary command may take on a host.
+                                 # Separate from REMOTE_CMD_TIMEOUT because the two answer
+                                 # different questions - that one bounds a whole collector
+                                 # run (~20 operations), this one bounds a single command -
+                                 # and sharing it would mean retuning a health sweep to
+                                 # give -c longer, or the reverse. The bash script did
+                                 # share it, having no other primitive to reuse.
 
 DOM0_MAX_USED = 75               # dom0 disk use % allowed before flagging
 DOM0_MEM_USED_MAX_PCT = 65       # dom0 memory use % allowed before flagging
@@ -3457,9 +3465,17 @@ class Transport(object):
                              timeout=config.REMOTE_CMD_TIMEOUT,
                              stdin_text=self.source)
 
-    def _run_ssh_collector(self, host, blob):
+    def _ssh_argv(self, host, remote_command):
+        """The ssh invocation and the environment that authenticates it, in one place.
+
+        Returns (argv, env). Both the collector and -c/--command go over it, and the
+        options are the whole reason a run behaves the same on every host - one real
+        connection per host, no host-key prompt, a bounded connect, and whichever
+        password mechanism _auth_env() settled on. Built here so the two callers cannot
+        drift apart on any of that; only the trailing command differs.
+        """
         env, prefix = self._auth_env()
-        argv = prefix + [
+        return prefix + [
             "ssh",
             "-p", str(self.ssh_port),
             "-o", "StrictHostKeyChecking=no",
@@ -3472,10 +3488,41 @@ class Transport(object):
             "-o", "ControlPersist=60",
             "-o", "BatchMode=no",
             "root@" + host,
-            _remote_launch(blob),
-        ]
+            remote_command,
+        ], env
+
+    def _run_ssh_collector(self, host, blob):
+        argv, env = self._ssh_argv(host, _remote_launch(blob))
         return run_local_cmd(argv, timeout=config.REMOTE_CMD_TIMEOUT,
                              env=env, stdin_text=self.source)
+
+    def run_command(self, host, cmd, timeout=None):
+        """-c/--command: run the user's own command on `host`. Returns (rc, out, err).
+
+        Always over ssh, with no local branch: -c is XOA-only (main rejects it on a
+        hypervisor), and an XOA reaches every host including the master that way. If it
+        ever gains a host mode, this needs an is_local() arm that runs the command
+        through a shell - there would be no ssh to interpret it.
+
+        Deliberately NOT a collector spec. The collector answers with a JSON document of
+        facts between markers, which is the wrong shape for raw output: it would be
+        base64'd in, JSON-encoded out, and clamped against a health sweep's budget, for
+        no gain whatsoever. This is the path bash's run_remote took - the same ssh
+        options, the same process-group timeout, the command handed over whole - and it
+        is why nothing had to be added to the collector for this.
+
+        Nothing here composes a command, so the no-shell rule the collector states does
+        not apply: the string is the user's, it arrives whole, it leaves whole as the
+        last argv element, and the remote login shell is the only thing that reads it -
+        exactly as it was for bash.
+
+        stdin is closed by run_local_cmd, which matters more here than anywhere: a
+        command that tried to read it (an unguarded 'yum update') would otherwise be
+        eating this script's own stdin.
+        """
+        timeout = config.RUN_CMD_TIMEOUT if timeout is None else timeout
+        argv, env = self._ssh_argv(host, cmd)
+        return run_local_cmd(argv, timeout=timeout, env=env)
 
     def _auth_env(self):
         """The environment and the argv prefix that hand ssh the password.
@@ -6124,6 +6171,82 @@ class Report(object):
 
 
 # ======================================================================================
+# --- runcmd ----------------------------------------------------------------------------
+
+def _run_one(run, host):
+    """Run the -c command on one host. Returns (rc, out, err); nothing is printed here.
+
+    Same reason _collect_one returns its note instead of writing it: this is called from
+    worker threads, and a thread printing as it finishes would interleave the hosts in
+    whatever order they happened to answer.
+    """
+    try:
+        return run.transport.run_command(host.address, run.run_cmd)
+    except Exception as exc:                      # a transport that could not even start
+        return (TRANSPORT_FAILED, "", str(exc))
+
+
+# Not an exit code any command can return: 0-255 are all reachable over ssh, and 255 in
+# particular is ssh's own 'the connection failed', which is a different thing from 'the
+# transport never started'. Printed as a reason, never as a number.
+TRANSPORT_FAILED = -1
+
+
+def execute(run, workers):
+    """Run the command on every host of the run and print what each said. Always 0.
+
+    With several hosts there is no single exit code that could mean anything, and 1 and 2
+    are already spoken for ('a check flagged' and 'you typed it wrong'), so a caller that
+    needs per-host success reads the output.
+
+    Hosts are labelled by address and not by name: the name is a fact this mode never
+    collects, and fetching it would be a second round trip per host for a label.
+
+    `workers` is passed in rather than worked out here: main owns that policy (it is the
+    same cap a collection runs under), and reaching back into main for it would make this
+    the one module that imports main - which on the stitched artifact is the function
+    main(), not a module, so it would be an AttributeError there and nowhere else.
+    """
+    transport.debug("running -c on %d host(s), %d at a time" % (len(run.hosts), workers))
+    if workers > 1:
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
+            futures = [pool.submit(_run_one, run, host) for host in run.hosts]
+            try:
+                results = [f.result() for f in futures]
+            except BaseException:
+                # the workers are blocked in communicate() and never see the ctrl-C
+                transport.kill_all_children()
+                raise
+        finally:
+            pool.shutdown(wait=True)
+    else:
+        results = [_run_one(run, host) for host in run.hosts]
+
+    # printed in host order, whatever order they finished in
+    for host, (rc, out, err) in zip(run.hosts, results):
+        sys.stdout.write(colors.cyan("== %s ==" % host.address) + "\n")
+        # stdout first either way: a command that failed part way through still said
+        # something, and bash printed it too rather than throwing it away
+        if out:
+            sys.stdout.write(out if out.endswith("\n") else out + "\n")
+        if rc != 0:
+            if rc == TRANSPORT_FAILED:
+                sys.stdout.write(colors.yellow("Could not run the command") + "\n")
+            elif rc == 124:
+                sys.stdout.write(colors.yellow(
+                    "Command timed out after %ds" % config.RUN_CMD_TIMEOUT) + "\n")
+            else:
+                sys.stdout.write(colors.yellow("Command failed (exit code %d)" % rc) + "\n")
+            # the reason goes to stderr, where every other transport failure goes, so it
+            # cannot contaminate output being piped somewhere
+            if err.strip():
+                sys.stderr.write(err if err.endswith("\n") else err + "\n")
+        sys.stdout.write("\n")
+    return 0
+
+
+# ======================================================================================
 # --- main ------------------------------------------------------------------------------
 
 # Laid out the way every other command-line tool on these boxes lays it out: the flag
@@ -6145,6 +6268,10 @@ in the pool is checked unless -s says otherwise.
                         being prompted: the first pool whose name contains
                         NAME, matched anywhere and ignoring case, so
                         '-n sec' matches 'XEN-SECONDARY'
+  -c, --command=CMD     run CMD on every reachable pool host and print what
+                        each one said, instead of the health report: no
+                        checks are run and no verdict is reached, so the
+                        exit status is always 0. Cannot be used with --json
       --json            print the run as one JSON document instead of a
                         report, for cron and monitoring: same checks, same
                         exit code, -f narrows it the same way, and anything
@@ -6159,6 +6286,7 @@ Examples:
   %(prog)s -s 192.168.1.7 'mypass'
   %(prog)s -n sec
   %(prog)s -f -n 'xen-main'
+  %(prog)s -c 'cat /etc/resolv.conf'
   %(prog)s --json -n sec
 """
 
@@ -6285,6 +6413,7 @@ class Run(object):
         self.filter_output = False
         self.pool_mode = True
         self.name_filter = ""
+        self.run_cmd = ""         # -c: a command to run on every host INSTEAD of the report
         self.json_output = False
         self.seed = ""
         self.password = ""
@@ -6322,7 +6451,8 @@ class Run(object):
     def parse_args(self, argv):
         try:
             opts, args = getopt.gnu_getopt(
-                argv, "fhsn:", ["filter", "help", "single", "name=", "json"])
+                argv, "fhsn:c:",
+                ["filter", "help", "single", "name=", "command=", "json"])
         except getopt.GetoptError as exc:
             sys.stderr.write("%s\n" % exc)
             usage(self.run_env)
@@ -6335,9 +6465,22 @@ class Run(object):
                 self.pool_mode = False
             elif opt in ("-n", "--name"):
                 self.name_filter = value
+            elif opt in ("-c", "--command"):
+                self.run_cmd = value
             elif opt == "--json":
                 self.json_output = True
         if len(args) > 2:
+            usage(self.run_env)
+        if self.run_cmd and self.json_output:
+            # The document is a health check's shape: every entry is a Line with a status
+            # and an explicit 'flags', and doc['flagged']/'exit_code' are summed from them.
+            # -c reports no verdict by design, so it has nothing to put there - and a
+            # consumer reading 'flagged': false off a document that judged nothing would
+            # conclude the pool was healthy. Refuse rather than emit that.
+            sys.stderr.write(
+                "ERROR: --json describes a health check, and -c/--command runs a command "
+                "and reaches\n       no verdict, so there is nothing for the document to "
+                "report. Use -c on its own.\n")
             usage(self.run_env)
         return args
 
@@ -6529,6 +6672,17 @@ def resolve_target_host_mode(run, args):
     if run.name_filter:
         sys.stderr.write("ERROR: -n/--name picks a pool out of xo-server-db, which only "
                          "exists on XOA.\n")
+        usage(run.run_env)
+    if run.run_cmd:
+        # XOA-only, like -n. There it earns its place by carrying the pool selection and
+        # the root password out of xo-server-db, so a sweep needs no inventory and no
+        # credentials. On a hypervisor neither exists: the command would run on this one
+        # host, or on the others only if a password were typed at the prompt - which is
+        # an ssh loop with extra steps, from a machine that already has a root shell.
+        sys.stderr.write("ERROR: -c/--command is an XOA feature: it runs a command across "
+                         "a pool using the\n       host list and root password from "
+                         "xo-server-db, neither of which exists here.\n"
+                         "       You already have a root shell on this host.\n")
         usage(run.run_env)
     if len(args) > 1:
         sys.stderr.write("ERROR: running on an XCP-ng host, so the host to check is this "
@@ -7168,6 +7322,17 @@ def main(argv=None):
         # here. It may well be a slave, which is why this is not master detection.
         hosts[0].is_master = True
 
+    # -c/--command: run the given command on every host and stop there. This is a raw
+    # diagnostic dump, not the health report, so nothing below it runs - no collection,
+    # no checks, and not the XOA section either: xoa_worker is a daemon thread with its
+    # cleanup already registered with atexit, so it is simply never read.
+    #
+    # Here, and not earlier, so -c inherits the whole target-selection path exactly as the
+    # report has it: the pool picked by -n or the picker, the password from xo-db, the
+    # host list from discovery, and -s / a password-less host run narrowing that list.
+    if run.run_cmd:
+        return runcmd.execute(run, parallel_workers(len(run.hosts)))
+
     run.pool_cmd_host = run.seed if run.run_env == "host" else run.master_address
     if run.pool_cmd_host not in [h.address for h in run.hosts]:
         run.pool_cmd_host = run.hosts[0].address if run.hosts else ""
@@ -7273,7 +7438,7 @@ def _module(name, exported):
     return module
 
 
-config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DMESG_MAX_LINES', 'DMESG_ROLLUP_MIN', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MOUNT_PROBE_RESERVE', 'MOUNT_PROBE_TIMEOUT', 'MOUNT_STALL_FILES', 'MOUNT_STALL_PHRASES', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'NETWORK_FS_TYPES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'PROGRESS_INTERVAL', 'REMOTE_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'STUCK_MAX_LINES', 'STUCK_MIN_AGE', 'STUCK_RECHECK_DELAY', 'STUCK_SAMPLES', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOA_STOCK_PLUGINS', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_QCOW2_MAX_LINES', 'XO_PLUGIN_LOOKUP_PATHS', 'XO_PLUGIN_PREFIX', 'XO_PLUGIN_SCOPE_DIR', 'XO_PLUGIN_SCOPE_PREFIX', 'XO_REDIS_TIMEOUT'])
+config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DMESG_MAX_LINES', 'DMESG_ROLLUP_MIN', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MOUNT_PROBE_RESERVE', 'MOUNT_PROBE_TIMEOUT', 'MOUNT_STALL_FILES', 'MOUNT_STALL_PHRASES', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'NETWORK_FS_TYPES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'PROGRESS_INTERVAL', 'REMOTE_CMD_TIMEOUT', 'RUN_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'STUCK_MAX_LINES', 'STUCK_MIN_AGE', 'STUCK_RECHECK_DELAY', 'STUCK_SAMPLES', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOA_STOCK_PLUGINS', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_QCOW2_MAX_LINES', 'XO_PLUGIN_LOOKUP_PATHS', 'XO_PLUGIN_PREFIX', 'XO_PLUGIN_SCOPE_DIR', 'XO_PLUGIN_SCOPE_PREFIX', 'XO_REDIS_TIMEOUT'])
 colors = _module('colors', ['CYAN', 'GREEN', 'RESET', 'YELLOW', 'cyan', 'green', 'init', 'strip_ansi', 'yellow'])
 result = _module('result', ['FLAG', 'Fact', 'INFO', 'Line', 'MISSING', 'OK', 'UNKNOWN', 'flag', 'guard', 'info', 'ok', 'pinned', 'raw', 'unknown', 'wrap'])
 parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', '_LINK_RE', '_MANIFEST_PKG_RE', '_MTU_RE', '_PARAM_RE', '_PREMIUM_SUFFIX', '_TS_RE', '_cidr_range', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'cap_lines', 'classify_multipath_path', 'classify_xo_plugins', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'format_age', 'has_overlapping_subnets', 'manifest_diff', 'manifest_plugin_names', 'manifest_versions', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pool_conf', 'parse_timedatectl', 'parse_xe_records', 'plugin_block', 'rollup_repeats', 'round_1dp', 'split_host_port', 'split_timestamp', 'truncate_block'])
@@ -7285,6 +7450,7 @@ xodb = _module('xodb', ['QUOTES', 'SELECT_NONE', 'SELECT_NO_MATCH', 'SELECT_OK',
 checks = _module('checks', ['_dmesg_phrase_blocks', '_linstor_column', '_linstor_has_rows', '_linstor_line', '_linstor_node_addresses', '_linstor_node_offline', '_linstor_table', '_linstor_unknown', '_maps', '_mount_detail', '_multipath_detail', '_multipath_read', '_network_line', '_render_scan_blocks', '_stuck_detail', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_block', 'dmesg_content', 'dmesg_content_of', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mount_stalls', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'network_mounts', 'ntp', 'oom_events', 'overlapping_subnets', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'stuck_processes', 'tap_status', 'task_timeout_override', 'vlan0', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_nodes', 'xostor_pref_nic', 'xostor_qcow2', 'xostor_ram', 'yum_patch_level'])
 xoa = _module('xoa', ['_dmesg', '_first_token', '_max_old_space', '_meminfo', '_os_version', '_plugin_autoload', '_plugin_scan_targets', '_plugin_version', '_plugins_line', '_service_state', '_updater', 'collect_xoa', 'debian_version_ok', 'lines', 'ping_silent', 'running_as_root', 'scan_plugins'])
 report = _module('report', ['Report', '_as_entry'])
+runcmd = _module('runcmd', ['TRANSPORT_FAILED', '_run_one', 'execute'])
 
 
 

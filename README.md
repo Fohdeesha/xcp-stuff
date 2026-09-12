@@ -45,6 +45,10 @@ in the pool is checked unless -s says otherwise.
                         being prompted: the first pool whose name contains
                         NAME, matched anywhere and ignoring case, so
                         '-n sec' matches 'XEN-SECONDARY'
+  -c, --command=CMD     run CMD on every reachable pool host and print what
+                        each one said, instead of the health report: no
+                        checks are run and no verdict is reached, so the
+                        exit status is always 0. Cannot be used with --json
       --json            print the run as one JSON document instead of a
                         report, for cron and monitoring: same checks, same
                         exit code, -f narrows it the same way, and anything
@@ -59,6 +63,7 @@ Examples:
   health.py -s 192.168.1.7 'mypass'
   health.py -n sec
   health.py -f -n 'xen-main'
+  health.py -c 'cat /etc/resolv.conf'
   health.py --json -n sec
   ```
 
@@ -110,7 +115,63 @@ python3 <(curl -fsSL https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/
   answers them from any pool member, slaves included.
 - The XOA section is never printed (there is no appliance). Running on a host with a
   password otherwise produces the same report an XOA run does for that pool.
-- `-f` and `-s` apply as usual; `-n` is XOA-only and is rejected with an explanation.
+- `-f` and `-s` apply as usual; `-n` and `-c` are XOA-only and are rejected with an
+  explanation.
+
+## Running one command across the pool
+
+`-c` runs a command on every host the run would have checked and prints what each said,
+instead of the health report. It is for the times you want to eyeball one thing across a
+whole pool without typing out an ssh loop:
+
+```
+$ health.py -n sec -c 'cat /etc/resolv.conf'
+Checking pool: XEN-SECONDARY (192.168.1.13)
+
+== 192.168.1.13 ==
+nameserver 192.168.1.1
+nameserver 1.1.1.1
+
+== 192.168.1.34 ==
+nameserver 192.168.1.1
+```
+
+The point of it is that **the pool, the host list and the root password all come from the
+same place the report gets them** - `-n`, the picker, or `xo-server-db` - so there is no
+inventory to keep and no password to look up. `-s` narrows it to one host, exactly as it
+narrows a report.
+
+**This is an XOA-only flag.** That is also the reason it exists: on a hypervisor there is
+no `xo-server-db` to name a pool or find a password in, the command would run on the one
+host you are already logged into, and you have a root shell there anyway. Run on a host it
+is refused with an explanation, the same way `-n` is.
+
+Worth knowing:
+
+- **It reports no verdict.** The exit code is always **0**, whatever the commands did -
+  with several hosts there is no single code that could mean anything, and `1` and `2`
+  already mean "a check flagged" and "you typed it wrong". A command that fails prints
+  `Command failed (exit code N)` under that host, with the reason on stderr; the run
+  carries on to the next host.
+- **Hosts are labelled by address, not by name.** The name is a fact this mode never
+  collects, and fetching it would be a second round trip per host just for a label.
+- **Output is printed in host order**, however the hosts finish. The command runs on up to
+  eight hosts at once (`HEALTH_MAX_PARALLEL` changes it), so on a large pool it is quick -
+  but that also means a destructive command reaches eight hosts before you can stop it.
+- **No health facts are collected**, so a one-line command costs one round trip per host
+  rather than a full sweep. Each command gets 120 s.
+- The command is handed to the host whole and read by the shell there, so pipes, quotes and
+  redirection work as typed - `-c 'ps aux | grep -c xapi'`. Quote it so your *local* shell
+  does not eat it first.
+- **`-c` cannot be combined with `--json`** (it is refused with exit 2). The document
+  describes a health check - every entry has a status, and `flagged`/`exit_code` are summed
+  from them - and `-c` reaches no verdict, so a consumer reading `"flagged": false` off it
+  would conclude the pool was healthy when nothing was ever judged.
+
+This is a diagnostic convenience, not configuration management. It runs as root on every
+host in the pool, with no dry run, no confirmation and no rollback. For anything you run
+more than once, or anything that changes state, use a tool built for it - Ansible, `pssh`,
+`clush` - and keep `-c` for looking.
 
 ## Machine-readable output
 
@@ -195,14 +256,14 @@ only `python` (2.7.5), 8.3 has both, and that is what keeps 8.2.1 pools checkabl
 |---|---|
 | `health.py` | the published artifact - one file, no install. **Generated**; do not edit |
 | `src/` | the sources it is built from, one module per concern |
-| `build/stitch.py` | builds `health.py` from `src/`; fails the build on a name collision or a collector that does not round-trip |
+| `build/stitch.py` | builds `health.py` from `src/`; fails the build on a name collision, an import of `main`, or a collector that does not round-trip |
 | `tests/` | pytest, no network or hosts needed |
 | `xo-config-recover.py` | exports XO's configuration when xo-server is dead - see [below](#xo-config-recover) |
 | `health.sh` | the previous bash implementation, **retired**. Prints a pointer to health.py and exits 1; the implementation itself is in the git history |
 
 ```
 python build/stitch.py     # rebuild health.py after changing src/
-python -m pytest tests/    # ~220 tests, all offline
+python -m pytest tests/    # ~490 tests, all offline
 ```
 
 You don't have to remember that first line. Push a change to `src/` and GitHub rebuilds
