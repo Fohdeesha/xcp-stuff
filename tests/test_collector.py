@@ -7,6 +7,11 @@ is exercised for real by every run against an 8.2.1 pool, which has no python3.
 """
 
 import json
+import sys
+import threading
+import time
+
+import pytest
 
 import collector
 
@@ -294,3 +299,209 @@ def test_collect_pool_pairs_the_asked_nodes_with_the_answers(monkeypatch):
     value = {"nodes": names, "nics": collector._linstor_pref_nics([], names)}
     assert value["nodes"] == ["xen-sec-01", "xen-sec-02"]
     assert value["nics"] == {"xen-sec-01": "bond0"}
+
+
+# --------------------------------------------------------------------------------------
+# where the time went
+# --------------------------------------------------------------------------------------
+
+def test_every_command_records_its_own_elapsed_time(monkeypatch):
+    """run() is the only way a command reaches a host, so this is complete by
+    construction rather than by remembering to instrument each caller."""
+    del collector.TIMINGS[:]
+    collector.run(["true"])
+    collector.run(["true", "again"])
+    assert len(collector.TIMINGS) == 2
+    assert [row[1] for row in collector.TIMINGS] == ["true", "true again"]
+    assert all(isinstance(row[0], float) for row in collector.TIMINGS)
+
+
+def test_a_command_the_budget_refused_is_still_recorded(monkeypatch):
+    """'run budget exhausted' at 0.0s is itself the finding: it says the budget was gone
+    before this command, which is what points at the ones before it."""
+    del collector.TIMINGS[:]
+    monkeypatch.setattr(collector, "DEADLINE", [0.0])
+    r = collector.run(["true"])
+    assert r.timed_out is True
+    assert [row[1] for row in collector.TIMINGS] == ["true"]
+
+
+def test_a_long_argv_keeps_the_path_at_the_end():
+    """The elision is in the middle for exactly this reason: 'a grep took 90 seconds' is
+    not an answer without the file it was reading, and the phrases come first."""
+    del collector.TIMINGS[:]
+    argv = ["grep", "-ainF"]
+    for i in range(6):
+        argv += ["-e", "a phrase long enough to need eliding %d" % i]
+    argv += ["--", "/var/log/xensource.log.1"]
+
+    collector.timed(argv, 0)
+    text = collector.TIMINGS[0][1]
+    assert text.startswith("grep -ainF -e a phrase")
+    assert text.endswith("/var/log/xensource.log.1")
+    assert " ... " in text
+
+
+def test_an_argv_carrying_newlines_stays_on_one_line():
+    """rpm's --qf formats end in a literal newline, which split the debug output across
+    lines and made the timing table unreadable."""
+    del collector.TIMINGS[:]
+    collector.timed(["rpm", "-qa", "--qf", "%{INSTALLTIME} %{NAME}\n"], 0)
+    assert collector.TIMINGS[0][1] == "rpm -qa --qf %{INSTALLTIME} %{NAME}"
+
+
+def test_timings_ride_along_only_when_the_spec_asks(monkeypatch):
+    """They are debug output, not part of any check, so a normal run does not carry them
+    across the wire at all."""
+    monkeypatch.setattr(collector, "collect_identity",
+                        lambda: {"self_uuid": collector.fact(""),
+                                 "hostname": collector.fact("h")})
+    del collector.TIMINGS[:]
+    collector.TIMINGS.append([1.5, "slow thing"])
+
+    assert "timings" not in collector.collect({"want": []})["collector"]
+    assert collector.collect({"want": [], "timings": True})["collector"]["timings"] \
+        == [[1.5, "slow thing"]]
+
+
+def test_the_slowest_commands_come_first_and_the_list_is_capped(monkeypatch):
+    """A host runs enough commands that the whole list would bury the answer, and the
+    answer is always at the slow end."""
+    monkeypatch.setattr(collector, "collect_identity",
+                        lambda: {"self_uuid": collector.fact(""),
+                                 "hostname": collector.fact("h")})
+    del collector.TIMINGS[:]
+    for i in range(30):
+        collector.TIMINGS.append([float(i), "cmd%d" % i])
+
+    ranked = collector.collect({"want": [], "timings": True})["collector"]["timings"]
+    assert len(ranked) == 15
+    assert ranked[0] == [29.0, "cmd29"]
+    assert ranked[-1] == [15.0, "cmd15"]
+
+
+# --------------------------------------------------------------------------------------
+# the watchdog: answering when a command cannot be killed
+# --------------------------------------------------------------------------------------
+
+def reset_collector_state():
+    del collector.TIMINGS[:]
+    collector.PARTIAL.clear()
+    collector.CURRENT[0] = ""
+    collector._EMITTED[0] = False
+
+
+def test_the_document_is_written_once_however_many_callers_try(capsys):
+    """_extract takes the first BEGIN and the last END, so a second document on one
+    stdout would be read as a truncated first."""
+    reset_collector_state()
+    assert collector.emit({"a": 1}) is True
+    assert collector.emit({"b": 2}) is False
+    out = capsys.readouterr().out
+    assert out.count(collector.BEGIN_MARKER) == 1
+    assert '"a": 1' in out
+    assert '"b"' not in out
+
+
+def test_the_watchdog_names_the_command_it_could_not_get_away_from(capsys, monkeypatch):
+    reset_collector_state()
+    collector.PARTIAL["hostname"] = collector.fact("athena")
+    collector.CURRENT[0] = "df -hP"
+    collector.TIMINGS.append([0.2, "timedatectl"])
+    exited = []
+    monkeypatch.setattr(collector.os, "_exit", lambda code: exited.append(code))
+    monkeypatch.setattr(collector, "DEADLINE", [time.time() - 100])   # past the grace
+
+    collector.watchdog(15)
+
+    payload = json.loads(capsys.readouterr().out.split(collector.BEGIN_MARKER)[1]
+                         .split(collector.END_MARKER)[0])
+    assert payload["__collector_stuck__"] == "df -hP"
+    # what it DID establish comes back too, rather than being lost with the host
+    assert payload["hostname"] == {"ok": True, "value": "athena"}
+    assert payload["collector"]["timings"] == [[0.2, "timedatectl"]]
+    assert exited == [0]
+
+
+def test_the_watchdog_says_so_when_nothing_was_running(capsys, monkeypatch):
+    """An empty CURRENT is a different fact from a command that hung, and must not read
+    as one - the collector was between commands, so the stall is somewhere else."""
+    reset_collector_state()
+    monkeypatch.setattr(collector.os, "_exit", lambda code: None)
+    monkeypatch.setattr(collector, "DEADLINE", [time.time() - 100])
+
+    collector.watchdog(15)
+
+    payload = json.loads(capsys.readouterr().out.split(collector.BEGIN_MARKER)[1]
+                         .split(collector.END_MARKER)[0])
+    assert payload["__collector_stuck__"] == "(no command was running)"
+
+
+def test_no_budget_means_no_watchdog(capsys, monkeypatch):
+    """A collector run with no deadline set must simply leave, rather than read 'no
+    budget' as 'budget exhausted' and abandon a run that was going fine."""
+    reset_collector_state()
+    monkeypatch.setattr(collector, "DEADLINE", [None])
+    monkeypatch.setattr(collector.os, "_exit",
+                        lambda code: pytest.fail("watchdog exited with no budget set"))
+
+    collector.watchdog(15)      # returns rather than exiting the process
+
+    assert capsys.readouterr().out == ""
+
+
+def test_a_command_that_will_not_die_is_abandoned_rather_than_waited_on(monkeypatch):
+    """The whole point: one unkillable command must cost one fact, not the whole host.
+
+    A real D-state process cannot be made on demand, so _kill is neutered instead - which
+    is exactly what the kernel does to SIGKILL for a process in uninterruptible sleep.
+    """
+    reset_collector_state()
+    del collector.ABANDONED[:]
+    monkeypatch.setattr(collector, "_kill", lambda proc: None)   # the signal never lands
+    monkeypatch.setattr(collector, "KILL_GRACE", 0.3)
+
+    started = time.time()
+    r = collector.run([sys.executable, "-c", "import time; time.sleep(30)"], timeout=0.5)
+    elapsed = time.time() - started
+
+    assert r.timed_out is True
+    assert r.ok is False
+    assert "uninterruptible" in r.err
+    # it gave up at timeout + grace rather than waiting out the command
+    assert elapsed < 5, "waited %.1fs for a command it had given up on" % elapsed
+    assert collector.ABANDONED == ["%s -c import time; time.sleep(30)" % sys.executable]
+    # ...and the next command still runs, which is the fact that used to be lost
+    assert collector.run([sys.executable, "-c", "print(1)"]).ok is True
+
+
+def test_a_killable_command_that_overruns_is_still_reported_as_timed_out(monkeypatch):
+    """The ordinary timeout path has to keep working: killed, reaped, and not abandoned."""
+    reset_collector_state()
+    del collector.ABANDONED[:]
+
+    r = collector.run([sys.executable, "-c", "import time; time.sleep(30)"], timeout=0.5)
+
+    assert r.timed_out is True
+    assert collector.ABANDONED == []      # it died, so nothing was left behind
+
+
+def test_a_command_that_hangs_is_named_while_it_hangs():
+    """End to end against a real child: CURRENT has to be set BEFORE the command can
+    block, since a command that never returns never reaches the line after it."""
+    reset_collector_state()
+    seen = []
+
+    def watcher():
+        # while run() is blocked in communicate(), which is exactly the watchdog's view
+        time.sleep(0.4)
+        seen.append(collector.CURRENT[0])
+
+    thread = threading.Thread(target=watcher)
+    thread.start()
+    collector.run([sys.executable, "-c", "import time; time.sleep(1.2)"], timeout=30)
+    thread.join()
+
+    assert seen and "time.sleep(1.2)" in seen[0]
+    # ...and cleared once it is no longer running, so a later stall is not blamed on it
+    assert collector.CURRENT[0] == ""

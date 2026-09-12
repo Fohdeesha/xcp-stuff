@@ -258,7 +258,7 @@ def main():
     # after every block: the aliases copy names out of the flat namespace, so the names
     # have to exist first
     out.append(alias_block)
-    out.append('\nif __name__ == "__main__":\n    sys.exit(main())\n')
+    out.append('\nif __name__ == "__main__":\n    sys.exit(entry())\n')
     text = "\n\n".join(out)
 
     # --check: is the committed health.py current? For a pre-commit hook or CI, so a

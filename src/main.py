@@ -22,7 +22,7 @@ import getopt
 import os
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 
 import checks
 import colors
@@ -35,26 +35,38 @@ import transport
 import xoa
 import xodb
 
-USAGE_XOA = """Usage:
-  %(prog)s [-f] [-s] [-n name] [-c 'command'] [pool_master_or_host[:ssh_port] [root_password]]
+# Laid out the way every other command-line tool on these boxes lays it out: the flag
+# first and the sentence after it, so the switches can be read down the left edge in one
+# glance. The prose that used to carry them ('Use -f to ...') read as a paragraph and had
+# to be searched.
+USAGE_XOA = """Usage: %(prog)s [OPTION]... [pool_master_or_host[:ssh_port] [root_password]]
+Health-check every host of an XCP-ng pool, from a Xen Orchestra appliance.
 
-  - All parameters are optional
-  - If a host is not supplied, the enabled pools in xo-server-db are listed to pick from
-    (a single enabled pool, or non-interactive use, just takes the first one)
-  - If a password is not supplied, it will be looked up locally in xo-server-db
-  - By default, the script runs in pool mode (checks all hosts in the pool)
-  - Use '-f' flag to filter output to only show issues found
-  - Use '-s' flag to only check the specified host (do not check other pool members if present)
-  - Use '-n' to pick a pool from xo-server-db by name instead of being prompted:
-    the first pool whose name contains the text is used, matched anywhere in the
-    name and ignoring case, so '-n sec' matches 'XEN-SECONDARY'
-  - Use '-c command' to run an arbitrary command on every reachable pool host
-    instead of the health report, and print each host's output
-  - Use '--json' to print the results as a JSON document instead of a report, for
-    cron and monitoring. Same checks, same exit code; '-f' narrows it the same way,
-    and everything that is not the document goes to stderr
+All arguments are optional. With no host, the enabled pools in xo-server-db
+are listed to pick from - a single enabled pool, or a non-interactive run,
+takes the first. With no password, it is looked up in xo-server-db. Every host
+in the pool is checked unless -s says otherwise.
 
-  Examples:
+  -f, --filter          only print checks that flagged; passing and
+                        informational lines are hidden, sections included
+  -s, --single          check only the given host, not the other pool members
+  -n, --name=NAME       pick the pool from xo-server-db by name instead of
+                        being prompted: the first pool whose name contains
+                        NAME, matched anywhere and ignoring case, so
+                        '-n sec' matches 'XEN-SECONDARY'
+  -c, --command=CMD     run CMD on every reachable pool host and print what
+                        each one said, instead of the health report: no
+                        checks are run and no verdict is reached, so the
+                        exit status is always 0. Cannot be used with --json
+      --json            print the run as one JSON document instead of a
+                        report, for cron and monitoring: same checks, same
+                        exit code, -f narrows it the same way, and anything
+                        that is not the document goes to stderr
+  -h, --help            print this help and exit
+
+Exit status: 0 if every check passed, 1 if any flagged, 2 on a usage error.
+
+Examples:
   %(prog)s 192.168.1.5
   %(prog)s 192.168.1.6 'mypass'
   %(prog)s -s 192.168.1.7 'mypass'
@@ -64,26 +76,31 @@ USAGE_XOA = """Usage:
   %(prog)s --json -n sec
 """
 
-USAGE_HOST = """Usage (running on an XCP-ng host):
-  %(prog)s [-f] [-s] [root_password]
+USAGE_HOST = """Usage: %(prog)s [OPTION]... [root_password]
+Health-check this XCP-ng host, and the rest of its pool given a root password.
 
-  - This host is always checked, using local commands (no ssh, no password needed)
-  - The other pool members are checked too if a root password is given: they are
-    reached over ssh, and sshpass is installed from the stock 'extras' repo if missing.
-    Pool members share the master's root password, so one password covers the pool
-  - With no password and a terminal you are asked for one; blank, or no terminal
-    (cron, pipe), just checks this host and says so in the Pool Status section
-  - Prefer the prompt over the argument: an argument is visible in 'ps' and lands
-    in your shell history
-  - Pool-level results are reported either way, since xapi answers those from any
-    pool member, slave included
-  - Use '-f' flag to filter output to only show issues found
-  - Use '-s' flag to skip the pool-level section and only report on this host
-  - Use '--json' to print the results as a JSON document instead of a report, for
-    cron and monitoring. Same checks, same exit code; '-f' narrows it the same way,
-    and everything that is not the document goes to stderr
+This host is always checked, using local commands - no ssh and no password
+needed. The other pool members are checked too if a root password is given:
+they are reached over ssh, which needs nothing installed to be handed a
+password. Pool members share the master's root password, so one
+password covers the pool. With no password and a terminal you are asked for
+one; blank, or no terminal (cron, pipe), just checks this host and says so in
+the Pool Status section. Prefer the prompt over the argument - an argument is
+visible in 'ps' and lands in your shell history. Pool-level results are
+reported either way, since xapi answers those from any pool member.
 
-  Examples:
+  -f, --filter          only print checks that flagged; passing and
+                        informational lines are hidden, sections included
+  -s, --single          skip the pool-level section, report on this host alone
+      --json            print the run as one JSON document instead of a
+                        report, for cron and monitoring: same checks, same
+                        exit code, -f narrows it the same way, and anything
+                        that is not the document goes to stderr
+  -h, --help            print this help and exit
+
+Exit status: 0 if every check passed, 1 if any flagged, 2 on a usage error.
+
+Examples:
   %(prog)s
   %(prog)s -f
   %(prog)s 'mypass'
@@ -146,6 +163,16 @@ def _host_spec(with_smapi):
                            "context": config.LOG_ERROR_CONTEXT},
         "multipath": {"transient": config.MULTIPATH_TRANSIENT_CHK_STATES,
                       "recheck_delay": config.MULTIPATH_RECHECK_DELAY},
+        "mount_stall_scan": {"files": config.MOUNT_STALL_FILES,
+                             "phrases": config.MOUNT_STALL_PHRASES,
+                             "context": config.LOG_ERROR_CONTEXT},
+        "stuck": {"recheck_delay": config.STUCK_RECHECK_DELAY,
+                  "samples": config.STUCK_SAMPLES,
+                  "min_age": config.STUCK_MIN_AGE,
+                  "max_lines": config.STUCK_MAX_LINES},
+        "mount_probe": {"types": config.NETWORK_FS_TYPES,
+                        "probe_timeout": config.MOUNT_PROBE_TIMEOUT,
+                        "probe_reserve": config.MOUNT_PROBE_RESERVE},
     }
 
 
@@ -254,6 +281,38 @@ def notice(run, text):
     (sys.stderr if run.json_output else sys.stdout).write(text)
 
 
+_PROGRESS_LOCK = threading.Lock()
+
+
+def progress_enabled():
+    """Live progress is for a person watching a terminal, and for nobody else.
+
+    stderr only, and only when it is a tty: stdout carries the report (or the --json
+    document) and does not change, and a captured, piped or cron run gets exactly the bytes
+    it got before - which is also what keeps the old-vs-new regression diffs honest.
+    """
+    try:
+        return bool(sys.stderr.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+def progress(text):
+    """One whole line at a time - every host worker writes here.
+
+    Between the banner and the first line of the report the run makes one ssh call to
+    discover the pool and then one per host, each of which may take REMOTE_CMD_TIMEOUT,
+    and the report cannot start until the last one is in. Printing nothing in the
+    meantime makes a slow host indistinguishable from a wedged script: it was read as one
+    and killed twice before the collectors had run out of their own budget.
+    """
+    if not progress_enabled():
+        return
+    with _PROGRESS_LOCK:
+        sys.stderr.write(text)
+        sys.stderr.flush()
+
+
 def print_banner(run, host, name):
     """Every run names what it is about to check, before any of the slow work.
 
@@ -264,7 +323,10 @@ def print_banner(run, host, name):
         notice(run, "Checking pool: %s\n" % colors.green("%s (%s)" % (name, host)))
     else:
         notice(run, "Checking host: %s\n" % colors.green(host))
-    notice(run, "\n")
+    # -f is asked for when the answer is wanted in as few lines as possible, and the very
+    # next thing it prints is a heading; a full report keeps the separator
+    if not run.filter_output:
+        notice(run, "\n")
 
 
 def require_root(run_env):
@@ -309,7 +371,11 @@ def _xodb_unreadable(consequence):
 
 
 def resolve_target_xoa(run, args):
-    """Pick a pool / take the host argument, then find a password for it."""
+    """Pick a pool / take the host argument, then find a password for it.
+
+    False if there is no way to give ssh a password at all, which is not fatal: the
+    appliance's own section is still worth printing, and is still the truth.
+    """
     if run.name_filter and len(args) > 1:
         sys.stderr.write("ERROR: -n/--name looks the host up in xo-server-db, so it takes "
                          "at most a password after it.\n")
@@ -356,9 +422,11 @@ def resolve_target_xoa(run, args):
     run.pool_name = selected.name if selected else xodb.pool_name_for_host(host)
     print_banner(run, host, run.pool_name)
 
-    if not transport.ensure_sshpass(run.run_env):
-        sys.stderr.write("ERROR: sshpass is required to reach the pool over ssh.\n")
-        sys.exit(1)
+    if not run.transport.enable_password_auth(run.run_env):
+        # not an exit: the appliance's own section needs no pool access, and on the
+        # offline XOA this fires on it is the half of the report that can still be
+        # produced. main() takes it from here - see xoa_only_report().
+        return False
 
     if len(args) == 2:
         run.password = args[1]
@@ -380,6 +448,7 @@ def resolve_target_xoa(run, args):
             sys.exit(1)
         run.password = password
     run.transport.password = run.password
+    return True
 
 
 def resolve_target_host_mode(run, args):
@@ -440,7 +509,8 @@ def prepare_host_sweep(run, argument_password):
             sys.stderr.write("\n")
     if not password:
         return
-    if not transport.ensure_sshpass(run.run_env):
+    if not run.transport.enable_password_auth(run.run_env):
+        sys.stderr.write("ERROR: %s.\n" % run.transport.auth_error)
         sys.stderr.write("Continuing with this host only.\n")
         return
     run.password = password
@@ -451,6 +521,7 @@ def prepare_host_sweep(run, argument_password):
 def discover(run):
     """Phase A: one call to the seed for the pool's host list and our own identity."""
     spec = {"want": ["pool_hosts"]}
+    progress("Asking %s for the pool's host list...\n" % (run.seed or "this host"))
     try:
         if run.run_env == "host":
             payload = run.transport.collect_local(spec)
@@ -543,12 +614,17 @@ def _collect_one(run, host, pool_spec):
     if run.pool_mode and host.address == run.pool_cmd_host:
         spec = _merge(spec, pool_spec)
     note = ""
+    started = _now()
     try:
         host.payload = run.transport.collect(host.address, spec)
     except transport.CollectError as exc:
         host.error = str(exc)
         note = "Failed when trying to check %s: %s\n" % (host.address, exc)
     host.local_now = _now()
+    # whichever way it went, say so now: the note is held back until every host is in, and
+    # by then the thing worth knowing - which host the run was waiting on - has passed
+    progress("  %s %s (%.1fs)\n" % (host.address, "failed" if host.error else "answered",
+                                    host.local_now - started))
     return note
 
 
@@ -568,16 +644,44 @@ def parallel_workers(host_count):
     return max(1, min(limit, host_count))
 
 
+def _wait_with_progress(futures, addresses):
+    """Wait for the collectors, naming every so often the hosts that have not answered.
+
+    A host that is merely slow - a wedged 'yum check-update' against an unreachable
+    mirror is the usual one - holds the whole phase for up to REMOTE_CMD_TIMEOUT, and
+    'answered' lines only appear as each host finishes. This is what fills the gap in
+    between, so the run says what it is waiting for instead of appearing to hang.
+    """
+    if not progress_enabled():
+        return
+    started = _now()
+    while True:
+        _, not_done = futures_wait(futures, timeout=config.PROGRESS_INTERVAL)
+        if not not_done:
+            return
+        waiting = [addresses[i] for i, f in enumerate(futures) if f in not_done]
+        progress("  still waiting on %s (%ds)\n"
+                 % (", ".join(waiting), _now() - started))
+
+
 def _collect_in_parallel(run, pool_spec, workers):
     pool = ThreadPoolExecutor(max_workers=workers)
     try:
         futures = [pool.submit(_collect_one, run, host, pool_spec) for host in run.hosts]
         try:
+            _wait_with_progress(futures, [h.address for h in run.hosts])
             return [f.result() for f in futures]
         except BaseException:
             # named and immediately re-raised, so this is not a swallowed error: the
             # workers are blocked in communicate() and cannot see a ctrl-C, so without
-            # this the shutdown below would wait out every collector still running
+            # this the shutdown below would wait out every collector still running.
+            # The hosts still QUEUED have to be dropped as well - shutdown(wait=True) does
+            # not discard pending work, so with more hosts than workers a ctrl-C would
+            # start a brand new ssh for every host it had not reached yet and then wait
+            # out all of them. (shutdown(cancel_futures=True) is 3.9; the floor here is
+            # 3.6.) Cancel before killing, so nothing is launched into the gap.
+            for future in futures:
+                future.cancel()
             transport.kill_all_children()
             raise
     finally:
@@ -597,6 +701,9 @@ def collect_hosts(run):
 
     workers = parallel_workers(len(run.hosts))
     transport.debug("collecting %d host(s), %d at a time" % (len(run.hosts), workers))
+    progress("Collecting from %d host(s), %d at a time, up to %ds each: %s\n"
+             % (len(run.hosts), workers, config.REMOTE_CMD_TIMEOUT,
+                ", ".join(h.address for h in run.hosts)))
     if workers > 1:
         notes = _collect_in_parallel(run, pool_spec, workers)
     else:
@@ -766,8 +873,71 @@ def pool_status_section(run, rep):
     rep.check("Migration Network", checks.migration_network, run.pool)
     rep.check("Backup Network", checks.backup_network, run.pool, run.run_env,
               xoa.ping_silent)
-    rep.end_section()
+    # inside the section, so that under -f a pool with nothing to report takes its own
+    # separator with it instead of leaving a blank line where the section was
     rep.blank()
+    rep.end_section()
+
+
+_NO_POOL_ACCESS_HELP = """\
+%(reason)s.
+
+Every check except the XOA section logs into the pool hosts over ssh as root, and ssh
+takes a password only from a terminal or from a helper program - so this run could report
+on the appliance and on nothing else.
+
+The helper is written into the run's temporary directory, so the fix that needs nothing
+installed and no internet access is to point the run at one it may execute from:
+
+    TMPDIR=/root python3 health.py %(args)s
+
+Failing that, 'apt-get install sshpass' is used instead when it is there. An XCP-ng 8.3
+host can also be checked by running health.py on the host itself, which needs no
+credentials at all for the machine it is running on."""
+
+
+def _target_hint(run):
+    """How this run named its target, for the suggested command line.
+
+    Rebuilt rather than taken from sys.argv, because the argv of a run given its password
+    on the command line contains that password, and this text is printed.
+    """
+    if run.name_filter:
+        name = run.name_filter
+        return "-n %s" % (("'%s'" % name) if " " in name else name)
+    return run.seed or ""
+
+
+def xoa_only_report(run, rep_meta, xoa_worker):
+    """Everything still establishable when the pool cannot be logged into at all.
+
+    The appliance's own section shares nothing with the pool - version, updates, services,
+    disk, plugins, backup networks - so it is a whole answer to half the question, and
+    printing it beats the single line about sshpass that an appliance with no internet
+    access used to get in place of a report.
+
+    The pool is reported Unknown rather than left out: a run that could not look at the
+    pool it was asked about must not exit 0, and a section that is simply absent reads as
+    one that passed.
+    """
+    rep = report.Report(run.filter_output, json_mode=run.json_output, meta=rep_meta)
+    rep.heading("== Pool Status ==")
+    rep.begin_section("pool")
+    reason = run.transport.auth_error or "the pool could not be reached over ssh"
+    shown = run.pool_name or run.seed or "the pool"
+    rep.add(result.unknown("Pool Access", "Unknown - %s was not checked: %s"
+                           % (shown, reason))
+            .with_detail("Pool Access",
+                         _NO_POOL_ACCESS_HELP % {"reason": reason,
+                                                 "args": _target_hint(run)}))
+    rep.blank()
+    rep.end_section()
+
+    rep.begin_section("xoa")
+    rep.heading("== XOA Status ==")
+    rep.add_all(xoa_worker.result(), "XOA")
+    rep.end_section()
+    return rep.finish()
 
 
 def run_meta(run):
@@ -812,6 +982,9 @@ def per_host_checks():
         ("lacp_negotiation", "LACP Negotiation Issues", checks.lacp),
         ("multipath_health", "Multipath Path Health", checks.multipath_health),
         ("multipath_events", "Multipath Path Events", checks.multipath_events),
+        ("stuck_processes", "Stuck Processes", checks.stuck_processes),
+        ("mount_stalls", "Mount Stalls", checks.mount_stalls),
+        ("network_mounts", "Network Mounts", checks.network_mounts),
         ("silly_mtus", "Silly MTUs", checks.silly_mtus),
         ("dns_gw_non_mgmt_pifs", "DNS/GW on Non-Mgmt PIFs", checks.dns_gw_non_mgmt_pifs),
         ("overlapping_subnets", "Overlapping Subnets", checks.overlapping_subnets),
@@ -953,10 +1126,11 @@ def main(argv=None):
         return 1
 
     argument_password = ""
+    pool_reachable = True
     if run.run_env == "host":
         argument_password = resolve_target_host_mode(run, args)
     else:
-        resolve_target_xoa(run, args)
+        pool_reachable = resolve_target_xoa(run, args)
 
     # The appliance's own section starts here and is not looked at again until the report
     # has nothing left to say about the pool. Here, and not at the top of main(), on
@@ -972,11 +1146,17 @@ def main(argv=None):
     # cores - whereas from here it runs against the host collection, which is waiting on
     # ssh and leaves the CPU idle. It also leaves every exit above untouched: a pool name
     # that matched nothing, an unreadable xo-db, the interactive picker, the sshpass
-    # install. Those cost the run nothing, exactly as before.
+    # fallback. Those cost the run nothing, exactly as before.
     #
     # The one case it loses is a single fast host, where there is under 2s of collection
     # to hide 2.9s of appliance behind. Do not move it back without re-measuring all five.
+    #
+    # It is also started BEFORE the no-password-mechanism exit below, which is the one
+    # case where this section is the entire report: there is nothing else left to overlap.
     xoa_worker = _Background(xoa.lines) if run.run_env != "host" else None
+
+    if not pool_reachable:
+        return xoa_only_report(run, rep_meta=run_meta(run), xoa_worker=xoa_worker)
 
     hosts = discover(run)
 
@@ -1053,9 +1233,9 @@ def main(argv=None):
     # that was asked about, so it has no business standing in front of the host results -
     # and by here it has almost always finished on its thread, making it free.
     if xoa_worker is not None:
-        if not run.pool_mode:
+        if not run.pool_mode or run.filter_output:
             # every section is preceded by exactly one blank line; in pool mode the
-            # pool.conf block already ends in one
+            # pool.conf block already ends in one - except under -f, which drops it
             rep.blank()
         rep.begin_section("xoa")
         rep.heading("== XOA Status ==")
@@ -1080,5 +1260,21 @@ def _narrow_to_seed(run, hosts):
     return [model.Host(run.seed)]
 
 
+def entry():
+    """The process's exit code, with a ctrl-C answered as one rather than as a crash.
+
+    Run the documented way - `python3 <(curl ...)` - the traceback an interrupt used to
+    print could not even show its own source lines: the file is a descriptor that is
+    already gone, so it was twenty lines of threading internals against a path called
+    /dev/fd/63. 130 is the shell's own convention for a SIGINT death, and the atexit
+    handlers still take the children and the work dir with them.
+    """
+    try:
+        return main()
+    except KeyboardInterrupt:
+        sys.stderr.write("\nInterrupted.\n")
+        return 130
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(entry())

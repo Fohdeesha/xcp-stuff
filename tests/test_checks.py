@@ -130,6 +130,8 @@ def test_hypervisor_version_flags_below_83_and_keeps_the_line_key():
 
     new = checks.hypervisor_version(host(os_release=fact({"NAME": "XCP-ng", "VERSION": "8.3.0"})))
     assert new.key == "Hypervisor Version" and new.status == INFO
+    # pinned: the only informational line -f keeps, because it is what names the host
+    # block the findings under it belong to
     assert new.always_print and not new.flags
 
     # the key never changes, even when os-release could not be read
@@ -158,7 +160,13 @@ def test_multipathing_never_flags():
     for value in ("true", "false", "Unknown"):
         h.multipathing = value
         line = checks.multipathing(h)
-        assert line.status == INFO and not line.flags and line.always_print
+        assert line.status == INFO and not line.flags
+    # a reading -f has no use for, versus a setting we could not read at all, which it
+    # must not hide - that is a green report over a fact nobody established
+    h.multipathing = "true"
+    assert not checks.multipathing(h).always_print
+    h.multipathing = "Unknown"
+    assert checks.multipathing(h).always_print
 
 
 def test_ntp_states():
@@ -286,8 +294,9 @@ def test_xostor_in_use_is_a_fact_not_a_finding():
     off = checks.xostor_in_use(pool(xostor_srs=fact([])))
     assert off.status == OK
     on = checks.xostor_in_use(pool(xostor_srs=fact(["sr-1"])))
-    # yellow-and-flagging would have marked every XOSTOR pool unhealthy forever
-    assert on.status == INFO and not on.flags and on.always_print
+    # yellow-and-flagging would have marked every XOSTOR pool unhealthy forever; green
+    # and informational is what it is, so -f hides it like any other reading
+    assert on.status == INFO and not on.flags and not on.always_print
 
 
 def test_xostor_ram():

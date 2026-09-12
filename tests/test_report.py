@@ -28,16 +28,54 @@ def test_passing_lines_are_hidden_by_f_and_findings_are_not():
     assert "Grey: Unknown" in out
 
 
-def test_info_lines_print_under_f_and_do_not_flag():
+def test_f_hides_readings_and_keeps_warnings():
+    """-f is 'show me what is wrong'. A green reading is not that; a yellow one is - it
+    is a fact the run failed to establish, and hiding it is the silent green the whole
+    tool is built against."""
     rep = new_report(filter_output=True)
     rep.add(result.info("Multipathing", "true"))
-    assert "Multipathing: true" in text(rep)
+    rep.add(result.raw("Last Booted", "2026-08-24 07:08:20"))
+    rep.add(result.info("Host Enabled", "Unknown", "yellow"))
+    out = text(rep)
+    assert "Multipathing" not in out and "Last Booted" not in out
+    assert "Host Enabled: Unknown" in out
+    assert rep.finish() == 0                  # ...and none of them flagged
+
+
+def test_a_pinned_info_line_survives_f():
+    rep = new_report(filter_output=True)
+    rep.add(result.pinned(result.info("Hypervisor Version", "XCP-ng 8.3.0")))
+    assert "Hypervisor Version: XCP-ng 8.3.0" in text(rep)
     assert rep.finish() == 0
 
 
-def test_headings_always_print():
+def test_a_heading_over_nothing_is_dropped_under_f():
+    """An empty '== Pool Status ==' reads as a section that passed, or as one whose
+    findings went missing. Both are claims the section did not earn."""
     rep = new_report(filter_output=True)
     rep.heading("== Pool Status ==")
+    rep.begin_section("pool")
+    rep.add(result.ok("Green", "OK"))
+    rep.blank()
+    rep.end_section()
+
+    rep.heading("== Individual Hosts ==")
+    rep.begin_section("host")
+    rep.add(result.flag("Yellow", "Fail"))
+    rep.end_section()
+
+    out = text(rep)
+    assert "== Pool Status ==" not in out
+    assert "== Individual Hosts ==" in out
+    # the dropped section's own separator went with it, so nothing precedes the heading
+    assert out.startswith("== Individual Hosts ==\n")
+
+
+def test_headings_always_print_without_f():
+    rep = new_report()
+    rep.heading("== Pool Status ==")
+    rep.begin_section("pool")
+    rep.end_section()
     assert "== Pool Status ==" in text(rep)
 
 
@@ -98,6 +136,27 @@ def test_poolconf_summary_takes_only_the_first_line():
     rep.add_poolconf("h (1.2.3.4)", "master\r\nsomething else\n")
     rep.print_poolconf_section()
     assert "h (1.2.3.4)\nmaster\n\n" in text(rep)
+
+
+def test_poolconf_is_dropped_whole_under_f():
+    """Every host's role, and no state of it is a finding - so -f has no use for it."""
+    rep = new_report(filter_output=True)
+    rep.add_poolconf("h (1.2.3.4)", "master\n")
+    rep.print_poolconf_section()
+    out = text(rep)
+    assert "pool.conf" not in out and "master" not in out
+
+
+def test_a_run_with_no_findings_under_f_is_just_the_version_line():
+    rep = new_report(filter_output=True)
+    rep.heading("== Pool Status ==")
+    rep.begin_section("pool")
+    rep.add(result.ok("Green", "OK"))
+    rep.end_section()
+    rep.finish()
+    assert "== Pool Status ==" not in text(rep)
+    lines = [l for l in text(rep).splitlines() if l.strip()]
+    assert len(lines) == 1 and lines[0].startswith("Health Script Version: v")
 
 
 def test_colours_only_when_asked():

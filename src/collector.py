@@ -40,6 +40,59 @@ DEFAULT_CMD_TIMEOUT = 60
 # hanging until the transport gives up and the report loses the host entirely.
 DEADLINE = [None]
 
+# Where a host's time actually went. Every command run on a host goes through run() or
+# grep_scan(), so this is complete by construction rather than by remembering to
+# instrument each caller. It is returned only when the spec asks for it (HEALTH_DEBUG),
+# but it is always collected: a list append per command is nothing next to the command.
+#
+# The reason it exists: a host that takes four minutes used to be a host that took four
+# minutes, with nothing to say which of its ~60 commands took them. Working that out from
+# the outside costs one round trip per candidate, and a wrong guess looks exactly like a
+# right one until you have run it.
+TIMINGS = []
+
+# The command running right now, and the document as it is built. Both exist for the
+# watchdog: when a command cannot be killed, these are the only things left to answer with.
+# One-element lists and a module dict rather than plain globals, so every writer can set
+# them without a `global` statement (2.7 has no nonlocal).
+CURRENT = [""]
+PARTIAL = {}
+
+# Commands that outlived their own SIGKILL. Not a report line - the fact each one was
+# collecting already says Unknown with the reason, and the trap ledger is explicit about
+# not reporting one thing twice in different words. It rides along only in the watchdog's
+# payload, where "these had already been abandoned before the fatal one" is additive.
+ABANDONED = []
+
+# How long to wait for a killed command to actually die before giving up on it. A child
+# that CAN be killed is gone in milliseconds; anything still there after this is in
+# uninterruptible sleep and is not coming back on any timescale worth waiting for.
+KILL_GRACE = 5
+
+# How long past the budget the watchdog waits before giving up on the main thread. The
+# transport allows REMOTE_CMD_TIMEOUT (300s) against a 240s budget, so this has to leave
+# the abandoned document time to travel.
+WATCHDOG_GRACE = 15
+
+
+def _argv_text(argv):
+    """Enough of an argv to identify it, on one line.
+
+    The argv rather than a description of it, so the command can be pasted straight into a
+    shell on the host. Whitespace is collapsed because rpm's --qf formats carry literal
+    newlines, and a long one is elided in the MIDDLE rather than the tail: the path is at
+    the end, and "a grep took 90 seconds" is not an answer without the file it was reading.
+    """
+    text = " ".join(" ".join(str(arg).split()) for arg in argv)
+    if len(text) > 110:
+        text = text[:60] + " ... " + text[-45:]
+    return text
+
+
+def timed(argv, started):
+    """Record one command's elapsed seconds, with enough argv to identify it."""
+    TIMINGS.append([round(time.time() - started, 2), _argv_text(argv)])
+
 
 def budget_left():
     if DEADLINE[0] is None:
@@ -125,29 +178,72 @@ def _kill(proc):
 
 
 def run(argv, timeout=DEFAULT_CMD_TIMEOUT):
-    """Run argv (no shell, ever) and return a Ran. Reads to EOF - see the xe/EPIPE note."""
+    """Run argv (no shell, ever) and return a Ran. Reads to EOF - see the xe/EPIPE note.
+
+    A command that will not die is one we stop waiting for. The timeout used to be a
+    threading.Timer firing SIGKILL while the main thread sat in communicate(), which
+    assumes the signal lands: a process in uninterruptible sleep (D state) does NOT die on
+    SIGKILL - the signal stays pending until it leaves D, which may be never - so
+    communicate() never returned, the collector never finished, and the transport lost the
+    WHOLE HOST to its own timeout.
+
+    Measured: a dom0 with a dead CIFS mount parks `df -hP` in D state permanently (wchan
+    open_shroot / smb2_reconnect). Five health check runs left five stuck df processes and
+    not one of them produced a document; the host reported only "timed out after 300s",
+    naming neither the command nor the mount.
+
+    So communicate() happens on a daemon thread and this joins it with a deadline. When
+    the kill does not take, the thread and its pipes are abandoned deliberately - the child
+    cannot be reaped, so there is nothing to clean up - and the collector goes on to the
+    next fact. One line then reads Unknown with the reason, instead of every line about
+    that host disappearing.
+    """
+    started = time.time()
     timeout = _clamp(timeout)
     if timeout is None:
+        timed(argv, started)
         return Ran(124, "", "run budget exhausted", True)
     try:
         proc, devnull = _popen(argv)
     except OSError as exc:
+        timed(argv, started)
         return Ran(127, "", "%s: %s" % (argv[0], exc), False)
 
-    state = {"killed": False}
+    # named before it can block, cleared after: if this one never returns, it is the only
+    # record of what the collector was doing when it stopped
+    CURRENT[0] = _argv_text(argv)
+    box = {}
 
-    def on_timeout():
-        state["killed"] = True
+    def reader():
+        try:
+            box["out"], box["err"] = proc.communicate()
+        except (IOError, OSError, ValueError) as exc:
+            # the pipes are ours and nobody else touches them, so this is a broken pipe or
+            # a closed file - never a command result, and never silently a success
+            box["failed"] = "%s: %s" % (argv[0], exc)
+
+    worker = threading.Thread(target=reader)
+    worker.daemon = True
+    worker.start()
+    worker.join(timeout)
+
+    killed = worker.is_alive()
+    if killed:
         _kill(proc)
+        worker.join(KILL_GRACE)      # a killable child dies here and the thread ends
 
-    timer = threading.Timer(timeout, on_timeout)
-    timer.start()
-    try:
-        out, error = proc.communicate()
-    finally:
-        timer.cancel()
-        devnull.close()
-    return Ran(proc.returncode, _decode(out), _decode(error), state["killed"])
+    abandoned = worker.is_alive()
+    timed(argv, started)
+    CURRENT[0] = ""
+    devnull.close()
+
+    if abandoned:
+        ABANDONED.append(_argv_text(argv))
+        return Ran(124, "", "did not die when killed - uninterruptible, so the host's "
+                            "storage or a mount is most likely wedged", True)
+    if "failed" in box:
+        return Ran(127, "", box["failed"], False)
+    return Ran(proc.returncode, _decode(box.get("out")), _decode(box.get("err")), killed)
 
 
 def _clamp(timeout):
@@ -294,6 +390,338 @@ def collect_df():
     if not r.ok:
         return err("df failed (%s)" % r.why())
     return fact(r.out)
+
+
+# --------------------------------------------------------------------------------------
+# stuck mounts, and the processes they take down with them
+# --------------------------------------------------------------------------------------
+
+def parse_proc_stat(text):
+    """(state, starttime_ticks, cpu_ticks) from one /proc/PID/stat, or (None, None, None).
+
+    The comm field is the trap, and a real one rather than a hypothetical: it is the
+    executable name in parentheses, unescaped, and may contain both spaces and
+    parentheses - a process can genuinely be called `(foo) bar)`. Splitting on whitespace,
+    or on the FIRST ')', mis-numbers every field after it, and here that would silently
+    read some other number as the state. rfind(')') is the documented way round it: comm
+    is the only parenthesised field, and nothing after it can contain one.
+
+    Fields after that closing paren are 3..52, so state is [0], utime and stime are [11]
+    and [12], and starttime is [19]. The CPU pair is read here rather than by a second
+    reader because it has to come from the SAME line as the state: two reads would let the
+    process move between them, and the entire value of the number is that it did not.
+
+    starttime and cpu are answered together or not at all, so a caller that has a
+    starttime always has a cpu figure to go with it.
+    """
+    close = text.rfind(")")
+    if close < 0:
+        return (None, None, None)
+    rest = text[close + 1:].split()
+    if len(rest) < 20:
+        return (None, None, None)
+    try:
+        return (rest[0], int(rest[19]), int(rest[11]) + int(rest[12]))
+    except ValueError:
+        return (rest[0], None, None)
+
+
+_MOUNT_ESCAPES = {"040": " ", "011": "\t", "012": "\n", "134": "\\"}
+
+
+def _unescape_mount(field):
+    """Undo /proc/mounts' octal escaping - a mount point with a space in it is written
+    with a backslash and 040, and would otherwise arrive with the escape still in it."""
+    if "\\" not in field:
+        return field
+    out = []
+    i = 0
+    while i < len(field):
+        if field[i] == "\\" and field[i + 1:i + 4] in _MOUNT_ESCAPES:
+            out.append(_MOUNT_ESCAPES[field[i + 1:i + 4]])
+            i += 4
+        else:
+            out.append(field[i])
+            i += 1
+    return "".join(out)
+
+
+def parse_mounts(text, network_types):
+    """[(source, target, fstype)] for the network mounts in /proc/mounts, in file order.
+
+    /proc/mounts is served by the kernel out of its own mount table, so reading it cannot
+    block on a mount that has stopped answering - which stat() of the same path very much
+    can. That difference is the whole basis of this check.
+    """
+    wanted = set(network_types or [])
+    found = []
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) < 3 or parts[2] not in wanted:
+            continue
+        found.append((_unescape_mount(parts[0]), _unescape_mount(parts[1]), parts[2]))
+    return found
+
+
+def fs_module_of(stack_text):
+    """The module a kernel stack is blocked in, e.g. 'cifs' or 'nfs'; "" if none.
+
+    /proc/PID/stack prints module-owned frames as `symbol+0x1/0x2 [module]`, which turns
+    "something is stuck" into "stuck in the SMB client" without any guessing. The wchan
+    column is NOT a substitute: it resolves through a symbol table that can be wrong, and
+    was - naming one cifs symbol for every stuck process on a host, kernel threads that
+    never touch cifs included.
+    """
+    for line in (stack_text or "").splitlines():
+        text = line.strip()
+        # the module is a trailing [name]; every frame ALSO opens with an address column
+        # spelled [<0>], and taking the last '[' without this ends up returning that
+        if not text.endswith("]"):
+            continue
+        start = text.rfind("[")
+        if start < 0:
+            continue
+        module = text[start + 1:-1].strip()
+        if re.match(r"^\w+$", module):
+            return module
+    return ""
+
+
+def _proc_pids():
+    try:
+        return sorted(int(name) for name in os.listdir("/proc") if name.isdigit())
+    except (IOError, OSError):
+        return None
+
+
+def _clock_ticks():
+    """USER_HZ - the unit /proc/PID/stat counts both of its times in. 100 on everything
+    this runs on, but asked for rather than assumed, and defaulted rather than raising."""
+    try:
+        return float(os.sysconf("SC_CLK_TCK")) or 100.0
+    except (ValueError, OSError, AttributeError):
+        return 100.0
+
+
+def _uptime():
+    """Seconds since boot, the clock /proc/PID/stat's starttime is measured against."""
+    text = read_file("/proc/uptime") or ""
+    try:
+        return float(text.split()[0])
+    except (IndexError, ValueError):
+        return None
+
+
+def _proc_io(pid):
+    """/proc/PID/io as it stands, or "" - the byte and syscall counters, unparsed.
+
+    Compared verbatim against a later reading, so there is nothing to parse: every counter
+    in it only ever grows, and it grows only when the process gets somewhere. It is the
+    half of the progress test that CPU time cannot cover, since a process can be almost
+    purely I/O-bound and tick over a hundredth of a second of CPU in ten.
+
+    "" when the kernel was built without CONFIG_TASK_IO_ACCOUNTING, which is not an error:
+    it then contributes no evidence in either direction and the CPU figure decides alone.
+    """
+    return read_file("/proc/%d/io" % pid) or ""
+
+
+def _d_state_procs(pids=None):
+    """{pid: (starttime, cpu_ticks, io)} for the processes in uninterruptible sleep now.
+
+    Everything read here is served out of kernel memory by procfs, so none of it can block
+    on the very mount being investigated - which is the whole reason this is the primary
+    signal rather than stat()ing mount points and seeing what hangs.
+
+    The value carries the identity AND the progress evidence, so two samples compare with
+    a single ==: the same process (starttime pins it - a pid freed and reused in between
+    is a different process and must not inherit the first one's history), which has not
+    consumed a tick of CPU or completed a byte of I/O since the last look.
+
+    `pids` narrows the scan to a set already under suspicion, which is all the later
+    samples need and saves re-reading every process on the host.
+    """
+    if pids is None:
+        pids = _proc_pids()
+        if pids is None:
+            return None
+    found = {}
+    for pid in pids:
+        text = read_file("/proc/%d/stat" % pid)
+        if not text:
+            continue                      # exited between listdir and open: not an error
+        state, starttime, cpu = parse_proc_stat(text)
+        if state == "D" and starttime is not None:
+            found[pid] = (starttime, cpu, _proc_io(pid))
+    return found
+
+
+def _proc_cmdline(pid):
+    """The command, or "" for a kernel thread - which is how kernel threads are told apart.
+
+    NUL-separated, and deliberately not /proc/PID/cmdline's neighbours cwd/exe/root: those
+    are symlinks INTO the filesystem, so resolving one belonging to a process stuck on a
+    dead mount blocks this collector in exactly the way it is here to detect.
+    """
+    raw = read_file("/proc/%d/cmdline" % pid)
+    if not raw:
+        return ""
+    return " ".join(part for part in raw.split("\0") if part).strip()
+
+
+# The mount probe never returns on a dead mount, so it is left parked in D state and the
+# NEXT run finds it - and would count the script's own leavings as if the host had
+# degraded further on its own. stat's format string is part of its argv, so putting a mark
+# in it makes those processes identifiable in /proc with certainty, rather than by
+# guessing at what a bare `stat` in D state belongs to. Only stat's exit status is read,
+# so the mark changes nothing else.
+MOUNT_PROBE_MARK = "health-mount-probe"
+
+
+def collect_stuck_processes(spec):
+    """Processes wedged in uninterruptible sleep, watched long enough to tell them apart
+    from processes doing work.
+
+    D state is where a process waits on storage, so a healthy host is full of it in
+    passing: every disk read, every coalesce, every backup is in D for some of its life.
+    Two facts separate a wedge from work and BOTH are required.
+
+    Persistence: the same process must be in D at every sample across the window.
+
+    Progress: it must have got nowhere in that time - not one tick of CPU, not one byte
+    through /proc/PID/io. That is a fact rather than a heuristic, and it is the one that
+    matters: a process parked in D executes no instructions and completes no I/O, while
+    anything making progress is being woken constantly to hand off the next buffer. Read
+    live as a false positive (issue #70) before this existed: a vhd-util coalesce one
+    minute into its run, in D at both samples, reported as stuck.
+
+    The age floor is a noise filter and nothing more - a process's age is how long it has
+    existed, an upper bound on how long it has been stuck. It is applied here, before the
+    first wait, rather than at the end: whatever is in D on the usual host is a disk read
+    a second old, and dropping it up front means that host pays no wall clock at all.
+
+    Kernel threads are counted separately rather than dropped: some sit in D quite
+    normally, but a kworker stuck in a filesystem's work queue is exactly the corroboration
+    that the mount, and not the process, is the problem.
+    """
+    settings = spec or {}
+    delay = settings.get("recheck_delay") or 0
+    rounds = max(1, (settings.get("samples") or 2) - 1)
+    min_age = settings.get("min_age") or 0
+    cap = settings.get("max_lines") or 0
+
+    ticks = _clock_ticks()
+    started = _uptime()
+    if started is None:
+        return err("could not read /proc/uptime")
+    procs = _d_state_procs()
+    if procs is None:
+        return err("could not read /proc")
+
+    # "old enough by the END of the window", so the floor is applied exactly once and a
+    # process on the boundary is not dropped for being seen a few seconds too early
+    floor = min_age - (delay * rounds)
+    watching = dict((pid, seen) for pid, seen in procs.items()
+                    if started - (seen[0] / ticks) >= floor)
+
+    watched = 0.0
+    for _ in range(rounds):
+        if not watching:
+            break                         # nothing left to watch: stop paying for looks
+        pause = min(delay, max(1, budget_left() or delay))
+        time.sleep(pause)
+        watched += pause
+        again = _d_state_procs(sorted(watching))
+        if again is None:
+            return err("could not read /proc")
+        # one == over the whole tuple: still in D, still the same process, and not a tick
+        # of CPU or a byte of I/O since the last sample
+        watching = dict((pid, seen) for pid, seen in watching.items()
+                        if again.get(pid) == seen)
+
+    now = _uptime()
+    if now is None:
+        return err("could not read /proc/uptime")
+
+    rows = []
+    for pid, seen in watching.items():
+        stack = read_file("/proc/%d/stack" % pid) or ""
+        rows.append({
+            "pid": pid,
+            "age": int(now - (seen[0] / ticks)),
+            "cmd": _proc_cmdline(pid)[:120],
+            "module": fs_module_of(stack),
+            "frame": (stack.splitlines() or [""])[0].strip()[:120],
+        })
+    rows.sort(key=lambda row: row["age"], reverse=True)
+    # counted here, over ALL of them, because the cap below is what the report sees: a
+    # tally taken from the sample would be printed as if it described the whole, and on
+    # the host this was built for that is 24 of 25 shown being reported as 24 of 589
+    return fact({"total": len(rows),
+                 "userspace": len([row for row in rows if row["cmd"]]),
+                 # the script's own probes from earlier runs, counted rather than hidden:
+                 # they really are stuck, and they really were left by this tool
+                 "own_probes": len([row for row in rows
+                                    if MOUNT_PROBE_MARK in (row["cmd"] or "")]),
+                 "watched": int(watched),
+                 "rows": rows[:cap] if cap else rows})
+
+
+def collect_network_mounts(spec):
+    """Whether each network mount still answers a stat().
+
+    The probe is a separate short-lived process precisely because it may never return: a
+    mount whose server has gone parks it in D state for good, and run() abandons it rather
+    than waiting. That leaves one unkillable process behind per dead mount, and it is done
+    knowingly. Until v3.12 it was skipped entirely on a host that already had stuck
+    processes, so as not to add to the mess being reported - but by then the mess is made,
+    one more parked stat changes nothing about a host in that state, and this is the only
+    check that can say WHICH mount is the one to go and fix. That is worth a process.
+    The probes mark themselves, so a later run reports them as what they are.
+
+    The one question still not asked is the one there is no time left to answer. run()
+    clamps a command's timeout to what remains of the whole-run budget, so a probe started
+    with a second left would report a mount that was merely slow as one that never
+    answered. That is a claim, and the mount is listed unprobed instead.
+
+    The reserve is the other half of that: each dead mount costs a full probe_timeout, so
+    a host with several of them could spend the entire run parked here and leave yum and
+    the pool questions to time out behind it. Probing stops with the reserve intact and
+    the rest of the mounts say they were not asked.
+    """
+    settings = spec or {}
+    timeout = settings.get("probe_timeout") or 10
+    reserve = settings.get("probe_reserve") or 0
+    text = read_file("/proc/mounts")
+    if text is None:
+        return err("could not read /proc/mounts")
+    mounts = parse_mounts(text, settings.get("types") or [])
+
+    rows = []
+    for source, target, fstype in mounts:
+        row = {"source": source, "target": target, "type": fstype}
+        left = budget_left()
+        if left is not None and left < timeout + reserve:
+            row["state"] = "not probed"
+            row["why"] = ("not enough of the run budget left to wait %ds for an answer"
+                          % timeout)
+        else:
+            started = time.time()
+            r = run(["stat", "-c", MOUNT_PROBE_MARK + " %i", "--", target],
+                    timeout=timeout)
+            row["seconds"] = round(time.time() - started, 2)
+            if r.ok:
+                row["state"] = "ok"
+            elif r.timed_out:
+                row["state"] = "no answer"
+                row["why"] = r.err.strip()[:160]
+            else:
+                # a stat that FAILED is not a stat that hung: permission, a path that is
+                # gone. Reported as its own state rather than folded into either
+                row["state"] = "error"
+                row["why"] = r.why()[:160]
+        rows.append(row)
+    return fact(rows)
 
 
 def collect_iplink():
@@ -785,6 +1213,7 @@ def grep_scan(path, phrases, timeout=180):
         argv += ["-e", p]
     argv += ["--", path]
 
+    started = time.time()
     try:
         proc, devnull = _popen(argv)
     except OSError:
@@ -798,6 +1227,7 @@ def grep_scan(path, phrases, timeout=180):
 
     timer = threading.Timer(timeout, on_timeout)
     timer.start()
+    CURRENT[0] = _argv_text(argv)
     lowered = [p.lower() for p in phrases]
     last = {}
     try:
@@ -818,6 +1248,10 @@ def grep_scan(path, phrases, timeout=180):
     finally:
         timer.cancel()
         devnull.close()
+        # the attribution loop above runs once per MATCHED line, so this is grep's time
+        # plus ours - which is the number that matters on a log full of hits
+        timed(argv, started)
+        CURRENT[0] = ""
     # rc 1 is grep's "no match", which is a real answer; 2+ means grep itself failed
     if state["killed"] or rc > 1:
         return None
@@ -1171,7 +1605,10 @@ def parse_other_config(text):
 
 def collect(spec):
     want = set(spec.get("want") or [])
-    out = {"collector": {"python": sys.version.split()[0], "pid": os.getpid()}}
+    # built in place, so the watchdog can hand back what was established if this call
+    # never returns
+    out = PARTIAL
+    out["collector"] = {"python": sys.version.split()[0], "pid": os.getpid()}
     ident = collect_identity()
     out.update(ident)
 
@@ -1216,6 +1653,17 @@ def collect(spec):
         out["multipath_scan"] = collect_log_scan(mps.get("files") or [],
                                                  mps.get("phrases") or [],
                                                  mps.get("context") or 3)
+        mstall = spec.get("mount_stall_scan") or {}
+        out["mount_stall_scan"] = collect_log_scan(mstall.get("files") or [],
+                                                   mstall.get("phrases") or [],
+                                                   mstall.get("context") or 3)
+
+        # The order matters and is the only thing left of the old gate: the process scan
+        # runs FIRST, so a probe this run parks on a dead mount is not then reported by
+        # this same run as a process that was already stuck. It shows up on the next run,
+        # marked, and counted as what it is.
+        out["stuck_procs"] = collect_stuck_processes(spec.get("stuck"))
+        out["network_mounts"] = collect_network_mounts(spec.get("mount_probe"))
         if spec.get("smapi"):
             out["smapi"] = collect_smapi_hidden_leaves()
 
@@ -1225,7 +1673,70 @@ def collect(spec):
     if "pool" in want:
         out["pool"] = collect_pool(spec, self_uuid)
 
+    if spec.get("timings"):
+        # slowest first: the question this answers is always "what took the time", and a
+        # host runs enough commands that the whole list would bury the answer
+        out["collector"]["timings"] = sorted(TIMINGS, reverse=True)[:15]
     return out
+
+
+_EMITTED = [False]
+_EMIT_LOCK = threading.Lock()
+
+
+def emit(payload):
+    """Write the document, once and whole. Answers whether this call was the one.
+
+    The watchdog and the normal path race only in the instant the last command returns,
+    but two documents on one stdout is not a document: _extract takes the first BEGIN and
+    the last END, so a second one would be read as a truncated first.
+    """
+    with _EMIT_LOCK:
+        if _EMITTED[0]:
+            return False
+        _EMITTED[0] = True
+    sys.stdout.write(BEGIN_MARKER + "\n")
+    sys.stdout.write(json.dumps(payload))
+    sys.stdout.write("\n" + END_MARKER + "\n")
+    sys.stdout.flush()
+    return True
+
+
+def watchdog(grace):
+    """Answer anyway when a command cannot be killed.
+
+    The whole-run budget works by SIGKILLing whatever is running when it expires. A
+    process in uninterruptible sleep - D state, anything blocked on wedged storage - does
+    NOT die on SIGKILL: the signal stays pending until it leaves D, which may be never.
+    communicate() then never returns, collect() never finishes, and the collector writes
+    nothing at all. The transport loses the whole host to its own timeout, and the report
+    can only say "timed out after 300s", which names neither the host's problem nor the
+    command that hit it.
+
+    Measured on a pool with 18 XOSTOR volumes stuck in DELETING: three hosts, two
+    answering in under 3s, the third producing no document at all across five runs and
+    nothing whatsoever to say why.
+
+    So this thread outlives the main one: at the deadline plus a grace period it emits
+    what was gathered, names the command still running, and leaves. os._exit rather than
+    sys.exit or a return, because the main thread is wedged in communicate() and any
+    orderly shutdown would wait for it - which is the whole problem.
+    """
+    while True:
+        left = budget_left()
+        if left is None:
+            return                      # no budget set: nothing to enforce
+        if left <= -grace:
+            break
+        time.sleep(min(5.0, max(0.5, left + grace)))
+
+    payload = dict(PARTIAL)
+    payload["__collector_stuck__"] = CURRENT[0] or "(no command was running)"
+    payload["collector"] = dict(payload.get("collector") or {})
+    payload["collector"]["timings"] = sorted(TIMINGS, reverse=True)[:15]
+    payload["collector"]["abandoned"] = list(ABANDONED)
+    emit(payload)
+    os._exit(0)
 
 
 def main(argv):
@@ -1233,15 +1744,17 @@ def main(argv):
     if len(argv) > 1 and argv[1]:
         spec = json.loads(base64.b64decode(argv[1].encode("ascii")).decode("utf-8"))
     DEADLINE[0] = time.time() + float(spec.get("budget") or 240)
+
+    guard = threading.Thread(target=watchdog, args=(WATCHDOG_GRACE,))
+    guard.daemon = True
+    guard.start()
+
     try:
         payload = collect(spec)
     except Exception:
         import traceback
         payload = {"__collector_error__": traceback.format_exc()}
-    sys.stdout.write(BEGIN_MARKER + "\n")
-    sys.stdout.write(json.dumps(payload))
-    sys.stdout.write("\n" + END_MARKER + "\n")
-    sys.stdout.flush()
+    emit(payload)
     return 0
 
 

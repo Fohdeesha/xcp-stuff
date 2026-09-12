@@ -22,7 +22,7 @@
 
 
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 import atexit
 import base64
 import getopt
@@ -43,11 +43,12 @@ import unicodedata
 # ======================================================================================
 # --- config ----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "3.8"
+SCRIPT_VERSION = "3.17"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
 MAX_PARALLEL_HOSTS = 8           # hosts collected at once (HEALTH_MAX_PARALLEL overrides)
+PROGRESS_INTERVAL = 15           # seconds between 'still waiting on ...' lines, tty only
 LOCAL_CMD_TIMEOUT = 10           # max seconds a local command may run (hung xoa-updater etc)
 XO_REDIS_TIMEOUT = 2             # reading xo's server records straight from redis: 0.002s
                                  # measured, so this is only here to bound a wedged socket
@@ -136,12 +137,140 @@ MULTIPATH_EVENT_FILES = [
     "/var/log/kern.log",
 ]
 
+# --- stuck mounts and the processes they take down -------------------------------------
+# A mount whose server stops answering parks anything that stats it in uninterruptible
+# sleep (D state), where no signal can reach it - SIGKILL included. It is not a niche
+# failure: it took a pool master out of every report for days, and the script said nothing,
+# because nothing it ran ever came back to say anything.
+#
+# The kernel has its own detector for this and it is NOT enough on its own, which is why
+# the D-state scan leads rather than a dmesg phrase. Measured twice over:
+#
+#   * It is enabled on 8.3.0 - hung_task_timeout_secs=120, CONFIG_DETECT_HUNG_TASK=y - but
+#     kernel.hung_task_warnings defaults to 10 and COUNTS DOWN, so it stops logging for
+#     the rest of the uptime after ten.
+#   * On the host this was built for it never fired AT ALL. 589 processes had been in D
+#     state for nearly four days, and there was not one "blocked for more than" line in
+#     the dmesg ring, the live kern.log, or any of its 30 rotated archives. Inference, not
+#     measurement, for the why: khungtaskd counts only a task that has not been scheduled
+#     since its last sweep, and a CIFS reconnect loop wakes its waiters periodically - so
+#     the failure this check exists for is one the kernel is structurally quiet about.
+NETWORK_FS_TYPES = [             # the ones that can hang forever waiting on a server
+    "nfs", "nfs4", "cifs", "smb3", "smbfs", "ceph", "glusterfs", "fuse.glusterfs",
+    "afs", "9p", "ncpfs", "lustre", "beegfs",
+]
+# D state on its own is NOT a fault, and reading it as one was a false positive in the
+# field (issue #70, v3.11): a `vhd-util coalesce` a minute into its run was reported as
+# stuck, because it was in D at two samples 5s apart - which is exactly what a process
+# copying data between VHDs looks like. Every disk read is in D for some of its life.
+#
+# So a finding needs a second, positive fact: that the process got NOWHERE while it was
+# watched. Its CPU ticks and its I/O counters must not move at all across the whole
+# window - a process parked in D executes no instructions and completes no I/O, while
+# anything doing real work is being woken constantly to hand off the next buffer.
+#
+# Age is not that fact and never was. It is how long the process has EXISTED, an upper
+# bound on how long it has been wedged, so raising the floor would only have moved the
+# same false positive to longer-running commands - and a backup can coalesce for an hour.
+# The floor stays where it is, as a noise filter, and the report says what age means.
+#
+# Excluding vhd-util (or tapdisk, or dd) by name was considered and declined: a coalesce
+# wedged on a dead SR is precisely the thing worth reporting, and a name list would hide
+# it. The progress test keeps that case - a wedged coalesce burns no CPU.
+STUCK_RECHECK_DELAY = 5          # seconds between D-state samples
+STUCK_SAMPLES = 3                # samples that must ALL show it wedged, so a 10s window.
+                                 # Only the first wait is paid by a host that is merely
+                                 # busy: one look at its CPU counter drops it
+STUCK_MIN_AGE = 60               # a process must also have existed this long to count
+STUCK_MAX_LINES = 25             # stuck processes listed in the detail block, oldest first
+MOUNT_PROBE_TIMEOUT = 10         # seconds a stat() of one mount point may take
+MOUNT_PROBE_RESERVE = 60         # run-budget seconds kept back for everything that comes
+                                 # after the probes. Every mount is probed now, dead ones
+                                 # included, and each dead one costs the full timeout
+                                 # above - so a host with several would leave yum and the
+                                 # pool questions to time out behind it. Past this line
+                                 # the rest read "not probed", which claims nothing
+
+# Both halves of the same event, from the two sources that keep it - see the multipath
+# event phrases above for why neither contains the other.
+#
+# These name the SERVER, which the process scan cannot. They also age out, and on the host
+# above they already had: the only copies left were in kern.log.4.gz and .5.gz, four days
+# back, with the ring wrapped clean past them (`dmesg | grep -i cifs` returned nothing at
+# all). Reading the .gz archives was considered for exactly that case and declined - it is
+# a zgrep of ~30 files on every host of every run to recover a server name that Network
+# Mounts already prints from /proc/mounts, for a condition Stuck Processes already reports.
+MOUNT_STALL_PHRASES = [
+    # verbatim from a live 8.3.0 dom0 whose SMB server had stopped answering:
+    # "CIFS VFS: Server 10.10.10.11 has not responded in 120 seconds. Reconnecting..."
+    "has not responded in",
+    "not responding",            # nfs: "server X not responding, still trying"
+    "blocked for more than",     # the kernel's hung-task detector - see the note above on
+                                 # why this one cannot be relied on, and is kept anyway
+]
+MOUNT_STALL_FILES = [
+    "/var/log/kern.log",
+]
+
 # --- "LUN Assignments" check ----------------------------------------------------------
 LUN_CHANGE_PHRASES = [
     "Warning! Received an indication that the LUN assignments on this target have changed",
 ]
 LUN_CHANGE_FILES = [
     "/var/log/kern.log",
+]
+
+# --- "XOA Plugins" check ---------------------------------------------------------------
+# Where xo-server looks for plugins, and what it accepts as one. Mirrors
+# packages/xo-server/config.toml's `plugins.lookupPaths` and registerPlugins() in
+# index.mjs: for every lookup path it takes each entry of `<path>/@xen-orchestra` starting
+# `server-` and each entry of `<path>` starting `xo-server-`, and the remainder of the
+# entry name IS the plugin's name. First path that has a name wins.
+#
+# Two of the three shipped lookup paths are relative to the process' cwd, which for a
+# systemd unit with no WorkingDirectory - and xo-server.service sets none - is "/". Hence
+# /node_modules and / here: neither holds a plugin on a stock appliance, and both are a
+# place somebody could put one. Listing "/" is one readdir.
+XO_PLUGIN_LOOKUP_PATHS = ["/usr/local/lib/node_modules", "/node_modules", "/"]
+XO_PLUGIN_PREFIX = "xo-server-"
+XO_PLUGIN_SCOPE_DIR = "@xen-orchestra"
+XO_PLUGIN_SCOPE_PREFIX = "server-"
+
+# The plugin names Vates ships, as a FALLBACK and not as the answer. A run reads
+# xoa-updater's own `getLocalManifest` first and unions those names in, so a plugin Vates
+# adds after this list was written is not reported as somebody else's; this list is what
+# is left when the updater is down, unregistered or timing out.
+#
+# Read off a stock appliance (XOA 6.7.1, xo-server 5.207.2, 2026-09-11) and cross-checked
+# against packages/xo-server-* in vatesfr/xen-orchestra. `cloud` is a retired Vates plugin
+# that is no longer installed but still leaves an `xo:plugin-metadata:cloud` record
+# behind. `test-plugin` is deliberately absent: it is a development fixture in Vates' repo
+# that XOA does not ship, so an appliance carrying it has had something done to it.
+XOA_STOCK_PLUGINS = [
+    "audit",
+    "auth-github",
+    "auth-google",
+    "auth-ldap",
+    "auth-oidc",
+    "auth-saml",
+    "backup-reports",
+    "cloud",
+    "ipmi-sensors",
+    "load-balancer",
+    "netbox",
+    "netdata",
+    "openmetrics",
+    "perf-alert",
+    "sdn-controller",
+    "telemetry",
+    "transport-email",
+    "transport-icinga2",
+    "transport-nagios",
+    "transport-slack",
+    "transport-xmpp",
+    "usage-report",
+    "web-hooks",
+    "xoa",
 ]
 
 CRASH_IGNORE_FILE = ".sacrificial-space-for-logs"   # file in /var/crash that is not a crash
@@ -169,6 +298,9 @@ POOL_RUN = {
     "lacp_negotiation": True,
     "multipath_health": True,
     "multipath_events": True,
+    "stuck_processes": True,
+    "mount_stalls": True,
+    "network_mounts": True,
     "silly_mtus": True,
     "dns_gw_non_mgmt_pifs": True,
     "overlapping_subnets": True,
@@ -253,7 +385,7 @@ INFO = "info"
 class Line(object):
     """One 'Key: value' line of the report, plus any detail blob it wants printed."""
 
-    __slots__ = ("key", "text", "status", "detail_title", "detail_text", "label")
+    __slots__ = ("key", "text", "status", "detail_title", "detail_text", "label", "keep")
 
     def __init__(self, key, text, status, detail_title=None, detail_text=None):
         self.key = key
@@ -262,6 +394,7 @@ class Line(object):
         self.detail_title = detail_title
         self.detail_text = detail_text
         self.label = key + ":"      # a couple of lines pad this for alignment
+        self.keep = False           # an INFO line that survives -f anyway; see pinned()
 
     @property
     def flags(self):
@@ -269,7 +402,8 @@ class Line(object):
 
     @property
     def always_print(self):
-        return self.status in (FLAG, UNKNOWN, INFO)
+        """Printed even under -f. A finding always is; an INFO line only if it says so."""
+        return self.flags or self.keep
 
     def render(self):
         return "%s %s" % (self.label, self.text)
@@ -295,15 +429,32 @@ def unknown(key, text):
 
 
 def info(key, text, color="green"):
-    """A fact with no threshold behind it, so it can never flag and always prints."""
+    """A fact with no threshold behind it, so it can never flag.
+
+    Yellow is the caller saying 'this one is worth a look' - a state that was not
+    established, or one that is unusual without being wrong. Those survive -f; the green
+    ones are just readings, and -f is not asking for readings.
+    """
     painted = colors.yellow(text) if color == "yellow" else (
         colors.green(text) if color == "green" else text)
-    return Line(key, painted, INFO)
+    line = Line(key, painted, INFO)
+    line.keep = (color == "yellow")
+    return line
 
 
 def raw(key, text):
-    """Uncoloured, exit-code neutral, always printed."""
+    """Uncoloured, exit-code neutral, hidden by -f."""
     return Line(key, text, INFO)
+
+
+def pinned(line):
+    """Print this line under -f even though it is not a finding.
+
+    Deliberately rare, and every use has to earn it: a line that survives -f while
+    claiming nothing is padding in a report someone asked to have narrowed.
+    """
+    line.keep = True
+    return line
 
 
 def guard(key, fn, *args, **kwargs):
@@ -1084,6 +1235,94 @@ def cap_lines(lines, limit, noun):
     return list(lines)
 
 
+def format_age(seconds):
+    """A duration a person can compare at a glance: 3d 4h, 1h 3m, 19m, 45s."""
+    seconds = int(seconds)
+    if seconds < 0:
+        seconds = 0
+    if seconds >= 86400:
+        return "%dd %dh" % (seconds // 86400, (seconds % 86400) // 3600)
+    if seconds >= 3600:
+        return "%dh %dm" % (seconds // 3600, (seconds % 3600) // 60)
+    if seconds >= 60:
+        return "%dm" % (seconds // 60)
+    return "%ds" % seconds
+
+
+# --------------------------------------------------------------------------------------
+# XOA plugins
+# --------------------------------------------------------------------------------------
+
+# The manifest is node's util.inspect, so its npm map reads
+#     'xo-server-audit-premium': '0.15.1',
+# The prefix is spelled out here rather than built from config.XO_PLUGIN_PREFIX because a
+# module body in the stitched health.py runs before the sibling aliases exist.
+_MANIFEST_PKG_RE = re.compile(r"'(xo-server-[A-Za-z0-9._-]+)'\s*:")
+_PREMIUM_SUFFIX = "-premium"
+
+
+def manifest_plugin_names(text):
+    """Plugin names out of `xoa-updater raw-api-call getLocalManifest`.
+
+    This is what makes the check self-updating: the manifest is the appliance's own record
+    of what Vates offers it on its channel and plan, so a plugin added to XOA after this
+    script was written is recognised as Vates' without a code change.
+
+    The registry package name is not the installed directory name - most carry a
+    `-premium` suffix that `npm install -g` strips off (`xo-server-audit-premium` lands in
+    `/usr/local/lib/node_modules/xo-server-audit`), so the suffix is stripped here and the
+    two sides are compared by the plugin name xo-server itself uses.
+
+    A set, possibly empty: the updater being down is not an error here, it just means the
+    built-in list is all there is.
+    """
+    names = set()
+    for package in _MANIFEST_PKG_RE.findall(text or ""):
+        name = package[len("xo-server-"):]
+        if name.endswith(_PREMIUM_SUFFIX):
+            name = name[:-len(_PREMIUM_SUFFIX)]
+        if name:
+            names.add(name)
+    return names
+
+
+def classify_xo_plugins(found, vates_names):
+    """Split the plugins found on disk into (vates, third_party), order preserved.
+
+    `found` is scan_plugins()' list of dicts; `vates_names` the union of the manifest and
+    the built-in list. Deliberately a whitelist and not a blacklist: an unrecognised name
+    is reported, so the failure mode of a stale list is a plugin named for review rather
+    than a plugin waved through.
+    """
+    vates, third_party = [], []
+    for plugin in found:
+        (vates if plugin["name"] in vates_names else third_party).append(plugin)
+    return vates, third_party
+
+
+def plugin_block(third_party, autoload, autoload_known):
+    """The detail block under a `XOA Plugins` finding.
+
+    `autoload` maps plugin name -> bool from xo's own metadata records. It is an
+    annotation and nothing more: when it could not be read every plugin says `unknown`
+    rather than the block quietly implying they are all inert.
+    """
+    out = []
+    for plugin in third_party:
+        version = plugin["version"] or "version unknown"
+        if not autoload_known:
+            state = "autoload unknown"
+        elif plugin["name"] in autoload:
+            state = "autoload on" if autoload[plugin["name"]] else "autoload off"
+        else:
+            state = "never loaded by XO"
+        out.append("%s  (%s, %s)" % (plugin["name"], version, state))
+        out.append("    %s" % plugin["path"])
+        if plugin["link"]:
+            out.append("    -> %s" % plugin["link"])
+    return "\n".join(out)
+
+
 # ======================================================================================
 # --- model -----------------------------------------------------------------------------
 
@@ -1277,6 +1516,59 @@ DEFAULT_CMD_TIMEOUT = 60
 # hanging until the transport gives up and the report loses the host entirely.
 DEADLINE = [None]
 
+# Where a host's time actually went. Every command run on a host goes through run() or
+# grep_scan(), so this is complete by construction rather than by remembering to
+# instrument each caller. It is returned only when the spec asks for it (HEALTH_DEBUG),
+# but it is always collected: a list append per command is nothing next to the command.
+#
+# The reason it exists: a host that takes four minutes used to be a host that took four
+# minutes, with nothing to say which of its ~60 commands took them. Working that out from
+# the outside costs one round trip per candidate, and a wrong guess looks exactly like a
+# right one until you have run it.
+TIMINGS = []
+
+# The command running right now, and the document as it is built. Both exist for the
+# watchdog: when a command cannot be killed, these are the only things left to answer with.
+# One-element lists and a module dict rather than plain globals, so every writer can set
+# them without a `global` statement (2.7 has no nonlocal).
+CURRENT = [""]
+PARTIAL = {}
+
+# Commands that outlived their own SIGKILL. Not a report line - the fact each one was
+# collecting already says Unknown with the reason, and the trap ledger is explicit about
+# not reporting one thing twice in different words. It rides along only in the watchdog's
+# payload, where "these had already been abandoned before the fatal one" is additive.
+ABANDONED = []
+
+# How long to wait for a killed command to actually die before giving up on it. A child
+# that CAN be killed is gone in milliseconds; anything still there after this is in
+# uninterruptible sleep and is not coming back on any timescale worth waiting for.
+KILL_GRACE = 5
+
+# How long past the budget the watchdog waits before giving up on the main thread. The
+# transport allows REMOTE_CMD_TIMEOUT (300s) against a 240s budget, so this has to leave
+# the abandoned document time to travel.
+WATCHDOG_GRACE = 15
+
+
+def _argv_text(argv):
+    """Enough of an argv to identify it, on one line.
+
+    The argv rather than a description of it, so the command can be pasted straight into a
+    shell on the host. Whitespace is collapsed because rpm's --qf formats carry literal
+    newlines, and a long one is elided in the MIDDLE rather than the tail: the path is at
+    the end, and "a grep took 90 seconds" is not an answer without the file it was reading.
+    """
+    text = " ".join(" ".join(str(arg).split()) for arg in argv)
+    if len(text) > 110:
+        text = text[:60] + " ... " + text[-45:]
+    return text
+
+
+def timed(argv, started):
+    """Record one command's elapsed seconds, with enough argv to identify it."""
+    TIMINGS.append([round(time.time() - started, 2), _argv_text(argv)])
+
 
 def budget_left():
     if DEADLINE[0] is None:
@@ -1362,29 +1654,72 @@ def _kill(proc):
 
 
 def run(argv, timeout=DEFAULT_CMD_TIMEOUT):
-    """Run argv (no shell, ever) and return a Ran. Reads to EOF - see the xe/EPIPE note."""
+    """Run argv (no shell, ever) and return a Ran. Reads to EOF - see the xe/EPIPE note.
+
+    A command that will not die is one we stop waiting for. The timeout used to be a
+    threading.Timer firing SIGKILL while the main thread sat in communicate(), which
+    assumes the signal lands: a process in uninterruptible sleep (D state) does NOT die on
+    SIGKILL - the signal stays pending until it leaves D, which may be never - so
+    communicate() never returned, the collector never finished, and the transport lost the
+    WHOLE HOST to its own timeout.
+
+    Measured: a dom0 with a dead CIFS mount parks `df -hP` in D state permanently (wchan
+    open_shroot / smb2_reconnect). Five health check runs left five stuck df processes and
+    not one of them produced a document; the host reported only "timed out after 300s",
+    naming neither the command nor the mount.
+
+    So communicate() happens on a daemon thread and this joins it with a deadline. When
+    the kill does not take, the thread and its pipes are abandoned deliberately - the child
+    cannot be reaped, so there is nothing to clean up - and the collector goes on to the
+    next fact. One line then reads Unknown with the reason, instead of every line about
+    that host disappearing.
+    """
+    started = time.time()
     timeout = _clamp(timeout)
     if timeout is None:
+        timed(argv, started)
         return Ran(124, "", "run budget exhausted", True)
     try:
         proc, devnull = _popen(argv)
     except OSError as exc:
+        timed(argv, started)
         return Ran(127, "", "%s: %s" % (argv[0], exc), False)
 
-    state = {"killed": False}
+    # named before it can block, cleared after: if this one never returns, it is the only
+    # record of what the collector was doing when it stopped
+    CURRENT[0] = _argv_text(argv)
+    box = {}
 
-    def on_timeout():
-        state["killed"] = True
+    def reader():
+        try:
+            box["out"], box["err"] = proc.communicate()
+        except (IOError, OSError, ValueError) as exc:
+            # the pipes are ours and nobody else touches them, so this is a broken pipe or
+            # a closed file - never a command result, and never silently a success
+            box["failed"] = "%s: %s" % (argv[0], exc)
+
+    worker = threading.Thread(target=reader)
+    worker.daemon = True
+    worker.start()
+    worker.join(timeout)
+
+    killed = worker.is_alive()
+    if killed:
         _kill(proc)
+        worker.join(KILL_GRACE)      # a killable child dies here and the thread ends
 
-    timer = threading.Timer(timeout, on_timeout)
-    timer.start()
-    try:
-        out, error = proc.communicate()
-    finally:
-        timer.cancel()
-        devnull.close()
-    return Ran(proc.returncode, _decode(out), _decode(error), state["killed"])
+    abandoned = worker.is_alive()
+    timed(argv, started)
+    CURRENT[0] = ""
+    devnull.close()
+
+    if abandoned:
+        ABANDONED.append(_argv_text(argv))
+        return Ran(124, "", "did not die when killed - uninterruptible, so the host's "
+                            "storage or a mount is most likely wedged", True)
+    if "failed" in box:
+        return Ran(127, "", box["failed"], False)
+    return Ran(proc.returncode, _decode(box.get("out")), _decode(box.get("err")), killed)
 
 
 def _clamp(timeout):
@@ -1531,6 +1866,338 @@ def collect_df():
     if not r.ok:
         return err("df failed (%s)" % r.why())
     return fact(r.out)
+
+
+# --------------------------------------------------------------------------------------
+# stuck mounts, and the processes they take down with them
+# --------------------------------------------------------------------------------------
+
+def parse_proc_stat(text):
+    """(state, starttime_ticks, cpu_ticks) from one /proc/PID/stat, or (None, None, None).
+
+    The comm field is the trap, and a real one rather than a hypothetical: it is the
+    executable name in parentheses, unescaped, and may contain both spaces and
+    parentheses - a process can genuinely be called `(foo) bar)`. Splitting on whitespace,
+    or on the FIRST ')', mis-numbers every field after it, and here that would silently
+    read some other number as the state. rfind(')') is the documented way round it: comm
+    is the only parenthesised field, and nothing after it can contain one.
+
+    Fields after that closing paren are 3..52, so state is [0], utime and stime are [11]
+    and [12], and starttime is [19]. The CPU pair is read here rather than by a second
+    reader because it has to come from the SAME line as the state: two reads would let the
+    process move between them, and the entire value of the number is that it did not.
+
+    starttime and cpu are answered together or not at all, so a caller that has a
+    starttime always has a cpu figure to go with it.
+    """
+    close = text.rfind(")")
+    if close < 0:
+        return (None, None, None)
+    rest = text[close + 1:].split()
+    if len(rest) < 20:
+        return (None, None, None)
+    try:
+        return (rest[0], int(rest[19]), int(rest[11]) + int(rest[12]))
+    except ValueError:
+        return (rest[0], None, None)
+
+
+_MOUNT_ESCAPES = {"040": " ", "011": "\t", "012": "\n", "134": "\\"}
+
+
+def _unescape_mount(field):
+    """Undo /proc/mounts' octal escaping - a mount point with a space in it is written
+    with a backslash and 040, and would otherwise arrive with the escape still in it."""
+    if "\\" not in field:
+        return field
+    out = []
+    i = 0
+    while i < len(field):
+        if field[i] == "\\" and field[i + 1:i + 4] in _MOUNT_ESCAPES:
+            out.append(_MOUNT_ESCAPES[field[i + 1:i + 4]])
+            i += 4
+        else:
+            out.append(field[i])
+            i += 1
+    return "".join(out)
+
+
+def parse_mounts(text, network_types):
+    """[(source, target, fstype)] for the network mounts in /proc/mounts, in file order.
+
+    /proc/mounts is served by the kernel out of its own mount table, so reading it cannot
+    block on a mount that has stopped answering - which stat() of the same path very much
+    can. That difference is the whole basis of this check.
+    """
+    wanted = set(network_types or [])
+    found = []
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) < 3 or parts[2] not in wanted:
+            continue
+        found.append((_unescape_mount(parts[0]), _unescape_mount(parts[1]), parts[2]))
+    return found
+
+
+def fs_module_of(stack_text):
+    """The module a kernel stack is blocked in, e.g. 'cifs' or 'nfs'; "" if none.
+
+    /proc/PID/stack prints module-owned frames as `symbol+0x1/0x2 [module]`, which turns
+    "something is stuck" into "stuck in the SMB client" without any guessing. The wchan
+    column is NOT a substitute: it resolves through a symbol table that can be wrong, and
+    was - naming one cifs symbol for every stuck process on a host, kernel threads that
+    never touch cifs included.
+    """
+    for line in (stack_text or "").splitlines():
+        text = line.strip()
+        # the module is a trailing [name]; every frame ALSO opens with an address column
+        # spelled [<0>], and taking the last '[' without this ends up returning that
+        if not text.endswith("]"):
+            continue
+        start = text.rfind("[")
+        if start < 0:
+            continue
+        module = text[start + 1:-1].strip()
+        if re.match(r"^\w+$", module):
+            return module
+    return ""
+
+
+def _proc_pids():
+    try:
+        return sorted(int(name) for name in os.listdir("/proc") if name.isdigit())
+    except (IOError, OSError):
+        return None
+
+
+def _clock_ticks():
+    """USER_HZ - the unit /proc/PID/stat counts both of its times in. 100 on everything
+    this runs on, but asked for rather than assumed, and defaulted rather than raising."""
+    try:
+        return float(os.sysconf("SC_CLK_TCK")) or 100.0
+    except (ValueError, OSError, AttributeError):
+        return 100.0
+
+
+def _uptime():
+    """Seconds since boot, the clock /proc/PID/stat's starttime is measured against."""
+    text = read_file("/proc/uptime") or ""
+    try:
+        return float(text.split()[0])
+    except (IndexError, ValueError):
+        return None
+
+
+def _proc_io(pid):
+    """/proc/PID/io as it stands, or "" - the byte and syscall counters, unparsed.
+
+    Compared verbatim against a later reading, so there is nothing to parse: every counter
+    in it only ever grows, and it grows only when the process gets somewhere. It is the
+    half of the progress test that CPU time cannot cover, since a process can be almost
+    purely I/O-bound and tick over a hundredth of a second of CPU in ten.
+
+    "" when the kernel was built without CONFIG_TASK_IO_ACCOUNTING, which is not an error:
+    it then contributes no evidence in either direction and the CPU figure decides alone.
+    """
+    return read_file("/proc/%d/io" % pid) or ""
+
+
+def _d_state_procs(pids=None):
+    """{pid: (starttime, cpu_ticks, io)} for the processes in uninterruptible sleep now.
+
+    Everything read here is served out of kernel memory by procfs, so none of it can block
+    on the very mount being investigated - which is the whole reason this is the primary
+    signal rather than stat()ing mount points and seeing what hangs.
+
+    The value carries the identity AND the progress evidence, so two samples compare with
+    a single ==: the same process (starttime pins it - a pid freed and reused in between
+    is a different process and must not inherit the first one's history), which has not
+    consumed a tick of CPU or completed a byte of I/O since the last look.
+
+    `pids` narrows the scan to a set already under suspicion, which is all the later
+    samples need and saves re-reading every process on the host.
+    """
+    if pids is None:
+        pids = _proc_pids()
+        if pids is None:
+            return None
+    found = {}
+    for pid in pids:
+        text = read_file("/proc/%d/stat" % pid)
+        if not text:
+            continue                      # exited between listdir and open: not an error
+        state, starttime, cpu = parse_proc_stat(text)
+        if state == "D" and starttime is not None:
+            found[pid] = (starttime, cpu, _proc_io(pid))
+    return found
+
+
+def _proc_cmdline(pid):
+    """The command, or "" for a kernel thread - which is how kernel threads are told apart.
+
+    NUL-separated, and deliberately not /proc/PID/cmdline's neighbours cwd/exe/root: those
+    are symlinks INTO the filesystem, so resolving one belonging to a process stuck on a
+    dead mount blocks this collector in exactly the way it is here to detect.
+    """
+    raw = read_file("/proc/%d/cmdline" % pid)
+    if not raw:
+        return ""
+    return " ".join(part for part in raw.split("\0") if part).strip()
+
+
+# The mount probe never returns on a dead mount, so it is left parked in D state and the
+# NEXT run finds it - and would count the script's own leavings as if the host had
+# degraded further on its own. stat's format string is part of its argv, so putting a mark
+# in it makes those processes identifiable in /proc with certainty, rather than by
+# guessing at what a bare `stat` in D state belongs to. Only stat's exit status is read,
+# so the mark changes nothing else.
+MOUNT_PROBE_MARK = "health-mount-probe"
+
+
+def collect_stuck_processes(spec):
+    """Processes wedged in uninterruptible sleep, watched long enough to tell them apart
+    from processes doing work.
+
+    D state is where a process waits on storage, so a healthy host is full of it in
+    passing: every disk read, every coalesce, every backup is in D for some of its life.
+    Two facts separate a wedge from work and BOTH are required.
+
+    Persistence: the same process must be in D at every sample across the window.
+
+    Progress: it must have got nowhere in that time - not one tick of CPU, not one byte
+    through /proc/PID/io. That is a fact rather than a heuristic, and it is the one that
+    matters: a process parked in D executes no instructions and completes no I/O, while
+    anything making progress is being woken constantly to hand off the next buffer. Read
+    live as a false positive (issue #70) before this existed: a vhd-util coalesce one
+    minute into its run, in D at both samples, reported as stuck.
+
+    The age floor is a noise filter and nothing more - a process's age is how long it has
+    existed, an upper bound on how long it has been stuck. It is applied here, before the
+    first wait, rather than at the end: whatever is in D on the usual host is a disk read
+    a second old, and dropping it up front means that host pays no wall clock at all.
+
+    Kernel threads are counted separately rather than dropped: some sit in D quite
+    normally, but a kworker stuck in a filesystem's work queue is exactly the corroboration
+    that the mount, and not the process, is the problem.
+    """
+    settings = spec or {}
+    delay = settings.get("recheck_delay") or 0
+    rounds = max(1, (settings.get("samples") or 2) - 1)
+    min_age = settings.get("min_age") or 0
+    cap = settings.get("max_lines") or 0
+
+    ticks = _clock_ticks()
+    started = _uptime()
+    if started is None:
+        return err("could not read /proc/uptime")
+    procs = _d_state_procs()
+    if procs is None:
+        return err("could not read /proc")
+
+    # "old enough by the END of the window", so the floor is applied exactly once and a
+    # process on the boundary is not dropped for being seen a few seconds too early
+    floor = min_age - (delay * rounds)
+    watching = dict((pid, seen) for pid, seen in procs.items()
+                    if started - (seen[0] / ticks) >= floor)
+
+    watched = 0.0
+    for _ in range(rounds):
+        if not watching:
+            break                         # nothing left to watch: stop paying for looks
+        pause = min(delay, max(1, budget_left() or delay))
+        time.sleep(pause)
+        watched += pause
+        again = _d_state_procs(sorted(watching))
+        if again is None:
+            return err("could not read /proc")
+        # one == over the whole tuple: still in D, still the same process, and not a tick
+        # of CPU or a byte of I/O since the last sample
+        watching = dict((pid, seen) for pid, seen in watching.items()
+                        if again.get(pid) == seen)
+
+    now = _uptime()
+    if now is None:
+        return err("could not read /proc/uptime")
+
+    rows = []
+    for pid, seen in watching.items():
+        stack = read_file("/proc/%d/stack" % pid) or ""
+        rows.append({
+            "pid": pid,
+            "age": int(now - (seen[0] / ticks)),
+            "cmd": _proc_cmdline(pid)[:120],
+            "module": fs_module_of(stack),
+            "frame": (stack.splitlines() or [""])[0].strip()[:120],
+        })
+    rows.sort(key=lambda row: row["age"], reverse=True)
+    # counted here, over ALL of them, because the cap below is what the report sees: a
+    # tally taken from the sample would be printed as if it described the whole, and on
+    # the host this was built for that is 24 of 25 shown being reported as 24 of 589
+    return fact({"total": len(rows),
+                 "userspace": len([row for row in rows if row["cmd"]]),
+                 # the script's own probes from earlier runs, counted rather than hidden:
+                 # they really are stuck, and they really were left by this tool
+                 "own_probes": len([row for row in rows
+                                    if MOUNT_PROBE_MARK in (row["cmd"] or "")]),
+                 "watched": int(watched),
+                 "rows": rows[:cap] if cap else rows})
+
+
+def collect_network_mounts(spec):
+    """Whether each network mount still answers a stat().
+
+    The probe is a separate short-lived process precisely because it may never return: a
+    mount whose server has gone parks it in D state for good, and run() abandons it rather
+    than waiting. That leaves one unkillable process behind per dead mount, and it is done
+    knowingly. Until v3.12 it was skipped entirely on a host that already had stuck
+    processes, so as not to add to the mess being reported - but by then the mess is made,
+    one more parked stat changes nothing about a host in that state, and this is the only
+    check that can say WHICH mount is the one to go and fix. That is worth a process.
+    The probes mark themselves, so a later run reports them as what they are.
+
+    The one question still not asked is the one there is no time left to answer. run()
+    clamps a command's timeout to what remains of the whole-run budget, so a probe started
+    with a second left would report a mount that was merely slow as one that never
+    answered. That is a claim, and the mount is listed unprobed instead.
+
+    The reserve is the other half of that: each dead mount costs a full probe_timeout, so
+    a host with several of them could spend the entire run parked here and leave yum and
+    the pool questions to time out behind it. Probing stops with the reserve intact and
+    the rest of the mounts say they were not asked.
+    """
+    settings = spec or {}
+    timeout = settings.get("probe_timeout") or 10
+    reserve = settings.get("probe_reserve") or 0
+    text = read_file("/proc/mounts")
+    if text is None:
+        return err("could not read /proc/mounts")
+    mounts = parse_mounts(text, settings.get("types") or [])
+
+    rows = []
+    for source, target, fstype in mounts:
+        row = {"source": source, "target": target, "type": fstype}
+        left = budget_left()
+        if left is not None and left < timeout + reserve:
+            row["state"] = "not probed"
+            row["why"] = ("not enough of the run budget left to wait %ds for an answer"
+                          % timeout)
+        else:
+            started = time.time()
+            r = run(["stat", "-c", MOUNT_PROBE_MARK + " %i", "--", target],
+                    timeout=timeout)
+            row["seconds"] = round(time.time() - started, 2)
+            if r.ok:
+                row["state"] = "ok"
+            elif r.timed_out:
+                row["state"] = "no answer"
+                row["why"] = r.err.strip()[:160]
+            else:
+                # a stat that FAILED is not a stat that hung: permission, a path that is
+                # gone. Reported as its own state rather than folded into either
+                row["state"] = "error"
+                row["why"] = r.why()[:160]
+        rows.append(row)
+    return fact(rows)
 
 
 def collect_iplink():
@@ -2022,6 +2689,7 @@ def grep_scan(path, phrases, timeout=180):
         argv += ["-e", p]
     argv += ["--", path]
 
+    started = time.time()
     try:
         proc, devnull = _popen(argv)
     except OSError:
@@ -2035,6 +2703,7 @@ def grep_scan(path, phrases, timeout=180):
 
     timer = threading.Timer(timeout, on_timeout)
     timer.start()
+    CURRENT[0] = _argv_text(argv)
     lowered = [p.lower() for p in phrases]
     last = {}
     try:
@@ -2055,6 +2724,10 @@ def grep_scan(path, phrases, timeout=180):
     finally:
         timer.cancel()
         devnull.close()
+        # the attribution loop above runs once per MATCHED line, so this is grep's time
+        # plus ours - which is the number that matters on a log full of hits
+        timed(argv, started)
+        CURRENT[0] = ""
     # rc 1 is grep's "no match", which is a real answer; 2+ means grep itself failed
     if state["killed"] or rc > 1:
         return None
@@ -2408,7 +3081,10 @@ def parse_other_config(text):
 
 def collect(spec):
     want = set(spec.get("want") or [])
-    out = {"collector": {"python": sys.version.split()[0], "pid": os.getpid()}}
+    # built in place, so the watchdog can hand back what was established if this call
+    # never returns
+    out = PARTIAL
+    out["collector"] = {"python": sys.version.split()[0], "pid": os.getpid()}
     ident = collect_identity()
     out.update(ident)
 
@@ -2453,6 +3129,17 @@ def collect(spec):
         out["multipath_scan"] = collect_log_scan(mps.get("files") or [],
                                                  mps.get("phrases") or [],
                                                  mps.get("context") or 3)
+        mstall = spec.get("mount_stall_scan") or {}
+        out["mount_stall_scan"] = collect_log_scan(mstall.get("files") or [],
+                                                   mstall.get("phrases") or [],
+                                                   mstall.get("context") or 3)
+
+        # The order matters and is the only thing left of the old gate: the process scan
+        # runs FIRST, so a probe this run parks on a dead mount is not then reported by
+        # this same run as a process that was already stuck. It shows up on the next run,
+        # marked, and counted as what it is.
+        out["stuck_procs"] = collect_stuck_processes(spec.get("stuck"))
+        out["network_mounts"] = collect_network_mounts(spec.get("mount_probe"))
         if spec.get("smapi"):
             out["smapi"] = collect_smapi_hidden_leaves()
 
@@ -2462,7 +3149,70 @@ def collect(spec):
     if "pool" in want:
         out["pool"] = collect_pool(spec, self_uuid)
 
+    if spec.get("timings"):
+        # slowest first: the question this answers is always "what took the time", and a
+        # host runs enough commands that the whole list would bury the answer
+        out["collector"]["timings"] = sorted(TIMINGS, reverse=True)[:15]
     return out
+
+
+_EMITTED = [False]
+_EMIT_LOCK = threading.Lock()
+
+
+def emit(payload):
+    """Write the document, once and whole. Answers whether this call was the one.
+
+    The watchdog and the normal path race only in the instant the last command returns,
+    but two documents on one stdout is not a document: _extract takes the first BEGIN and
+    the last END, so a second one would be read as a truncated first.
+    """
+    with _EMIT_LOCK:
+        if _EMITTED[0]:
+            return False
+        _EMITTED[0] = True
+    sys.stdout.write(BEGIN_MARKER + "\n")
+    sys.stdout.write(json.dumps(payload))
+    sys.stdout.write("\n" + END_MARKER + "\n")
+    sys.stdout.flush()
+    return True
+
+
+def watchdog(grace):
+    """Answer anyway when a command cannot be killed.
+
+    The whole-run budget works by SIGKILLing whatever is running when it expires. A
+    process in uninterruptible sleep - D state, anything blocked on wedged storage - does
+    NOT die on SIGKILL: the signal stays pending until it leaves D, which may be never.
+    communicate() then never returns, collect() never finishes, and the collector writes
+    nothing at all. The transport loses the whole host to its own timeout, and the report
+    can only say "timed out after 300s", which names neither the host's problem nor the
+    command that hit it.
+
+    Measured on a pool with 18 XOSTOR volumes stuck in DELETING: three hosts, two
+    answering in under 3s, the third producing no document at all across five runs and
+    nothing whatsoever to say why.
+
+    So this thread outlives the main one: at the deadline plus a grace period it emits
+    what was gathered, names the command still running, and leaves. os._exit rather than
+    sys.exit or a return, because the main thread is wedged in communicate() and any
+    orderly shutdown would wait for it - which is the whole problem.
+    """
+    while True:
+        left = budget_left()
+        if left is None:
+            return                      # no budget set: nothing to enforce
+        if left <= -grace:
+            break
+        time.sleep(min(5.0, max(0.5, left + grace)))
+
+    payload = dict(PARTIAL)
+    payload["__collector_stuck__"] = CURRENT[0] or "(no command was running)"
+    payload["collector"] = dict(payload.get("collector") or {})
+    payload["collector"]["timings"] = sorted(TIMINGS, reverse=True)[:15]
+    payload["collector"]["abandoned"] = list(ABANDONED)
+    emit(payload)
+    os._exit(0)
 
 
 def main(argv):
@@ -2470,15 +3220,17 @@ def main(argv):
     if len(argv) > 1 and argv[1]:
         spec = json.loads(base64.b64decode(argv[1].encode("ascii")).decode("utf-8"))
     DEADLINE[0] = time.time() + float(spec.get("budget") or 240)
+
+    guard = threading.Thread(target=watchdog, args=(WATCHDOG_GRACE,))
+    guard.daemon = True
+    guard.start()
+
     try:
         payload = collect(spec)
     except Exception:
         import traceback
         payload = {"__collector_error__": traceback.format_exc()}
-    sys.stdout.write(BEGIN_MARKER + "\n")
-    sys.stdout.write(json.dumps(payload))
-    sys.stdout.write("\n" + END_MARKER + "\n")
-    sys.stdout.flush()
+    emit(payload)
     return 0
 
 
@@ -2506,6 +3258,24 @@ _REMOTE_LAUNCH_PINNED = 'exec %s - %%s'
 
 BEGIN_MARKER = "<<<HEALTHPY-JSON-BEGIN>>>"
 END_MARKER = "<<<HEALTHPY-JSON-END>>>"
+
+AUTH_ASKPASS = "askpass"
+AUTH_SSHPASS = "sshpass"
+
+# The variable the helper prints. Deliberately not SSHPASS: the two mechanisms are
+# mutually exclusive and reading one variable in a run that chose the other mechanism is
+# the kind of half-configured state that authenticates with an empty password.
+ASKPASS_ENV = "HEALTH_SSH_PASSWORD"
+
+# Four lines of sh, written into the run's own work dir (mode 700, deleted at exit). It
+# prints what is in the environment, so the password still never reaches a file or an
+# argv - the same guarantee sshpass -e gives.
+ASKPASS_SCRIPT = (
+    "#!/bin/sh\n"
+    "# health.py: hands ssh the root password it was already given, from the\n"
+    "# environment only. Written per run into a temporary directory and deleted with it.\n"
+    "printf '%s\\n' \"${" + ASKPASS_ENV + "}\"\n"
+)
 
 
 class CollectError(Exception):
@@ -2610,6 +3380,9 @@ class Transport(object):
         self.password = ""
         self.ssh_port = 22
         self.source = collectorsrc.collector_source()
+        self.auth = ""            # AUTH_ASKPASS / AUTH_SSHPASS, once one is established
+        self.askpass = ""         # path to the helper, when that is the chosen one
+        self.auth_error = ""      # why there is no way to authenticate, for the report
 
     def is_local(self, host):
         """Host mode runs its own commands locally: nothing is gained by logging into
@@ -2622,6 +3395,8 @@ class Transport(object):
         """Run the collector on `host` and return its document. Raises CollectError."""
         spec = dict(spec)
         spec.setdefault("budget", config.REMOTE_CMD_TIMEOUT - 60)
+        if os.environ.get("HEALTH_DEBUG") == "1":
+            spec["timings"] = True
         blob = base64.b64encode(json.dumps(spec).encode("utf-8")).decode("ascii")
         debug("collect %s want=%s" % (host, spec.get("want")))
 
@@ -2644,10 +3419,23 @@ class Transport(object):
             raise CollectError("%s failed (exit %d)%s" % (what, rc, (": " + detail) if detail else ""))
         if "__collector_error__" in payload:
             raise CollectError("collector crashed on %s:\n%s" % (host, payload["__collector_error__"]))
+        if "__collector_stuck__" in payload:
+            # the host gave up on itself rather than being given up on: a command it could
+            # not kill, named. The old shape of this was the transport's own 300s timeout,
+            # which could say only that the host did not answer
+            debug("%s abandoned its run in: %s" % (host, payload["__collector_stuck__"]))
+            for elapsed, command in (payload.get("collector", {}).get("timings") or [])[:8]:
+                debug("%s   %6.2fs  %s" % (host, elapsed, command))
+            raise CollectError(
+                "gave up after %ds stuck in '%s' - that command cannot be killed, so the "
+                "host's storage or a driver is most likely wedged"
+                % (config.REMOTE_CMD_TIMEOUT - 60, payload["__collector_stuck__"]))
         if err.strip():
             debug("stderr from %s:\n%s" % (host, err.strip()))
         info = payload.get("collector") or {}
         debug("%s answered from python %s" % (host, info.get("python", "?")))
+        for elapsed, command in (info.get("timings") or [])[:8]:
+            debug("%s   %6.2fs  %s" % (host, elapsed, command))
         return payload
 
     def collect_local(self, spec):
@@ -2677,37 +3465,35 @@ class Transport(object):
                              stdin_text=self.source)
 
     def _ssh_argv(self, host, remote_command):
-        """The ssh invocation, in one place.
+        """The ssh invocation and the environment that authenticates it, in one place.
 
-        Both the collector and -c/--command go over it, and the options are the whole
-        reason a run behaves the same on every host - one real connection per host,
-        no host-key prompt, a bounded connect. Built here so the two callers cannot
+        Returns (argv, env). Both the collector and -c/--command go over it, and the
+        options are the whole reason a run behaves the same on every host - one real
+        connection per host, no host-key prompt, a bounded connect, and whichever
+        password mechanism _auth_env() settled on. Built here so the two callers cannot
         drift apart on any of that; only the trailing command differs.
         """
-        return [
-            "sshpass", "-e", "ssh",
+        env, prefix = self._auth_env()
+        return prefix + [
+            "ssh",
             "-p", str(self.ssh_port),
             "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null",
             "-o", "LogLevel=ERROR",
             "-o", "ConnectTimeout=%d" % config.SSH_TIMEOUT,
+            "-o", "NumberOfPasswordPrompts=1",
             "-o", "ControlMaster=auto",
             "-o", "ControlPath=%s" % os.path.join(self.work_dir, "cm-%r@%h:%p"),
             "-o", "ControlPersist=60",
             "-o", "BatchMode=no",
             "root@" + host,
             remote_command,
-        ]
-
-    def _env_with_password(self):
-        env = dict(os.environ)
-        env["SSHPASS"] = self.password
-        return env
+        ], env
 
     def _run_ssh_collector(self, host, blob):
-        return run_local_cmd(self._ssh_argv(host, _remote_launch(blob)),
-                             timeout=config.REMOTE_CMD_TIMEOUT,
-                             env=self._env_with_password(), stdin_text=self.source)
+        argv, env = self._ssh_argv(host, _remote_launch(blob))
+        return run_local_cmd(argv, timeout=config.REMOTE_CMD_TIMEOUT,
+                             env=env, stdin_text=self.source)
 
     def run_command(self, host, cmd, timeout=None):
         """-c/--command: run the user's own command on `host`. Returns (rc, out, err).
@@ -2734,8 +3520,78 @@ class Transport(object):
         eating this script's own stdin.
         """
         timeout = config.RUN_CMD_TIMEOUT if timeout is None else timeout
-        return run_local_cmd(self._ssh_argv(host, cmd), timeout=timeout,
-                             env=self._env_with_password())
+        argv, env = self._ssh_argv(host, cmd)
+        return run_local_cmd(argv, timeout=timeout, env=env)
+
+    def _auth_env(self):
+        """The environment and the argv prefix that hand ssh the password.
+
+        Two variables for the askpass helper, because two generations of OpenSSH decide
+        differently whether to use one. SSH_ASKPASS_REQUIRE is 8.4 and later (XOA's 9.2)
+        and settles it outright. 7.4 - which is what both dom0 releases ship, so it is the
+        host-mode sweep - consults the helper only when there is no controlling terminal
+        AND DISPLAY is set: the first is already true of every child here (they are all
+        started with start_new_session=True, so open("/dev/tty") fails in them), and the
+        second is why a DISPLAY nothing will ever connect to is set. An existing DISPLAY
+        is left alone; it is only ever read as a flag.
+        """
+        env = dict(os.environ)
+        if self.auth == AUTH_ASKPASS:
+            env[ASKPASS_ENV] = self.password
+            env["SSH_ASKPASS"] = self.askpass
+            env["SSH_ASKPASS_REQUIRE"] = "force"
+            if not env.get("DISPLAY"):
+                env["DISPLAY"] = ":0"
+            return env, []
+        env["SSHPASS"] = self.password
+        return env, ["sshpass", "-e"]
+
+    def enable_password_auth(self, run_env):
+        """Find a way to give ssh a password, or record why there is none. True if found.
+
+        The helper is tried FIRST because it needs nothing installed and nothing from the
+        network. That is not a corner: health.py is routinely pasted onto a customer's
+        appliance over ssh precisely because the appliance has no internet access, and
+        there 'apt-get install sshpass' cannot work - the run used to die on that before
+        printing a line, including the whole XOA section, which needs no pool access at
+        all. It also means the path that runs in the field is the path the lab runs on
+        every test, rather than a fallback nothing exercises until it matters.
+
+        sshpass remains the fallback for the one thing the helper depends on that can be
+        missing: a work dir it is allowed to execute from (a noexec /tmp).
+
+        HEALTH_SSH_AUTH=askpass|sshpass pins the choice, which is how each is regression
+        tested against the other on hosts that have both.
+        """
+        pinned = os.environ.get("HEALTH_SSH_AUTH", "")
+        if pinned not in ("", AUTH_ASKPASS, AUTH_SSHPASS):
+            sys.stderr.write("Warning: ignoring HEALTH_SSH_AUTH=%s (expected %s or %s).\n"
+                             % (pinned, AUTH_ASKPASS, AUTH_SSHPASS))
+            pinned = ""
+
+        tried = []
+        if pinned != AUTH_SSHPASS:
+            path = write_askpass(self.work_dir)
+            if path:
+                self.auth = AUTH_ASKPASS
+                self.askpass = path
+                debug("password auth: ssh askpass helper at %s" % path)
+                return True
+            tried.append("the askpass helper would not run from %s" % self.work_dir)
+            debug("askpass helper unusable")
+
+        if pinned != AUTH_ASKPASS:
+            if ensure_sshpass(run_env):
+                self.auth = AUTH_SSHPASS
+                debug("password auth: sshpass")
+                return True
+            tried.append("sshpass is not installed and could not be installed")
+
+        # named individually: 'no way to authenticate' with no reason is the kind of
+        # message that gets read as 'wrong password' and sends someone after the pool
+        self.auth_error = ("ssh needs a password and there is no way to hand it one (%s)"
+                           % " and ".join(tried))
+        return False
 
     @staticmethod
     def _extract(text):
@@ -2784,8 +3640,43 @@ def have(binary):
     return bool(which(binary))
 
 
+def write_askpass(work_dir):
+    """Write the askpass helper and PROVE it runs. Returns its path, or "" if it does not.
+
+    The proof is the point. Everything that can go wrong here - a noexec /tmp, a work dir
+    on a filesystem that drops the execute bit, no /bin/sh - fails silently at the far
+    end otherwise: ssh gets an empty password back and reports an authentication failure,
+    which reads as a wrong root password and sends someone off to check xo-server-db.
+    A probe value, never the real password, so the check costs nothing to be wrong about.
+    """
+    path = os.path.join(work_dir, "askpass")
+    try:
+        handle = open(path, "w")
+        try:
+            handle.write(ASKPASS_SCRIPT)
+        finally:
+            handle.close()
+        os.chmod(path, 0o700)
+    except (IOError, OSError) as exc:
+        debug("askpass helper could not be written to %s: %s" % (path, exc))
+        return ""
+    probe = "health-askpass-probe"
+    env = dict(os.environ)
+    env[ASKPASS_ENV] = probe
+    rc, out, err = run_local_cmd([path], timeout=config.LOCAL_CMD_TIMEOUT, env=env)
+    if rc != 0 or out.strip() != probe:
+        debug("askpass helper did not run (exit %d): %s"
+              % (rc, ((err or out).strip() or "no output")[:200]))
+        return ""
+    return path
+
+
 def ensure_sshpass(run_env):
     """Make sshpass available, or say why it is not.
+
+    The fallback since v3.15, reached only when the askpass helper could not be run - see
+    enable_password_auth(). A run that gets here is on a machine where the work dir cannot
+    be executed from, so the install is the one way left to reach another host.
 
     On a hypervisor it comes from 'extras', a stock XCP-ng repo that ships in
     CentOS-Base.repo pointing at Vates' own mirror and is merely disabled by default.
@@ -2810,9 +3701,24 @@ def ensure_sshpass(run_env):
         return True
 
     sys.stderr.write("sshpass not found. Installing via apt...\n")
-    run_local_cmd(["apt-get", "update", "-y"], timeout=300)
-    run_local_cmd(["apt-get", "install", "-y", "sshpass"], timeout=300)
-    return have("sshpass")
+    env = dict(os.environ)
+    # stdin is /dev/null here, so anything that stops to ask (dpkg's conffile prompt,
+    # needrestart) would read EOF part way through an install nobody can see
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+    rc, out, err = run_local_cmd(["apt-get", "update", "-y"], timeout=300, env=env)
+    if rc != 0:
+        # not fatal by itself: the package may well already be in the local index
+        sys.stderr.write("Warning: 'apt-get update' exited %d; trying the install anyway.\n" % rc)
+    rc, out, err = run_local_cmd(["apt-get", "install", "-y", "sshpass"], timeout=300, env=env)
+    if not have("sshpass"):
+        # the yum half has always said this much; the apt half said nothing at all, so a
+        # failure surfaced only as the caller's one-line 'sshpass is required'
+        sys.stderr.write("ERROR: could not install sshpass (apt-get exit code %d).\n" % rc)
+        for line in (out + err).splitlines()[-5:]:
+            sys.stderr.write(line + "\n")
+        return False
+    sys.stderr.write("sshpass installed.\n")
+    return True
 
 
 # ======================================================================================
@@ -2822,6 +3728,8 @@ DEFAULT_ADDR = ("127.0.0.1", 6379)   # node-redis' default, used when [redis] is
 ENCRYPTION_PREFIX = "enc:"           # xo-server/src/xo-mixins/crypto-credentials.mjs
 IDS_KEY = "xo:server_ids"
 RECORD_PREFIX = "xo:server:"
+PLUGIN_IDS_KEY = "xo:plugin-metadata_ids"
+PLUGIN_RECORD_PREFIX = "xo:plugin-metadata:"
 
 
 class RedisError(Exception):
@@ -3037,6 +3945,78 @@ def read_server_records(cli_path, addr=DEFAULT_ADDR, timeout=None):
     except ValueError as exc:
         # json.loads on a record, or int() on a malformed RESP length prefix
         raise RedisError("unreadable answer from redis: %s" % exc)
+
+
+# --------------------------------------------------------------------------------------
+# plugin metadata - an annotation, never a finding
+# --------------------------------------------------------------------------------------
+
+def read_plugin_autoload(cli_path, addr=DEFAULT_ADDR, timeout=None):
+    """{plugin name: autoload bool} from xo's own `plugin-metadata` records.
+
+    This is the only place XO records whether a plugin is switched on, and it is a
+    RECORD OF WHAT XO HAS SEEN, not of what is installed: a plugin that was loaded once
+    and then removed keeps its record (the appliance still carries `cloud`, retired
+    years ago), and a plugin installed but never loaded has none. So it can annotate the
+    `XOA Plugins` finding and it must never be the thing that produces one - the
+    directory scan is what establishes installation.
+
+    Raises RedisError on anything doubtful, exactly like read_server_records, and the
+    caller degrades to saying autoload is unknown. There is deliberately no fallback to
+    `xo-server-db` here: 3.3s of node for an annotation is not a trade worth making.
+    """
+    if timeout is None:
+        timeout = config.XO_REDIS_TIMEOUT
+    if _mentions_redis(cli_path):
+        raise RedisError("xo-server config mentions redis; not assuming %s:%d" % DEFAULT_ADDR)
+    try:
+        return _fetch_autoload(addr, timeout)
+    except OSError as exc:
+        raise RedisError("%s:%d: %s" % (addr[0], addr[1], exc))
+    except UnicodeDecodeError as exc:
+        raise RedisError("undecodable answer from redis: %s" % exc)
+    except ValueError as exc:
+        raise RedisError("unreadable answer from redis: %s" % exc)
+
+
+def _fetch_autoload(addr, timeout):
+    sock = socket.create_connection(addr, timeout=timeout)
+    try:
+        handle = sock.makefile("rb")
+        try:
+            sock.sendall(_encode(["SMEMBERS", PLUGIN_IDS_KEY]))
+            ids = _read_reply(handle)
+            if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+                raise RedisError("%s is not a set of ids" % PLUGIN_IDS_KEY)
+            if not ids:
+                # unlike the server ids, empty is a real and harmless answer here: an
+                # appliance xo-server has never started on has no metadata yet
+                return {}
+            sock.sendall(_encode(["MGET"] + [PLUGIN_RECORD_PREFIX + i for i in ids]))
+            blobs = _read_reply(handle)
+            if not isinstance(blobs, list) or len(blobs) != len(ids):
+                got = len(blobs) if isinstance(blobs, list) else "a non-list of"
+                raise RedisError("MGET answered %s value(s) for %d id(s)" % (got, len(ids)))
+        finally:
+            handle.close()
+    finally:
+        sock.close()
+
+    out = {}
+    for ident, blob in zip(ids, blobs):
+        if blob is None:
+            continue                      # deleted between the two calls; not our record
+        if blob.startswith(ENCRYPTION_PREFIX):
+            raise RedisError("plugin metadata is encrypted (%s%s)"
+                             % (PLUGIN_RECORD_PREFIX, ident))
+        record = json.loads(blob)
+        if not isinstance(record, dict):
+            raise RedisError("%s%s is not an object" % (PLUGIN_RECORD_PREFIX, ident))
+        # XO stores every field as a JSON string, so autoload is 'true'/'false' and not a
+        # boolean; both spellings are accepted so this keeps working if that changes
+        value = record.get("autoload")
+        out[ident] = (value is True) or (value == "true")
+    return out
 
 
 # ======================================================================================
@@ -3413,12 +4393,12 @@ def hypervisor_version(host):
     if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
         major, minor = int(parts[0]), int(parts[1])
         if major > 8 or (major == 8 and minor >= 3):
-            # deliberately always printed, -f included, even though this line CAN flag:
-            # under -f it is the identity anchor for the host block, and every other
-            # always-printed line there (Last Booted, Multipathing, NTP) is info-only.
-            # Suppressing it would leave a findings-only report that does not say which
-            # version produced them.
-            return info("Hypervisor Version", "%s %s" % (name, version))
+            # pinned, so -f prints it even though this branch cannot flag: it is the
+            # identity anchor for the host block, and under -f every other line in that
+            # block is a finding. Without it a findings-only report would not say which
+            # version produced them - and now that -f hides informational lines
+            # (Last Booted, Multipathing, NTP), it is the ONLY line that would.
+            return pinned(info("Hypervisor Version", "%s %s" % (name, version)))
     # 8.2 reached end of life on 2025-09-16 and receives no security updates at all
     return flag("Hypervisor Version", "%s %s" % (name, version))
 
@@ -3469,7 +4449,10 @@ def ntp(host):
     if enabled == "no" or synced == "no":
         line.status = result.FLAG
     elif enabled != "yes" or synced != "yes":
+        # neither half was established, which -f must not hide: the yellow in the text is
+        # the same warning info(..., "yellow") carries, so it keeps its line the same way
         line.status = result.INFO
+        line.keep = True
     return line
 
 
@@ -4357,6 +5340,184 @@ def backup_network(pool, run_env, pinger):
                 " - No ping answer from XOA for: " + ", ".join(silent))
 
 
+# --------------------------------------------------------------------------------------
+# stuck mounts
+# --------------------------------------------------------------------------------------
+
+def stuck_processes(host):
+    """Processes wedged in uninterruptible sleep - the consequence, whatever the cause.
+
+    This is the primary signal for a mount that has stopped answering, and it is primary
+    because it costs nothing and cannot itself hang: every input is served out of kernel
+    memory by procfs. It is also filesystem-agnostic, which is the point - a dead NFS
+    server, a dead SMB share, a dropped iSCSI LUN and a failing local disk all arrive
+    here identically, and none of them needed to be anticipated by name.
+
+    Kernel threads are reported separately from userspace processes. Some kernel threads
+    sit in D quite normally, so the line says outright when that is all there is - but a
+    kworker parked in a filesystem's work queue corroborates the rest, and dropping it
+    would throw away the clearest evidence of which subsystem is stuck.
+
+    What the collector establishes is that each of these was in D and made no progress at
+    all for the whole window it watched. Age is NOT that: it is how long the process has
+    existed, an upper bound on how long it has been wedged, and the wording keeps the two
+    apart. They coincide for a `df` that wedged the moment it ran, and they are days apart
+    for a daemon that has been up since boot.
+    """
+    facts = host.fact("stuck_procs")
+    if not facts.ok:
+        return unknown("Stuck Processes", "Unknown (%s)" % facts.error)
+
+    rows = facts.value.get("rows") or []
+    total = facts.value.get("total") or 0
+    if not total:
+        return ok("Stuck Processes", "None")
+
+    user_count = facts.value.get("userspace")
+    modules = sorted(set(row.get("module") or "" for row in rows) - set([""]))
+    oldest = max((row.get("age") or 0) for row in rows)
+
+    what = "%d stuck" % total
+    if user_count == 0:
+        # worth saying in the summary line rather than only in the block: it is the
+        # difference between "this host has lost commands" and "one kworker is parked"
+        what += ", all kernel threads"
+    summary = "%s (oldest started %s ago)" % (what, parsers.format_age(oldest))
+    if modules:
+        summary += " in " + ", ".join(modules)
+    # the userspace tally comes from the collector, which counted every one of them.
+    # Counting it here would count only the capped sample and print that as the whole
+    return flag("Stuck Processes", "Yes - " + summary).with_detail(
+        "Stuck Processes", _stuck_detail(rows, total, user_count,
+                                         facts.value.get("watched"),
+                                         facts.value.get("own_probes")))
+
+
+def _stuck_detail(rows, total, user_count, watched, own_probes):
+    if user_count is None:
+        head = "%d process(es) in uninterruptible sleep." % total
+    else:
+        head = ("%d process(es) in uninterruptible sleep; %d of them userspace, the rest "
+                "kernel threads." % (total, user_count))
+    lines = [head,
+             "None of these can be killed - not even with SIGKILL - until whatever they "
+             "are waiting on answers."]
+    if watched:
+        # the measured claim, and the one that says this is not just a busy disk
+        lines.append("Each of them consumed no CPU and completed no I/O for the whole %s "
+                     "it was watched." % parsers.format_age(watched))
+    lines.append("Age is how long the process has existed, which is an upper bound on how "
+                 "long it has been stuck, not a measurement of it.")
+    if own_probes:
+        # named rather than hidden, and counted rather than dropped: they are genuinely
+        # stuck, and a reader who does not know where they came from would read a growing
+        # count as the host getting worse on its own
+        lines.append("%d of them are this script's own mount probes, parked by earlier "
+                     "runs on a mount that stopped answering. Each one names the mount "
+                     "it was asking about." % own_probes)
+    lines.append("")
+    for row in rows:
+        lines.append("  %-8s %-9s %-10s %s"
+                     % (row.get("pid"), parsers.format_age(row.get("age") or 0),
+                        row.get("module") or "-",
+                        row.get("cmd") or "[kernel thread] " + (row.get("frame") or "")))
+    if len(rows) < total:
+        # never a silent cut: 25 rows under a heading saying 589 still reads as "here they
+        # are" unless the block says outright that it is showing a slice
+        lines.append("")
+        lines.append("(oldest %d of %d shown)" % (len(rows), total))
+    elif len(rows) > 1:
+        lines.append("")
+        lines.append("(listed oldest first)")
+    return "\n".join(lines)
+
+
+def mount_stalls(host):
+    """The server-side half: what the kernel said when a mount stopped answering.
+
+    Read from kern.log and the dmesg ring for the same reason Multipath Path Events reads
+    both - neither contains the other. It names the SERVER, which the process scan cannot:
+    a stuck process says a mount is wedged, this says which one and since when.
+
+    It cannot be relied on alone, and the reason is worth writing down. The kernel's own
+    hung-task detector is enabled on 8.3 (hung_task_timeout_secs=120) but
+    kernel.hung_task_warnings defaults to 10 and counts DOWN - after ten it stops logging
+    for the rest of the uptime. A host wedged for days can therefore be completely silent
+    here while dozens of processes pile up, which is why the process scan leads.
+    """
+    scan = host.fact("mount_stall_scan")
+    dmesg = host.fact("dmesg")
+
+    blocks = list(scan.value) if (scan.ok and scan.value) else []
+    if dmesg.ok:
+        blocks = blocks + _dmesg_phrase_blocks(dmesg.value, config.MOUNT_STALL_PHRASES,
+                                               config.LOG_ERROR_CONTEXT)
+    if blocks:
+        return flag("Mount Stalls", "Yes, See Error Output").with_detail(
+            "Mount Stalls", _render_scan_blocks(blocks))
+    if not scan.ok:
+        return unknown("Mount Stalls", "Unknown (%s)" % scan.error)
+    if not dmesg.ok:
+        return unknown("Mount Stalls", "Unknown (could not read dmesg)")
+    return ok("Mount Stalls", "None")
+
+
+def network_mounts(host):
+    """Does each network mount still answer a stat()?
+
+    The only one of the three that can name a mount nothing has touched yet - and the only
+    one with a cost, since the probe of a dead mount becomes a stuck process itself. It is
+    run anyway, on every host, including one that is already full of stuck processes: this
+    is the line that says WHICH mount to go and fix, and on a host in that state the cost
+    it was once spared has already been paid many times over.
+
+    A mount is left unprobed only when the run budget has no room to wait for an answer,
+    and that reads Unknown rather than green - nothing was established about it.
+    """
+    facts = host.fact("network_mounts")
+    if not facts.ok:
+        return unknown("Network Mounts", "Unknown (%s)" % facts.error)
+
+    rows = facts.value
+    if not rows:
+        return ok("Network Mounts", "None")
+
+    dead = [row for row in rows if row.get("state") == "no answer"]
+    unprobed = [row for row in rows if row.get("state") == "not probed"]
+    errored = [row for row in rows if row.get("state") == "error"]
+
+    if dead:
+        return flag("Network Mounts",
+                    "%d of %d not responding" % (len(dead), len(rows))).with_detail(
+            "Network Mounts", _mount_detail(rows))
+    if unprobed:
+        # not probed is not "fine": it is a question that was deliberately not asked, and
+        # the reason it was not asked is itself already flagged by Stuck Processes
+        return unknown("Network Mounts",
+                       "Unknown - %d mount(s) not probed (%s)"
+                       % (len(unprobed), unprobed[0].get("why") or "no reason given")
+                       ).with_detail("Network Mounts", _mount_detail(rows))
+    if errored:
+        return flag("Network Mounts",
+                    "%d of %d could not be checked" % (len(errored), len(rows))).with_detail(
+            "Network Mounts", _mount_detail(rows))
+    return ok("Network Mounts", "%d responding" % len(rows))
+
+
+def _mount_detail(rows):
+    lines = []
+    for row in rows:
+        when = ""
+        if row.get("seconds") is not None:
+            when = "  %ss" % row["seconds"]
+        lines.append("  %-10s %-11s %s on %s%s"
+                     % (row.get("type") or "-", row.get("state") or "-",
+                        row.get("source") or "-", row.get("target") or "-", when))
+        if row.get("why"):
+            lines.append("               %s" % row["why"])
+    return "\n".join(lines)
+
+
 # ======================================================================================
 # --- xoa -------------------------------------------------------------------------------
 
@@ -4398,9 +5559,95 @@ def _service_state(name):
     return state
 
 
+def _plugin_scan_targets():
+    """Every (directory, prefix) pair xo-server would look in, in its own order."""
+    pairs = []
+    for path in config.XO_PLUGIN_LOOKUP_PATHS:
+        pairs.append((os.path.join(path, config.XO_PLUGIN_SCOPE_DIR),
+                      config.XO_PLUGIN_SCOPE_PREFIX))
+        pairs.append((path, config.XO_PLUGIN_PREFIX))
+    return pairs
+
+
+def _plugin_version(directory):
+    """The version out of the package's own package.json, or "".
+
+    Best effort by design - a third-party plugin with no package.json, or a broken one, is
+    still a third-party plugin, and the finding must not depend on it parsing.
+    """
+    try:
+        with open(os.path.join(directory, "package.json"), "r") as handle:
+            data = json.load(handle)
+    except (IOError, OSError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    version = data.get("version")
+    return version if isinstance(version, str) else ""
+
+
+def scan_plugins():
+    """Every plugin installed on this appliance, whether or not XO ever loaded it.
+
+    Returns (plugins, errors). The filesystem is the source of truth here and redis is
+    not, because the question is "what is installed", and a plugin that is installed,
+    present and switched off in the UI is exactly the case this check exists for. XO's
+    own metadata records answer a different question - what it has loaded at some point -
+    and they go stale in both directions.
+
+    A directory it could not list goes in `errors` and turns the line Unknown. A
+    directory that is not there is an answer, not an error: two of the three lookup paths
+    do not exist on a stock appliance.
+    """
+    plugins, errors, seen = [], [], set()
+    for directory, prefix in _plugin_scan_targets():
+        try:
+            entries = sorted(os.listdir(directory))
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            errors.append("%s: %s" % (directory, exc))
+            continue
+        for entry in entries:
+            if not entry.startswith(prefix) or entry == prefix:
+                continue
+            name = entry[len(prefix):]
+            if name in seen:
+                continue          # xo-server keeps the first path that has the name
+            seen.add(name)
+            full = os.path.join(directory, entry)
+            plugins.append({
+                "name": name,
+                "package": entry,
+                "path": full,
+                "version": _plugin_version(full),
+                # an npm-linked or hand-symlinked plugin is worth naming outright: the
+                # directory says nothing about where its code actually came from
+                "link": os.path.realpath(full) if os.path.islink(full) else "",
+            })
+    return plugins, errors
+
+
+def _plugin_autoload():
+    """(autoload map, was it established). Annotation only - never a finding of its own."""
+    cli_path = transport.which("xo-server-db")
+    if not cli_path:
+        return {}, False
+    try:
+        return xoredis.read_plugin_autoload(cli_path), True
+    except xoredis.RedisError:
+        return {}, False
+
+
 def collect_xoa():
     """Everything the section needs, gathered before anything is printed."""
     data = {}
+    # Local reads, so they happen whatever state the updater is in - the plugin scan has
+    # to survive an appliance whose updater is down, which is one of the states somebody
+    # investigating odd behaviour is most likely to be in
+    data["plugins"], data["plugin_errors"] = scan_plugins()
+    data["plugin_autoload"], data["plugin_autoload_known"] = _plugin_autoload()
+
     # Asked before the updater is, because every xoa-updater call below talks to this
     # daemon: with it down they fail, and a failed call used to read as 'Unregistered' and
     # 'Updates available' - findings invented by the tool rather than found by it.
@@ -4433,6 +5680,9 @@ def collect_xoa():
             version = parts[3]
             break
     data["version"] = version
+    # the same call already paid for, read twice: it also lists every npm package Vates
+    # offers this appliance, which is the golden list the plugin scan is judged against
+    data["manifest_plugins"] = parsers.manifest_plugin_names(manifest)
 
     _, plan = _updater("raw-api-call", "getXoaPlan")
     data["plan"] = _first_token(plan)
@@ -4478,6 +5728,37 @@ def _max_old_space():
 def _dmesg():
     rc, out, _err = transport.run_local_cmd(["dmesg", "-T"], timeout=60)
     return out if rc == 0 else None
+
+
+def _plugins_line(data):
+    """Is anything installed here that Vates did not ship?
+
+    A plugin runs inside xo-server with xo-server's access to the pool, and nothing in
+    XOA's own tooling ever mentions one it did not install - so an appliance behaving
+    oddly can be carrying one with no sign of it anywhere else. That is the whole reason
+    for the line, and it is why an unrecognised name is reported rather than assumed
+    benign: the list is a whitelist, so a stale list names a plugin for a human to look at
+    instead of waving one through.
+
+    Vates' set is the union of two sources. This appliance's own xoa-updater manifest is
+    the live one and covers whatever Vates ships next; config.XOA_STOCK_PLUGINS is what is
+    left when the updater is down, unregistered or timing out - which are states this
+    check has to keep working in.
+    """
+    if data.get("plugin_errors"):
+        return unknown("XOA Plugins",
+                       "Unknown (could not read %s)" % "; ".join(data["plugin_errors"]))
+    found = data.get("plugins") or []
+    vates_names = set(config.XOA_STOCK_PLUGINS) | set(data.get("manifest_plugins") or ())
+    _stock, third_party = parsers.classify_xo_plugins(found, vates_names)
+    if not third_party:
+        return ok("XOA Plugins", "%d installed, all shipped with XOA" % len(found))
+    return flag("XOA Plugins",
+                "%d of %d Not Shipped With XOA, See Below"
+                % (len(third_party), len(found))).with_detail(
+        "Plugins Not Shipped With XOA",
+        parsers.plugin_block(third_party, data.get("plugin_autoload") or {},
+                             bool(data.get("plugin_autoload_known"))))
 
 
 def lines():
@@ -4536,6 +5817,8 @@ def lines():
             out.append(flag("XOA Check", "Issues Found, See Output Below").with_detail(
                 "XOA Check Issues", data["check_output"]))
 
+    out.append(_plugins_line(data))
+
     osv = _os_version()
     out.append(ok("OS Version", osv) if osv else unknown("OS Version", "Unknown"))
 
@@ -4550,7 +5833,8 @@ def lines():
         avail_gb = avail_mb / 1024.0
         used_gb = total_gb - avail_gb
         pct = (used_gb / total_gb) * 100 if total_gb > 0 else 0.0
-        # an info line with no threshold behind it, so it prints under -f like uptime does
+        # a reading with no threshold behind it, so it can never flag - and -f hides it,
+        # the same as every other reading. The heap cap below is the line with a rule
         out.append(Line("Memory Usage",
                         "%s GB used of %s GB (%s%%)" % (colors.green("%.1f" % used_gb),
                                                         colors.green("%.1f" % total_gb),
@@ -4656,13 +5940,21 @@ class Report(object):
         self.host_label = None   # which detail bucket the current section writes into
         self._sections = []      # json only: the buckets, in the order the report makes them
         self._section = None
+        self._pending = []       # headings and blanks no line has earned yet
+        self._written = 0        # body lines out so far, so a section can tell if it said anything
+        self._section_mark = 0
 
     # -- raw output ---------------------------------------------------------------
     def write(self, text=""):
-        """--json puts the document on stdout and nothing else, so the rendered report is
-        suppressed at the single point that produces it rather than at every caller."""
+        """One piece of report BODY. Anything held waiting for it goes out first.
+
+        --json puts the document on stdout and nothing else, so the rendered report is
+        suppressed at the single point that produces it rather than at every caller.
+        """
         if self.json_mode:
             return
+        self._flush_pending()
+        self._written += 1
         self.stream.write(text + "\n")
 
     def write_raw(self, text):
@@ -4670,7 +5962,29 @@ class Report(object):
         spacing, and putting it through write() would silently reshape the report."""
         if self.json_mode:
             return
+        self._flush_pending()
+        self._written += 1
         self.stream.write(text)
+
+    def _structural(self, text):
+        """A heading or a separator: it describes body rather than being body.
+
+        Printed straight out in a full report, held back under -f until a line justifies
+        it. See the module docstring for why an empty section may not keep its heading.
+        """
+        if self.json_mode:
+            return
+        if self.filter_output:
+            self._pending.append(text)
+        else:
+            self.stream.write(text + "\n")
+
+    def _flush_pending(self):
+        if not self._pending:
+            return
+        held, self._pending = self._pending, []
+        for text in held:
+            self.stream.write(text + "\n")
 
     # -- sections -----------------------------------------------------------------
     def begin_section(self, kind, host=None):
@@ -4681,6 +5995,10 @@ class Report(object):
         disagree.
         """
         self.host_label = "XOA" if kind == "xoa" else (host.label if host is not None else None)
+        # where this section starts, so end_section can tell whether it printed anything.
+        # The heading is already pending by now - it is written before the section opens -
+        # which is exactly what makes it droppable along with the rest.
+        self._section_mark = self._written
         if not self.json_mode:
             return
         section = {"kind": kind}
@@ -4694,6 +6012,10 @@ class Report(object):
         self._section = section
 
     def end_section(self):
+        if self.filter_output and self._written == self._section_mark:
+            # nothing in it printed, so its heading and its separator go with it rather
+            # than being flushed by whatever section prints next
+            self._pending = []
         self.host_label = None
         self._section = None
 
@@ -4712,11 +6034,11 @@ class Report(object):
                                "error": host.error or "not collected"})
 
     def heading(self, text):
-        """Section headings always print: -f hides passing results, not structure."""
-        self.write(colors.cyan(text))
+        """A heading prints when the section under it has something to say."""
+        self._structural(colors.cyan(text))
 
     def blank(self):
-        self.write("")
+        self._structural("")
 
     # -- lines --------------------------------------------------------------------
     def add(self, line, host_label=None):
@@ -4767,6 +6089,10 @@ class Report(object):
 
     # -- tail ---------------------------------------------------------------------
     def print_poolconf_section(self):
+        """Every host's role, verbatim. -f drops the block whole: it is a reading of every
+        host in the pool and there is no state of it that is a finding."""
+        if self.filter_output:
+            return
         self.blank()
         self.heading("---pool.conf contents---")
         self.write_raw("".join(self._poolconf))
@@ -4818,6 +6144,9 @@ class Report(object):
             self.stream.write(
                 json.dumps(self.document(), indent=2, ensure_ascii=True) + "\n")
             return 1 if self.flagged else 0
+        # the last section may have printed nothing and left its heading held; the version
+        # line is not what earns it, so drop it before anything below flushes
+        self._pending = []
         for blob in (self._pool_details, self._host_details):
             text = "".join(blob)
             if text.strip():
@@ -4843,26 +6172,38 @@ class Report(object):
 # ======================================================================================
 # --- main ------------------------------------------------------------------------------
 
-USAGE_XOA = """Usage:
-  %(prog)s [-f] [-s] [-n name] [-c 'command'] [pool_master_or_host[:ssh_port] [root_password]]
+# Laid out the way every other command-line tool on these boxes lays it out: the flag
+# first and the sentence after it, so the switches can be read down the left edge in one
+# glance. The prose that used to carry them ('Use -f to ...') read as a paragraph and had
+# to be searched.
+USAGE_XOA = """Usage: %(prog)s [OPTION]... [pool_master_or_host[:ssh_port] [root_password]]
+Health-check every host of an XCP-ng pool, from a Xen Orchestra appliance.
 
-  - All parameters are optional
-  - If a host is not supplied, the enabled pools in xo-server-db are listed to pick from
-    (a single enabled pool, or non-interactive use, just takes the first one)
-  - If a password is not supplied, it will be looked up locally in xo-server-db
-  - By default, the script runs in pool mode (checks all hosts in the pool)
-  - Use '-f' flag to filter output to only show issues found
-  - Use '-s' flag to only check the specified host (do not check other pool members if present)
-  - Use '-n' to pick a pool from xo-server-db by name instead of being prompted:
-    the first pool whose name contains the text is used, matched anywhere in the
-    name and ignoring case, so '-n sec' matches 'XEN-SECONDARY'
-  - Use '-c command' to run an arbitrary command on every reachable pool host
-    instead of the health report, and print each host's output
-  - Use '--json' to print the results as a JSON document instead of a report, for
-    cron and monitoring. Same checks, same exit code; '-f' narrows it the same way,
-    and everything that is not the document goes to stderr
+All arguments are optional. With no host, the enabled pools in xo-server-db
+are listed to pick from - a single enabled pool, or a non-interactive run,
+takes the first. With no password, it is looked up in xo-server-db. Every host
+in the pool is checked unless -s says otherwise.
 
-  Examples:
+  -f, --filter          only print checks that flagged; passing and
+                        informational lines are hidden, sections included
+  -s, --single          check only the given host, not the other pool members
+  -n, --name=NAME       pick the pool from xo-server-db by name instead of
+                        being prompted: the first pool whose name contains
+                        NAME, matched anywhere and ignoring case, so
+                        '-n sec' matches 'XEN-SECONDARY'
+  -c, --command=CMD     run CMD on every reachable pool host and print what
+                        each one said, instead of the health report: no
+                        checks are run and no verdict is reached, so the
+                        exit status is always 0. Cannot be used with --json
+      --json            print the run as one JSON document instead of a
+                        report, for cron and monitoring: same checks, same
+                        exit code, -f narrows it the same way, and anything
+                        that is not the document goes to stderr
+  -h, --help            print this help and exit
+
+Exit status: 0 if every check passed, 1 if any flagged, 2 on a usage error.
+
+Examples:
   %(prog)s 192.168.1.5
   %(prog)s 192.168.1.6 'mypass'
   %(prog)s -s 192.168.1.7 'mypass'
@@ -4872,26 +6213,31 @@ USAGE_XOA = """Usage:
   %(prog)s --json -n sec
 """
 
-USAGE_HOST = """Usage (running on an XCP-ng host):
-  %(prog)s [-f] [-s] [root_password]
+USAGE_HOST = """Usage: %(prog)s [OPTION]... [root_password]
+Health-check this XCP-ng host, and the rest of its pool given a root password.
 
-  - This host is always checked, using local commands (no ssh, no password needed)
-  - The other pool members are checked too if a root password is given: they are
-    reached over ssh, and sshpass is installed from the stock 'extras' repo if missing.
-    Pool members share the master's root password, so one password covers the pool
-  - With no password and a terminal you are asked for one; blank, or no terminal
-    (cron, pipe), just checks this host and says so in the Pool Status section
-  - Prefer the prompt over the argument: an argument is visible in 'ps' and lands
-    in your shell history
-  - Pool-level results are reported either way, since xapi answers those from any
-    pool member, slave included
-  - Use '-f' flag to filter output to only show issues found
-  - Use '-s' flag to skip the pool-level section and only report on this host
-  - Use '--json' to print the results as a JSON document instead of a report, for
-    cron and monitoring. Same checks, same exit code; '-f' narrows it the same way,
-    and everything that is not the document goes to stderr
+This host is always checked, using local commands - no ssh and no password
+needed. The other pool members are checked too if a root password is given:
+they are reached over ssh, which needs nothing installed to be handed a
+password. Pool members share the master's root password, so one
+password covers the pool. With no password and a terminal you are asked for
+one; blank, or no terminal (cron, pipe), just checks this host and says so in
+the Pool Status section. Prefer the prompt over the argument - an argument is
+visible in 'ps' and lands in your shell history. Pool-level results are
+reported either way, since xapi answers those from any pool member.
 
-  Examples:
+  -f, --filter          only print checks that flagged; passing and
+                        informational lines are hidden, sections included
+  -s, --single          skip the pool-level section, report on this host alone
+      --json            print the run as one JSON document instead of a
+                        report, for cron and monitoring: same checks, same
+                        exit code, -f narrows it the same way, and anything
+                        that is not the document goes to stderr
+  -h, --help            print this help and exit
+
+Exit status: 0 if every check passed, 1 if any flagged, 2 on a usage error.
+
+Examples:
   %(prog)s
   %(prog)s -f
   %(prog)s 'mypass'
@@ -4954,6 +6300,16 @@ def _host_spec(with_smapi):
                            "context": config.LOG_ERROR_CONTEXT},
         "multipath": {"transient": config.MULTIPATH_TRANSIENT_CHK_STATES,
                       "recheck_delay": config.MULTIPATH_RECHECK_DELAY},
+        "mount_stall_scan": {"files": config.MOUNT_STALL_FILES,
+                             "phrases": config.MOUNT_STALL_PHRASES,
+                             "context": config.LOG_ERROR_CONTEXT},
+        "stuck": {"recheck_delay": config.STUCK_RECHECK_DELAY,
+                  "samples": config.STUCK_SAMPLES,
+                  "min_age": config.STUCK_MIN_AGE,
+                  "max_lines": config.STUCK_MAX_LINES},
+        "mount_probe": {"types": config.NETWORK_FS_TYPES,
+                        "probe_timeout": config.MOUNT_PROBE_TIMEOUT,
+                        "probe_reserve": config.MOUNT_PROBE_RESERVE},
     }
 
 
@@ -5062,6 +6418,38 @@ def notice(run, text):
     (sys.stderr if run.json_output else sys.stdout).write(text)
 
 
+_PROGRESS_LOCK = threading.Lock()
+
+
+def progress_enabled():
+    """Live progress is for a person watching a terminal, and for nobody else.
+
+    stderr only, and only when it is a tty: stdout carries the report (or the --json
+    document) and does not change, and a captured, piped or cron run gets exactly the bytes
+    it got before - which is also what keeps the old-vs-new regression diffs honest.
+    """
+    try:
+        return bool(sys.stderr.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+def progress(text):
+    """One whole line at a time - every host worker writes here.
+
+    Between the banner and the first line of the report the run makes one ssh call to
+    discover the pool and then one per host, each of which may take REMOTE_CMD_TIMEOUT,
+    and the report cannot start until the last one is in. Printing nothing in the
+    meantime makes a slow host indistinguishable from a wedged script: it was read as one
+    and killed twice before the collectors had run out of their own budget.
+    """
+    if not progress_enabled():
+        return
+    with _PROGRESS_LOCK:
+        sys.stderr.write(text)
+        sys.stderr.flush()
+
+
 def print_banner(run, host, name):
     """Every run names what it is about to check, before any of the slow work.
 
@@ -5072,7 +6460,10 @@ def print_banner(run, host, name):
         notice(run, "Checking pool: %s\n" % colors.green("%s (%s)" % (name, host)))
     else:
         notice(run, "Checking host: %s\n" % colors.green(host))
-    notice(run, "\n")
+    # -f is asked for when the answer is wanted in as few lines as possible, and the very
+    # next thing it prints is a heading; a full report keeps the separator
+    if not run.filter_output:
+        notice(run, "\n")
 
 
 def require_root(run_env):
@@ -5117,7 +6508,11 @@ def _xodb_unreadable(consequence):
 
 
 def resolve_target_xoa(run, args):
-    """Pick a pool / take the host argument, then find a password for it."""
+    """Pick a pool / take the host argument, then find a password for it.
+
+    False if there is no way to give ssh a password at all, which is not fatal: the
+    appliance's own section is still worth printing, and is still the truth.
+    """
     if run.name_filter and len(args) > 1:
         sys.stderr.write("ERROR: -n/--name looks the host up in xo-server-db, so it takes "
                          "at most a password after it.\n")
@@ -5164,9 +6559,11 @@ def resolve_target_xoa(run, args):
     run.pool_name = selected.name if selected else xodb.pool_name_for_host(host)
     print_banner(run, host, run.pool_name)
 
-    if not transport.ensure_sshpass(run.run_env):
-        sys.stderr.write("ERROR: sshpass is required to reach the pool over ssh.\n")
-        sys.exit(1)
+    if not run.transport.enable_password_auth(run.run_env):
+        # not an exit: the appliance's own section needs no pool access, and on the
+        # offline XOA this fires on it is the half of the report that can still be
+        # produced. main() takes it from here - see xoa_only_report().
+        return False
 
     if len(args) == 2:
         run.password = args[1]
@@ -5188,6 +6585,7 @@ def resolve_target_xoa(run, args):
             sys.exit(1)
         run.password = password
     run.transport.password = run.password
+    return True
 
 
 def resolve_target_host_mode(run, args):
@@ -5248,7 +6646,8 @@ def prepare_host_sweep(run, argument_password):
             sys.stderr.write("\n")
     if not password:
         return
-    if not transport.ensure_sshpass(run.run_env):
+    if not run.transport.enable_password_auth(run.run_env):
+        sys.stderr.write("ERROR: %s.\n" % run.transport.auth_error)
         sys.stderr.write("Continuing with this host only.\n")
         return
     run.password = password
@@ -5259,6 +6658,7 @@ def prepare_host_sweep(run, argument_password):
 def discover(run):
     """Phase A: one call to the seed for the pool's host list and our own identity."""
     spec = {"want": ["pool_hosts"]}
+    progress("Asking %s for the pool's host list...\n" % (run.seed or "this host"))
     try:
         if run.run_env == "host":
             payload = run.transport.collect_local(spec)
@@ -5351,12 +6751,17 @@ def _collect_one(run, host, pool_spec):
     if run.pool_mode and host.address == run.pool_cmd_host:
         spec = _merge(spec, pool_spec)
     note = ""
+    started = _now()
     try:
         host.payload = run.transport.collect(host.address, spec)
     except transport.CollectError as exc:
         host.error = str(exc)
         note = "Failed when trying to check %s: %s\n" % (host.address, exc)
     host.local_now = _now()
+    # whichever way it went, say so now: the note is held back until every host is in, and
+    # by then the thing worth knowing - which host the run was waiting on - has passed
+    progress("  %s %s (%.1fs)\n" % (host.address, "failed" if host.error else "answered",
+                                    host.local_now - started))
     return note
 
 
@@ -5376,16 +6781,44 @@ def parallel_workers(host_count):
     return max(1, min(limit, host_count))
 
 
+def _wait_with_progress(futures, addresses):
+    """Wait for the collectors, naming every so often the hosts that have not answered.
+
+    A host that is merely slow - a wedged 'yum check-update' against an unreachable
+    mirror is the usual one - holds the whole phase for up to REMOTE_CMD_TIMEOUT, and
+    'answered' lines only appear as each host finishes. This is what fills the gap in
+    between, so the run says what it is waiting for instead of appearing to hang.
+    """
+    if not progress_enabled():
+        return
+    started = _now()
+    while True:
+        _, not_done = futures_wait(futures, timeout=config.PROGRESS_INTERVAL)
+        if not not_done:
+            return
+        waiting = [addresses[i] for i, f in enumerate(futures) if f in not_done]
+        progress("  still waiting on %s (%ds)\n"
+                 % (", ".join(waiting), _now() - started))
+
+
 def _collect_in_parallel(run, pool_spec, workers):
     pool = ThreadPoolExecutor(max_workers=workers)
     try:
         futures = [pool.submit(_collect_one, run, host, pool_spec) for host in run.hosts]
         try:
+            _wait_with_progress(futures, [h.address for h in run.hosts])
             return [f.result() for f in futures]
         except BaseException:
             # named and immediately re-raised, so this is not a swallowed error: the
             # workers are blocked in communicate() and cannot see a ctrl-C, so without
-            # this the shutdown below would wait out every collector still running
+            # this the shutdown below would wait out every collector still running.
+            # The hosts still QUEUED have to be dropped as well - shutdown(wait=True) does
+            # not discard pending work, so with more hosts than workers a ctrl-C would
+            # start a brand new ssh for every host it had not reached yet and then wait
+            # out all of them. (shutdown(cancel_futures=True) is 3.9; the floor here is
+            # 3.6.) Cancel before killing, so nothing is launched into the gap.
+            for future in futures:
+                future.cancel()
             transport.kill_all_children()
             raise
     finally:
@@ -5405,6 +6838,9 @@ def collect_hosts(run):
 
     workers = parallel_workers(len(run.hosts))
     transport.debug("collecting %d host(s), %d at a time" % (len(run.hosts), workers))
+    progress("Collecting from %d host(s), %d at a time, up to %ds each: %s\n"
+             % (len(run.hosts), workers, config.REMOTE_CMD_TIMEOUT,
+                ", ".join(h.address for h in run.hosts)))
     if workers > 1:
         notes = _collect_in_parallel(run, pool_spec, workers)
     else:
@@ -5574,8 +7010,71 @@ def pool_status_section(run, rep):
     rep.check("Migration Network", checks.migration_network, run.pool)
     rep.check("Backup Network", checks.backup_network, run.pool, run.run_env,
               xoa.ping_silent)
-    rep.end_section()
+    # inside the section, so that under -f a pool with nothing to report takes its own
+    # separator with it instead of leaving a blank line where the section was
     rep.blank()
+    rep.end_section()
+
+
+_NO_POOL_ACCESS_HELP = """\
+%(reason)s.
+
+Every check except the XOA section logs into the pool hosts over ssh as root, and ssh
+takes a password only from a terminal or from a helper program - so this run could report
+on the appliance and on nothing else.
+
+The helper is written into the run's temporary directory, so the fix that needs nothing
+installed and no internet access is to point the run at one it may execute from:
+
+    TMPDIR=/root python3 health.py %(args)s
+
+Failing that, 'apt-get install sshpass' is used instead when it is there. An XCP-ng 8.3
+host can also be checked by running health.py on the host itself, which needs no
+credentials at all for the machine it is running on."""
+
+
+def _target_hint(run):
+    """How this run named its target, for the suggested command line.
+
+    Rebuilt rather than taken from sys.argv, because the argv of a run given its password
+    on the command line contains that password, and this text is printed.
+    """
+    if run.name_filter:
+        name = run.name_filter
+        return "-n %s" % (("'%s'" % name) if " " in name else name)
+    return run.seed or ""
+
+
+def xoa_only_report(run, rep_meta, xoa_worker):
+    """Everything still establishable when the pool cannot be logged into at all.
+
+    The appliance's own section shares nothing with the pool - version, updates, services,
+    disk, plugins, backup networks - so it is a whole answer to half the question, and
+    printing it beats the single line about sshpass that an appliance with no internet
+    access used to get in place of a report.
+
+    The pool is reported Unknown rather than left out: a run that could not look at the
+    pool it was asked about must not exit 0, and a section that is simply absent reads as
+    one that passed.
+    """
+    rep = report.Report(run.filter_output, json_mode=run.json_output, meta=rep_meta)
+    rep.heading("== Pool Status ==")
+    rep.begin_section("pool")
+    reason = run.transport.auth_error or "the pool could not be reached over ssh"
+    shown = run.pool_name or run.seed or "the pool"
+    rep.add(result.unknown("Pool Access", "Unknown - %s was not checked: %s"
+                           % (shown, reason))
+            .with_detail("Pool Access",
+                         _NO_POOL_ACCESS_HELP % {"reason": reason,
+                                                 "args": _target_hint(run)}))
+    rep.blank()
+    rep.end_section()
+
+    rep.begin_section("xoa")
+    rep.heading("== XOA Status ==")
+    rep.add_all(xoa_worker.result(), "XOA")
+    rep.end_section()
+    return rep.finish()
 
 
 def run_meta(run):
@@ -5620,6 +7119,9 @@ def per_host_checks():
         ("lacp_negotiation", "LACP Negotiation Issues", checks.lacp),
         ("multipath_health", "Multipath Path Health", checks.multipath_health),
         ("multipath_events", "Multipath Path Events", checks.multipath_events),
+        ("stuck_processes", "Stuck Processes", checks.stuck_processes),
+        ("mount_stalls", "Mount Stalls", checks.mount_stalls),
+        ("network_mounts", "Network Mounts", checks.network_mounts),
         ("silly_mtus", "Silly MTUs", checks.silly_mtus),
         ("dns_gw_non_mgmt_pifs", "DNS/GW on Non-Mgmt PIFs", checks.dns_gw_non_mgmt_pifs),
         ("overlapping_subnets", "Overlapping Subnets", checks.overlapping_subnets),
@@ -5761,10 +7263,11 @@ def main(argv=None):
         return 1
 
     argument_password = ""
+    pool_reachable = True
     if run.run_env == "host":
         argument_password = resolve_target_host_mode(run, args)
     else:
-        resolve_target_xoa(run, args)
+        pool_reachable = resolve_target_xoa(run, args)
 
     # The appliance's own section starts here and is not looked at again until the report
     # has nothing left to say about the pool. Here, and not at the top of main(), on
@@ -5780,11 +7283,17 @@ def main(argv=None):
     # cores - whereas from here it runs against the host collection, which is waiting on
     # ssh and leaves the CPU idle. It also leaves every exit above untouched: a pool name
     # that matched nothing, an unreadable xo-db, the interactive picker, the sshpass
-    # install. Those cost the run nothing, exactly as before.
+    # fallback. Those cost the run nothing, exactly as before.
     #
     # The one case it loses is a single fast host, where there is under 2s of collection
     # to hide 2.9s of appliance behind. Do not move it back without re-measuring all five.
+    #
+    # It is also started BEFORE the no-password-mechanism exit below, which is the one
+    # case where this section is the entire report: there is nothing else left to overlap.
     xoa_worker = _Background(xoa.lines) if run.run_env != "host" else None
+
+    if not pool_reachable:
+        return xoa_only_report(run, rep_meta=run_meta(run), xoa_worker=xoa_worker)
 
     hosts = discover(run)
 
@@ -5861,9 +7370,9 @@ def main(argv=None):
     # that was asked about, so it has no business standing in front of the host results -
     # and by here it has almost always finished on its thread, making it free.
     if xoa_worker is not None:
-        if not run.pool_mode:
+        if not run.pool_mode or run.filter_output:
             # every section is preceded by exactly one blank line; in pool mode the
-            # pool.conf block already ends in one
+            # pool.conf block already ends in one - except under -f, which drops it
             rep.blank()
         rep.begin_section("xoa")
         rep.heading("== XOA Status ==")
@@ -5888,6 +7397,22 @@ def _narrow_to_seed(run, hosts):
     return [model.Host(run.seed)]
 
 
+def entry():
+    """The process's exit code, with a ctrl-C answered as one rather than as a crash.
+
+    Run the documented way - `python3 <(curl ...)` - the traceback an interrupt used to
+    print could not even show its own source lines: the file is a descriptor that is
+    already gone, so it was twenty lines of threading internals against a path called
+    /dev/fd/63. 130 is the shell's own convention for a SIGINT death, and the atexit
+    handlers still take the children and the work dir with them.
+    """
+    try:
+        return main()
+    except KeyboardInterrupt:
+        sys.stderr.write("\nInterrupted.\n")
+        return 130
+
+
 # ======================================================================================
 # --- module aliases --------------------------------------------------------------------
 
@@ -5904,20 +7429,20 @@ def _module(name, exported):
     return module
 
 
-config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DMESG_MAX_LINES', 'DMESG_ROLLUP_MIN', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'REMOTE_CMD_TIMEOUT', 'RUN_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_QCOW2_MAX_LINES', 'XO_REDIS_TIMEOUT'])
+config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DMESG_MAX_LINES', 'DMESG_ROLLUP_MIN', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MOUNT_PROBE_RESERVE', 'MOUNT_PROBE_TIMEOUT', 'MOUNT_STALL_FILES', 'MOUNT_STALL_PHRASES', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'NETWORK_FS_TYPES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'PROGRESS_INTERVAL', 'REMOTE_CMD_TIMEOUT', 'RUN_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'STUCK_MAX_LINES', 'STUCK_MIN_AGE', 'STUCK_RECHECK_DELAY', 'STUCK_SAMPLES', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOA_STOCK_PLUGINS', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_QCOW2_MAX_LINES', 'XO_PLUGIN_LOOKUP_PATHS', 'XO_PLUGIN_PREFIX', 'XO_PLUGIN_SCOPE_DIR', 'XO_PLUGIN_SCOPE_PREFIX', 'XO_REDIS_TIMEOUT'])
 colors = _module('colors', ['CYAN', 'GREEN', 'RESET', 'YELLOW', 'cyan', 'green', 'init', 'strip_ansi', 'yellow'])
-result = _module('result', ['FLAG', 'Fact', 'INFO', 'Line', 'MISSING', 'OK', 'UNKNOWN', 'flag', 'guard', 'info', 'ok', 'raw', 'unknown', 'wrap'])
-parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', '_LINK_RE', '_MTU_RE', '_PARAM_RE', '_TS_RE', '_cidr_range', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'cap_lines', 'classify_multipath_path', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'has_overlapping_subnets', 'manifest_diff', 'manifest_versions', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pool_conf', 'parse_timedatectl', 'parse_xe_records', 'rollup_repeats', 'round_1dp', 'split_host_port', 'split_timestamp', 'truncate_block'])
+result = _module('result', ['FLAG', 'Fact', 'INFO', 'Line', 'MISSING', 'OK', 'UNKNOWN', 'flag', 'guard', 'info', 'ok', 'pinned', 'raw', 'unknown', 'wrap'])
+parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', '_LINK_RE', '_MANIFEST_PKG_RE', '_MTU_RE', '_PARAM_RE', '_PREMIUM_SUFFIX', '_TS_RE', '_cidr_range', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'cap_lines', 'classify_multipath_path', 'classify_xo_plugins', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'format_age', 'has_overlapping_subnets', 'manifest_diff', 'manifest_plugin_names', 'manifest_versions', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pool_conf', 'parse_timedatectl', 'parse_xe_records', 'plugin_block', 'rollup_repeats', 'round_1dp', 'split_host_port', 'split_timestamp', 'truncate_block'])
 model = _module('model', ['Host', 'Pool', 'ntp_match', 'ram_match'])
 collectorsrc = _module('collectorsrc', ['EMBEDDED', 'collector_source'])
-transport = _module('transport', ['BEGIN_MARKER', 'CollectError', 'END_MARKER', 'Transport', '_DEBUG_LOCK', '_LIVE', '_LIVE_LOCK', '_REMOTE_LAUNCH', '_REMOTE_LAUNCH_PINNED', '_kill_tree', '_remote_launch', 'cleanup_work_dir', 'debug', 'ensure_sshpass', 'have', 'kill_all_children', 'make_work_dir', 'run_local_cmd', 'which'])
-xoredis = _module('xoredis', ['DEFAULT_ADDR', 'ENCRYPTION_PREFIX', 'IDS_KEY', 'RECORD_PREFIX', 'RedisError', '_config_dirs', '_config_files', '_encode', '_fetch', '_flatten', '_mentions_redis', '_read_reply', 'read_server_records'])
+transport = _module('transport', ['ASKPASS_ENV', 'ASKPASS_SCRIPT', 'AUTH_ASKPASS', 'AUTH_SSHPASS', 'BEGIN_MARKER', 'CollectError', 'END_MARKER', 'Transport', '_DEBUG_LOCK', '_LIVE', '_LIVE_LOCK', '_REMOTE_LAUNCH', '_REMOTE_LAUNCH_PINNED', '_kill_tree', '_remote_launch', 'cleanup_work_dir', 'debug', 'ensure_sshpass', 'have', 'kill_all_children', 'make_work_dir', 'run_local_cmd', 'which', 'write_askpass'])
+xoredis = _module('xoredis', ['DEFAULT_ADDR', 'ENCRYPTION_PREFIX', 'IDS_KEY', 'PLUGIN_IDS_KEY', 'PLUGIN_RECORD_PREFIX', 'RECORD_PREFIX', 'RedisError', '_config_dirs', '_config_files', '_encode', '_fetch', '_fetch_autoload', '_flatten', '_mentions_redis', '_read_reply', 'read_plugin_autoload', 'read_server_records'])
 xodb = _module('xodb', ['QUOTES', 'SELECT_NONE', 'SELECT_NO_MATCH', 'SELECT_OK', 'SELECT_QUIT', 'SELECT_UNREADABLE', 'Server', '_ALL_SERVERS', '_ESCAPE_RE', '_KEY_RE', '_READ_ERROR', '_SIMPLE_ESCAPES', '_describe_failure', '_ls', '_read_servers', '_sort_key', 'all_servers', 'clean', 'enabled_servers', 'have_xo_server_db', 'password_for', 'pool_name_for_host', 'read_error', 'reset_cache', 'scan_records', 'select_pool', 'unescape'])
-checks = _module('checks', ['_dmesg_phrase_blocks', '_linstor_column', '_linstor_has_rows', '_linstor_line', '_linstor_node_addresses', '_linstor_node_offline', '_linstor_table', '_linstor_unknown', '_maps', '_multipath_detail', '_multipath_read', '_network_line', '_render_scan_blocks', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_block', 'dmesg_content', 'dmesg_content_of', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'ntp', 'oom_events', 'overlapping_subnets', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'tap_status', 'task_timeout_override', 'vlan0', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_nodes', 'xostor_pref_nic', 'xostor_qcow2', 'xostor_ram', 'yum_patch_level'])
-xoa = _module('xoa', ['_dmesg', '_first_token', '_max_old_space', '_meminfo', '_os_version', '_service_state', '_updater', 'collect_xoa', 'debian_version_ok', 'lines', 'ping_silent', 'running_as_root'])
+checks = _module('checks', ['_dmesg_phrase_blocks', '_linstor_column', '_linstor_has_rows', '_linstor_line', '_linstor_node_addresses', '_linstor_node_offline', '_linstor_table', '_linstor_unknown', '_maps', '_mount_detail', '_multipath_detail', '_multipath_read', '_network_line', '_render_scan_blocks', '_stuck_detail', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_block', 'dmesg_content', 'dmesg_content_of', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mount_stalls', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'network_mounts', 'ntp', 'oom_events', 'overlapping_subnets', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'stuck_processes', 'tap_status', 'task_timeout_override', 'vlan0', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_nodes', 'xostor_pref_nic', 'xostor_qcow2', 'xostor_ram', 'yum_patch_level'])
+xoa = _module('xoa', ['_dmesg', '_first_token', '_max_old_space', '_meminfo', '_os_version', '_plugin_autoload', '_plugin_scan_targets', '_plugin_version', '_plugins_line', '_service_state', '_updater', 'collect_xoa', 'debian_version_ok', 'lines', 'ping_silent', 'running_as_root', 'scan_plugins'])
 report = _module('report', ['Report', '_as_entry'])
 
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(entry())

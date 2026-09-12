@@ -7,6 +7,8 @@ stderr notes come out in host order however the hosts finished, and the concurre
 real rather than a pool that quietly runs one at a time.
 """
 
+import io
+import sys
 import threading
 import time
 
@@ -15,6 +17,13 @@ import pytest
 import main
 import model
 import transport
+
+
+class TtyErr(io.StringIO):
+    """A stderr that claims to be a terminal, which is the only thing progress asks."""
+
+    def isatty(self):
+        return True
 
 
 class FakeTransport(object):
@@ -256,6 +265,32 @@ def test_an_interrupted_run_kills_the_children_it_left_behind(monkeypatch):
     assert killed == [True]
 
 
+def test_an_interrupt_drops_the_hosts_that_had_not_started(monkeypatch):
+    """shutdown(wait=True) does not discard queued work.
+
+    With more hosts than workers, a ctrl-C used to start a brand new ssh for every host
+    the pool had not reached yet and then wait out all of them - the interrupt landing on
+    the first host, and the run carrying on collecting the other seven.
+    """
+    monkeypatch.setenv("HEALTH_MAX_PARALLEL", "2")
+    monkeypatch.setattr(transport, "kill_all_children", lambda: None)
+    addresses = ["10.0.0.%d" % i for i in range(1, 9)]
+
+    def behave(address):
+        if address == "10.0.0.1":
+            raise KeyboardInterrupt()
+        time.sleep(1.0)      # long enough that the pool cannot drain past the interrupt
+        return payload_for(address)
+
+    run = make_run(addresses, {a: behave for a in addresses})
+    with pytest.raises(KeyboardInterrupt):
+        main.collect_hosts(run)
+
+    seen = set(address for address, _ in run.transport.seen)
+    # .1 raised and .2 was already in flight beside it; the six behind them were queued
+    assert seen <= {"10.0.0.1", "10.0.0.2", "10.0.0.3"}, sorted(seen)
+
+
 def test_an_unexpected_exception_still_stops_the_run(monkeypatch):
     """A CollectError is a host that could not be reached; anything else is a bug in us,
     and it must not be quietly turned into an unreachable host."""
@@ -271,3 +306,82 @@ def test_an_unexpected_exception_still_stops_the_run(monkeypatch):
     run = make_run(addresses, {a: behave for a in addresses})
     with pytest.raises(ValueError):
         main.collect_hosts(run)
+
+
+# --------------------------------------------------------------------------------------
+# progress: what a person watching the terminal is told while it blocks
+# --------------------------------------------------------------------------------------
+
+def test_a_captured_run_says_nothing_new(monkeypatch, capsys):
+    """The whole guarantee that lets progress exist at all.
+
+    stdout carries the report and the --json document; the regression protocol diffs two
+    builds' captured output. Neither may gain a byte because a host was slow.
+    """
+    monkeypatch.delenv("HEALTH_MAX_PARALLEL", raising=False)
+    addresses = ["10.0.0.1", "10.0.0.2"]
+    run = make_run(addresses, {a: payload_for for a in addresses})
+    main.collect_hosts(run)
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_a_terminal_is_told_which_hosts_answered_and_which_failed(monkeypatch):
+    monkeypatch.delenv("HEALTH_MAX_PARALLEL", raising=False)
+    addresses = ["10.0.0.1", "10.0.0.2"]
+
+    def behave(address):
+        if address == "10.0.0.2":
+            raise transport.CollectError("down")
+        return payload_for(address)
+
+    fake = TtyErr()
+    monkeypatch.setattr(sys, "stderr", fake)
+    run = make_run(addresses, {a: behave for a in addresses})
+    main.collect_hosts(run)
+    text = fake.getvalue()
+
+    assert "Collecting from 2 host(s)" in text
+    assert "10.0.0.1, 10.0.0.2" in text
+    assert "10.0.0.1 answered" in text
+    # a host that could not be reached says so as it happens, not only in the note the
+    # run holds back until every other host is in
+    assert "10.0.0.2 failed" in text
+
+
+def test_the_wait_names_the_hosts_still_outstanding(monkeypatch):
+    """The line that fills the gap: 'answered' only prints when a host finishes, so a
+    single slow host leaves the phase silent for up to REMOTE_CMD_TIMEOUT."""
+    monkeypatch.setattr(main.config, "PROGRESS_INTERVAL", 0.05)
+    monkeypatch.delenv("HEALTH_MAX_PARALLEL", raising=False)
+    addresses = ["10.0.0.1", "10.0.0.2"]
+
+    def behave(address):
+        if address == "10.0.0.2":
+            time.sleep(0.4)
+        return payload_for(address)
+
+    fake = TtyErr()
+    monkeypatch.setattr(sys, "stderr", fake)
+    run = make_run(addresses, {a: behave for a in addresses})
+    main.collect_hosts(run)
+    text = fake.getvalue()
+
+    assert "still waiting on 10.0.0.2" in text
+    # ...and only the one that is actually outstanding
+    assert "still waiting on 10.0.0.1" not in text
+
+
+def test_an_interrupt_exits_130_instead_of_a_traceback(monkeypatch):
+    """Run as `python3 <(curl ...)`, the traceback cannot even show its own source: the
+    file is a descriptor that is already gone."""
+    fake = TtyErr()
+    monkeypatch.setattr(sys, "stderr", fake)
+
+    def boom(*_args, **_kwargs):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(main, "main", boom)
+    assert main.entry() == 130
+    assert fake.getvalue() == "\nInterrupted.\n"

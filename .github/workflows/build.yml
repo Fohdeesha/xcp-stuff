@@ -115,11 +115,21 @@ jobs:
           # attached. Ask GitHub rather than the clone, which is shallow and has no tags.
           # Stop rather than publish a mismatch - once published, a release, its tag and
           # its assets cannot be edited or deleted, only superseded by another bump.
-          TAG_SHA=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$VERSION" \
-                      --jq '.object.sha' 2>/dev/null || true)
-          if [ -n "$TAG_SHA" ] && [ "$TAG_SHA" != "$(git rev-parse HEAD)" ]; then
-            echo "::error::tag v$VERSION already exists at $TAG_SHA, not $(git rev-parse HEAD) - releasing would attach this build under a tag pointing somewhere else. Sort the tag out by hand."
-            exit 1
+          #
+          # Branch on gh's EXIT STATUS, never on what it printed. On a ref that does not
+          # exist gh writes the 404 response BODY to stdout and does not apply --jq to it,
+          # so capturing stdout put '{"message":"Not Found",...}' into TAG_SHA - non-empty
+          # - and every absent tag read as a tag pointing somewhere else. v3.8 was the
+          # first version to reach this line: the pushes before it all stopped at the
+          # 'already released' check above, so the guard had never once run. The body is
+          # still in TAG_SHA on the failure branch, which is why the comparison lives
+          # inside the success branch rather than after it.
+          if TAG_SHA=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$VERSION" \
+                         --jq '.object.sha' 2>/dev/null); then
+            if [ "$TAG_SHA" != "$(git rev-parse HEAD)" ]; then
+              echo "::error::tag v$VERSION already exists at $TAG_SHA, not $(git rev-parse HEAD) - releasing would attach this build under a tag pointing somewhere else. Sort the tag out by hand."
+              exit 1
+            fi
           fi
           # --target takes a branch or a FULL sha; a short one is rejected as
           # "Release.target_commitish is invalid".

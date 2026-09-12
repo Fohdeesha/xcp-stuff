@@ -27,28 +27,37 @@ Run health.py on an XOA appliance with no arguments, it will pull pool/host info
 - Providing the password is not necessary, it will be pulled from XOA
 - If the host/pool is not in XOA, you can manually specify the pool master IP and password
 - If the host it's checking is part of a pool, it will health check every pool member, unless you provide "-s" for single host check only
+- "-f" cuts the report down to the findings: passing checks, informational readings and any section left with nothing in it are all dropped, so a clean pool prints almost nothing
 ```
 [03:34 14] xoa:~$ ./health.py --help
-Usage:
-  health.py [-f] [-s] [-n name] [-c 'command'] [pool_master_or_host[:ssh_port] [root_password]]
+Usage: health.py [OPTION]... [pool_master_or_host[:ssh_port] [root_password]]
+Health-check every host of an XCP-ng pool, from a Xen Orchestra appliance.
 
-  - All parameters are optional
-  - If a host is not supplied, the enabled pools in xo-server-db are listed to pick from
-    (a single enabled pool, or non-interactive use, just takes the first one)
-  - If a password is not supplied, it will be looked up locally in xo-server-db
-  - By default, the script runs in pool mode (checks all hosts in the pool)
-  - Use '-f' flag to filter output to only show issues found
-  - Use '-s' flag to only check the specified host (do not check other pool members if present)
-  - Use '-n' to pick a pool from xo-server-db by name instead of being prompted:
-    the first pool whose name contains the text is used, matched anywhere in the
-    name and ignoring case, so '-n sec' matches 'XEN-SECONDARY'
-  - Use '-c command' to run an arbitrary command on every reachable pool host
-    instead of the health report, and print each host's output
-  - Use '--json' to print the results as a JSON document instead of a report, for
-    cron and monitoring. Same checks, same exit code; '-f' narrows it the same way,
-    and everything that is not the document goes to stderr
+All arguments are optional. With no host, the enabled pools in xo-server-db
+are listed to pick from - a single enabled pool, or a non-interactive run,
+takes the first. With no password, it is looked up in xo-server-db. Every host
+in the pool is checked unless -s says otherwise.
 
-  Examples:
+  -f, --filter          only print checks that flagged; passing and
+                        informational lines are hidden, sections included
+  -s, --single          check only the given host, not the other pool members
+  -n, --name=NAME       pick the pool from xo-server-db by name instead of
+                        being prompted: the first pool whose name contains
+                        NAME, matched anywhere and ignoring case, so
+                        '-n sec' matches 'XEN-SECONDARY'
+  -c, --command=CMD     run CMD on every reachable pool host and print what
+                        each one said, instead of the health report: no
+                        checks are run and no verdict is reached, so the
+                        exit status is always 0. Cannot be used with --json
+      --json            print the run as one JSON document instead of a
+                        report, for cron and monitoring: same checks, same
+                        exit code, -f narrows it the same way, and anything
+                        that is not the document goes to stderr
+  -h, --help            print this help and exit
+
+Exit status: 0 if every check passed, 1 if any flagged, 2 on a usage error.
+
+Examples:
   health.py 192.168.1.5
   health.py 192.168.1.6 'mypass'
   health.py -s 192.168.1.7 'mypass'
@@ -60,8 +69,12 @@ Usage:
 
 Exit code is **0** when everything passed, **1** when any check flagged, **2** for a usage
 error - so a wrapper or cron job can tell "you typed the flag wrong" from "the pool has a
-problem". Nothing is installed and nothing is written on the hosts; the only exception is
-`sshpass`, and only in the one case described below.
+problem". Nothing is installed and nothing is written on the hosts. Reaching a host over
+ssh with a password needs no package either: the password is handed to `ssh` by a helper
+the script writes into its own temporary directory and deletes when it exits, so an
+appliance with no internet access is checked exactly like one with it. If there is no way
+to authenticate at all, the run still prints everything about the appliance itself and
+reports the pool as `Unknown` - it never exits with one line and no report.
 
 ## Requirements
 
@@ -74,13 +87,9 @@ Python 3 only - no pip, no modules to install, nothing outside the standard libr
 | XCP-ng hosts being *checked from XOA* | nothing - the collector runs under the `python` that every dom0 has, 8.2.1 included |
 
 **XCP-ng 8.2.1 dom0 has no `python3`**, so health.py cannot be run *on* an 8.2 host. Checking
-an 8.2.1 **pool from XOA** works exactly as it always has. For host mode on 8.2.1, use the
-frozen `health.sh` (v2.8) that lives beside it in this repo:
-
-```
-# on an 8.2.1 host only:
-bash <(curl -fsSL https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/health.sh)
-```
+an 8.2.1 **pool from XOA** works exactly as it always has, and that is the way to check one.
+The old bash `health.sh` that used to cover 8.2 host mode is **retired** - it now only prints
+a pointer back to health.py.
 
 ## Running it on an XCP-ng host instead of XOA
 
@@ -96,10 +105,8 @@ python3 <(curl -fsSL https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/
 - **The rest of the pool is checked too if you give a root password.** Pool members share
   the master's root password, so one covers the pool. With a terminal you are simply asked
   for it; you can also pass it as an argument, though the prompt is preferable since an
-  argument is visible in `ps` and lands in your shell history. dom0 has no `sshpass`, so
-  the script installs it the same way it does on XOA - from the stock `extras` repo
-  (Vates' own mirror, already configured, just disabled), a 21KB package with no
-  dependencies. `--enablerepo` is one-shot, so the host's yum config is left as it was.
+  argument is visible in `ps` and lands in your shell history. dom0 needs no package for
+  this either - the same helper that hands `ssh` the password on XOA is used here.
 - **With no password it checks this host alone and says so** - a `Hosts in Pool` line
   reports how much of the pool the run covered. Cron and piped runs take this path rather
   than hanging on a prompt.
@@ -207,9 +214,10 @@ Worth knowing:
 - **The three host counts are all reported** because they routinely differ: how many
   members the pool has, how many this run put in scope (`-s`, a solo host run), and how
   many actually answered.
-- **`-f` narrows the document exactly as it narrows the report** - so it still contains the
-  always-printed informational lines. For findings only, filter on `flags`, which is
-  cheaper and does not depend on how the run was invoked.
+- **`-f` narrows the document exactly as it narrows the report**, and since v3.13 that
+  means findings only: passing lines and informational readings are gone from both. The
+  one exception is `Hypervisor Version`, which stays as the host block's identity anchor.
+  `flags` is still the cheaper filter, and does not depend on how the run was invoked.
 - **There is no timestamp in the document**, deliberately: two runs of an unchanged pool
   produce identical output, so diffing one against the last one says something.
 - On a usage error nothing is written to stdout at all, so stdout is always either a whole
@@ -250,7 +258,8 @@ only `python` (2.7.5), 8.3 has both, and that is what keeps 8.2.1 pools checkabl
 | `src/` | the sources it is built from, one module per concern |
 | `build/stitch.py` | builds `health.py` from `src/`; fails the build on a name collision or a collector that does not round-trip |
 | `tests/` | pytest, no network or hosts needed |
-| `health.sh` | the previous bash implementation, frozen at v2.8. Kept as the 8.2.1 host-mode fallback and the rollback path |
+| `xo-config-recover.py` | exports XO's configuration when xo-server is dead - see [below](#xo-config-recover) |
+| `health.sh` | the previous bash implementation, **retired**. Prints a pointer to health.py and exits 1; the implementation itself is in the git history |
 
 ```
 python build/stitch.py     # rebuild health.py after changing src/
@@ -261,6 +270,44 @@ You don't have to remember that first line. Push a change to `src/` and GitHub r
 `health.py` and commits it back to the branch - merging a PR does it too. So `git pull`
 after a push that touched `src/`.
 
-  ## Example Output
+## Example Output
 
 ![Alt text](example-output.png)
+
+---
+
+# xo-config-recover
+
+Exports Xen Orchestra's configuration from the command line - the same file as
+*Settings → Config → Export* in the web UI - without needing xo-server. For when an update
+has broken XOA and the UI you would normally export from is dead.
+
+```
+# on the XOA, as root
+python3 <(curl -fsSL https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/xo-config-recover.py)
+```
+
+That writes `XO-config_<UTC>.json.gz` in the current directory. Restore it later with
+*Settings → Config → Import*, exactly like a web UI export.
+
+It reads the two places xo-server keeps its config, redis and a small leveldb, straight
+from the stores. Nothing has to be running except redis, and if redis is down too it reads
+the last saved `dump.rdb` and tells you how old that is. One file, Python 3 standard
+library only, read-only: the only thing it writes is the output.
+
+| | |
+|---|---|
+| `--check` | show what would be exported and from where, write nothing |
+| `--bundle` | also write a `.tar.gz` with a fresh redis dump, a copy of the leveldb and the config files - everything a rebuild might want |
+| `--passphrase-file FILE` | encrypt the export like the web UI's passphrase option (imports the same way) |
+| `--entries a,b` | only some sections, dependencies added like the API does |
+| `-o FILE` / `-o -` | name the file, or stream it to stdout |
+
+Exit code is **0** when the file was written, **1** with `--partial` when a section had to
+be left out, **2** when nothing could be written. The export contains every pool's root
+password, the same as the web UI's does - treat the file accordingly.
+
+Verified against a real web UI export with xo-server running, with xo-server and
+xoa-updater stopped, and with redis stopped: same records in every section. If XO's
+credential database is encrypted (`redis.encryptCredentialDatabase`) the tool stops and
+says so; decrypting it is not implemented yet.

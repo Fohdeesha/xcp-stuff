@@ -164,11 +164,11 @@ def resolve(monkeypatch, argv, db_answer, name_filter=""):
     monkeypatch.setattr(main, "detect_run_env", lambda: "xoa")
     monkeypatch.setattr(transport, "run_local_cmd",
                         lambda argv_, timeout=None, env=None, stdin_text=None: db_answer)
-    monkeypatch.setattr(transport, "ensure_sshpass", lambda run_env: True)
     monkeypatch.setattr(xodb, "have_xo_server_db", lambda: True)
     run = main.Run()
     run.name_filter = name_filter
-    run.transport = types.SimpleNamespace(ssh_port=22, password="")
+    run.transport = types.SimpleNamespace(ssh_port=22, password="",
+                                          enable_password_auth=lambda run_env: True)
     code = None
     try:
         main.resolve_target_xoa(run, list(argv))

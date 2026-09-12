@@ -8,6 +8,12 @@ whose absence made -f show the master's baseline while hiding every slave's Matc
 reading as though the slaves had never been checked. Forgetting a guard is not possible
 from here.
 
+Headings and blank lines are held rather than printed, because -f now hides informational
+lines too and a whole section can come out empty. '== Pool Status ==' standing over
+nothing reads as a section that passed, or as one whose findings were lost on the way;
+either way it is a claim. So structural output waits for a line to earn it and is dropped
+with the section if none ever does.
+
 --json is the same Lines, written out as a document instead of as text. It is deliberately
 not a second renderer with its own idea of what was checked: the same add() records both,
 so the two modes cannot drift apart about which checks ran, what they said, or whether the
@@ -51,13 +57,21 @@ class Report(object):
         self.host_label = None   # which detail bucket the current section writes into
         self._sections = []      # json only: the buckets, in the order the report makes them
         self._section = None
+        self._pending = []       # headings and blanks no line has earned yet
+        self._written = 0        # body lines out so far, so a section can tell if it said anything
+        self._section_mark = 0
 
     # -- raw output ---------------------------------------------------------------
     def write(self, text=""):
-        """--json puts the document on stdout and nothing else, so the rendered report is
-        suppressed at the single point that produces it rather than at every caller."""
+        """One piece of report BODY. Anything held waiting for it goes out first.
+
+        --json puts the document on stdout and nothing else, so the rendered report is
+        suppressed at the single point that produces it rather than at every caller.
+        """
         if self.json_mode:
             return
+        self._flush_pending()
+        self._written += 1
         self.stream.write(text + "\n")
 
     def write_raw(self, text):
@@ -65,7 +79,29 @@ class Report(object):
         spacing, and putting it through write() would silently reshape the report."""
         if self.json_mode:
             return
+        self._flush_pending()
+        self._written += 1
         self.stream.write(text)
+
+    def _structural(self, text):
+        """A heading or a separator: it describes body rather than being body.
+
+        Printed straight out in a full report, held back under -f until a line justifies
+        it. See the module docstring for why an empty section may not keep its heading.
+        """
+        if self.json_mode:
+            return
+        if self.filter_output:
+            self._pending.append(text)
+        else:
+            self.stream.write(text + "\n")
+
+    def _flush_pending(self):
+        if not self._pending:
+            return
+        held, self._pending = self._pending, []
+        for text in held:
+            self.stream.write(text + "\n")
 
     # -- sections -----------------------------------------------------------------
     def begin_section(self, kind, host=None):
@@ -76,6 +112,10 @@ class Report(object):
         disagree.
         """
         self.host_label = "XOA" if kind == "xoa" else (host.label if host is not None else None)
+        # where this section starts, so end_section can tell whether it printed anything.
+        # The heading is already pending by now - it is written before the section opens -
+        # which is exactly what makes it droppable along with the rest.
+        self._section_mark = self._written
         if not self.json_mode:
             return
         section = {"kind": kind}
@@ -89,6 +129,10 @@ class Report(object):
         self._section = section
 
     def end_section(self):
+        if self.filter_output and self._written == self._section_mark:
+            # nothing in it printed, so its heading and its separator go with it rather
+            # than being flushed by whatever section prints next
+            self._pending = []
         self.host_label = None
         self._section = None
 
@@ -107,11 +151,11 @@ class Report(object):
                                "error": host.error or "not collected"})
 
     def heading(self, text):
-        """Section headings always print: -f hides passing results, not structure."""
-        self.write(colors.cyan(text))
+        """A heading prints when the section under it has something to say."""
+        self._structural(colors.cyan(text))
 
     def blank(self):
-        self.write("")
+        self._structural("")
 
     # -- lines --------------------------------------------------------------------
     def add(self, line, host_label=None):
@@ -162,6 +206,10 @@ class Report(object):
 
     # -- tail ---------------------------------------------------------------------
     def print_poolconf_section(self):
+        """Every host's role, verbatim. -f drops the block whole: it is a reading of every
+        host in the pool and there is no state of it that is a finding."""
+        if self.filter_output:
+            return
         self.blank()
         self.heading("---pool.conf contents---")
         self.write_raw("".join(self._poolconf))
@@ -213,6 +261,9 @@ class Report(object):
             self.stream.write(
                 json.dumps(self.document(), indent=2, ensure_ascii=True) + "\n")
             return 1 if self.flagged else 0
+        # the last section may have printed nothing and left its heading held; the version
+        # line is not what earns it, so drop it before anything below flushes
+        self._pending = []
         for blob in (self._pool_details, self._host_details):
             text = "".join(blob)
             if text.strip():

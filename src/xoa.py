@@ -11,6 +11,7 @@ stdout or stderr, or mutate anything a check reads - it builds Lines and returns
 and everything it runs goes through transport.run_local_cmd, which is thread-safe.
 """
 
+import json
 import os
 import re
 import threading
@@ -20,6 +21,7 @@ import colors
 import config
 import parsers
 import transport
+import xoredis
 from result import FLAG, INFO, OK, Line, flag, ok, unknown
 
 
@@ -61,9 +63,95 @@ def _service_state(name):
     return state
 
 
+def _plugin_scan_targets():
+    """Every (directory, prefix) pair xo-server would look in, in its own order."""
+    pairs = []
+    for path in config.XO_PLUGIN_LOOKUP_PATHS:
+        pairs.append((os.path.join(path, config.XO_PLUGIN_SCOPE_DIR),
+                      config.XO_PLUGIN_SCOPE_PREFIX))
+        pairs.append((path, config.XO_PLUGIN_PREFIX))
+    return pairs
+
+
+def _plugin_version(directory):
+    """The version out of the package's own package.json, or "".
+
+    Best effort by design - a third-party plugin with no package.json, or a broken one, is
+    still a third-party plugin, and the finding must not depend on it parsing.
+    """
+    try:
+        with open(os.path.join(directory, "package.json"), "r") as handle:
+            data = json.load(handle)
+    except (IOError, OSError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    version = data.get("version")
+    return version if isinstance(version, str) else ""
+
+
+def scan_plugins():
+    """Every plugin installed on this appliance, whether or not XO ever loaded it.
+
+    Returns (plugins, errors). The filesystem is the source of truth here and redis is
+    not, because the question is "what is installed", and a plugin that is installed,
+    present and switched off in the UI is exactly the case this check exists for. XO's
+    own metadata records answer a different question - what it has loaded at some point -
+    and they go stale in both directions.
+
+    A directory it could not list goes in `errors` and turns the line Unknown. A
+    directory that is not there is an answer, not an error: two of the three lookup paths
+    do not exist on a stock appliance.
+    """
+    plugins, errors, seen = [], [], set()
+    for directory, prefix in _plugin_scan_targets():
+        try:
+            entries = sorted(os.listdir(directory))
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            errors.append("%s: %s" % (directory, exc))
+            continue
+        for entry in entries:
+            if not entry.startswith(prefix) or entry == prefix:
+                continue
+            name = entry[len(prefix):]
+            if name in seen:
+                continue          # xo-server keeps the first path that has the name
+            seen.add(name)
+            full = os.path.join(directory, entry)
+            plugins.append({
+                "name": name,
+                "package": entry,
+                "path": full,
+                "version": _plugin_version(full),
+                # an npm-linked or hand-symlinked plugin is worth naming outright: the
+                # directory says nothing about where its code actually came from
+                "link": os.path.realpath(full) if os.path.islink(full) else "",
+            })
+    return plugins, errors
+
+
+def _plugin_autoload():
+    """(autoload map, was it established). Annotation only - never a finding of its own."""
+    cli_path = transport.which("xo-server-db")
+    if not cli_path:
+        return {}, False
+    try:
+        return xoredis.read_plugin_autoload(cli_path), True
+    except xoredis.RedisError:
+        return {}, False
+
+
 def collect_xoa():
     """Everything the section needs, gathered before anything is printed."""
     data = {}
+    # Local reads, so they happen whatever state the updater is in - the plugin scan has
+    # to survive an appliance whose updater is down, which is one of the states somebody
+    # investigating odd behaviour is most likely to be in
+    data["plugins"], data["plugin_errors"] = scan_plugins()
+    data["plugin_autoload"], data["plugin_autoload_known"] = _plugin_autoload()
+
     # Asked before the updater is, because every xoa-updater call below talks to this
     # daemon: with it down they fail, and a failed call used to read as 'Unregistered' and
     # 'Updates available' - findings invented by the tool rather than found by it.
@@ -96,6 +184,9 @@ def collect_xoa():
             version = parts[3]
             break
     data["version"] = version
+    # the same call already paid for, read twice: it also lists every npm package Vates
+    # offers this appliance, which is the golden list the plugin scan is judged against
+    data["manifest_plugins"] = parsers.manifest_plugin_names(manifest)
 
     _, plan = _updater("raw-api-call", "getXoaPlan")
     data["plan"] = _first_token(plan)
@@ -141,6 +232,37 @@ def _max_old_space():
 def _dmesg():
     rc, out, _err = transport.run_local_cmd(["dmesg", "-T"], timeout=60)
     return out if rc == 0 else None
+
+
+def _plugins_line(data):
+    """Is anything installed here that Vates did not ship?
+
+    A plugin runs inside xo-server with xo-server's access to the pool, and nothing in
+    XOA's own tooling ever mentions one it did not install - so an appliance behaving
+    oddly can be carrying one with no sign of it anywhere else. That is the whole reason
+    for the line, and it is why an unrecognised name is reported rather than assumed
+    benign: the list is a whitelist, so a stale list names a plugin for a human to look at
+    instead of waving one through.
+
+    Vates' set is the union of two sources. This appliance's own xoa-updater manifest is
+    the live one and covers whatever Vates ships next; config.XOA_STOCK_PLUGINS is what is
+    left when the updater is down, unregistered or timing out - which are states this
+    check has to keep working in.
+    """
+    if data.get("plugin_errors"):
+        return unknown("XOA Plugins",
+                       "Unknown (could not read %s)" % "; ".join(data["plugin_errors"]))
+    found = data.get("plugins") or []
+    vates_names = set(config.XOA_STOCK_PLUGINS) | set(data.get("manifest_plugins") or ())
+    _stock, third_party = parsers.classify_xo_plugins(found, vates_names)
+    if not third_party:
+        return ok("XOA Plugins", "%d installed, all shipped with XOA" % len(found))
+    return flag("XOA Plugins",
+                "%d of %d Not Shipped With XOA, See Below"
+                % (len(third_party), len(found))).with_detail(
+        "Plugins Not Shipped With XOA",
+        parsers.plugin_block(third_party, data.get("plugin_autoload") or {},
+                             bool(data.get("plugin_autoload_known"))))
 
 
 def lines():
@@ -199,6 +321,8 @@ def lines():
             out.append(flag("XOA Check", "Issues Found, See Output Below").with_detail(
                 "XOA Check Issues", data["check_output"]))
 
+    out.append(_plugins_line(data))
+
     osv = _os_version()
     out.append(ok("OS Version", osv) if osv else unknown("OS Version", "Unknown"))
 
@@ -213,7 +337,8 @@ def lines():
         avail_gb = avail_mb / 1024.0
         used_gb = total_gb - avail_gb
         pct = (used_gb / total_gb) * 100 if total_gb > 0 else 0.0
-        # an info line with no threshold behind it, so it prints under -f like uptime does
+        # a reading with no threshold behind it, so it can never flag - and -f hides it,
+        # the same as every other reading. The heap cap below is the line with a rule
         out.append(Line("Memory Usage",
                         "%s GB used of %s GB (%s%%)" % (colors.green("%.1f" % used_gb),
                                                         colors.green("%.1f" % total_gb),

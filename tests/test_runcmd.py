@@ -7,6 +7,7 @@ touches the exit code), and it never collects a health fact - a one-line command
 cost a full sweep.
 """
 
+import re
 import threading
 import time
 
@@ -266,19 +267,32 @@ def test_host_mode_rejects_c_as_a_usage_error(capsys):
     assert "-c/--command" in capsys.readouterr().err
 
 
+def _flag_lines(text):
+    """The flag column of a usage block: the lines that introduce an option.
+
+    Matched on the layout rather than on a bare substring, because the prose carries
+    plenty of incidental '-c' ('Health-check ...') and a substring test reads those as
+    the flag being advertised.
+    """
+    return [line for line in text.splitlines()
+            if re.match(r"^\s+(-\w|--)", line)]
+
+
 def test_host_mode_usage_does_not_advertise_c(capsys):
     """The host usage block must not offer a flag host mode refuses."""
     with pytest.raises(SystemExit):
         main.usage("host", 0)
-    text = capsys.readouterr().out
-    assert "-c" not in text and "--command" not in text
+    flags = _flag_lines(capsys.readouterr().out)
+    assert flags, "no option lines found - has the usage layout changed?"
+    assert not [line for line in flags if "-c," in line or "--command" in line]
 
 
 def test_xoa_usage_does_advertise_c(capsys):
     with pytest.raises(SystemExit):
         main.usage("xoa", 0)
     text = capsys.readouterr().out
-    assert "-c 'command'" in text and "-c command" in text
+    assert [line for line in _flag_lines(text) if "-c, --command=CMD" in line]
+    assert "-c 'cat /etc/resolv.conf'" in text        # and it is shown being used
 
 
 def test_c_is_always_sent_over_ssh(monkeypatch):
@@ -290,6 +304,9 @@ def test_c_is_always_sent_over_ssh(monkeypatch):
                         lambda argv, **kw: (seen.append(argv), (0, "", ""))[1])
     tr = transport.Transport("xoa", "/tmp/wd", local_address="10.0.0.1")
     tr.password = "p"
+    tr.auth = transport.AUTH_ASKPASS           # whatever enable_password_auth settled on
+    tr.askpass = "/tmp/wd/askpass"
     tr.run_command("10.0.0.1", "uptime")       # even our own address goes over ssh
-    assert seen[0][0] == "sshpass"
+    assert "ssh" in seen[0]
+    assert seen[0][-1] == "uptime"             # handed over whole, as the last argument
     assert "sh" not in seen[0]

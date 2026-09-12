@@ -11,7 +11,7 @@ import config
 import parsers
 import result
 from parsers import round_1dp
-from result import flag, info, ok, raw, unknown
+from result import flag, info, ok, pinned, raw, unknown
 
 
 # --------------------------------------------------------------------------------------
@@ -35,12 +35,12 @@ def hypervisor_version(host):
     if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
         major, minor = int(parts[0]), int(parts[1])
         if major > 8 or (major == 8 and minor >= 3):
-            # deliberately always printed, -f included, even though this line CAN flag:
-            # under -f it is the identity anchor for the host block, and every other
-            # always-printed line there (Last Booted, Multipathing, NTP) is info-only.
-            # Suppressing it would leave a findings-only report that does not say which
-            # version produced them.
-            return info("Hypervisor Version", "%s %s" % (name, version))
+            # pinned, so -f prints it even though this branch cannot flag: it is the
+            # identity anchor for the host block, and under -f every other line in that
+            # block is a finding. Without it a findings-only report would not say which
+            # version produced them - and now that -f hides informational lines
+            # (Last Booted, Multipathing, NTP), it is the ONLY line that would.
+            return pinned(info("Hypervisor Version", "%s %s" % (name, version)))
     # 8.2 reached end of life on 2025-09-16 and receives no security updates at all
     return flag("Hypervisor Version", "%s %s" % (name, version))
 
@@ -91,7 +91,10 @@ def ntp(host):
     if enabled == "no" or synced == "no":
         line.status = result.FLAG
     elif enabled != "yes" or synced != "yes":
+        # neither half was established, which -f must not hide: the yellow in the text is
+        # the same warning info(..., "yellow") carries, so it keeps its line the same way
         line.status = result.INFO
+        line.keep = True
     return line
 
 
@@ -977,3 +980,181 @@ def backup_network(pool, run_env, pinger):
     # what was tested and nothing more
     return flag("Backup Network", "Configured but not fully reachable",
                 " - No ping answer from XOA for: " + ", ".join(silent))
+
+
+# --------------------------------------------------------------------------------------
+# stuck mounts
+# --------------------------------------------------------------------------------------
+
+def stuck_processes(host):
+    """Processes wedged in uninterruptible sleep - the consequence, whatever the cause.
+
+    This is the primary signal for a mount that has stopped answering, and it is primary
+    because it costs nothing and cannot itself hang: every input is served out of kernel
+    memory by procfs. It is also filesystem-agnostic, which is the point - a dead NFS
+    server, a dead SMB share, a dropped iSCSI LUN and a failing local disk all arrive
+    here identically, and none of them needed to be anticipated by name.
+
+    Kernel threads are reported separately from userspace processes. Some kernel threads
+    sit in D quite normally, so the line says outright when that is all there is - but a
+    kworker parked in a filesystem's work queue corroborates the rest, and dropping it
+    would throw away the clearest evidence of which subsystem is stuck.
+
+    What the collector establishes is that each of these was in D and made no progress at
+    all for the whole window it watched. Age is NOT that: it is how long the process has
+    existed, an upper bound on how long it has been wedged, and the wording keeps the two
+    apart. They coincide for a `df` that wedged the moment it ran, and they are days apart
+    for a daemon that has been up since boot.
+    """
+    facts = host.fact("stuck_procs")
+    if not facts.ok:
+        return unknown("Stuck Processes", "Unknown (%s)" % facts.error)
+
+    rows = facts.value.get("rows") or []
+    total = facts.value.get("total") or 0
+    if not total:
+        return ok("Stuck Processes", "None")
+
+    user_count = facts.value.get("userspace")
+    modules = sorted(set(row.get("module") or "" for row in rows) - set([""]))
+    oldest = max((row.get("age") or 0) for row in rows)
+
+    what = "%d stuck" % total
+    if user_count == 0:
+        # worth saying in the summary line rather than only in the block: it is the
+        # difference between "this host has lost commands" and "one kworker is parked"
+        what += ", all kernel threads"
+    summary = "%s (oldest started %s ago)" % (what, parsers.format_age(oldest))
+    if modules:
+        summary += " in " + ", ".join(modules)
+    # the userspace tally comes from the collector, which counted every one of them.
+    # Counting it here would count only the capped sample and print that as the whole
+    return flag("Stuck Processes", "Yes - " + summary).with_detail(
+        "Stuck Processes", _stuck_detail(rows, total, user_count,
+                                         facts.value.get("watched"),
+                                         facts.value.get("own_probes")))
+
+
+def _stuck_detail(rows, total, user_count, watched, own_probes):
+    if user_count is None:
+        head = "%d process(es) in uninterruptible sleep." % total
+    else:
+        head = ("%d process(es) in uninterruptible sleep; %d of them userspace, the rest "
+                "kernel threads." % (total, user_count))
+    lines = [head,
+             "None of these can be killed - not even with SIGKILL - until whatever they "
+             "are waiting on answers."]
+    if watched:
+        # the measured claim, and the one that says this is not just a busy disk
+        lines.append("Each of them consumed no CPU and completed no I/O for the whole %s "
+                     "it was watched." % parsers.format_age(watched))
+    lines.append("Age is how long the process has existed, which is an upper bound on how "
+                 "long it has been stuck, not a measurement of it.")
+    if own_probes:
+        # named rather than hidden, and counted rather than dropped: they are genuinely
+        # stuck, and a reader who does not know where they came from would read a growing
+        # count as the host getting worse on its own
+        lines.append("%d of them are this script's own mount probes, parked by earlier "
+                     "runs on a mount that stopped answering. Each one names the mount "
+                     "it was asking about." % own_probes)
+    lines.append("")
+    for row in rows:
+        lines.append("  %-8s %-9s %-10s %s"
+                     % (row.get("pid"), parsers.format_age(row.get("age") or 0),
+                        row.get("module") or "-",
+                        row.get("cmd") or "[kernel thread] " + (row.get("frame") or "")))
+    if len(rows) < total:
+        # never a silent cut: 25 rows under a heading saying 589 still reads as "here they
+        # are" unless the block says outright that it is showing a slice
+        lines.append("")
+        lines.append("(oldest %d of %d shown)" % (len(rows), total))
+    elif len(rows) > 1:
+        lines.append("")
+        lines.append("(listed oldest first)")
+    return "\n".join(lines)
+
+
+def mount_stalls(host):
+    """The server-side half: what the kernel said when a mount stopped answering.
+
+    Read from kern.log and the dmesg ring for the same reason Multipath Path Events reads
+    both - neither contains the other. It names the SERVER, which the process scan cannot:
+    a stuck process says a mount is wedged, this says which one and since when.
+
+    It cannot be relied on alone, and the reason is worth writing down. The kernel's own
+    hung-task detector is enabled on 8.3 (hung_task_timeout_secs=120) but
+    kernel.hung_task_warnings defaults to 10 and counts DOWN - after ten it stops logging
+    for the rest of the uptime. A host wedged for days can therefore be completely silent
+    here while dozens of processes pile up, which is why the process scan leads.
+    """
+    scan = host.fact("mount_stall_scan")
+    dmesg = host.fact("dmesg")
+
+    blocks = list(scan.value) if (scan.ok and scan.value) else []
+    if dmesg.ok:
+        blocks = blocks + _dmesg_phrase_blocks(dmesg.value, config.MOUNT_STALL_PHRASES,
+                                               config.LOG_ERROR_CONTEXT)
+    if blocks:
+        return flag("Mount Stalls", "Yes, See Error Output").with_detail(
+            "Mount Stalls", _render_scan_blocks(blocks))
+    if not scan.ok:
+        return unknown("Mount Stalls", "Unknown (%s)" % scan.error)
+    if not dmesg.ok:
+        return unknown("Mount Stalls", "Unknown (could not read dmesg)")
+    return ok("Mount Stalls", "None")
+
+
+def network_mounts(host):
+    """Does each network mount still answer a stat()?
+
+    The only one of the three that can name a mount nothing has touched yet - and the only
+    one with a cost, since the probe of a dead mount becomes a stuck process itself. It is
+    run anyway, on every host, including one that is already full of stuck processes: this
+    is the line that says WHICH mount to go and fix, and on a host in that state the cost
+    it was once spared has already been paid many times over.
+
+    A mount is left unprobed only when the run budget has no room to wait for an answer,
+    and that reads Unknown rather than green - nothing was established about it.
+    """
+    facts = host.fact("network_mounts")
+    if not facts.ok:
+        return unknown("Network Mounts", "Unknown (%s)" % facts.error)
+
+    rows = facts.value
+    if not rows:
+        return ok("Network Mounts", "None")
+
+    dead = [row for row in rows if row.get("state") == "no answer"]
+    unprobed = [row for row in rows if row.get("state") == "not probed"]
+    errored = [row for row in rows if row.get("state") == "error"]
+
+    if dead:
+        return flag("Network Mounts",
+                    "%d of %d not responding" % (len(dead), len(rows))).with_detail(
+            "Network Mounts", _mount_detail(rows))
+    if unprobed:
+        # not probed is not "fine": it is a question that was deliberately not asked, and
+        # the reason it was not asked is itself already flagged by Stuck Processes
+        return unknown("Network Mounts",
+                       "Unknown - %d mount(s) not probed (%s)"
+                       % (len(unprobed), unprobed[0].get("why") or "no reason given")
+                       ).with_detail("Network Mounts", _mount_detail(rows))
+    if errored:
+        return flag("Network Mounts",
+                    "%d of %d could not be checked" % (len(errored), len(rows))).with_detail(
+            "Network Mounts", _mount_detail(rows))
+    return ok("Network Mounts", "%d responding" % len(rows))
+
+
+def _mount_detail(rows):
+    lines = []
+    for row in rows:
+        when = ""
+        if row.get("seconds") is not None:
+            when = "  %ss" % row["seconds"]
+        lines.append("  %-10s %-11s %s on %s%s"
+                     % (row.get("type") or "-", row.get("state") or "-",
+                        row.get("source") or "-", row.get("target") or "-", when))
+        if row.get("why"):
+            lines.append("               %s" % row["why"])
+    return "\n".join(lines)
