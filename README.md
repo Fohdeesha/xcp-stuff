@@ -256,14 +256,14 @@ only `python` (2.7.5), 8.3 has both, and that is what keeps 8.2.1 pools checkabl
 |---|---|
 | `health.py` | the published artifact - one file, no install. **Generated**; do not edit |
 | `src/` | the sources it is built from, one module per concern |
-| `build/stitch.py` | builds `health.py` from `src/`; fails the build on a name collision or a collector that does not round-trip |
+| `build/stitch.py` | builds `health.py` from `src/`; fails the build on a name collision, an import of `main`, or a collector that does not round-trip |
 | `tests/` | pytest, no network or hosts needed |
 | `xo-config-recover.py` | exports XO's configuration when xo-server is dead - see [below](#xo-config-recover) |
 | `health.sh` | the previous bash implementation, **retired**. Prints a pointer to health.py and exits 1; the implementation itself is in the git history |
 
 ```
 python build/stitch.py     # rebuild health.py after changing src/
-python -m pytest tests/    # ~375 tests, all offline
+python -m pytest tests/    # ~490 tests, all offline
 ```
 
 You don't have to remember that first line. Push a change to `src/` and GitHub rebuilds

@@ -31,6 +31,7 @@ import model
 import parsers
 import report
 import result
+import runcmd
 import transport
 import xoa
 import xodb
@@ -742,74 +743,6 @@ def _collect_pool_elsewhere(run, pool_spec):
     run.pool.error = "no reachable pool member to ask"
 
 
-def _run_command_one(run, host):
-    """Run the -c command on one host. Returns (rc, out, err); nothing is printed here.
-
-    Same reason _collect_one returns its note instead of writing it: this is called from
-    worker threads, and a thread printing as it finishes would interleave the hosts in
-    whatever order they happened to answer.
-    """
-    try:
-        return run.transport.run_command(host.address, run.run_cmd)
-    except Exception as exc:                      # a transport that could not even start
-        return (255, "", str(exc))
-
-
-def run_command_on_all_hosts(run):
-    """-c/--command: run one command on every host being checked and print what each said.
-
-    A reporting helper, not a check. It takes no part in the exit code and none in -f:
-    the caller asked for raw output, not a pass/fail verdict, so this always exits 0 -
-    with several hosts there is no single code that could mean anything, and 1 and 2 are
-    already spoken for ('a check flagged' and 'you typed it wrong').
-
-    Hosts are labelled by address and not by name: the name is a fact this mode never
-    collects, and fetching it would be a second round trip per host for a label.
-
-    The host list is whatever the run settled on, so -s and a host run with no password
-    narrow this exactly as they narrow the report.
-    """
-    workers = parallel_workers(len(run.hosts))
-    transport.debug("running -c on %d host(s), %d at a time" % (len(run.hosts), workers))
-    if workers > 1:
-        pool = ThreadPoolExecutor(max_workers=workers)
-        try:
-            futures = [pool.submit(_run_command_one, run, host) for host in run.hosts]
-            try:
-                results = [f.result() for f in futures]
-            except BaseException:
-                # the workers are blocked in communicate() and never see the ctrl-C
-                transport.kill_all_children()
-                raise
-        finally:
-            pool.shutdown(wait=True)
-    else:
-        results = [_run_command_one(run, host) for host in run.hosts]
-
-    # printed in host order, whatever order they finished in
-    for host, (rc, out, err) in zip(run.hosts, results):
-        sys.stdout.write(colors.cyan("== %s ==" % host.address) + "\n")
-        if rc == 0:
-            if out:
-                sys.stdout.write(out if out.endswith("\n") else out + "\n")
-        else:
-            # stdout first: a command that failed part way through still said something,
-            # and bash printed it too rather than throwing it away
-            if out:
-                sys.stdout.write(out if out.endswith("\n") else out + "\n")
-            if rc == 124:
-                sys.stdout.write(colors.yellow(
-                    "Command timed out after %ds" % config.RUN_CMD_TIMEOUT) + "\n")
-            else:
-                sys.stdout.write(colors.yellow("Command failed (exit code %d)" % rc) + "\n")
-            # the reason goes to stderr, where every other transport failure goes, so it
-            # cannot contaminate output being piped somewhere
-            if err.strip():
-                sys.stderr.write(err if err.endswith("\n") else err + "\n")
-        sys.stdout.write("\n")
-    return 0
-
-
 def _now():
     import time
     return time.time()
@@ -1185,7 +1118,7 @@ def main(argv=None):
     # report has it: the pool picked by -n or the picker, the password from xo-db, the
     # host list from discovery, and -s / a password-less host run narrowing that list.
     if run.run_cmd:
-        return run_command_on_all_hosts(run)
+        return runcmd.execute(run, parallel_workers(len(run.hosts)))
 
     run.pool_cmd_host = run.seed if run.run_env == "host" else run.master_address
     if run.pool_cmd_host not in [h.address for h in run.hosts]:

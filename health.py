@@ -22,6 +22,7 @@
 
 
 
+from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 import atexit
 import base64
@@ -6170,6 +6171,82 @@ class Report(object):
 
 
 # ======================================================================================
+# --- runcmd ----------------------------------------------------------------------------
+
+def _run_one(run, host):
+    """Run the -c command on one host. Returns (rc, out, err); nothing is printed here.
+
+    Same reason _collect_one returns its note instead of writing it: this is called from
+    worker threads, and a thread printing as it finishes would interleave the hosts in
+    whatever order they happened to answer.
+    """
+    try:
+        return run.transport.run_command(host.address, run.run_cmd)
+    except Exception as exc:                      # a transport that could not even start
+        return (TRANSPORT_FAILED, "", str(exc))
+
+
+# Not an exit code any command can return: 0-255 are all reachable over ssh, and 255 in
+# particular is ssh's own 'the connection failed', which is a different thing from 'the
+# transport never started'. Printed as a reason, never as a number.
+TRANSPORT_FAILED = -1
+
+
+def execute(run, workers):
+    """Run the command on every host of the run and print what each said. Always 0.
+
+    With several hosts there is no single exit code that could mean anything, and 1 and 2
+    are already spoken for ('a check flagged' and 'you typed it wrong'), so a caller that
+    needs per-host success reads the output.
+
+    Hosts are labelled by address and not by name: the name is a fact this mode never
+    collects, and fetching it would be a second round trip per host for a label.
+
+    `workers` is passed in rather than worked out here: main owns that policy (it is the
+    same cap a collection runs under), and reaching back into main for it would make this
+    the one module that imports main - which on the stitched artifact is the function
+    main(), not a module, so it would be an AttributeError there and nowhere else.
+    """
+    transport.debug("running -c on %d host(s), %d at a time" % (len(run.hosts), workers))
+    if workers > 1:
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
+            futures = [pool.submit(_run_one, run, host) for host in run.hosts]
+            try:
+                results = [f.result() for f in futures]
+            except BaseException:
+                # the workers are blocked in communicate() and never see the ctrl-C
+                transport.kill_all_children()
+                raise
+        finally:
+            pool.shutdown(wait=True)
+    else:
+        results = [_run_one(run, host) for host in run.hosts]
+
+    # printed in host order, whatever order they finished in
+    for host, (rc, out, err) in zip(run.hosts, results):
+        sys.stdout.write(colors.cyan("== %s ==" % host.address) + "\n")
+        # stdout first either way: a command that failed part way through still said
+        # something, and bash printed it too rather than throwing it away
+        if out:
+            sys.stdout.write(out if out.endswith("\n") else out + "\n")
+        if rc != 0:
+            if rc == TRANSPORT_FAILED:
+                sys.stdout.write(colors.yellow("Could not run the command") + "\n")
+            elif rc == 124:
+                sys.stdout.write(colors.yellow(
+                    "Command timed out after %ds" % config.RUN_CMD_TIMEOUT) + "\n")
+            else:
+                sys.stdout.write(colors.yellow("Command failed (exit code %d)" % rc) + "\n")
+            # the reason goes to stderr, where every other transport failure goes, so it
+            # cannot contaminate output being piped somewhere
+            if err.strip():
+                sys.stderr.write(err if err.endswith("\n") else err + "\n")
+        sys.stdout.write("\n")
+    return 0
+
+
+# ======================================================================================
 # --- main ------------------------------------------------------------------------------
 
 # Laid out the way every other command-line tool on these boxes lays it out: the flag
@@ -6879,74 +6956,6 @@ def _collect_pool_elsewhere(run, pool_spec):
     run.pool.error = "no reachable pool member to ask"
 
 
-def _run_command_one(run, host):
-    """Run the -c command on one host. Returns (rc, out, err); nothing is printed here.
-
-    Same reason _collect_one returns its note instead of writing it: this is called from
-    worker threads, and a thread printing as it finishes would interleave the hosts in
-    whatever order they happened to answer.
-    """
-    try:
-        return run.transport.run_command(host.address, run.run_cmd)
-    except Exception as exc:                      # a transport that could not even start
-        return (255, "", str(exc))
-
-
-def run_command_on_all_hosts(run):
-    """-c/--command: run one command on every host being checked and print what each said.
-
-    A reporting helper, not a check. It takes no part in the exit code and none in -f:
-    the caller asked for raw output, not a pass/fail verdict, so this always exits 0 -
-    with several hosts there is no single code that could mean anything, and 1 and 2 are
-    already spoken for ('a check flagged' and 'you typed it wrong').
-
-    Hosts are labelled by address and not by name: the name is a fact this mode never
-    collects, and fetching it would be a second round trip per host for a label.
-
-    The host list is whatever the run settled on, so -s and a host run with no password
-    narrow this exactly as they narrow the report.
-    """
-    workers = parallel_workers(len(run.hosts))
-    transport.debug("running -c on %d host(s), %d at a time" % (len(run.hosts), workers))
-    if workers > 1:
-        pool = ThreadPoolExecutor(max_workers=workers)
-        try:
-            futures = [pool.submit(_run_command_one, run, host) for host in run.hosts]
-            try:
-                results = [f.result() for f in futures]
-            except BaseException:
-                # the workers are blocked in communicate() and never see the ctrl-C
-                transport.kill_all_children()
-                raise
-        finally:
-            pool.shutdown(wait=True)
-    else:
-        results = [_run_command_one(run, host) for host in run.hosts]
-
-    # printed in host order, whatever order they finished in
-    for host, (rc, out, err) in zip(run.hosts, results):
-        sys.stdout.write(colors.cyan("== %s ==" % host.address) + "\n")
-        if rc == 0:
-            if out:
-                sys.stdout.write(out if out.endswith("\n") else out + "\n")
-        else:
-            # stdout first: a command that failed part way through still said something,
-            # and bash printed it too rather than throwing it away
-            if out:
-                sys.stdout.write(out if out.endswith("\n") else out + "\n")
-            if rc == 124:
-                sys.stdout.write(colors.yellow(
-                    "Command timed out after %ds" % config.RUN_CMD_TIMEOUT) + "\n")
-            else:
-                sys.stdout.write(colors.yellow("Command failed (exit code %d)" % rc) + "\n")
-            # the reason goes to stderr, where every other transport failure goes, so it
-            # cannot contaminate output being piped somewhere
-            if err.strip():
-                sys.stderr.write(err if err.endswith("\n") else err + "\n")
-        sys.stdout.write("\n")
-    return 0
-
-
 def _now():
     import time
     return time.time()
@@ -7322,7 +7331,7 @@ def main(argv=None):
     # report has it: the pool picked by -n or the picker, the password from xo-db, the
     # host list from discovery, and -s / a password-less host run narrowing that list.
     if run.run_cmd:
-        return run_command_on_all_hosts(run)
+        return runcmd.execute(run, parallel_workers(len(run.hosts)))
 
     run.pool_cmd_host = run.seed if run.run_env == "host" else run.master_address
     if run.pool_cmd_host not in [h.address for h in run.hosts]:
@@ -7441,6 +7450,7 @@ xodb = _module('xodb', ['QUOTES', 'SELECT_NONE', 'SELECT_NO_MATCH', 'SELECT_OK',
 checks = _module('checks', ['_dmesg_phrase_blocks', '_linstor_column', '_linstor_has_rows', '_linstor_line', '_linstor_node_addresses', '_linstor_node_offline', '_linstor_table', '_linstor_unknown', '_maps', '_mount_detail', '_multipath_detail', '_multipath_read', '_network_line', '_render_scan_blocks', '_stuck_detail', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_block', 'dmesg_content', 'dmesg_content_of', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mount_stalls', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'network_mounts', 'ntp', 'oom_events', 'overlapping_subnets', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'stuck_processes', 'tap_status', 'task_timeout_override', 'vlan0', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_nodes', 'xostor_pref_nic', 'xostor_qcow2', 'xostor_ram', 'yum_patch_level'])
 xoa = _module('xoa', ['_dmesg', '_first_token', '_max_old_space', '_meminfo', '_os_version', '_plugin_autoload', '_plugin_scan_targets', '_plugin_version', '_plugins_line', '_service_state', '_updater', 'collect_xoa', 'debian_version_ok', 'lines', 'ping_silent', 'running_as_root', 'scan_plugins'])
 report = _module('report', ['Report', '_as_entry'])
+runcmd = _module('runcmd', ['TRANSPORT_FAILED', '_run_one', 'execute'])
 
 
 

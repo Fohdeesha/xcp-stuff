@@ -17,6 +17,7 @@ import colors
 import config
 import main
 import model
+import runcmd
 import transport
 
 
@@ -109,7 +110,7 @@ def test_each_host_is_labelled_by_address_and_its_output_printed(capsys):
     run = make_run(["10.0.0.1", "10.0.0.2"],
                    {"10.0.0.1": ok("nameserver 1.1.1.1\n"),
                     "10.0.0.2": ok("nameserver 8.8.8.8\n")})
-    rc = main.run_command_on_all_hosts(run)
+    rc = runcmd.execute(run, len(run.hosts))
     out = capsys.readouterr().out
     assert rc == 0
     assert "== 10.0.0.1 ==" in out and "== 10.0.0.2 ==" in out
@@ -129,7 +130,7 @@ def test_output_is_printed_in_host_order_however_the_hosts_finish(capsys):
         return (0, "out-" + address, "")
 
     run = make_run(addresses, dict((a, behave) for a in addresses))
-    main.run_command_on_all_hosts(run)
+    runcmd.execute(run, len(run.hosts))
     out = capsys.readouterr().out
     assert [line for line in out.splitlines() if line.startswith("== ")] == [
         "== 10.0.0.1 ==", "== 10.0.0.2 ==", "== 10.0.0.3 =="]
@@ -148,7 +149,19 @@ def test_hosts_really_do_run_at_the_same_time(monkeypatch):
         return (0, "ok", "")
 
     run = make_run(addresses, dict((a, rendezvous) for a in addresses))
-    assert main.run_command_on_all_hosts(run) == 0
+    assert runcmd.execute(run, len(run.hosts)) == 0
+
+
+def test_one_worker_runs_them_sequentially_and_prints_the_same_thing(capsys):
+    """HEALTH_MAX_PARALLEL=1 is how the parallel and serial paths are diffed against each
+    other, so the sequential arm has to produce byte-identical output."""
+    addresses = ["10.0.0.1", "10.0.0.2", "10.0.0.3"]
+    behaviour = dict((a, ok("out-" + a)) for a in addresses)
+
+    runcmd.execute(make_run(addresses, behaviour), 1)
+    serial = capsys.readouterr().out
+    runcmd.execute(make_run(addresses, behaviour), len(addresses))
+    assert serial == capsys.readouterr().out
 
 
 # --------------------------------------------------------------------------------------
@@ -157,7 +170,7 @@ def test_hosts_really_do_run_at_the_same_time(monkeypatch):
 
 def test_a_failing_command_says_so_and_still_exits_zero(capsys):
     run = make_run(["10.0.0.1"], {"10.0.0.1": lambda a: (2, "", "no such file\n")})
-    rc = main.run_command_on_all_hosts(run)
+    rc = runcmd.execute(run, len(run.hosts))
     captured = capsys.readouterr()
     assert rc == 0                                  # -c reaches no verdict
     assert "Command failed (exit code 2)" in captured.out
@@ -167,7 +180,7 @@ def test_a_failing_command_says_so_and_still_exits_zero(capsys):
 def test_partial_output_from_a_failing_command_is_kept(capsys):
     """A command that printed something and then failed said something worth seeing."""
     run = make_run(["10.0.0.1"], {"10.0.0.1": lambda a: (1, "half a line\n", "boom\n")})
-    main.run_command_on_all_hosts(run)
+    runcmd.execute(run, len(run.hosts))
     captured = capsys.readouterr()
     assert "half a line" in captured.out
     assert "Command failed (exit code 1)" in captured.out
@@ -175,7 +188,7 @@ def test_partial_output_from_a_failing_command_is_kept(capsys):
 
 def test_a_timeout_is_named_as_a_timeout(capsys):
     run = make_run(["10.0.0.1"], {"10.0.0.1": lambda a: (124, "", "")})
-    main.run_command_on_all_hosts(run)
+    runcmd.execute(run, len(run.hosts))
     out = capsys.readouterr().out
     assert "timed out after %ds" % config.RUN_CMD_TIMEOUT in out
     assert "exit code 124" not in out
@@ -189,11 +202,33 @@ def test_one_unreachable_host_does_not_lose_the_others(capsys):
 
     run = make_run(["10.0.0.1", "10.0.0.2", "10.0.0.3"],
                    dict((a, behave) for a in ["10.0.0.1", "10.0.0.2", "10.0.0.3"]))
-    assert main.run_command_on_all_hosts(run) == 0
+    assert runcmd.execute(run, len(run.hosts)) == 0
     captured = capsys.readouterr()
     assert "out-10.0.0.1" in captured.out and "out-10.0.0.3" in captured.out
     assert "== 10.0.0.2 ==" in captured.out          # named, not silently skipped
     assert "ssh to 10.0.0.2 failed" in captured.err
+
+
+def test_a_transport_that_never_started_is_not_reported_as_exit_255(capsys):
+    """255 is ssh's own 'the connection failed', which is a real answer from a real
+    connection attempt. A transport that never started is a different thing, and saying
+    'exit code 255' for it invents a remote exit status that nothing produced."""
+    def behave(address):
+        raise transport.CollectError("sshpass is not installed")
+
+    run = make_run(["10.0.0.1"], {"10.0.0.1": behave})
+    assert runcmd.execute(run, len(run.hosts)) == 0
+    captured = capsys.readouterr()
+    assert "exit code" not in captured.out
+    assert "Could not run the command" in captured.out
+    assert "sshpass is not installed" in captured.err
+
+
+def test_ssh_s_own_255_is_still_reported_as_an_exit_code(capsys):
+    """The other side of it: a connection that was made and failed keeps its number."""
+    run = make_run(["10.0.0.1"], {"10.0.0.1": lambda a: (255, "", "Connection refused")})
+    assert runcmd.execute(run, len(run.hosts)) == 0
+    assert "exit code 255" in capsys.readouterr().out
 
 
 def test_no_health_facts_are_collected(capsys):
@@ -201,7 +236,7 @@ def test_no_health_facts_are_collected(capsys):
     -c ever routes through the collector."""
     run = make_run(["10.0.0.1", "10.0.0.2"],
                    {"10.0.0.1": ok("a"), "10.0.0.2": ok("b")})
-    main.run_command_on_all_hosts(run)
+    runcmd.execute(run, len(run.hosts))
     assert run.transport.collected == []
 
 
