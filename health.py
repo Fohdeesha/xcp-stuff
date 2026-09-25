@@ -44,7 +44,7 @@ import unicodedata
 # ======================================================================================
 # --- config ----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "3.17"
+SCRIPT_VERSION = "3.18"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
@@ -578,6 +578,29 @@ def parse_host_list(text):
     return hosts
 
 
+def host_records_from_state_db(rows):
+    """The collector's state.db host rows, in parse_host_list's shape.
+
+    enabled and multipathing are Unknown rather than read out of the file. The file is
+    what xapi last saved, and when it is being read at all it is because xapi is not
+    answering: 'enabled: true' from a toolstack that is down is a reading of the past,
+    reported as the present.
+    """
+    hosts = []
+    for row in rows or []:
+        if not row.get("uuid"):
+            continue
+        hosts.append({
+            "uuid": row.get("uuid", ""),
+            "name_label": row.get("name_label", ""),
+            "hostname": row.get("hostname", ""),
+            "address": row.get("address", ""),
+            "enabled": "Unknown",
+            "multipathing": "Unknown",
+        })
+    return hosts
+
+
 def parse_dns_gw_pifs(text):
     """True when any non-management PIF carries a gateway or a DNS server."""
     for line in text.splitlines():
@@ -977,7 +1000,15 @@ def parse_lacp(text):
 
 
 def parse_pool_conf(text):
-    """('master', None) | ('slave', address) | (None, None)."""
+    """('master', None) | ('slave', address) | ('broken', None) | (None, None).
+
+    Those three are every role xapi knows (Pool_role in xen-api's pool_role.ml). 'broken'
+    is the one a failed master change leaves behind: the would-be master writes it before
+    telling the others to commit, and keeps it if any of them fails to. xapi reads
+    anything else - an empty file included - as broken too, but (None, None) is kept
+    apart from it here, because a caller that could not read the file must not be told
+    what the file says.
+    """
     first = (text or "").replace("\r", "").strip().splitlines()
     if not first:
         return (None, None)
@@ -985,6 +1016,8 @@ def parse_pool_conf(text):
     low = line.lower()
     if low == "master":
         return ("master", None)
+    if low == "broken":
+        return ("broken", None)
     if low.startswith("slave:"):
         addr = re.sub(r"\s+", "", line.split(":", 1)[1])
         return ("slave", addr) if addr else (None, None)
@@ -1506,6 +1539,7 @@ import subprocess
 import sys
 import threading
 import time
+from xml.etree import ElementTree
 
 BEGIN_MARKER = "<<<HEALTHPY-JSON-BEGIN>>>"
 END_MARKER = "<<<HEALTHPY-JSON-END>>>"
@@ -1607,6 +1641,9 @@ class Ran(object):
         return self.rc == 0 and not self.timed_out
 
     def why(self):
+        if self.rc is None:
+            # never started - see xe() - so there is no exit status, only the reason
+            return self.err
         if self.timed_out:
             return "timed out"
         msg = self.err.strip().splitlines()
@@ -1744,8 +1781,31 @@ def which(name):
     return None
 
 
+# The first xe call xapi let run out its whole timeout, once one has. A one-element list
+# for the same reason as CURRENT: written without a `global` statement.
+XAPI_WEDGED = [""]
+
+
 def xe(args, timeout=DEFAULT_CMD_TIMEOUT):
-    return run(["xe"] + list(args), timeout=timeout)
+    """One xe command - or, once xapi has sat on one until it timed out, not.
+
+    A wedged xapi accepts the connection and never answers, so every call waits out its
+    whole timeout: 60s apiece, a dozen of them on the host the pool questions ride on,
+    and the host spends its entire run budget learning the same thing again. The calls
+    after the first are therefore not made, and each fact says why rather than waiting to.
+
+    A timeout only counts when it was the call's own. One the run budget cut short says
+    the budget is gone, not that xapi is, and run() already answers every later call with
+    exactly that. A refused connection does not count either: it fails in milliseconds,
+    so every call can go on reporting its own reason, which is the more useful answer.
+    """
+    if XAPI_WEDGED[0]:
+        return Ran(None, "", "not asked - xapi did not answer %s" % XAPI_WEDGED[0], False)
+    full = _clamp(timeout) == timeout
+    r = run(["xe"] + list(args), timeout=timeout)
+    if r.timed_out and full:
+        XAPI_WEDGED[0] = "'xe %s' within %ds" % (args[0], timeout)
+    return r
 
 
 def read_file(path, limit=None):
@@ -1835,6 +1895,78 @@ def collect_pool_hosts():
     if not r.ok:
         return err("xe host-list failed (%s)" % r.why())
     return fact(r.out)
+
+
+# xapi's whole database, as it last saved it. Every member has one: a master writes its
+# own, and a slave holds the copy its master last sent it - on the lab's two-host 8.3 pool
+# the slave's was seconds older than the master's. Same path and format on 8.2.1 and 8.3.0.
+STATE_DB = "/var/lib/xcp/state.db"
+
+
+def parse_state_db_hosts(data):
+    """(rows, None) from a state.db's bytes, or (None, why). Rows are the host table's
+    uuid, name-label, hostname and address.
+
+    The file is one line of XML, 0.7-1.8 MB on the lab pools and a great deal more on a
+    big one, and only the host table is wanted - so that table is cut out by its markers
+    and nothing else is parsed. That is exact as well as cheap: '<' cannot appear
+    unescaped inside an attribute value, so the first '</table>' after the table opens is
+    where it closes, whatever the rows hold. What is cut out goes through a real XML
+    parser, so escaped names come back as the names they are.
+
+    Bytes rather than text: 2.7's ElementTree will not take a unicode string holding
+    anything outside ASCII, and a host's name-label may well.
+    """
+    start = data.find(b'<table name="host">')
+    if start < 0:
+        return None, "it has no host table"
+    end = data.find(b"</table>", start)
+    if end < 0:
+        return None, "its host table never closes"
+    try:
+        table = ElementTree.fromstring(data[start:end + len(b"</table>")])
+    except SyntaxError as exc:
+        # ElementTree.ParseError is a SyntaxError on 2.7 and 3.x alike, and this is the
+        # one thing fromstring raises for a fragment it cannot read
+        return None, "its host table does not parse (%s)" % exc
+    rows = []
+    for row in table.findall("row"):
+        uuid = row.get("uuid") or ""
+        if not uuid:
+            continue
+        rows.append({"uuid": uuid,
+                     "name_label": row.get("name__label") or "",
+                     "hostname": row.get("hostname") or "",
+                     "address": row.get("address") or ""})
+    if not rows:
+        return None, "its host table has no hosts in it"
+    return rows, None
+
+
+def collect_state_db_hosts():
+    """The pool's members from xapi's database FILE, for when xapi will not answer.
+
+    The file answers with the toolstack dead on every host, which is exactly what a failed
+    master change leaves behind - and the report is then about hosts it can still ssh to,
+    rather than nothing at all. What it cannot say is whether the copy is current, so the
+    time it was last written travels with it, rendered here in the host's own clock.
+    """
+    try:
+        f = open(STATE_DB, "rb")
+    except (IOError, OSError) as exc:
+        return err("could not read %s (%s)" % (STATE_DB, exc.strerror or exc))
+    try:
+        data = f.read()
+        mtime = os.fstat(f.fileno()).st_mtime
+    except (IOError, OSError) as exc:
+        return err("could not read %s (%s)" % (STATE_DB, exc.strerror or exc))
+    finally:
+        f.close()
+    rows, why = parse_state_db_hosts(data)
+    if rows is None:
+        return err("could not read the pool's hosts from %s: %s" % (STATE_DB, why))
+    return fact({"path": STATE_DB, "hosts": rows,
+                 "saved": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime))})
 
 
 # --------------------------------------------------------------------------------------
@@ -3092,7 +3224,14 @@ def collect(spec):
     self_uuid = ident["self_uuid"]["value"] if ident["self_uuid"]["ok"] else ""
 
     if "pool_hosts" in want:
-        out["pool_hosts"] = collect_pool_hosts()
+        if spec.get("host_list") == "statedb":
+            out["pool_hosts"] = err("not asked - the run asked for state.db instead")
+        else:
+            out["pool_hosts"] = collect_pool_hosts()
+        if not out["pool_hosts"]["ok"]:
+            # the toolstack did not answer, but what it would have answered from is a
+            # file, and every member keeps a copy of it
+            out["pool_hosts_db"] = collect_state_db_hosts()
 
     if "host" in want:
         out["meminfo"] = collect_meminfo()
@@ -4437,6 +4576,30 @@ def multipathing(host):
     return info("Multipathing", value, "yellow" if value == "Unknown" else "green")
 
 
+def xapi_status(host):
+    """Whether this host's toolstack answers an API call.
+
+    It is the line that explains the others: every xe-sourced fact in the block (Host
+    Enabled, Multipathing, DNS/GW on Non-Mgmt PIFs, and the pool lines when this is the
+    host they were asked of) is Unknown when xapi does not answer, and this is where the
+    reason is. Everything that is not xe - the logs, dmesg, disks, memory, multipath,
+    pool.conf - was still read, which is what makes a report on a broken pool possible.
+
+    It reads the collector's identity call, so it costs nothing: every host is asked for
+    its own address with `xe host-param-get` before anything else. A slave keeps no
+    database of its own and reads through its master, so on a slave 'Responding' covers
+    the master connection too - a slave whose master is gone does not answer, which is
+    the reading wanted from a pool whose master change failed.
+    """
+    uuid = host.fact("self_uuid")
+    if not uuid.ok:
+        return unknown("XAPI Status", "Unknown (%s, so xapi was not asked)" % uuid.error)
+    f = host.fact("self_address")
+    if f.ok:
+        return ok("XAPI Status", "Responding")
+    return flag("XAPI Status", "Not responding", " - %s" % f.error)
+
+
 def ntp(host):
     """One line, two facts. An explicit 'no' is a real finding; 'Unknown' (address not in
     the xe maps) stays informational."""
@@ -5029,6 +5192,179 @@ def yum_patch_level(host, is_master, master_manifest):
 # --------------------------------------------------------------------------------------
 # pool-level
 # --------------------------------------------------------------------------------------
+
+def pool_host_list(state_db, seed, count):
+    """Where the host list came from, when it was not xapi - and only then.
+
+    Every 'Unreachable Hosts' and 'Hosts in Pool' figure is counted off this list, so a
+    run that took it from a file has to say so: the file is a saved copy, and a host
+    joined or ejected since it was written is not in it. A run whose list came from xapi
+    has nothing to say here, and a green line saying so would be padding.
+    """
+    where = seed or "this host"
+    path = state_db.get("path") or "state.db"
+    if state_db.get("forced"):
+        # asked for by name, so it is a warning worth keeping under -f, not a finding
+        return info("Pool Host List",
+                    "Read from %s on %s (HEALTH_HOST_LIST=statedb)" % (path, where), "yellow")
+    # the variable parts - an error, a path, a timestamp - sit on lines of their own, so
+    # the prose around them wraps the same whatever length they turn out to be
+    detail = (
+        "xapi on %s did not answer when asked for the pool's hosts:\n"
+        "    %s\n"
+        "\n"
+        "so the hosts checked are the ones in its saved copy of the pool database:\n"
+        "    %s, last written %s (%s's clock)\n"
+        "\n"
+        "A master writes that file itself and a slave holds the copy its master last sent\n"
+        "it, so a host joined to or ejected from the pool since then is not reflected here.\n"
+        "Host Enabled and Multipathing are only ever read from xapi, so they are Unknown\n"
+        "for every host in this run."
+        % (where, state_db.get("reason") or "no reason given", path,
+           state_db.get("saved") or "at an unknown time", where))
+    return unknown("Pool Host List",
+                   "Unknown - xapi on %s did not answer, so %d host(s) were read from its "
+                   "saved database, See Below" % (where, count)
+                   ).with_detail("Pool Host List", detail)
+
+
+def _pool_conf_target(pointer, hosts):
+    """The member a slave's pool.conf points at, or None if it names none of them.
+
+    xapi itself only ever writes an IP here: pool-join and emergency-reset-master resolve
+    the address they were given first (Helpers.gethostbyname, via emergency_reset_master),
+    and designate-new-master writes the new master's own address. So this is an address
+    match in practice - but a hand-edited file may carry a name, and a slave pointing at
+    its master by name must not read as pointing at nothing, so names are tried after the
+    addresses. An FQDN is tried by its first label as well, since xapi's own hostname is
+    usually the short one.
+    """
+    want = (pointer or "").strip().lower()
+    if not want:
+        return None
+    for host in hosts:
+        if host.address.lower() == want:
+            return host
+    parts = want.split(".")
+    short = want if (len(parts) == 4 and all(p.isdigit() for p in parts)) else parts[0]
+    for host in hosts:
+        names = set(name.lower() for name in (host.hostname, host.name) if name)
+        if want in names or short in names:
+            return host
+    return None
+
+
+def _first_line(text):
+    return ((text or "").replace("\r", "").strip().splitlines() or [""])[0].strip()
+
+
+def pool_roles(hosts):
+    """Every reachable member's pool.conf, judged against the others'.
+
+    pool.conf is what xapi reads at startup to decide what it is - the master, a slave of
+    some address, or broken - and it is a file, so this answers with the toolstack down on
+    every host, which is exactly when it is wanted. A master change that failed part way
+    leaves the pool in this state: hosts that disagree about who the master is, each xapi
+    acting on its own copy, and none of them able to say so over the API.
+
+    Only what holds whatever the addressing is flagged: more than one master; a host that
+    says broken, or holds something xapi would read as broken; a slave pointing at itself,
+    or at a host whose own pool.conf says it is not the master; slaves split between
+    masters; and, when every host was reached, no master at all. A host that was not
+    reached is not guessed at - 'Unreachable Hosts' already names it.
+
+    The raw files are in the pool.conf block at the end of a full report. This line says
+    whether they agree, and its detail carries them too, because -f drops that block.
+    """
+    reached = [h for h in hosts if h.reachable]
+    if not reached:
+        return unknown("Pool Roles", "Unknown (no host was reached)")
+
+    entries, unread = [], []
+    for host in reached:
+        f = host.fact("pool_conf")
+        if not f.ok:
+            unread.append((host, f.error))
+            continue
+        role, pointer = parsers.parse_pool_conf(f.value)
+        entries.append({"host": host, "role": role, "pointer": pointer,
+                        "text": _first_line(f.value) or "(empty)",
+                        "target": _pool_conf_target(pointer, hosts) if role == "slave"
+                        else None})
+    own = dict((e["host"], e) for e in entries)
+    masters = [e["host"] for e in entries if e["role"] == "master"]
+    slaves = [e for e in entries if e["role"] == "slave"]
+
+    problems = []
+    for e in entries:
+        if e["role"] == "broken":
+            problems.append("%s says broken" % e["host"].name)
+        elif e["role"] is None:
+            problems.append("%s holds '%s', which xapi reads as broken"
+                            % (e["host"].name, e["text"]))
+    if len(masters) > 1:
+        problems.append("%d hosts say master (%s)"
+                        % (len(masters), ", ".join(h.name for h in masters)))
+    for e in slaves:
+        target = e["target"]
+        if target is e["host"]:
+            problems.append("%s points at itself" % e["host"].name)
+            continue
+        theirs = own.get(target)
+        if theirs is not None and theirs["role"] != "master":
+            problems.append("%s points at %s, which says %s"
+                            % (e["host"].name, target.name, theirs["text"]))
+        elif len(masters) == 1 and target is not masters[0]:
+            problems.append("%s points at %s, not at %s"
+                            % (e["host"].name, e["pointer"], masters[0].name))
+    if not masters:
+        pointed_at = sorted(set(e["target"].address if e["target"] else e["pointer"]
+                                for e in slaves))
+        if len(pointed_at) > 1:
+            problems.append("the slaves point at different masters (%s)"
+                            % ", ".join(pointed_at))
+        if not unread and len(reached) == len(hosts):
+            problems.append("no host says master")
+
+    if problems:
+        summary = problems[0] + ("; and %d more" % (len(problems) - 1)
+                                 if len(problems) > 1 else "")
+        return flag("Pool Roles", "Mismatch - %s, See Below" % summary).with_detail(
+            "Pool Roles", _pool_roles_detail(hosts, own, unread, problems))
+    if unread:
+        return unknown("Pool Roles", "Unknown (pool.conf could not be read on %s)"
+                       % ", ".join(h.name for h, _error in unread)).with_detail(
+            "Pool Roles", _pool_roles_detail(hosts, own, unread, []))
+    if not masters:
+        # the reachable hosts are all slaves and agree - on a host this run could not
+        # read, or on an address that is no member's. Either way the master's own
+        # pool.conf was never seen, so agreement is all that was established
+        return unknown("Pool Roles", "Unknown (no reachable host says master; the slaves "
+                                     "point at %s)" % slaves[0]["pointer"]).with_detail(
+            "Pool Roles", _pool_roles_detail(hosts, own, unread, []))
+    if len(reached) < len(hosts):
+        return ok("Pool Roles", "Consistent (%d of %d hosts reached)"
+                  % (len(reached), len(hosts)))
+    return ok("Pool Roles", "Consistent")
+
+
+def _pool_roles_detail(hosts, own, unread, problems):
+    """What each host's pool.conf says, one line each, under whatever was wrong with it."""
+    out = ["  - %s" % p for p in problems]
+    if out:
+        out.append("")
+    why_unread = dict(unread)
+    width = max(len(h.label) for h in hosts)
+    for host in hosts:
+        if host in own:
+            said = own[host]["text"]
+        elif host in why_unread:
+            said = "(could not be read: %s)" % why_unread[host]
+        else:
+            said = "(not reached)"
+        out.append("%s  %s" % (host.label.ljust(width), said))
+    return "\n".join(out)
+
 
 def ha_enabled(pool):
     f = pool.fact("ha_enabled")
@@ -6429,6 +6765,7 @@ class Run(object):
         self.pool_size = 0
         self.all_addresses = []
         self.host_names = {}      # address -> xapi hostname, for EVERY pool member
+        self.state_db = None      # set when the host list came from a state.db, not xapi
 
     def host_solo(self):
         """On a hypervisor with nothing else reachable. This, not the run environment, is
@@ -6732,9 +7069,70 @@ def prepare_host_sweep(run, argument_password):
     run.host_sweep = True
 
 
+def discovery_spec():
+    """What the discovery call asks for.
+
+    HEALTH_HOST_LIST=statedb takes the host list from the seed's state.db even when xapi
+    would have answered. That path is otherwise only reached on a pool whose toolstack is
+    down, so this is how it is diffed against xapi's answer on a healthy one - and the
+    only way to exercise it on a multi-host pool without stopping anybody's xapi.
+    """
+    spec = {"want": ["pool_hosts"]}
+    pinned = os.environ.get("HEALTH_HOST_LIST", "")
+    if pinned not in ("", "xapi", "statedb"):
+        sys.stderr.write("Warning: ignoring HEALTH_HOST_LIST=%s (expected xapi or statedb).\n"
+                         % pinned)
+    elif pinned == "statedb":
+        spec["host_list"] = "statedb"
+    return spec
+
+
+def _host_records(run, payload, forced):
+    """The pool's members: xapi's answer, or failing that the seed's saved database.
+
+    xapi not answering used to end the run here, before a single host was looked at -
+    on exactly the pools that most need looking at, since a master change that fails
+    part way leaves xapi down or refusing on every member. The database xapi would have
+    answered from is a file that every member keeps, so the run carries on from that,
+    checks whatever it can on each host without xapi, and says where the list came from.
+    """
+    listed = result.wrap(payload, "pool_hosts")
+    if listed.ok and not forced:
+        return parsers.parse_host_list(listed.value)
+    saved = result.wrap(payload, "pool_hosts_db")
+    if not saved.ok:
+        sys.stderr.write("ERROR: Could not retrieve pool host addresses from '%s': %s\n"
+                         "       and its saved copy of the pool database could not be read "
+                         "either: %s\n"
+                         % (run.seed or "this host", listed.error, saved.error))
+        sys.exit(1)
+    run.state_db = {"forced": forced, "reason": listed.error,
+                    "path": saved.value.get("path"), "saved": saved.value.get("saved")}
+    records = parsers.host_records_from_state_db(saved.value.get("hosts"))
+    if not forced:
+        progress("  xapi did not answer (%s)\n  read %d host(s) from its %s instead\n"
+                 % (listed.error, len(records), saved.value.get("path")))
+    return records
+
+
+def _own_address(payload, records):
+    """This host's address in host mode: xapi's answer, else its own row in the saved
+    database - found by the INSTALLATION_UUID the collector read off disk, so it cannot
+    be some other member's. None if neither says."""
+    address = result.wrap(payload, "self_address")
+    if address.ok and address.value:
+        return address.value, None
+    uuid = result.wrap(payload, "self_uuid")
+    if uuid.ok:
+        for rec in records:
+            if rec["uuid"] == uuid.value and rec["address"]:
+                return rec["address"], None
+    return None, address.error
+
+
 def discover(run):
     """Phase A: one call to the seed for the pool's host list and our own identity."""
-    spec = {"want": ["pool_hosts"]}
+    spec = discovery_spec()
     progress("Asking %s for the pool's host list...\n" % (run.seed or "this host"))
     try:
         if run.run_env == "host":
@@ -6746,30 +7144,28 @@ def discover(run):
                          % (run.seed or "this host", exc))
         sys.exit(1)
 
+    records = _host_records(run, payload, spec.get("host_list") == "statedb")
+
     if run.run_env == "host":
-        address = result.wrap(payload, "self_address")
-        if not address.ok or not address.value:
+        address, why = _own_address(payload, records)
+        if not address:
             sys.stderr.write("ERROR: could not get this host's address from xapi "
-                             "(is the toolstack running?): %s\n" % address.error)
+                             "(is the toolstack running?): %s\n"
+                             "       and this host is not in its own saved copy of the pool "
+                             "database either\n" % why)
             sys.exit(1)
-        run.seed = address.value
-        run.transport.local_address = address.value
+        run.seed = address
+        run.transport.local_address = address
         name = result.wrap(payload, "hostname")
-        shown = ("%s (%s)" % (name.value, address.value)
-                 if name.ok and name.value else address.value)
+        shown = ("%s (%s)" % (name.value, address)
+                 if name.ok and name.value else address)
         print_banner(run, shown, "")
 
-    hosts_fact = result.wrap(payload, "pool_hosts")
-    if not hosts_fact.ok:
-        sys.stderr.write("ERROR: Could not retrieve pool host addresses from '%s': %s\n"
-                         % (run.seed, hosts_fact.error))
-        sys.exit(1)
-
     hosts = []
-    for rec in parsers.parse_host_list(hosts_fact.value):
+    for rec in records:
         if not rec["address"]:
-            sys.stderr.write("Warning: pool host %s has no address in xapi; skipping it\n"
-                             % rec["uuid"])
+            sys.stderr.write("Warning: pool host %s has no address in the host list; "
+                             "skipping it\n" % rec["uuid"])
             continue
         hosts.append(model.Host(rec["address"], rec["uuid"], rec["hostname"],
                                 rec["enabled"], rec["multipathing"]))
@@ -6971,6 +7367,10 @@ def pool_status_section(run, rep):
     else:
         rep.add(result.info("Pool Master", "(unknown)", "yellow"))
 
+    if run.state_db is not None:
+        rep.check("Pool Host List", checks.pool_host_list, run.state_db, run.seed,
+                  run.pool_size)
+
     if run.host_solo():
         # nothing else was probed, so there is no reachability result to report and
         # nothing to compare across hosts - the RAM and time-sync lines would be claims
@@ -6987,6 +7387,9 @@ def pool_status_section(run, rep):
             rep.add(result.flag("Unreachable Hosts", " ".join(unreachable)))
         else:
             rep.add(result.ok("Unreachable Hosts", "None"))
+        # who each host thinks the master is, read off disk - so it still answers when
+        # xapi is down everywhere, which is when a failed master change needs it most
+        rep.check("Pool Roles", checks.pool_roles, run.hosts)
 
         reachable = [h for h in run.hosts if h.reachable]
         rep.add(result.ok("Dom0 RAM Allocations", "Matched") if model.ram_match(reachable)
@@ -7175,6 +7578,8 @@ def host_section(run, rep, host):
     rep.check("Hypervisor Version", checks.hypervisor_version, host)
     rep.check("Last Booted", checks.last_booted, host)
     rep.check("Last Patched", checks.last_patched, host)
+    # ahead of the xe-sourced lines it explains
+    rep.check("XAPI Status", checks.xapi_status, host)
     rep.check("Host Enabled", checks.host_enabled, host)
     rep.check("Multipathing", checks.multipathing, host)
     rep.check("NTP", checks.ntp, host)
@@ -7441,13 +7846,13 @@ def _module(name, exported):
 config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DMESG_MAX_LINES', 'DMESG_ROLLUP_MIN', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MOUNT_PROBE_RESERVE', 'MOUNT_PROBE_TIMEOUT', 'MOUNT_STALL_FILES', 'MOUNT_STALL_PHRASES', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'NETWORK_FS_TYPES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'PROGRESS_INTERVAL', 'REMOTE_CMD_TIMEOUT', 'RUN_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'STUCK_MAX_LINES', 'STUCK_MIN_AGE', 'STUCK_RECHECK_DELAY', 'STUCK_SAMPLES', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOA_STOCK_PLUGINS', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_QCOW2_MAX_LINES', 'XO_PLUGIN_LOOKUP_PATHS', 'XO_PLUGIN_PREFIX', 'XO_PLUGIN_SCOPE_DIR', 'XO_PLUGIN_SCOPE_PREFIX', 'XO_REDIS_TIMEOUT'])
 colors = _module('colors', ['CYAN', 'GREEN', 'RESET', 'YELLOW', 'cyan', 'green', 'init', 'strip_ansi', 'yellow'])
 result = _module('result', ['FLAG', 'Fact', 'INFO', 'Line', 'MISSING', 'OK', 'UNKNOWN', 'flag', 'guard', 'info', 'ok', 'pinned', 'raw', 'unknown', 'wrap'])
-parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', '_LINK_RE', '_MANIFEST_PKG_RE', '_MTU_RE', '_PARAM_RE', '_PREMIUM_SUFFIX', '_TS_RE', '_cidr_range', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'cap_lines', 'classify_multipath_path', 'classify_xo_plugins', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'format_age', 'has_overlapping_subnets', 'manifest_diff', 'manifest_plugin_names', 'manifest_versions', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pool_conf', 'parse_timedatectl', 'parse_xe_records', 'plugin_block', 'rollup_repeats', 'round_1dp', 'split_host_port', 'split_timestamp', 'truncate_block'])
+parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', '_LINK_RE', '_MANIFEST_PKG_RE', '_MTU_RE', '_PARAM_RE', '_PREMIUM_SUFFIX', '_TS_RE', '_cidr_range', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'cap_lines', 'classify_multipath_path', 'classify_xo_plugins', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'format_age', 'has_overlapping_subnets', 'host_records_from_state_db', 'manifest_diff', 'manifest_plugin_names', 'manifest_versions', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pool_conf', 'parse_timedatectl', 'parse_xe_records', 'plugin_block', 'rollup_repeats', 'round_1dp', 'split_host_port', 'split_timestamp', 'truncate_block'])
 model = _module('model', ['Host', 'Pool', 'ntp_match', 'ram_match'])
 collectorsrc = _module('collectorsrc', ['EMBEDDED', 'collector_source'])
 transport = _module('transport', ['ASKPASS_ENV', 'ASKPASS_SCRIPT', 'AUTH_ASKPASS', 'AUTH_SSHPASS', 'BEGIN_MARKER', 'CollectError', 'END_MARKER', 'Transport', '_DEBUG_LOCK', '_LIVE', '_LIVE_LOCK', '_REMOTE_LAUNCH', '_REMOTE_LAUNCH_PINNED', '_kill_tree', '_remote_launch', 'cleanup_work_dir', 'debug', 'ensure_sshpass', 'have', 'kill_all_children', 'make_work_dir', 'run_local_cmd', 'which', 'write_askpass'])
 xoredis = _module('xoredis', ['DEFAULT_ADDR', 'ENCRYPTION_PREFIX', 'IDS_KEY', 'PLUGIN_IDS_KEY', 'PLUGIN_RECORD_PREFIX', 'RECORD_PREFIX', 'RedisError', '_config_dirs', '_config_files', '_encode', '_fetch', '_fetch_autoload', '_flatten', '_mentions_redis', '_read_reply', 'read_plugin_autoload', 'read_server_records'])
 xodb = _module('xodb', ['QUOTES', 'SELECT_NONE', 'SELECT_NO_MATCH', 'SELECT_OK', 'SELECT_QUIT', 'SELECT_UNREADABLE', 'Server', '_ALL_SERVERS', '_ESCAPE_RE', '_KEY_RE', '_READ_ERROR', '_SIMPLE_ESCAPES', '_describe_failure', '_ls', '_read_servers', '_sort_key', 'all_servers', 'clean', 'enabled_servers', 'have_xo_server_db', 'password_for', 'pool_name_for_host', 'read_error', 'reset_cache', 'scan_records', 'select_pool', 'unescape'])
-checks = _module('checks', ['_dmesg_phrase_blocks', '_linstor_column', '_linstor_has_rows', '_linstor_line', '_linstor_node_addresses', '_linstor_node_offline', '_linstor_table', '_linstor_unknown', '_maps', '_mount_detail', '_multipath_detail', '_multipath_read', '_network_line', '_render_scan_blocks', '_stuck_detail', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_block', 'dmesg_content', 'dmesg_content_of', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mount_stalls', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'network_mounts', 'ntp', 'oom_events', 'overlapping_subnets', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'stuck_processes', 'tap_status', 'task_timeout_override', 'vlan0', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_nodes', 'xostor_pref_nic', 'xostor_qcow2', 'xostor_ram', 'yum_patch_level'])
+checks = _module('checks', ['_dmesg_phrase_blocks', '_first_line', '_linstor_column', '_linstor_has_rows', '_linstor_line', '_linstor_node_addresses', '_linstor_node_offline', '_linstor_table', '_linstor_unknown', '_maps', '_mount_detail', '_multipath_detail', '_multipath_read', '_network_line', '_pool_conf_target', '_pool_roles_detail', '_render_scan_blocks', '_stuck_detail', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_block', 'dmesg_content', 'dmesg_content_of', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mount_stalls', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'network_mounts', 'ntp', 'oom_events', 'overlapping_subnets', 'pool_host_list', 'pool_roles', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'stuck_processes', 'tap_status', 'task_timeout_override', 'vlan0', 'xapi_status', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_nodes', 'xostor_pref_nic', 'xostor_qcow2', 'xostor_ram', 'yum_patch_level'])
 xoa = _module('xoa', ['_dmesg', '_first_token', '_max_old_space', '_meminfo', '_os_version', '_plugin_autoload', '_plugin_scan_targets', '_plugin_version', '_plugins_line', '_service_state', '_updater', 'collect_xoa', 'debian_version_ok', 'lines', 'ping_silent', 'running_as_root', 'scan_plugins'])
 report = _module('report', ['Report', '_as_entry'])
 runcmd = _module('runcmd', ['TRANSPORT_FAILED', '_run_one', 'execute'])

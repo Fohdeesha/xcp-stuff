@@ -85,6 +85,29 @@ def parse_host_list(text):
     return hosts
 
 
+def host_records_from_state_db(rows):
+    """The collector's state.db host rows, in parse_host_list's shape.
+
+    enabled and multipathing are Unknown rather than read out of the file. The file is
+    what xapi last saved, and when it is being read at all it is because xapi is not
+    answering: 'enabled: true' from a toolstack that is down is a reading of the past,
+    reported as the present.
+    """
+    hosts = []
+    for row in rows or []:
+        if not row.get("uuid"):
+            continue
+        hosts.append({
+            "uuid": row.get("uuid", ""),
+            "name_label": row.get("name_label", ""),
+            "hostname": row.get("hostname", ""),
+            "address": row.get("address", ""),
+            "enabled": "Unknown",
+            "multipathing": "Unknown",
+        })
+    return hosts
+
+
 def parse_dns_gw_pifs(text):
     """True when any non-management PIF carries a gateway or a DNS server."""
     for line in text.splitlines():
@@ -484,7 +507,15 @@ def parse_lacp(text):
 
 
 def parse_pool_conf(text):
-    """('master', None) | ('slave', address) | (None, None)."""
+    """('master', None) | ('slave', address) | ('broken', None) | (None, None).
+
+    Those three are every role xapi knows (Pool_role in xen-api's pool_role.ml). 'broken'
+    is the one a failed master change leaves behind: the would-be master writes it before
+    telling the others to commit, and keeps it if any of them fails to. xapi reads
+    anything else - an empty file included - as broken too, but (None, None) is kept
+    apart from it here, because a caller that could not read the file must not be told
+    what the file says.
+    """
     first = (text or "").replace("\r", "").strip().splitlines()
     if not first:
         return (None, None)
@@ -492,6 +523,8 @@ def parse_pool_conf(text):
     low = line.lower()
     if low == "master":
         return ("master", None)
+    if low == "broken":
+        return ("broken", None)
     if low.startswith("slave:"):
         addr = re.sub(r"\s+", "", line.split(":", 1)[1])
         return ("slave", addr) if addr else (None, None)

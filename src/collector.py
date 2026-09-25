@@ -29,6 +29,7 @@ import subprocess
 import sys
 import threading
 import time
+from xml.etree import ElementTree
 
 BEGIN_MARKER = "<<<HEALTHPY-JSON-BEGIN>>>"
 END_MARKER = "<<<HEALTHPY-JSON-END>>>"
@@ -130,6 +131,9 @@ class Ran(object):
         return self.rc == 0 and not self.timed_out
 
     def why(self):
+        if self.rc is None:
+            # never started - see xe() - so there is no exit status, only the reason
+            return self.err
         if self.timed_out:
             return "timed out"
         msg = self.err.strip().splitlines()
@@ -267,8 +271,31 @@ def which(name):
     return None
 
 
+# The first xe call xapi let run out its whole timeout, once one has. A one-element list
+# for the same reason as CURRENT: written without a `global` statement.
+XAPI_WEDGED = [""]
+
+
 def xe(args, timeout=DEFAULT_CMD_TIMEOUT):
-    return run(["xe"] + list(args), timeout=timeout)
+    """One xe command - or, once xapi has sat on one until it timed out, not.
+
+    A wedged xapi accepts the connection and never answers, so every call waits out its
+    whole timeout: 60s apiece, a dozen of them on the host the pool questions ride on,
+    and the host spends its entire run budget learning the same thing again. The calls
+    after the first are therefore not made, and each fact says why rather than waiting to.
+
+    A timeout only counts when it was the call's own. One the run budget cut short says
+    the budget is gone, not that xapi is, and run() already answers every later call with
+    exactly that. A refused connection does not count either: it fails in milliseconds,
+    so every call can go on reporting its own reason, which is the more useful answer.
+    """
+    if XAPI_WEDGED[0]:
+        return Ran(None, "", "not asked - xapi did not answer %s" % XAPI_WEDGED[0], False)
+    full = _clamp(timeout) == timeout
+    r = run(["xe"] + list(args), timeout=timeout)
+    if r.timed_out and full:
+        XAPI_WEDGED[0] = "'xe %s' within %ds" % (args[0], timeout)
+    return r
 
 
 def read_file(path, limit=None):
@@ -358,6 +385,78 @@ def collect_pool_hosts():
     if not r.ok:
         return err("xe host-list failed (%s)" % r.why())
     return fact(r.out)
+
+
+# xapi's whole database, as it last saved it. Every member has one: a master writes its
+# own, and a slave holds the copy its master last sent it - on the lab's two-host 8.3 pool
+# the slave's was seconds older than the master's. Same path and format on 8.2.1 and 8.3.0.
+STATE_DB = "/var/lib/xcp/state.db"
+
+
+def parse_state_db_hosts(data):
+    """(rows, None) from a state.db's bytes, or (None, why). Rows are the host table's
+    uuid, name-label, hostname and address.
+
+    The file is one line of XML, 0.7-1.8 MB on the lab pools and a great deal more on a
+    big one, and only the host table is wanted - so that table is cut out by its markers
+    and nothing else is parsed. That is exact as well as cheap: '<' cannot appear
+    unescaped inside an attribute value, so the first '</table>' after the table opens is
+    where it closes, whatever the rows hold. What is cut out goes through a real XML
+    parser, so escaped names come back as the names they are.
+
+    Bytes rather than text: 2.7's ElementTree will not take a unicode string holding
+    anything outside ASCII, and a host's name-label may well.
+    """
+    start = data.find(b'<table name="host">')
+    if start < 0:
+        return None, "it has no host table"
+    end = data.find(b"</table>", start)
+    if end < 0:
+        return None, "its host table never closes"
+    try:
+        table = ElementTree.fromstring(data[start:end + len(b"</table>")])
+    except SyntaxError as exc:
+        # ElementTree.ParseError is a SyntaxError on 2.7 and 3.x alike, and this is the
+        # one thing fromstring raises for a fragment it cannot read
+        return None, "its host table does not parse (%s)" % exc
+    rows = []
+    for row in table.findall("row"):
+        uuid = row.get("uuid") or ""
+        if not uuid:
+            continue
+        rows.append({"uuid": uuid,
+                     "name_label": row.get("name__label") or "",
+                     "hostname": row.get("hostname") or "",
+                     "address": row.get("address") or ""})
+    if not rows:
+        return None, "its host table has no hosts in it"
+    return rows, None
+
+
+def collect_state_db_hosts():
+    """The pool's members from xapi's database FILE, for when xapi will not answer.
+
+    The file answers with the toolstack dead on every host, which is exactly what a failed
+    master change leaves behind - and the report is then about hosts it can still ssh to,
+    rather than nothing at all. What it cannot say is whether the copy is current, so the
+    time it was last written travels with it, rendered here in the host's own clock.
+    """
+    try:
+        f = open(STATE_DB, "rb")
+    except (IOError, OSError) as exc:
+        return err("could not read %s (%s)" % (STATE_DB, exc.strerror or exc))
+    try:
+        data = f.read()
+        mtime = os.fstat(f.fileno()).st_mtime
+    except (IOError, OSError) as exc:
+        return err("could not read %s (%s)" % (STATE_DB, exc.strerror or exc))
+    finally:
+        f.close()
+    rows, why = parse_state_db_hosts(data)
+    if rows is None:
+        return err("could not read the pool's hosts from %s: %s" % (STATE_DB, why))
+    return fact({"path": STATE_DB, "hosts": rows,
+                 "saved": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime))})
 
 
 # --------------------------------------------------------------------------------------
@@ -1615,7 +1714,14 @@ def collect(spec):
     self_uuid = ident["self_uuid"]["value"] if ident["self_uuid"]["ok"] else ""
 
     if "pool_hosts" in want:
-        out["pool_hosts"] = collect_pool_hosts()
+        if spec.get("host_list") == "statedb":
+            out["pool_hosts"] = err("not asked - the run asked for state.db instead")
+        else:
+            out["pool_hosts"] = collect_pool_hosts()
+        if not out["pool_hosts"]["ok"]:
+            # the toolstack did not answer, but what it would have answered from is a
+            # file, and every member keeps a copy of it
+            out["pool_hosts_db"] = collect_state_db_hosts()
 
     if "host" in want:
         out["meminfo"] = collect_meminfo()

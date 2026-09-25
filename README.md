@@ -173,6 +173,41 @@ host in the pool, with no dry run, no confirmation and no rollback. For anything
 more than once, or anything that changes state, use a tool built for it - Ansible, `pssh`,
 `clush` - and keep `-c` for looking.
 
+## When xapi is not answering
+
+A pool whose toolstack is down still gets a report. The usual cause is a master change that
+failed part way, which leaves xapi refusing or hanging on every member. Before v3.18 such a
+run stopped at `xe host-list failed`, having looked at nothing.
+
+- **The host list comes from the pool database file** when xapi will not give it:
+  `/var/lib/xcp/state.db` on the host you pointed it at. Every member keeps one: a master
+  writes its own, and a slave holds the last copy its master sent it. A `Pool Host List`
+  line says the list came from there, and its detail gives the time the file was last
+  written, because a host added or removed since then is not in it.
+- **Every host is still checked for everything that does not need xapi**: logs, dmesg,
+  disks, memory, multipath, mounts, crash dumps, packages, pool.conf. Lines that only xapi
+  can answer (`Host Enabled`, `Multipathing`, `DNS/GW on Non-Mgmt PIFs`, and the pool-level
+  lines when the host they are asked of is down) read `Unknown`.
+- **`XAPI Status`** in each host block says whether that host's toolstack answers. On a
+  slave that includes its connection to the master, since a slave reads everything through
+  its master.
+- **`Pool Roles`** compares every host's `/etc/xensource/pool.conf`, the file xapi reads at
+  startup to decide whether it is the master, a slave of some address, or `broken`. It flags
+  two masters, no master, a `broken` host, and slaves pointing at different hosts or at
+  another slave. Its detail lists every host's pool.conf, so the diagnosis survives `-f` and
+  `--json`. A pool.conf edited by hand to name the master by hostname still counts as
+  pointing at the master.
+- **A wedged xapi is only waited on once per host.** After one `xe` call times out, the rest
+  on that host are skipped and say why, rather than each waiting out its own 60 s.
+- `-c` works on such a pool as well, since it uses the same host list:
+  `health.py -n mypool -c 'cat /etc/xensource/pool.conf'`.
+- Host mode does the same thing. A host whose xapi is down finds its own address in its own
+  copy of the database.
+
+`HEALTH_HOST_LIST=statedb` makes a run take its host list from the file even when xapi
+would have answered. It is a debug knob, for comparing the file's list against xapi's on a
+healthy pool.
+
 ## Machine-readable output
 
 `--json` prints the same run as one JSON document instead of a report. Same checks, same
@@ -263,7 +298,7 @@ only `python` (2.7.5), 8.3 has both, and that is what keeps 8.2.1 pools checkabl
 
 ```
 python build/stitch.py     # rebuild health.py after changing src/
-python -m pytest tests/    # ~490 tests, all offline
+python -m pytest tests/    # ~540 tests, all offline
 ```
 
 You don't have to remember that first line. Push a change to `src/` and GitHub rebuilds

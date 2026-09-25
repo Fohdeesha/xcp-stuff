@@ -78,6 +78,30 @@ def multipathing(host):
     return info("Multipathing", value, "yellow" if value == "Unknown" else "green")
 
 
+def xapi_status(host):
+    """Whether this host's toolstack answers an API call.
+
+    It is the line that explains the others: every xe-sourced fact in the block (Host
+    Enabled, Multipathing, DNS/GW on Non-Mgmt PIFs, and the pool lines when this is the
+    host they were asked of) is Unknown when xapi does not answer, and this is where the
+    reason is. Everything that is not xe - the logs, dmesg, disks, memory, multipath,
+    pool.conf - was still read, which is what makes a report on a broken pool possible.
+
+    It reads the collector's identity call, so it costs nothing: every host is asked for
+    its own address with `xe host-param-get` before anything else. A slave keeps no
+    database of its own and reads through its master, so on a slave 'Responding' covers
+    the master connection too - a slave whose master is gone does not answer, which is
+    the reading wanted from a pool whose master change failed.
+    """
+    uuid = host.fact("self_uuid")
+    if not uuid.ok:
+        return unknown("XAPI Status", "Unknown (%s, so xapi was not asked)" % uuid.error)
+    f = host.fact("self_address")
+    if f.ok:
+        return ok("XAPI Status", "Responding")
+    return flag("XAPI Status", "Not responding", " - %s" % f.error)
+
+
 def ntp(host):
     """One line, two facts. An explicit 'no' is a real finding; 'Unknown' (address not in
     the xe maps) stays informational."""
@@ -670,6 +694,179 @@ def yum_patch_level(host, is_master, master_manifest):
 # --------------------------------------------------------------------------------------
 # pool-level
 # --------------------------------------------------------------------------------------
+
+def pool_host_list(state_db, seed, count):
+    """Where the host list came from, when it was not xapi - and only then.
+
+    Every 'Unreachable Hosts' and 'Hosts in Pool' figure is counted off this list, so a
+    run that took it from a file has to say so: the file is a saved copy, and a host
+    joined or ejected since it was written is not in it. A run whose list came from xapi
+    has nothing to say here, and a green line saying so would be padding.
+    """
+    where = seed or "this host"
+    path = state_db.get("path") or "state.db"
+    if state_db.get("forced"):
+        # asked for by name, so it is a warning worth keeping under -f, not a finding
+        return info("Pool Host List",
+                    "Read from %s on %s (HEALTH_HOST_LIST=statedb)" % (path, where), "yellow")
+    # the variable parts - an error, a path, a timestamp - sit on lines of their own, so
+    # the prose around them wraps the same whatever length they turn out to be
+    detail = (
+        "xapi on %s did not answer when asked for the pool's hosts:\n"
+        "    %s\n"
+        "\n"
+        "so the hosts checked are the ones in its saved copy of the pool database:\n"
+        "    %s, last written %s (%s's clock)\n"
+        "\n"
+        "A master writes that file itself and a slave holds the copy its master last sent\n"
+        "it, so a host joined to or ejected from the pool since then is not reflected here.\n"
+        "Host Enabled and Multipathing are only ever read from xapi, so they are Unknown\n"
+        "for every host in this run."
+        % (where, state_db.get("reason") or "no reason given", path,
+           state_db.get("saved") or "at an unknown time", where))
+    return unknown("Pool Host List",
+                   "Unknown - xapi on %s did not answer, so %d host(s) were read from its "
+                   "saved database, See Below" % (where, count)
+                   ).with_detail("Pool Host List", detail)
+
+
+def _pool_conf_target(pointer, hosts):
+    """The member a slave's pool.conf points at, or None if it names none of them.
+
+    xapi itself only ever writes an IP here: pool-join and emergency-reset-master resolve
+    the address they were given first (Helpers.gethostbyname, via emergency_reset_master),
+    and designate-new-master writes the new master's own address. So this is an address
+    match in practice - but a hand-edited file may carry a name, and a slave pointing at
+    its master by name must not read as pointing at nothing, so names are tried after the
+    addresses. An FQDN is tried by its first label as well, since xapi's own hostname is
+    usually the short one.
+    """
+    want = (pointer or "").strip().lower()
+    if not want:
+        return None
+    for host in hosts:
+        if host.address.lower() == want:
+            return host
+    parts = want.split(".")
+    short = want if (len(parts) == 4 and all(p.isdigit() for p in parts)) else parts[0]
+    for host in hosts:
+        names = set(name.lower() for name in (host.hostname, host.name) if name)
+        if want in names or short in names:
+            return host
+    return None
+
+
+def _first_line(text):
+    return ((text or "").replace("\r", "").strip().splitlines() or [""])[0].strip()
+
+
+def pool_roles(hosts):
+    """Every reachable member's pool.conf, judged against the others'.
+
+    pool.conf is what xapi reads at startup to decide what it is - the master, a slave of
+    some address, or broken - and it is a file, so this answers with the toolstack down on
+    every host, which is exactly when it is wanted. A master change that failed part way
+    leaves the pool in this state: hosts that disagree about who the master is, each xapi
+    acting on its own copy, and none of them able to say so over the API.
+
+    Only what holds whatever the addressing is flagged: more than one master; a host that
+    says broken, or holds something xapi would read as broken; a slave pointing at itself,
+    or at a host whose own pool.conf says it is not the master; slaves split between
+    masters; and, when every host was reached, no master at all. A host that was not
+    reached is not guessed at - 'Unreachable Hosts' already names it.
+
+    The raw files are in the pool.conf block at the end of a full report. This line says
+    whether they agree, and its detail carries them too, because -f drops that block.
+    """
+    reached = [h for h in hosts if h.reachable]
+    if not reached:
+        return unknown("Pool Roles", "Unknown (no host was reached)")
+
+    entries, unread = [], []
+    for host in reached:
+        f = host.fact("pool_conf")
+        if not f.ok:
+            unread.append((host, f.error))
+            continue
+        role, pointer = parsers.parse_pool_conf(f.value)
+        entries.append({"host": host, "role": role, "pointer": pointer,
+                        "text": _first_line(f.value) or "(empty)",
+                        "target": _pool_conf_target(pointer, hosts) if role == "slave"
+                        else None})
+    own = dict((e["host"], e) for e in entries)
+    masters = [e["host"] for e in entries if e["role"] == "master"]
+    slaves = [e for e in entries if e["role"] == "slave"]
+
+    problems = []
+    for e in entries:
+        if e["role"] == "broken":
+            problems.append("%s says broken" % e["host"].name)
+        elif e["role"] is None:
+            problems.append("%s holds '%s', which xapi reads as broken"
+                            % (e["host"].name, e["text"]))
+    if len(masters) > 1:
+        problems.append("%d hosts say master (%s)"
+                        % (len(masters), ", ".join(h.name for h in masters)))
+    for e in slaves:
+        target = e["target"]
+        if target is e["host"]:
+            problems.append("%s points at itself" % e["host"].name)
+            continue
+        theirs = own.get(target)
+        if theirs is not None and theirs["role"] != "master":
+            problems.append("%s points at %s, which says %s"
+                            % (e["host"].name, target.name, theirs["text"]))
+        elif len(masters) == 1 and target is not masters[0]:
+            problems.append("%s points at %s, not at %s"
+                            % (e["host"].name, e["pointer"], masters[0].name))
+    if not masters:
+        pointed_at = sorted(set(e["target"].address if e["target"] else e["pointer"]
+                                for e in slaves))
+        if len(pointed_at) > 1:
+            problems.append("the slaves point at different masters (%s)"
+                            % ", ".join(pointed_at))
+        if not unread and len(reached) == len(hosts):
+            problems.append("no host says master")
+
+    if problems:
+        summary = problems[0] + ("; and %d more" % (len(problems) - 1)
+                                 if len(problems) > 1 else "")
+        return flag("Pool Roles", "Mismatch - %s, See Below" % summary).with_detail(
+            "Pool Roles", _pool_roles_detail(hosts, own, unread, problems))
+    if unread:
+        return unknown("Pool Roles", "Unknown (pool.conf could not be read on %s)"
+                       % ", ".join(h.name for h, _error in unread)).with_detail(
+            "Pool Roles", _pool_roles_detail(hosts, own, unread, []))
+    if not masters:
+        # the reachable hosts are all slaves and agree - on a host this run could not
+        # read, or on an address that is no member's. Either way the master's own
+        # pool.conf was never seen, so agreement is all that was established
+        return unknown("Pool Roles", "Unknown (no reachable host says master; the slaves "
+                                     "point at %s)" % slaves[0]["pointer"]).with_detail(
+            "Pool Roles", _pool_roles_detail(hosts, own, unread, []))
+    if len(reached) < len(hosts):
+        return ok("Pool Roles", "Consistent (%d of %d hosts reached)"
+                  % (len(reached), len(hosts)))
+    return ok("Pool Roles", "Consistent")
+
+
+def _pool_roles_detail(hosts, own, unread, problems):
+    """What each host's pool.conf says, one line each, under whatever was wrong with it."""
+    out = ["  - %s" % p for p in problems]
+    if out:
+        out.append("")
+    why_unread = dict(unread)
+    width = max(len(h.label) for h in hosts)
+    for host in hosts:
+        if host in own:
+            said = own[host]["text"]
+        elif host in why_unread:
+            said = "(could not be read: %s)" % why_unread[host]
+        else:
+            said = "(not reached)"
+        out.append("%s  %s" % (host.label.ljust(width), said))
+    return "\n".join(out)
+
 
 def ha_enabled(pool):
     f = pool.fact("ha_enabled")

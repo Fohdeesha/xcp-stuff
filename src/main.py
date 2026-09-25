@@ -216,6 +216,7 @@ class Run(object):
         self.pool_size = 0
         self.all_addresses = []
         self.host_names = {}      # address -> xapi hostname, for EVERY pool member
+        self.state_db = None      # set when the host list came from a state.db, not xapi
 
     def host_solo(self):
         """On a hypervisor with nothing else reachable. This, not the run environment, is
@@ -519,9 +520,70 @@ def prepare_host_sweep(run, argument_password):
     run.host_sweep = True
 
 
+def discovery_spec():
+    """What the discovery call asks for.
+
+    HEALTH_HOST_LIST=statedb takes the host list from the seed's state.db even when xapi
+    would have answered. That path is otherwise only reached on a pool whose toolstack is
+    down, so this is how it is diffed against xapi's answer on a healthy one - and the
+    only way to exercise it on a multi-host pool without stopping anybody's xapi.
+    """
+    spec = {"want": ["pool_hosts"]}
+    pinned = os.environ.get("HEALTH_HOST_LIST", "")
+    if pinned not in ("", "xapi", "statedb"):
+        sys.stderr.write("Warning: ignoring HEALTH_HOST_LIST=%s (expected xapi or statedb).\n"
+                         % pinned)
+    elif pinned == "statedb":
+        spec["host_list"] = "statedb"
+    return spec
+
+
+def _host_records(run, payload, forced):
+    """The pool's members: xapi's answer, or failing that the seed's saved database.
+
+    xapi not answering used to end the run here, before a single host was looked at -
+    on exactly the pools that most need looking at, since a master change that fails
+    part way leaves xapi down or refusing on every member. The database xapi would have
+    answered from is a file that every member keeps, so the run carries on from that,
+    checks whatever it can on each host without xapi, and says where the list came from.
+    """
+    listed = result.wrap(payload, "pool_hosts")
+    if listed.ok and not forced:
+        return parsers.parse_host_list(listed.value)
+    saved = result.wrap(payload, "pool_hosts_db")
+    if not saved.ok:
+        sys.stderr.write("ERROR: Could not retrieve pool host addresses from '%s': %s\n"
+                         "       and its saved copy of the pool database could not be read "
+                         "either: %s\n"
+                         % (run.seed or "this host", listed.error, saved.error))
+        sys.exit(1)
+    run.state_db = {"forced": forced, "reason": listed.error,
+                    "path": saved.value.get("path"), "saved": saved.value.get("saved")}
+    records = parsers.host_records_from_state_db(saved.value.get("hosts"))
+    if not forced:
+        progress("  xapi did not answer (%s)\n  read %d host(s) from its %s instead\n"
+                 % (listed.error, len(records), saved.value.get("path")))
+    return records
+
+
+def _own_address(payload, records):
+    """This host's address in host mode: xapi's answer, else its own row in the saved
+    database - found by the INSTALLATION_UUID the collector read off disk, so it cannot
+    be some other member's. None if neither says."""
+    address = result.wrap(payload, "self_address")
+    if address.ok and address.value:
+        return address.value, None
+    uuid = result.wrap(payload, "self_uuid")
+    if uuid.ok:
+        for rec in records:
+            if rec["uuid"] == uuid.value and rec["address"]:
+                return rec["address"], None
+    return None, address.error
+
+
 def discover(run):
     """Phase A: one call to the seed for the pool's host list and our own identity."""
-    spec = {"want": ["pool_hosts"]}
+    spec = discovery_spec()
     progress("Asking %s for the pool's host list...\n" % (run.seed or "this host"))
     try:
         if run.run_env == "host":
@@ -533,30 +595,28 @@ def discover(run):
                          % (run.seed or "this host", exc))
         sys.exit(1)
 
+    records = _host_records(run, payload, spec.get("host_list") == "statedb")
+
     if run.run_env == "host":
-        address = result.wrap(payload, "self_address")
-        if not address.ok or not address.value:
+        address, why = _own_address(payload, records)
+        if not address:
             sys.stderr.write("ERROR: could not get this host's address from xapi "
-                             "(is the toolstack running?): %s\n" % address.error)
+                             "(is the toolstack running?): %s\n"
+                             "       and this host is not in its own saved copy of the pool "
+                             "database either\n" % why)
             sys.exit(1)
-        run.seed = address.value
-        run.transport.local_address = address.value
+        run.seed = address
+        run.transport.local_address = address
         name = result.wrap(payload, "hostname")
-        shown = ("%s (%s)" % (name.value, address.value)
-                 if name.ok and name.value else address.value)
+        shown = ("%s (%s)" % (name.value, address)
+                 if name.ok and name.value else address)
         print_banner(run, shown, "")
 
-    hosts_fact = result.wrap(payload, "pool_hosts")
-    if not hosts_fact.ok:
-        sys.stderr.write("ERROR: Could not retrieve pool host addresses from '%s': %s\n"
-                         % (run.seed, hosts_fact.error))
-        sys.exit(1)
-
     hosts = []
-    for rec in parsers.parse_host_list(hosts_fact.value):
+    for rec in records:
         if not rec["address"]:
-            sys.stderr.write("Warning: pool host %s has no address in xapi; skipping it\n"
-                             % rec["uuid"])
+            sys.stderr.write("Warning: pool host %s has no address in the host list; "
+                             "skipping it\n" % rec["uuid"])
             continue
         hosts.append(model.Host(rec["address"], rec["uuid"], rec["hostname"],
                                 rec["enabled"], rec["multipathing"]))
@@ -758,6 +818,10 @@ def pool_status_section(run, rep):
     else:
         rep.add(result.info("Pool Master", "(unknown)", "yellow"))
 
+    if run.state_db is not None:
+        rep.check("Pool Host List", checks.pool_host_list, run.state_db, run.seed,
+                  run.pool_size)
+
     if run.host_solo():
         # nothing else was probed, so there is no reachability result to report and
         # nothing to compare across hosts - the RAM and time-sync lines would be claims
@@ -774,6 +838,9 @@ def pool_status_section(run, rep):
             rep.add(result.flag("Unreachable Hosts", " ".join(unreachable)))
         else:
             rep.add(result.ok("Unreachable Hosts", "None"))
+        # who each host thinks the master is, read off disk - so it still answers when
+        # xapi is down everywhere, which is when a failed master change needs it most
+        rep.check("Pool Roles", checks.pool_roles, run.hosts)
 
         reachable = [h for h in run.hosts if h.reachable]
         rep.add(result.ok("Dom0 RAM Allocations", "Matched") if model.ram_match(reachable)
@@ -962,6 +1029,8 @@ def host_section(run, rep, host):
     rep.check("Hypervisor Version", checks.hypervisor_version, host)
     rep.check("Last Booted", checks.last_booted, host)
     rep.check("Last Patched", checks.last_patched, host)
+    # ahead of the xe-sourced lines it explains
+    rep.check("XAPI Status", checks.xapi_status, host)
     rep.check("Host Enabled", checks.host_enabled, host)
     rep.check("Multipathing", checks.multipathing, host)
     rep.check("NTP", checks.ntp, host)
