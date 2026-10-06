@@ -14,12 +14,13 @@ import sys
 import threading
 import time
 import xml.parsers.expat
-VERSION = '1.2'
+VERSION = '1.3'
 PYTHON = sys.version.split()[0]
 DB_PATH = '/var/lib/xcp/state.db'
 BACKUP_SUFFIX = '.snapshot_of.backup'
 PRE_RESTORE_SUFFIX = '.snapshot_of.pre-restore-'
 TMP_SUFFIX = '.snapshot_of.tmp-'
+HA_MARK_SUFFIX = '.snapshot_of.ha'
 INVENTORY = '/etc/xensource-inventory'
 POOL_CONF = '/etc/xensource/pool.conf'
 DB_CONF = '/etc/xensource/db.conf'
@@ -50,6 +51,10 @@ XHAD_GONE_WAIT = 60
 HA_ENABLE_TIMEOUT = 900
 HA_ENABLE_WINDOW = 300
 HA_ENABLE_RETRY = 20
+TASK_WAIT = 60
+LIVE_WAIT = 300
+REARM_WAIT = 120
+VM_HA_FIELDS = ('ha-restart-priority', 'order', 'start-delay')
 UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
 UUID_ANY = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
 _TEXT = type(u'')
@@ -78,8 +83,15 @@ def _native(value):
         return _utf8(value)
     return _text(value)
 
+def _quote(value):
+    value = _text(value)
+    if re.match(u'^[A-Za-z0-9@%+=:,./_-]+\\Z', value):
+        return value
+    return u"'" + value.replace(u"'", u"'\"'\"'") + u"'"
+
 _AUDIT = [False]
 _SYSLOG = [None]
+_WROTE = []
 
 def _write(stream, text):
     data = _utf8(text + u'\n')
@@ -273,6 +285,7 @@ def write_new(path, data, mode=0o600, owner=None):
         os.close(fd)
         if not done:
             _unlink_quietly(path)
+    _WROTE.append(path)
     fsync_dir(path)
     if read_file(path) != data:
         raise Failed('%s does not read back as written' % path)
@@ -298,7 +311,10 @@ def replace_file(path, data):
         os.rename(tmp, path)
     except OSError:
         _unlink_quietly(tmp)
+        _WROTE.remove(tmp)
         raise
+    _WROTE.remove(tmp)
+    _WROTE.append(path)
     fsync_dir(path)
     if read_file(path) != data:
         raise Failed('%s does not read back as written' % path)
@@ -760,8 +776,8 @@ def take_lock():
 def local_db_value(key):
     try:
         data = read_file(LOCAL_DB)
-    except EnvironmentError:
-        return None
+    except EnvironmentError as exc:
+        raise Failed('cannot read %s: %s' % (LOCAL_DB, _describe(exc)))
     found = {}
     parser = xml.parsers.expat.ParserCreate()
     def on_start(name, attrs):
@@ -770,10 +786,16 @@ def local_db_value(key):
     parser.StartElementHandler = on_start
     try:
         parser.Parse(data, True)
-    except xml.parsers.expat.ExpatError:
-        return None
+    except xml.parsers.expat.ExpatError as exc:
+        raise Failed('%s cannot be read as XML: %s' % (LOCAL_DB, _text(exc)))
     value = found.get(key)
     return None if value is None else _text(value)
+
+def local_armed():
+    try:
+        return local_db_value('ha.armed'), None
+    except Failed as exc:
+        return None, _text(exc)
 
 def local_ha_armed():
     return local_db_value('ha.armed')
@@ -835,18 +857,34 @@ def xapi_pids():
 def xhad_pids():
     return pids_named(b'xhad')
 
+def armed_text(armed, why):
+    return why or '%s says ha.armed=%s' % (LOCAL_DB, armed or '(absent)')
+
 def require_disarmed(interruptible=True):
     deadline = _now() + XHAD_GONE_WAIT
     while True:
-        armed, pids = local_db_value('ha.armed'), xhad_pids()
-        if armed in ('false', None) and not pids:
-            step('HA is disarmed on this host (ha.armed=%s, no xhad process).' % armed)
+        (armed, why), pids = local_armed(), xhad_pids()
+        if why is None and armed in ('false', None) and not pids:
+            step('HA is disarmed on this host (ha.armed=%s, no xhad process).'
+                 % (armed or '(absent)'))
             return
         if _now() > deadline:
-            raise Failed('HA is not disarmed on this host after %ds (%s says ha.armed=%s; '
-                         'xhad pid(s) %s), so xapi was not stopped'
-                         % (XHAD_GONE_WAIT, LOCAL_DB, armed, pids or 'none'))
+            raise Failed('HA is not disarmed on this host after %ds (%s; xhad pid(s) %s), so '
+                         'xapi was not stopped'
+                         % (XHAD_GONE_WAIT, armed_text(armed, why), pids or 'none'))
         pause(POLL, interruptible)
+
+def wait_rearmed():
+    deadline = _now() + REARM_WAIT
+    while True:
+        (armed, why), pids = local_armed(), xhad_pids()
+        if armed == 'true' and pids:
+            step('HA is armed on this host again (ha.armed=true, xhad pid(s) %s).' % pids)
+            return
+        if _now() > deadline:
+            raise Failed('HA reads enabled, but this host is not armed after %ds (%s; xhad '
+                         'pid(s) %s)' % (REARM_WAIT, armed_text(armed, why), pids or 'none'))
+        pause(POLL, False)
 
 def unit_state():
     r = systemctl('is-active', XAPI_UNIT)
@@ -917,14 +955,14 @@ def start_xapi(interruptible=True):
     step('xapi has finished initialising.')
     return res
 
-def ensure_xapi():
-    if xapi_answers():
+def require_xapi():
+    r = xe('pool-list', '--minimal', timeout=30)
+    if r.ok and UUID_RE.match(r.out.strip()):
         return
-    step('xapi is not answering; starting it to check the pool...')
-    res = start_xapi()
-    if not res.answering:
-        raise Refused('xapi is not running and could not be started: %s. Nothing was '
-                      'changed.' % res.detail)
+    raise Refused('xapi is not answering (%s). Nothing is started or stopped before you have '
+                  'confirmed: start it yourself (systemctl start xapi), wait until xe '
+                  'pool-list answers, and run this again'
+                  % (r.why() if not r.ok else u'"%s"' % r.out.strip()))
 
 def pool_uuid():
     r = xe('pool-list', '--minimal')
@@ -945,12 +983,12 @@ def ha_enabled(pool):
         raise Failed('the pool\'s ha-enabled reads "%s"' % value)
     return value == 'true'
 
-def require_master_is_us(pool, inv):
+def require_master_is_us(pool, inv, refuse=Refused):
     master = pool_param(pool, 'master')
     me = inv.get('INSTALLATION_UUID')
     if not me or master != me:
-        raise Refused('xapi says the pool master is %s, but this host is %s'
-                      % (master, me or '(no INSTALLATION_UUID)'))
+        raise refuse('xapi says the pool master is %s, but this host is %s'
+                     % (master, me or '(no INSTALLATION_UUID)'))
 
 def parse_xe_map(text):
     pairs = []
@@ -978,34 +1016,96 @@ def parse_xe_records(text):
         records.append(current)
     return records
 
-def check_tasks(ignore):
-    r = xe('task-list', 'status=pending', 'params=uuid,name-label')
+def xe_records(*args):
+    r = xe(*args)
     if not r.ok:
-        raise Refused('cannot list pending tasks: %s' % r.why())
-    tasks = parse_xe_records(r.out)
-    if not tasks:
-        return
+        raise Failed('xe %s: %s' % (args[0], r.why()))
+    return parse_xe_records(r.out)
+
+def pool_fields(pool, names):
+    recs = xe_records('pool-list', 'uuid=' + pool, 'params=' + ','.join(names))
+    if len(recs) != 1:
+        raise Failed('xe pool-list uuid=%s answered %d records' % (pool, len(recs)))
+    return recs[0]
+
+def pending_tasks():
+    try:
+        return xe_records('task-list', 'status=pending', 'params=uuid,name-label')
+    except Failed as exc:
+        raise Failed('cannot list pending tasks: %s' % _text(exc))
+
+def list_tasks(tasks):
     say('Pending tasks - stopping xapi on the master fails them:')
     for task in tasks:
         say('  %s  %s' % (task.get('uuid', '?'), task.get('name-label', '')))
+
+def check_tasks(ignore):
+    try:
+        tasks = pending_tasks()
+    except Failed as exc:
+        raise Refused(_text(exc))
+    if not tasks:
+        return
+    list_tasks(tasks)
     if not ignore:
         raise Refused('%d task(s) pending. Wait for them (backups, migrations...) to finish, '
                       'or pass --ignore-tasks to go ahead and let them fail.' % len(tasks))
     warn('going ahead with %d pending task(s): --ignore-tasks' % len(tasks))
 
+def await_tasks(ignore, before):
+    deadline = _now() + TASK_WAIT
+    shown = False
+    while True:
+        tasks = pending_tasks()
+        if not tasks:
+            return
+        if ignore:
+            list_tasks(tasks)
+            warn('%s with %d pending task(s): --ignore-tasks' % (before, len(tasks)))
+            return
+        if not shown:
+            list_tasks(tasks)
+            step('Waiting up to %ds for them to finish before %s...' % (TASK_WAIT, before))
+            shown = True
+        if _now() > deadline:
+            raise Failed('%d task(s) still pending after %ds, so this run stopped before %s'
+                         % (len(tasks), TASK_WAIT, before))
+        pause(POLL)
+
 class HaSettings(object):
-    def __init__(self, srs, config, tolerate, overcommit):
+    def __init__(self, pool, srs, statefiles, config, tolerate, overcommit, stack, vms):
+        self.pool = pool
         self.srs = srs
+        self.statefiles = statefiles
         self.config = config
         self.tolerate = tolerate
         self.overcommit = overcommit
+        self.stack = stack
+        self.vms = vms
+    def key(self):
+        return (self.srs, self.config, self.tolerate, self.overcommit, self.stack)
     def enable_args(self):
         args = ['pool-ha-enable', 'heartbeat-sr-uuids=' + ','.join(self.srs)]
         for key, value in self.config:
             args.append('ha-config:%s=%s' % (key, value))
         return args
-    def command(self):
-        return 'xe ' + ' '.join(self.enable_args())
+    def commands(self, enable=True):
+        lines = [u' '.join(['xe'] + [_quote(a) for a in self.enable_args()])] if enable else []
+        for param, value in (('ha-host-failures-to-tolerate', self.tolerate),
+                             ('ha-allow-overcommit', self.overcommit)):
+            lines.append(u'xe pool-param-set %s %s' % (_quote('uuid=' + self.pool),
+                                                       _quote('%s=%s' % (param, value))))
+        return lines
+
+def vm_ha_settings():
+    vms = {}
+    for rec in xe_records('vm-list', 'is-control-domain=false',
+                          'params=uuid,' + ','.join(VM_HA_FIELDS)):
+        uuid = rec.get('uuid', '')
+        if not UUID_RE.match(uuid):
+            raise Failed('xe vm-list answered a record without a uuid')
+        vms[uuid] = tuple(rec.get(name) for name in VM_HA_FIELDS)
+    return vms
 
 def capture_ha(pool):
     if not ha_enabled(pool):
@@ -1023,11 +1123,56 @@ def capture_ha(pool):
                           % (vdi, r.why() if not r.ok else u'"%s"' % sr))
         if sr not in srs:
             srs.append(sr)
-    return HaSettings(srs, parse_xe_map(pool_param(pool, 'ha-configuration')),
+    return HaSettings(pool, srs, vdis, parse_xe_map(pool_param(pool, 'ha-configuration')),
                       pool_param(pool, 'ha-host-failures-to-tolerate'),
-                      pool_param(pool, 'ha-allow-overcommit'))
+                      pool_param(pool, 'ha-allow-overcommit'),
+                      pool_fields(pool, ('ha-cluster-stack',)).get('ha-cluster-stack'),
+                      vm_ha_settings())
 
-def disable_ha(pool, interruptible=True):
+def host_names(hosts):
+    return [h.get('name-label') or h.get('uuid', '?') for h in hosts]
+
+def check_ha_hosts(ha, refuse):
+    hosts = xe_records('host-list', 'params=uuid,name-label,host-metrics-live,ha-statefiles')
+    if not hosts:
+        raise refuse('xe host-list answered no hosts')
+    bad = []
+    for host, name in zip(hosts, host_names(hosts)):
+        if host.get('host-metrics-live') != 'true':
+            bad.append('%s is not live' % name)
+        elif not host.get('ha-statefiles', '').strip():
+            bad.append('%s has no access to the HA statefile' % name)
+    for sr in ha.srs:
+        plugged = set(p.get('host-uuid') for p in
+                      xe_records('pbd-list', 'sr-uuid=' + sr,
+                                 'params=host-uuid,currently-attached')
+                      if p.get('currently-attached') == 'true')
+        for host, name in zip(hosts, host_names(hosts)):
+            if host.get('uuid') not in plugged:
+                bad.append('%s does not have the heartbeat SR %s plugged' % (name, sr))
+    if bad:
+        raise refuse('HA cannot be turned off and on again safely: %s. A host that cannot see '
+                     'the statefile when HA is disabled fences itself, and HA cannot be enabled '
+                     'again until every host is back. Fix HA first' % '; '.join(bad))
+
+def ha_marker():
+    return DB_PATH + HA_MARK_SUFFIX
+
+def marker_text():
+    path = ha_marker()
+    if not os.path.lexists(path):
+        return None
+    try:
+        saved = read_text(path).strip()
+    except EnvironmentError as exc:
+        saved = u'(unreadable: %s)' % _describe(exc)
+    return (u'%s exists: a run %s ago turned HA off and did not see it back on. Check that HA '
+            u'is back as it was; if it is not, put it back with the commands that run saved:\n'
+            u'%s\nthen remove the file: rm %s'
+            % (path, format_age(time.time() - os.lstat(path).st_mtime),
+               u'\n'.join(u'    ' + l for l in saved.splitlines()), path))
+
+def disable_ha(pool):
     step('Disabling HA...')
     r = xe('pool-ha-disable', timeout=HA_DISABLE_TIMEOUT)
     if not r.ok:
@@ -1036,7 +1181,24 @@ def disable_ha(pool, interruptible=True):
         raise Failed('HA still reads enabled after xe pool-ha-disable')
     step('HA is disabled.')
 
-def enable_ha(pool, ha, interruptible=False):
+def wait_hosts_live():
+    deadline = _now() + LIVE_WAIT
+    while True:
+        try:
+            hosts = xe_records('host-list', 'params=uuid,name-label,host-metrics-live')
+            down = host_names([h for h in hosts if h.get('host-metrics-live') != 'true'])
+            why = None if hosts else 'xe host-list answered no hosts'
+        except Failed as exc:
+            down, why = [], _text(exc)
+        if why is None and not down:
+            return
+        if _now() > deadline:
+            raise Failed('not every host is live after %ds (%s), so HA was not enabled again'
+                         % (LIVE_WAIT, why or 'not live: ' + ', '.join(down)))
+        pause(POLL, False)
+
+def enable_ha(pool, ha):
+    wait_hosts_live()
     step('Re-enabling HA (heartbeat SR %s)...' % ', '.join(ha.srs))
     deadline = _now() + HA_ENABLE_WINDOW
     while True:
@@ -1047,18 +1209,48 @@ def enable_ha(pool, ha, interruptible=False):
         except Failed:
             pass
         if _now() > deadline:
-            raise Failed('%s: %s' % (ha.command(), r.why()))
+            raise Failed('xe pool-ha-enable: %s' % r.why())
         step('HA did not enable yet (%s); retrying in %ds...' % (r.why(), HA_ENABLE_RETRY))
-        pause(HA_ENABLE_RETRY, interruptible)
+        pause(HA_ENABLE_RETRY, False)
+
+def restore_ha_params(pool, ha):
     for param, want in (('ha-host-failures-to-tolerate', ha.tolerate),
                         ('ha-allow-overcommit', ha.overcommit)):
         now = pool_param(pool, param)
+        if now == want:
+            continue
+        r = xe('pool-param-set', 'uuid=' + pool, '%s=%s' % (param, want))
+        if not r.ok:
+            raise Failed('HA is enabled, but %s is %s where it was %s, and setting it back '
+                         'failed: %s' % (param, now, want, r.why()))
+        now = pool_param(pool, param)
         if now != want:
-            r = xe('pool-param-set', 'uuid=' + pool, '%s=%s' % (param, want))
-            if not r.ok:
-                raise Failed('HA is enabled, but %s is %s where it was %s, and setting it '
-                             'back failed: %s' % (param, now, want, r.why()))
-    step('HA is enabled again.')
+            raise Failed('HA is enabled, but %s reads %s after setting it back to %s'
+                         % (param, now, want))
+        step('%s is %s again.' % (param, want))
+
+def compare_ha(run_):
+    ha = run_.ha
+    try:
+        fields = pool_fields(run_.pool, ('ha-cluster-stack', 'ha-plan-exists-for'))
+        vms = vm_ha_settings() if run_.compare_vms else {}
+    except Failed as exc:
+        run_.fail('HA is enabled again, but its settings could not be compared with the ones '
+                  'from before: %s' % _text(exc))
+        return
+    stack, plan = fields.get('ha-cluster-stack'), fields.get('ha-plan-exists-for') or u''
+    if stack != ha.stack:
+        run_.fail('HA is enabled again, but its cluster stack reads %s where it was %s'
+                  % (stack, ha.stack))
+    if plan.isdigit() and ha.tolerate.isdigit() and int(plan) < int(ha.tolerate):
+        warn('HA has a plan for %s host failure(s) only, where %s are to be tolerated: check '
+             'it with xe pool-param-get uuid=%s param-name=ha-plan-exists-for'
+             % (plan, ha.tolerate, run_.pool))
+    show = lambda values: u'/'.join(_text(v) for v in values)
+    for uuid in sorted(ha.vms):
+        if uuid in vms and vms[uuid] != ha.vms[uuid]:
+            run_.fail('VM %s: its HA restart priority, order and start delay read %s where they '
+                      'were %s' % (uuid, show(vms[uuid]), show(ha.vms[uuid])))
 
 def verify_live(repairs):
     try:
@@ -1089,9 +1281,13 @@ def verify_live(repairs):
     return problems
 
 class Run(object):
-    def __init__(self, pool, ha):
+    def __init__(self, pool, ha, inv, ignore_tasks, compare_vms):
         self.pool = pool
         self.ha = ha
+        self.inv = inv
+        self.ignore_tasks = ignore_tasks
+        self.compare_vms = compare_vms
+        self.marker = None
         self.ha_touched = False
         self.xapi_touched = False
         self.fallback = None
@@ -1137,12 +1333,41 @@ def settle(run_):
         else:
             run_.fail('xapi is not answering, so the repair could not be read back')
     if run_.ha is not None and run_.ha_touched:
+        settle_ha(run_)
+
+def settle_ha(run_):
+    stage = 'enable'
+    try:
+        if not ha_enabled(run_.pool):
+            enable_ha(run_.pool, run_.ha)
+        stage = 'params'
+        restore_ha_params(run_.pool, run_.ha)
+        stage = 'armed'
+        wait_rearmed()
+    except Exception as exc:
+        run_.fail('HA is not back as it was: %s' % _text(exc))
+        if stage == 'armed':
+            intro, lines = 'If it does not arm, turn HA off and on again with:', \
+                ['xe pool-ha-disable'] + run_.ha.commands()
+        else:
+            try:
+                on = ha_enabled(run_.pool)
+            except Exception:
+                on = False
+            intro, lines = 'Put it back with:', run_.ha.commands(enable=not on)
+        run_.fail('%s\n%s%s' % (intro, u'\n'.join(u'    ' + l for l in lines),
+                                u'\nOnce HA is back, remove %s' % run_.marker
+                                if run_.marker else u''))
+        return
+    step('HA is enabled again.')
+    if run_.marker:
         try:
-            if not ha_enabled(run_.pool):
-                enable_ha(run_.pool, run_.ha)
-        except Exception as exc:
-            run_.fail('HA is not enabled again: %s' % _text(exc))
-            run_.fail('Re-enable it with: %s' % run_.ha.command())
+            os.unlink(run_.marker)
+            run_.marker = None
+        except OSError as exc:
+            run_.fail('HA is back, but %s could not be removed (%s): remove it by hand'
+                      % (run_.marker, _describe(exc)))
+    compare_ha(run_)
 
 def rollback(run_):
     step('Putting the database back as it was before this run...')
@@ -1170,9 +1395,12 @@ def rollback(run_):
                   'xapi; /var/log/xensource.log' % up.detail)
 
 def ha_hint(ha):
-    say('HA will be re-enabled at the end with:')
-    say('    ' + ha.command())
-    say('If this run is killed before then, run that command yourself.')
+    say('HA is on (statefile %s, cluster stack %s). It is turned off for this, and put back '
+        'at the end with:' % (', '.join(ha.statefiles), ha.stack))
+    for line in ha.commands():
+        say('    ' + line)
+    say('If this run is killed before then, run those yourself. They are also kept in %s '
+        'until HA is back.' % ha_marker())
 
 def check_stopped_db(scan):
     if scan.pool.get('ha_enabled') != 'false':
@@ -1191,8 +1419,11 @@ def check_host_flags():
             raise Failed('%s says %s=%s' % (LOCAL_DB, key, value))
 
 def refuse_redo_log(scan):
-    if scan.pool.get('redo_log_enabled') == 'true' or \
-            local_db_value('redo_log.enabled') == 'true':
+    try:
+        local = local_db_value('redo_log.enabled')
+    except Failed as exc:
+        raise Refused(_text(exc))
+    if scan.pool.get('redo_log_enabled') == 'true' or local == 'true':
         raise Refused('the pool has the database redo log enabled (xe pool-enable-redo-log). '
                       'xapi loads it instead of the file at start, undoing the repair. '
                       'Disable it first with: xe pool-disable-redo-log')
@@ -1270,6 +1501,10 @@ def cmd_dry_run(args):
             say('Note: %s exists, from an earlier run (%s ago); rewrite will refuse until '
                 'it is moved away.' % (backup, format_age(time.time() -
                                                            os.lstat(backup).st_mtime)))
+        marked = marker_text()
+        if marked:
+            say('')
+            say('Note: rewrite will refuse until this is dealt with: %s' % marked)
         for check in (lambda: refuse_redo_log(scan), check_load_path):
             try:
                 check()
@@ -1303,6 +1538,9 @@ def live_rewrite(args, inv):
                       'pool is fine, move it away and run this again: mv %s %s.%s'
                       % (backup, format_age(time.time() - os.lstat(backup).st_mtime),
                          backup, backup, time.strftime('%Y%m%d-%H%M%S')))
+    marked = marker_text()
+    if marked:
+        raise Refused(marked)
     data, scan = read_live_db()
     plan = Plan(scan)
     print_plan(plan, DB_PATH, len(data))
@@ -1312,11 +1550,13 @@ def live_rewrite(args, inv):
     check_load_path()
     require_space(DB_PATH, len(data), 2)
     say('')
-    ensure_xapi()
+    require_xapi()
     pool = pool_uuid()
     require_master_is_us(pool, inv)
     check_tasks(args.ignore_tasks)
     ha = capture_ha(pool)
+    if ha:
+        check_ha_hosts(ha, Refused)
     say('')
     say('To repair, xapi is stopped for about a minute: no VM can be started, stopped or '
         'migrated meanwhile, and backups fail. Running VMs are not affected.')
@@ -1326,7 +1566,7 @@ def live_rewrite(args, inv):
         say('Nothing was changed.')
         return 1
     begin_disruptive()
-    run_ = Run(pool, ha)
+    run_ = Run(pool, ha, inv, args.ignore_tasks, True)
     try:
         do_rewrite(run_)
     except BaseException as exc:
@@ -1338,15 +1578,46 @@ def live_rewrite(args, inv):
     settle(run_)
     return report(run_, 'The repair')
 
-def do_rewrite(run_):
-    if run_.ha:
-        run_.ha_touched = True
-        disable_ha(run_.pool)
-        checkpoint()
+def recheck(run_):
+    try:
+        require_master_is_us(run_.pool, run_.inv, Failed)
+        ha = capture_ha(run_.pool)
+    except Refused as exc:
+        raise Failed(_text(exc))
+    if (ha is None) != (run_.ha is None) or (ha is not None and ha.key() != run_.ha.key()):
+        raise Failed('the pool\'s HA settings changed while this run waited to be confirmed, '
+                     'so nothing was done: run it again')
+    if ha is not None:
+        check_ha_hosts(ha, Failed)
+        await_tasks(run_.ignore_tasks, 'turning HA off')
+
+def ha_off(run_):
+    path = ha_marker()
+    try:
+        write_new(path, _utf8(u'\n'.join(run_.ha.commands()) + u'\n'))
+    except BaseException:
+        if path in _WROTE:
+            _unlink_quietly(path)
+        raise
+    run_.marker = path
+    step('Kept the commands that put HA back in %s.' % path)
+    run_.ha_touched = True
+    disable_ha(run_.pool)
+    checkpoint()
+
+def stop_for_edit(run_, xapi_up=True):
     require_disarmed()
+    if xapi_up:
+        await_tasks(run_.ignore_tasks, 'stopping xapi')
     run_.xapi_touched = True
     stop_xapi()
     checkpoint()
+
+def do_rewrite(run_):
+    recheck(run_)
+    if run_.ha:
+        ha_off(run_)
+    stop_for_edit(run_)
     data = read_file(DB_PATH)
     scan = scan_db(data)
     check_stopped_db(scan)
@@ -1403,6 +1674,7 @@ def live_restore(args, inv):
         return 0
     check_load_path()
     require_space(DB_PATH, len(saved), 2)
+    marked = marker_text()
     was_up = xapi_answers()
     pool = ha = None
     if was_up:
@@ -1410,14 +1682,24 @@ def live_restore(args, inv):
         require_master_is_us(pool, inv)
         check_tasks(args.ignore_tasks)
         ha = capture_ha(pool)
+        if ha and marked:
+            raise Refused(marked)
+        if ha:
+            check_ha_hosts(ha, Refused)
     else:
-        armed = local_ha_armed()
+        try:
+            armed = local_ha_armed()
+        except Failed as exc:
+            raise Refused('xapi is not answering, so HA cannot be checked or disabled through '
+                          'it, and %s. Deal with HA first.' % _text(exc))
         if armed != 'false':
             raise Refused('xapi is not answering, so HA cannot be checked or disabled through '
                           'it, and %s says ha.armed=%s. Deal with HA first.'
                           % (LOCAL_DB, armed))
         warn('xapi is not answering. HA is not armed on this host; the backup is put in '
              'place and xapi started. Check HA afterwards.')
+    if marked:
+        warn(marked)
     say('')
     say('Restoring puts the whole database back to the moment the backup was taken: every '
         'change the pool has seen since (VMs, disks, snapshots, settings) is lost from '
@@ -1428,30 +1710,32 @@ def live_restore(args, inv):
         say('Nothing was changed.')
         return 1
     begin_disruptive()
-    run_ = Run(pool, ha)
+    run_ = Run(pool, ha, inv, args.ignore_tasks, False)
     try:
         do_restore(run_, saved, bscan, was_up)
     except BaseException as exc:
         run_.fail(_describe(exc))
         settle(run_)
+        if marked:
+            run_.fail(marked)
         if not isinstance(exc, (Interrupted, Failed, DbError, EnvironmentError)):
             raise
         return report(run_, 'The restore')
     settle(run_)
+    clean = run_.installed and not run_.problems
+    if marked:
+        run_.fail(marked)
     code = report(run_, 'The restore')
-    if run_.installed and not run_.problems:
+    if clean:
         say('The backup is back in place.')
     return code
 
 def do_restore(run_, saved, bscan, was_up):
+    if was_up:
+        recheck(run_)
     if run_.ha:
-        run_.ha_touched = True
-        disable_ha(run_.pool)
-        checkpoint()
-    require_disarmed()
-    run_.xapi_touched = True
-    stop_xapi()
-    checkpoint()
+        ha_off(run_)
+    stop_for_edit(run_, was_up)
     check_host_flags()
     check_load_path()
     try:
@@ -1589,11 +1873,19 @@ def main(argv=None):
         error(_text(exc))
         return 1
     except DbError as exc:
-        error('the database cannot be used: %s. Nothing was changed.' % _text(exc))
+        error('the database cannot be used: %s. %s' % (_text(exc), unchanged()))
         return 1
     except (Failed, EnvironmentError) as exc:
-        error('%s. Nothing was changed.' % _describe(exc))
+        error('%s. %s' % (_describe(exc), unchanged()))
         return 1
+    except KeyboardInterrupt:
+        error('interrupted' if _AUDIT[0] else 'interrupted. %s' % unchanged())
+        return 1
+
+def unchanged():
+    if not _WROTE:
+        return u'Nothing was changed.'
+    return u'Written before it stopped: %s' % u', '.join(_text(p) for p in _WROTE)
 
 if __name__ == '__main__':
     sys.exit(main())
