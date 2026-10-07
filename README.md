@@ -1,315 +1,30 @@
 # xcp-stuff
 Home of the XCP-ng infra health check script & misc xcp tooling
 
-## how to use
+## Repair Scripts
+Both run as root on the pool master, look before they touch anything, and
+ask first. Download the file and run it, don't pipe it in from curl.
+
+**storage-state-fixer.py** (8.3 only) - for when exports, backups or VBD unplugs start failing
+because of storage junk left behind (dead dom0 datapaths, stale dom0 VBDs, stuck GC flags).
+`check` just reports, `fix` shows the list and asks y/N. Editing storage.db restarts xapi on
+that host (VMs keep running), with HA turned off and back on around it.
 ```
-# from XOA as root (no args = interactive menu to choose pool):
-python3 <(curl -fsSL https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/health.py)
-
-# With args:
-python3 <(curl -fsSL https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/health.py) -n mainpool
+curl -fsSLO https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/storage-state-fixer.py
+python3 storage-state-fixer.py check
+python3 storage-state-fixer.py fix
 ```
-That first command works just the same run directly on an XCP-ng host as root - the script
-looks at `/etc/os-release` to see where it is and adapts. See
-[Running it on an XCP-ng host](#running-it-on-an-xcp-ng-host-instead-of-xoa) below for what
-differs there (`-n` is the one flag that doesn't apply, it needs XOA's database).
+If a run gets cut off, `python3 storage-state-fixer.py recover` puts xapi and HA back.
 
-It has to be root in both places. On XOA the pool list and root passwords come out of
-`xo-server-db`, which only root can read, and `xoa check` needs root as well - so run as the
-`xoa` user it stops and says so rather than guessing. Become root first with `sudo -i`, then
-run the one-liner; `sudo python3 <(curl ...)` on its own does not work, because sudo closes
-the file descriptor the `<( )` opens.
-
-Run health.py on an XOA appliance with no arguments, it will pull pool/host information from XOA's database.
-
-- If XOA is connected to more than one pool, it lists the enabled pools and asks which one to check
-- You can also provide a pool's name or part of a name with "-n", (for example, "-n pri" would match XEN-PRIMARY) or by giving the IP of the pool master directly
-- Providing the password is not necessary, it will be pulled from XOA
-- If the host/pool is not in XOA, you can manually specify the pool master IP and password
-- If the host it's checking is part of a pool, it will health check every pool member, unless you provide "-s" for single host check only
-- "-f" cuts the report down to the findings: passing checks, informational readings and any section left with nothing in it are all dropped, so a clean pool prints almost nothing
+**snapshot-fixer.py** (8.2 and 8.3) - fixes broken snapshot links in xapi's database: a VM or
+disk that isn't a snapshot but still claims to be a snapshot of something, or a disk that's a
+snapshot of itself. `dry-run` shows what it would change, `rewrite` does it (stops xapi, backs
+the database up, fixes it, starts xapi, HA handled), `restore-backup` puts the backup back.
 ```
-[03:34 14] xoa:~$ ./health.py --help
-Usage: health.py [OPTION]... [pool_master_or_host[:ssh_port] [root_password]]
-Health-check every host of an XCP-ng pool, from a Xen Orchestra appliance.
-
-All arguments are optional. With no host, the enabled pools in xo-server-db
-are listed to pick from - a single enabled pool, or a non-interactive run,
-takes the first. With no password, it is looked up in xo-server-db. Every host
-in the pool is checked unless -s says otherwise.
-
-  -f, --filter          only print checks that flagged; passing and
-                        informational lines are hidden, sections included
-  -s, --single          check only the given host, not the other pool members
-  -n, --name=NAME       pick the pool from xo-server-db by name instead of
-                        being prompted: the first pool whose name contains
-                        NAME, matched anywhere and ignoring case, so
-                        '-n sec' matches 'XEN-SECONDARY'
-  -c, --command=CMD     run CMD on every reachable pool host and print what
-                        each one said, instead of the health report: no
-                        checks are run and no verdict is reached, so the
-                        exit status is always 0. Cannot be used with --json
-      --json            print the run as one JSON document instead of a
-                        report, for cron and monitoring: same checks, same
-                        exit code, -f narrows it the same way, and anything
-                        that is not the document goes to stderr
-  -h, --help            print this help and exit
-
-Exit status: 0 if every check passed, 1 if any flagged, 2 on a usage error.
-
-Examples:
-  health.py 192.168.1.5
-  health.py 192.168.1.6 'mypass'
-  health.py -s 192.168.1.7 'mypass'
-  health.py -n sec
-  health.py -f -n 'xen-main'
-  health.py -c 'cat /etc/resolv.conf'
-  health.py --json -n sec
-  ```
-
-Exit code is **0** when everything passed, **1** when any check flagged, **2** for a usage
-error - so a wrapper or cron job can tell "you typed the flag wrong" from "the pool has a
-problem". Nothing is installed and nothing is written on the hosts. Reaching a host over
-ssh with a password needs no package either: the password is handed to `ssh` by a helper
-the script writes into its own temporary directory and deletes when it exits, so an
-appliance with no internet access is checked exactly like one with it. If there is no way
-to authenticate at all, the run still prints everything about the appliance itself and
-reports the pool as `Unknown` - it never exits with one line and no report.
-
-## Requirements
-
-Python 3 only - no pip, no modules to install, nothing outside the standard library.
-
-| | needs |
-|---|---|
-| XOA (Debian 11+) | `python3` (Debian ships it; XOA has 3.11) |
-| XCP-ng / XenServer host, 8.3+ | `python3` (dom0 ships 3.6.8) |
-| XCP-ng hosts being *checked from XOA* | nothing - the collector runs under the `python` that every dom0 has, 8.2.1 included |
-
-**XCP-ng 8.2.1 dom0 has no `python3`**, so health.py cannot be run *on* an 8.2 host. Checking
-an 8.2.1 **pool from XOA** works exactly as it always has, and that is the way to check one.
-The old bash `health.sh` that used to cover 8.2 host mode is **retired** - it now only prints
-a pointer back to health.py.
-
-## Running it on an XCP-ng host instead of XOA
-
-The same script can be run directly on a host - it looks at `/etc/os-release` and adapts.
-Useful when there is no XOA to hand, or when XOA cannot reach the pool.
-
+curl -fsSLO https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/snapshot-fixer.py
+python snapshot-fixer.py dry-run
+python snapshot-fixer.py rewrite
 ```
-# on the host, as root (8.3 or newer):
-python3 <(curl -fsSL https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/health.py)
-```
-
-- **This host is always checked**, using local commands - no ssh and no password involved.
-- **The rest of the pool is checked too if you give a root password.** Pool members share
-  the master's root password, so one covers the pool. With a terminal you are simply asked
-  for it; you can also pass it as an argument, though the prompt is preferable since an
-  argument is visible in `ps` and lands in your shell history. dom0 needs no package for
-  this either - the same helper that hands `ssh` the password on XOA is used here.
-- **With no password it checks this host alone and says so** - a `Hosts in Pool` line
-  reports how much of the pool the run covered. Cron and piped runs take this path rather
-  than hanging on a prompt.
-- Pool-level results (pool master, HA, XOSTOR, VLAN 0, migration/backup network, migration
-  compression, missing patches) are reported either way - those are `xe` queries, and xapi
-  answers them from any pool member, slaves included.
-- The XOA section is never printed (there is no appliance). Running on a host with a
-  password otherwise produces the same report an XOA run does for that pool.
-- `-f` and `-s` apply as usual; `-n` and `-c` are XOA-only and are rejected with an
-  explanation.
-
-## Running one command across the pool
-
-`-c` runs a command on every host the run would have checked and prints what each said,
-instead of the health report. It is for the times you want to eyeball one thing across a
-whole pool without typing out an ssh loop:
-
-```
-$ health.py -n sec -c 'cat /etc/resolv.conf'
-Checking pool: XEN-SECONDARY (192.168.1.13)
-
-== 192.168.1.13 ==
-nameserver 192.168.1.1
-nameserver 1.1.1.1
-
-== 192.168.1.34 ==
-nameserver 192.168.1.1
-```
-
-The point of it is that **the pool, the host list and the root password all come from the
-same place the report gets them** - `-n`, the picker, or `xo-server-db` - so there is no
-inventory to keep and no password to look up. `-s` narrows it to one host, exactly as it
-narrows a report.
-
-**This is an XOA-only flag.** That is also the reason it exists: on a hypervisor there is
-no `xo-server-db` to name a pool or find a password in, the command would run on the one
-host you are already logged into, and you have a root shell there anyway. Run on a host it
-is refused with an explanation, the same way `-n` is.
-
-Worth knowing:
-
-- **It reports no verdict.** The exit code is always **0**, whatever the commands did -
-  with several hosts there is no single code that could mean anything, and `1` and `2`
-  already mean "a check flagged" and "you typed it wrong". A command that fails prints
-  `Command failed (exit code N)` under that host, with the reason on stderr; the run
-  carries on to the next host.
-- **Hosts are labelled by address, not by name.** The name is a fact this mode never
-  collects, and fetching it would be a second round trip per host just for a label.
-- **Output is printed in host order**, however the hosts finish. The command runs on up to
-  eight hosts at once (`HEALTH_MAX_PARALLEL` changes it), so on a large pool it is quick -
-  but that also means a destructive command reaches eight hosts before you can stop it.
-- **No health facts are collected**, so a one-line command costs one round trip per host
-  rather than a full sweep. Each command gets 120 s.
-- The command is handed to the host whole and read by the shell there, so pipes, quotes and
-  redirection work as typed - `-c 'ps aux | grep -c xapi'`. Quote it so your *local* shell
-  does not eat it first.
-- **`-c` cannot be combined with `--json`** (it is refused with exit 2). The document
-  describes a health check - every entry has a status, and `flagged`/`exit_code` are summed
-  from them - and `-c` reaches no verdict, so a consumer reading `"flagged": false` off it
-  would conclude the pool was healthy when nothing was ever judged.
-
-This is a diagnostic convenience, not configuration management. It runs as root on every
-host in the pool, with no dry run, no confirmation and no rollback. For anything you run
-more than once, or anything that changes state, use a tool built for it - Ansible, `pssh`,
-`clush` - and keep `-c` for looking.
-
-## When xapi is not answering
-
-A pool whose toolstack is down still gets a report. The usual cause is a master change that
-failed part way, which leaves xapi refusing or hanging on every member. Before v3.18 such a
-run stopped at `xe host-list failed`, having looked at nothing.
-
-- **The host list comes from the pool database file** when xapi will not give it:
-  `/var/lib/xcp/state.db` on the host you pointed it at. Every member keeps one: a master
-  writes its own, and a slave holds the last copy its master sent it. A `Pool Host List`
-  line says the list came from there, and its detail gives the time the file was last
-  written, because a host added or removed since then is not in it.
-- **Every host is still checked for everything that does not need xapi**: logs, dmesg,
-  disks, memory, multipath, mounts, crash dumps, packages, pool.conf. Lines that only xapi
-  can answer (`Host Enabled`, `Multipathing`, `DNS/GW on Non-Mgmt PIFs`, and the pool-level
-  lines when the host they are asked of is down) read `Unknown`.
-- **`XAPI Status`** in each host block says whether that host's toolstack answers. On a
-  slave that includes its connection to the master, since a slave reads everything through
-  its master.
-- **`Pool Roles`** compares every host's `/etc/xensource/pool.conf`, the file xapi reads at
-  startup to decide whether it is the master, a slave of some address, or `broken`. It flags
-  two masters, no master, a `broken` host, and slaves pointing at different hosts or at
-  another slave. Its detail lists every host's pool.conf, so the diagnosis survives `-f` and
-  `--json`. A pool.conf edited by hand to name the master by hostname still counts as
-  pointing at the master.
-- **A wedged xapi is only waited on once per host.** After one `xe` call times out, the rest
-  on that host are skipped and say why, rather than each waiting out its own 60 s.
-- `-c` works on such a pool as well, since it uses the same host list:
-  `health.py -n mypool -c 'cat /etc/xensource/pool.conf'`.
-- Host mode does the same thing. A host whose xapi is down finds its own address in its own
-  copy of the database.
-
-`HEALTH_HOST_LIST=statedb` makes a run take its host list from the file even when xapi
-would have answered. It is a debug knob, for comparing the file's list against xapi's on a
-healthy pool.
-
-## Machine-readable output
-
-`--json` prints the same run as one JSON document instead of a report. Same checks, same
-exit code, and the document is the only thing on stdout - the banner, prompts and warnings
-all go to stderr, so `health.py --json -n sec | jq` works with nothing to strip first.
-
-```json
-{
-  "script_version": "3.1",
-  "run": { "environment": "xoa", "pool_mode": true, "filtered": false,
-           "target": "192.168.1.13", "pool_name": "XEN-SECONDARY",
-           "hosts_in_pool": 2, "hosts_attempted": 2, "hosts_checked": 1 },
-  "xoa":  { "checks": [ ... ] },
-  "pool": { "checks": [ ... ] },
-  "hosts": [
-    { "name": "xen-sec-01", "address": "192.168.1.13", "master": true, "reachable": true,
-      "pool_conf": "master",
-      "checks": [
-        { "key": "Dom0 Disk Usage", "value": "OK", "status": "ok", "flags": false },
-        { "key": "Log Errors", "value": "Yes, See Error Output", "status": "flag",
-          "flags": true, "detail": { "title": "Log Errors", "text": "..." } }
-      ] },
-    { "name": "xen-sec-02", "address": "192.168.1.34", "master": false,
-      "reachable": false, "error": "ssh to 192.168.1.34 failed (exit 255): ..." }
-  ],
-  "flagged": true,
-  "exit_code": 1
-}
-```
-
-Worth knowing:
-
-- **`flags` is the field to alert on**, not the colour and not `status`. A yellow line is
-  usually a finding, but `XOSTOR In Use: Yes` and a backslash in the root password are
-  facts rather than problems, and `flags` already encodes that rule.
-- **A host that could not be reached has no `checks` key at all** - not an empty one. An
-  empty list sums to zero findings, which is exactly the "looks healthy because we never
-  looked" claim the whole script is built to avoid. Check `reachable` and `error`.
-- **The three host counts are all reported** because they routinely differ: how many
-  members the pool has, how many this run put in scope (`-s`, a solo host run), and how
-  many actually answered.
-- **`-f` narrows the document exactly as it narrows the report**, and since v3.13 that
-  means findings only: passing lines and informational readings are gone from both. The
-  one exception is `Hypervisor Version`, which stays as the host block's identity anchor.
-  `flags` is still the cheaper filter, and does not depend on how the run was invoked.
-- **There is no timestamp in the document**, deliberately: two runs of an unchanged pool
-  produce identical output, so diffing one against the last one says something.
-- On a usage error nothing is written to stdout at all, so stdout is always either a whole
-  valid document or empty - never a fragment that fails to parse for an invisible reason.
-
-## How it works
-
-Every host is asked **once**, and the hosts are asked **at the same time** - up to eight at
-a time by default (`HEALTH_MAX_PARALLEL` changes it, `=1` makes it strictly sequential).
-The script ships a small collector to each host over ssh stdin (or runs it locally, in host
-mode), and the collector answers with one JSON document holding every fact the report
-needs. Nothing is written to the host, no shell quoting is involved, and each fact says
-either "here is the value" or "here is why I could not get it" - which is what keeps the
-report from ever printing a green line for something it never established.
-
-Collecting and reporting are separate passes, so running the hosts concurrently changes
-the wall clock and nothing else: the report is still written host by host, in order, and
-reads identically either way.
-
-The `== XOA Status ==` section - the appliance checking itself - runs on its own thread
-alongside the pool and is printed **last**, after the hosts. It shares nothing with them,
-so there is no reason for its `xoa-updater` and `xoa check` calls to stand in front of
-results that are ready. Measured across three pools, that turned 2.9 s of blocking into a
-0-1.3 s wait at the very end, depending on how much host work there was to hide it behind.
-`xo-server-db` is likewise read exactly once per run: one `ls server` returns every record,
-password field included, and costs the same as a narrower query, so the second call the
-password lookup used to make was re-reading what was already in hand. Between them those
-two changes took a typical run from 11-13 s to 6 s.
-
-The collector is written to the Python 2.7 / 3.6 intersection on purpose: 8.2.1 dom0 has
-only `python` (2.7.5), 8.3 has both, and that is what keeps 8.2.1 pools checkable from XOA.
-
-## Repo layout
-
-| | |
-|---|---|
-| `health.py` | the published artifact - one file, no install. **Generated**; do not edit |
-| `src/` | the sources it is built from, one module per concern |
-| `build/stitch.py` | builds `health.py` from `src/`; fails the build on a name collision, an import of `main`, or a collector that does not round-trip |
-| `tests/` | pytest, no network or hosts needed |
-| `xo-config-recover.py` | exports XO's configuration when xo-server is dead - see [below](#xo-config-recover) |
-| `health.sh` | the previous bash implementation, **retired**. Prints a pointer to health.py and exits 1; the implementation itself is in the git history |
-
-```
-python build/stitch.py     # rebuild health.py after changing src/
-python -m pytest tests/    # ~540 tests, all offline
-```
-
-You don't have to remember that first line. Push a change to `src/` and GitHub rebuilds
-`health.py` and commits it back to the branch - merging a PR does it too. So `git pull`
-after a push that touched `src/`.
-
-## Example Output
-
-![Alt text](example-output.png)
-
----
 
 # xo-config-recover
 
@@ -346,3 +61,102 @@ Verified against a real web UI export with xo-server running, with xo-server and
 xoa-updater stopped, and with redis stopped: same records in every section. If XO's
 credential database is encrypted (`redis.encryptCredentialDatabase`) the tool stops and
 says so; decrypting it is not implemented yet.
+
+## Infra Health Check
+Checks for 100+ of the most common XOA and XCP-ng issues across entire pools. Paste this on XOA as root:
+
+```
+python3 <(curl -fsSL https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/health.py)
+```
+
+With no args it grabs the pool list and root passwords from XOA's database and asks which
+pool to check (with only one pool, or no terminal, it just takes the first). Every host in
+the pool gets checked. Nothing gets installed on XOA or the hosts, not even sshpass, so an
+XOA with no internet works fine too - just copy the file over.
+
+It has to run as root. On XOA do `sudo -i` first: `sudo python3 <(curl ...)` won't work,
+because sudo closes the file descriptor `<( )` opens.
+
+Args go on the end of the one-liner:
+
+| | |
+|---|---|
+| `-n NAME` | pick the pool by name instead of from the menu. Partial match, any case, so `-n sec` finds XEN-SECONDARY |
+| `IP [password]` | check a pool by its master's IP (`IP:port` for a different ssh port). Password's only needed if XOA doesn't have it, e.g. `-s` on a slave |
+| `-s` | only check the host you gave it, not the rest of the pool |
+| `-f` | findings only. Everything that passed is hidden, so a healthy pool prints almost nothing |
+| `-c CMD` | run a command on every host in the pool instead of the health check (see below) |
+| `--json` | the same run as JSON, for cron/monitoring (see below) |
+| `-h` | full help |
+
+```
+health.py -n sec
+health.py -f -n xen-main
+health.py -s 192.168.1.7 'mypass'
+```
+
+Exit code is 0 if everything passed, 1 if anything flagged, 2 if you got the arguments wrong.
+
+### On an XCP-ng host
+The same one-liner works as root on an 8.3 host, it figures out where it's running. It
+always checks the host it's on, and if you give it the root password (it'll ask if you're at
+a terminal) it checks the rest of the pool too. No password just means this host only. `-n`
+and `-c` need XOA, so they don't work here.
+
+8.2.1 hosts have no python3, so it can't run on them. Check 8.2 pools from XOA instead, that
+works fine.
+
+### Running a command across the pool
+`-c` runs one command on every host and prints what each one said, using the same pool and
+password lookup as the health check. Handy for eyeballing something pool-wide without
+writing an ssh loop. XOA only.
+
+```
+$ health.py -n sec -c 'cat /etc/resolv.conf'
+Checking pool: XEN-SECONDARY (192.168.1.13)
+
+== 192.168.1.13 ==
+nameserver 192.168.1.1
+
+== 192.168.1.34 ==
+nameserver 192.168.1.1
+```
+
+It hits up to 8 hosts at once with no confirmation, so use it for looking at things, not
+changing them. Exit code is always 0, and it can't be combined with `--json`.
+
+### JSON output
+`--json` gives you the same checks and exit code as one JSON document. Only the JSON goes to
+stdout (banner and prompts go to stderr), so `health.py --json -n sec | jq` works as is.
+
+- Alert on each check's `flags` field, not `status` or the color
+- A host it couldn't reach has `reachable: false` and no `checks` at all, so don't read a
+  missing list as healthy
+- `-f` trims it the same way it trims the report
+- No timestamp, so two runs of an unchanged pool diff clean
+
+
+### How it works
+Each host gets one ssh call, up to 8 at a time. A small collector goes over ssh stdin, grabs
+everything, and sends back one JSON blob, so nothing's written to the host. Every fact comes
+back as either a value or the reason it couldn't get one, so the report never shows green
+for something it didn't actually check. The collector also runs on python 2.7, which is how
+8.2.1 pools get checked from XOA.
+
+It only needs python3's standard library, which XOA and 8.3 hosts already have.
+
+### Working on it
+`health.py` is built from `src/`, so don't edit it directly.
+```
+python build/stitch.py     # rebuild health.py after changing src/
+python -m pytest tests/    # all offline, no hosts needed
+```
+GitHub rebuilds `health.py` on every push anyway, so `git pull` after pushing a `src/`
+change. The old bash `health.sh` is retired and just points here now.
+
+### Example Output
+
+![Alt text](example-output.png)
+
+---
+
