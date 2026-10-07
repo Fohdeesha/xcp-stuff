@@ -25,7 +25,7 @@ import threading
 import time
 import xml.parsers.expat
 
-VERSION = '1.4'
+VERSION = '1.5'
 PYTHON = sys.version.split()[0]
 PROG = 'storage-state-fixer'
 STORAGE_DB = '/var/run/nonpersistent/xapi/storage.db'
@@ -108,6 +108,8 @@ ENSURE_TIMEOUT = 1800
 ENSURE_MARGIN = 60
 ACT_START_TIMEOUT = 120
 FETCH_TIMEOUT = 120
+TASK_WAIT = 120
+HOUSEKEEPING_TASKS = ('SR.scan',)
 UNPLUG_TIMEOUT = 300
 DP_DESTROY_TIMEOUT = 300
 SCAN_TIMEOUT = 300
@@ -2807,17 +2809,6 @@ def local_recheck(spec):
     problems.extend(ha_stop_problems())
     if problems:
         return problems
-    deadline = _now() + QUIET_WAIT
-    while True:
-        try:
-            busy = bounded(local_sm_activity, SCAN_BUDGET)
-        except Failed as exc:
-            return [_text(exc)]
-        if not busy:
-            break
-        if _now() > deadline:
-            return ['SM is not quiet here after %ds: %s' % (QUIET_WAIT, '; '.join(busy[:5]))]
-        time.sleep(1)
     try:
         rows = f_tapdisks()
     except Exception as exc:
@@ -2840,11 +2831,6 @@ def local_recheck(spec):
     try:
         x = s.xenapi
         me = x.host.get_by_uuid(spec['host_uuid'])
-        for ref, t in x.task.get_all_records().items():
-            if t['status'] != 'pending':
-                continue
-            if spec.get('is_master') or t['resident_on'] == me:
-                problems.append('task %s "%s" is pending' % (t['uuid'], t['name_label']))
         if served:
             for ref, v in x.VDI.get_all_records().items():
                 if v['uuid'] not in served:
@@ -2853,6 +2839,21 @@ def local_recheck(spec):
                 for key in ('paused', 'relinking'):
                     if key in smc:
                         problems.append('VDI %s, served here, now carries %s' % (v['uuid'], key))
+        if problems:
+            return problems
+        deadline = _now() + QUIET_WAIT
+        while True:
+            busy = bounded(local_sm_activity, SCAN_BUDGET)
+            for ref, t in x.task.get_all_records().items():
+                if t['status'] == 'pending' and (spec.get('is_master') or t['resident_on'] == me):
+                    busy.append('task %s "%s" is pending' % (t['uuid'], t['name_label']))
+            if not busy:
+                break
+            if _now() > deadline:
+                return ['xapi and SM are not quiet here after %ds: %s' % (QUIET_WAIT, '; '.join(busy[:5]))]
+            time.sleep(1)
+    except Failed as exc:
+        problems.append(_text(exc))
     except Exception as exc:
         problems.append('reading the pool through the local xapi failed: %s' % _text(exc))
     finally:
@@ -2928,6 +2929,14 @@ def local_sm_activity():
                 busy.append('lock %s held by pid %d' % (l['path'] or '(an unlinked SM lock file)', l['pid']))
     except Exception as exc:
         busy.append('the SM lock holders cannot be read: %s' % _text(exc))
+    r = systemctl('list-units', '--all', '--no-legend', '--plain', 'SMGC@*')
+    if not r.ok:
+        busy.append('the GC units cannot be listed: %s' % r.why())
+    else:
+        for line in r.out.splitlines():
+            f = line.split()
+            if len(f) >= 3 and f[2] in ('active', 'activating', 'deactivating', 'reloading'):
+                busy.append('%s is %s' % (f[0].replace('\\x2d', '-'), f[2]))
     return busy
 
 
@@ -4117,10 +4126,15 @@ def xapi_ensure(args):
                 safe_status(d, checked_state(st, load), detail='%s; recover found xapi running%s' % (
                     'its load was not established' if st.get('state') == 'unverified' else 'the action did not finish',
                     note), recover_load=load)
-            ready = xapi_ready(f_xapi_state(), f_cookies())
+            deadline = _now() + INIT_WAIT
+            while True:
+                ready = xapi_ready(f_xapi_state(), f_cookies())
+                if ready or _now() > deadline:
+                    break
+                time.sleep(POLL)
             return {'started': False, 'busy': None, 'ready': ready,
                     'detail': 'xapi is running and answering%s%s' % (
-                        '' if ready else ', but has not finished initialising', note)}
+                        '' if ready else ', but has not finished initialising after %ds' % INIT_WAIT, note)}
         old = edited = note = None
         if unfinished:
             old, edited, note = edited_by_action(st, log_dir, 'recover')
@@ -4448,10 +4462,10 @@ class Model(object):
         s = self.srs.get(sref)
         return u'%s "%s" (%s)' % (s['uuid'], s['name_label'], s['type']) if s else _text(sref)
 
-    def pending_tasks(self, href=None):
+    def pending_tasks(self, href=None, work=False):
         out = []
         for ref, t in self.tasks.items():
-            if t['status'] != 'pending':
+            if t['status'] != 'pending' or (work and t['name_label'] in HOUSEKEEPING_TASKS):
                 continue
             if href is None or t['resident_on'] == href:
                 out.append(t)
@@ -4988,7 +5002,7 @@ def host_gate(audit, href, opts):
     m = audit.model
     hv = audit.view(href)
     block, unknown = [], []
-    for t in m.pending_tasks(href):
+    for t in m.pending_tasks(href, work=True):
         if m.is_gc_task(t):
             continue
         block.append('task "%s" (%s) is pending on this host' % (t['name_label'], t['uuid']))
@@ -5488,6 +5502,13 @@ def eval_dom0_dp(a, opts, hv, dp, cl, sr, vdi, st, naming, selfcheck, gate):
     elif keys:
         waits.append('a xapi restart on %s would change its version (%s): %s' % (hv.name, '; '.join(keys),
                                                                                 UPGRADE_REMEDY))
+    for row in hv.live_taps() if hv.taps is not None else []:
+        if row['state'] is not None and row['state'] & PAUSED:
+            waits.append('tapdisk pid %s minor %s on %s is paused (see C12), and xapi is not restarted next to a '
+                         'paused tapdisk' % (row['pid'], row['minor'], hv.name))
+        elif row['state'] is not None and row['state'] & ~LOG_DROPPED:
+            waits.append('tapdisk pid %s minor %s on %s is in state %s, and xapi is not restarted next to it'
+                         % (row['pid'], row['minor'], hv.name, tap_state_text(row['state'])))
     waits.extend(gate[0])
     unknowns.extend(gate[1])
     verdict, reason = verdict_of(problems, unknowns, waits)
@@ -6672,8 +6693,8 @@ def eval_paused_tap(a, opts, hv, row):
     elif not st.get('ok'):
         unknowns.append('the tapdisk gave no stats: %s%s' % (st.get('error'), ' (its process is gone)'
                                                              if st.get('gone') else ''))
-    if m.pending_tasks():
-        waits.append('%d task(s) are pending in the pool' % len(m.pending_tasks()))
+    if m.pending_tasks(work=True):
+        waits.append('%d task(s) are pending in the pool' % len(m.pending_tasks(work=True)))
     gstate, greasons = gc_state(a, v['SR'])
     if gstate != 'idle':
         waits.append('GC on the SR is %s' % gstate)
@@ -6817,8 +6838,13 @@ def eval_gc(a, opts):
         for note in (orphan_block(a, sr['uuid']), orphan_unknown(a, sr['uuid'])):
             if note:
                 extra.append(note)
-        out.append(ev(('C19', sr['uuid']), 'C19', REPORT, hv.uuid, 'C19 GC on SR %s' % m.name_sr(sref),
-                      '%d of its last %d runs failed%s' % (len(bad), len(last), (': ' + '; '.join(why)) if why else ''),
+        latest = last[-1]
+        recovered = latest.get('outcome') == 'exited' and not latest.get('aborted') and not latest.get('error')
+        out.append(ev(('C19', sr['uuid']), 'C19', INFO if recovered else REPORT, hv.uuid,
+                      'C19 GC on SR %s' % m.name_sr(sref),
+                      '%d of its last %d runs failed%s%s' % (
+                          len(bad), len(last), (': ' + '; '.join(why)) if why else '',
+                          '; its latest run ended normally, so the GC works again' if recovered else ''),
                       ['%s %s' % (format_age(host_time(hv, a) - r['last']) + ' ago', r.get('outcome') or r.get('error'))
                        for r in last] + ['GC now: %s%s' % (st, (' (%s)' % '; '.join(swhy)) if swhy else '')] + extra))
     for href in sorted(set(m.sr_master(s) for s in m.srs) - set([None])):
@@ -7704,7 +7730,7 @@ class Engine(object):
             if not isinstance(snap, dict):
                 snap = {}
             if cls == 'task':
-                if op == 'del' or snap.get('status') != 'pending':
+                if op == 'del' or snap.get('status') != 'pending' or snap.get('name_label') in HOUSEKEEPING_TASKS:
                     continue
                 if snap.get('name_label') == 'Garbage Collection':
                     gsr = [s for s in srs if (snap.get('name_description') or '').endswith(s)]
@@ -7854,7 +7880,7 @@ class Engine(object):
         elif hv.room['free'] < 2 * hv.sdb['size'] + (1 << 20):
             reasons.append('%s has %d bytes free, too little for the storage.db backup' % (hv.room['path'],
                                                                                          hv.room['free']))
-        tasks = m.pending_tasks(None if h.is_master else href)
+        tasks = m.pending_tasks(None if h.is_master else href, work=True)
         for t in tasks:
             reasons.append('task "%s" (%s) is pending%s' % (t['name_label'], t['uuid'],
                                                             '' if h.is_master else ' on this host'))
@@ -8071,7 +8097,7 @@ class Engine(object):
                 self.result(it, 'skipped', 'nothing written: %s' % stat_['skipped'])
             return
         step('  %s: xapi is back; reading storage.db again in %ds' % (h.name, VERIFY_DELAY))
-        pause(VERIFY_DELAY)
+        pause(VERIFY_DELAY, False)
         check = self.audit(hosts=[h.uuid], smlog=False)
         cv = check.view(m.host_by_uuid[h.uuid])
         if cv.claim is None:
@@ -8261,9 +8287,17 @@ class Engine(object):
         if late:
             raise Skip('HA is not touched: xapi on %s has not finished initialising, and HA could not be enabled '
                        'again around it' % ', '.join(late))
-        busy = [t for t in m.pending_tasks() if not m.is_gc_task(t)]
-        if busy:
-            raise Skip('HA is not touched: task "%s" (%s) is pending' % (busy[0]['name_label'], busy[0]['uuid']))
+        deadline = _now() + TASK_WAIT
+        while True:
+            busy = [t for t in m.pending_tasks() if not m.is_gc_task(t)]
+            if not busy:
+                break
+            if _now() > deadline:
+                raise Skip('HA is not touched: task "%s" (%s) is still pending after %ds'
+                           % (busy[0]['name_label'], busy[0]['uuid'], TASK_WAIT))
+            waiting(u'task "%s" to finish before HA is turned off' % busy[0]['name_label'])
+            pause(2)
+            m = Model(pool_snapshot(self.ctx.api))
         try:
             self.set_marker()
         except Exception as exc:
