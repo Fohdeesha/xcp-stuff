@@ -26,7 +26,7 @@ import threading
 import time
 import xml.parsers.expat
 
-VERSION = '1.6'
+VERSION = '1.7'
 PYTHON = sys.version.split()[0]
 PROG = 'storage-state-fixer'
 STORAGE_DB = '/var/run/nonpersistent/xapi/storage.db'
@@ -5897,7 +5897,7 @@ def descendants(model, vref):
 
 
 PHASES = (('S', 'storage.db (xapi restarted on the host)'), ('V', 'dom0 VBD releases'),
-          ('L', 'leaked guest datapaths'), ('F', 'sm-config flags'), ('P', 'paused tapdisks'),
+          ('L', 'datapaths removed through xapi'), ('F', 'sm-config flags'), ('P', 'paused tapdisks'),
           ('G', 'garbage collector'))
 CLASS_TITLES = {
     'C01': 'dead dom0 datapath that duplicates another', 'C02': 'dead dom0 datapath',
@@ -6202,22 +6202,8 @@ def not_judged(a, hv, dp, sr, key, vdi, st, why):
               ['state %s' % canon(st)])
 
 
-def eval_dom0_dp(a, opts, hv, dp, cl, sr, vdi, st, naming, selfcheck, gate):
+def dom0_dp_proofs(a, hv, dp, sr, vdi, sr_type, vref, naming, selfcheck, evidence):
     m = a.model
-    dup = len(cl) >= 2
-    cls = 'C01' if dup else 'C02'
-    key = ('DP0', hv.uuid, sr, vdi, dp)
-    vref = m.vdi_by_uuid.get(vdi)
-    sref = m.sr_by_uuid.get(sr)
-    sr_type = m.srs[sref]['type'] if sref else None
-    title = '%s %s on %s, VDI %s' % (cls, dp, hv.name, m.name_vdi(vref) if vref else vdi + ' (not in xapi)')
-    others = ['%s %s' % (c[1], canon(c[2])) for c in cl if c[1] != vdi]
-    evidence = ['state %s; %s' % (canon(st), ('other claimant(s): ' + ', '.join(others)) if others
-                                  else 'no other claimant yet: the next export on this name would fail')]
-    if st != ['Attached', 'RO']:
-        return ev(key, cls, REPORT, hv.uuid, title,
-                  'it is %s with no attached dom0 VBD behind it; only Attached/RO datapaths (refused export '
-                  'activations) are removed' % canon(st), evidence)
     problems, unknowns, waits = [], [], []
     if sr_type is None:
         unknowns.append('SR %s is not known to xapi, so how this datapath was attached is not established' % sr)
@@ -6289,6 +6275,28 @@ def eval_dom0_dp(a, opts, hv, dp, cl, sr, vdi, st, naming, selfcheck, gate):
                     evidence.append('%s: open:no here' % vol)
                 else:
                     problems.append('%s is open here (%s)' % (vol, canon(d['value'].get('open'))))
+    return problems, unknowns, waits
+
+
+def eval_dom0_dp(a, opts, hv, dp, cl, sr, vdi, st, naming, selfcheck, gate):
+    m = a.model
+    dup = len(cl) >= 2
+    cls = 'C01' if dup else 'C02'
+    key = ('DP0', hv.uuid, sr, vdi, dp)
+    vref = m.vdi_by_uuid.get(vdi)
+    sref = m.sr_by_uuid.get(sr)
+    sr_type = m.srs[sref]['type'] if sref else None
+    title = '%s %s on %s, VDI %s' % (cls, dp, hv.name, m.name_vdi(vref) if vref else vdi + ' (not in xapi)')
+    others = ['%s %s' % (c[1], canon(c[2])) for c in cl if c[1] != vdi]
+    evidence = ['state %s; %s' % (canon(st), ('other claimant(s): ' + ', '.join(others)) if others
+                                  else 'no other claimant yet: the next export on this name would fail')]
+    if st == ['Attached', 'RW']:
+        return eval_dom0_attached(a, hv, dp, cl, sr, vdi, st, naming, selfcheck, gate, cls, key, title, evidence)
+    if st != ['Attached', 'RO']:
+        return ev(key, cls, REPORT, hv.uuid, title,
+                  'it is %s with no attached dom0 VBD behind it; only datapaths a refused activation left '
+                  'Attached are removed' % canon(st), evidence)
+    problems, unknowns, waits = dom0_dp_proofs(a, hv, dp, sr, vdi, sr_type, vref, naming, selfcheck, evidence)
     keys, why, notes = xapi_move(a, hv.href)
     if why:
         unknowns.append(why)
@@ -6311,6 +6319,76 @@ def eval_dom0_dp(a, opts, hv, dp, cl, sr, vdi, st, naming, selfcheck, gate):
             'state': st}
     return ev(key, cls, verdict, hv.uuid, title, reason, evidence,
               sig=[dp, st, sorted([c[0], c[1], c[2]] for c in cl)], item=item if verdict == FIX else None)
+
+
+def userdevice_number(s):
+    s = _text(s or '')
+    if s.isdigit():
+        return int(s)
+    for n in range(26 * 27):
+        if devname(n) == s:
+            return n
+    return None
+
+
+def eval_dom0_attached(a, hv, dp, cl, sr, vdi, st, naming, selfcheck, gate, cls, key, title, evidence):
+    m = a.model
+    vref = m.vdi_by_uuid.get(vdi)
+    sref = m.sr_by_uuid.get(sr)
+    sr_type = m.srs[sref]['type'] if sref else None
+    problems, unknowns, waits = dom0_dp_proofs(a, hv, dp, sr, vdi, sr_type, vref, naming, selfcheck, evidence)
+    if len(cl) > 1:
+        problems.append('%d VDIs on this host claim %s, and xapi\'s teardown acts on the name, so it would take every '
+                        'one of them' % (len(cl), dp))
+    if sr_type is not None and sr_type not in ATOMIC_PAUSE_SR_TYPES:
+        problems.append('on a %s SR, SM\'s attach is not known to leave nothing behind, so what the datapath still '
+                        'holds is not established' % sr_type)
+    if vref is not None and 'host_' + hv.href in (m.vdis[vref].get('sm_config') or {}):
+        problems.append('the VDI carries sm-config host_%s: SM marks it activated on this host, so this is not a '
+                        'refused activation (see C13)' % hv.href)
+    side = dp.replace('/', '-')
+    route = None
+    if hv.dps_files is None:
+        unknowns.append('xapi\'s storage-dps records on this host were not read: %s' % hv.why('storage_dps'))
+    elif side not in hv.dps_files:
+        problems.append('xapi has no storage-dps/%s record, so its own teardown would do nothing' % side)
+    else:
+        route, why = route_of(hv.dps_files[side], sr, [c[3] for c in cl if c[0] == sr and c[1] == vdi] or [vdi],
+                              '0', st)
+        if why:
+            unknowns.append('xapi routes its teardown of %s by its storage-dps/%s record, and %s, so what the '
+                            'teardown would reach is not established' % (dp, side, why))
+    userdevice = userdevice_number(dp.split('/')[-1])
+    holders, placeholder = collections.OrderedDict(), None
+    if userdevice is None:
+        unknowns.append('the device name of %s does not map to a userdevice' % dp)
+    else:
+        dom0 = m.dom0_of(hv.href)
+        for vbds in (m.vbds, a.vbd2 or {}):
+            for vbref, vbd in vbds.items():
+                if vbd['VM'] != dom0 or userdevice_number(vbd['userdevice']) != userdevice:
+                    continue
+                if (vbd.get('other_config') or {}).get(RESERVE_KEY) and not vbd['currently_attached'] and \
+                        vbd['VDI'] == vref:
+                    placeholder = vbd['uuid']
+                    continue
+                holders[vbd['uuid']] = vbd
+        for u, vbd in holders.items():
+            problems.append('dom0 VBD %s holds its device name (userdevice %s)%s: plugging it would land on this '
+                            'datapath, so it is released first (see C04)'
+                            % (u, vbd['userdevice'], ', and is attached' if vbd['currently_attached'] else ''))
+    if placeholder:
+        evidence.append('its device name is held by placeholder dom0 VBD %s of this tool' % placeholder)
+    waits.extend(gate[0])
+    unknowns.extend(gate[1])
+    verdict, reason = verdict_of(problems, unknowns, waits)
+    if verdict == FIX:
+        reason = ('an activation that was refused left it Attached: nothing on %s serves or holds it, and no dom0 VBD '
+                  'there holds its device name; xapi\'s own teardown removes it, without a xapi restart' % hv.name)
+    item = {'cls': cls, 'phase': 'L', 'action': 'dp0-destroy', 'host': hv.uuid, 'sr': sr, 'vdi': vdi, 'dp': dp,
+            'userdevice': str(userdevice)}
+    return ev(key, cls, verdict, hv.uuid, title, reason, evidence,
+              sig=[dp, st, sorted([c[0], c[1], c[2]] for c in cl), route], item=item if verdict == FIX else None)
 
 
 def eval_guest_dp(a, opts, hv, dp, cl, sr, vdi, st):
@@ -6528,6 +6606,12 @@ def eval_vbd(a, opts, vbd, vm, vdi):
                                             'is a snapshot' if vdi['is_a_snapshot'] else 'type %s' % vdi['type'],
                                             '; owner(s): ' + ', '.join('"%s" %s' % (o['name_label'], o['power_state'])
                                                                        for o, _ in regular) if regular else '')]
+    tag = _text((vbd.get('other_config') or {}).get(RESERVE_KEY) or '')
+    if tag and not vbd['currently_attached']:
+        return ev(key, cls, REPORT, m.hosts[href]['uuid'] if href in m.hosts else None, title,
+                  'a placeholder this tool makes to hold the device name of a datapath while xapi removes that '
+                  'datapath (run %s); it is never plugged. If no run of this tool is open, it is left over: xe '
+                  'vbd-destroy uuid=%s' % (tag.split(' ')[0], vbd['uuid']), evidence)
     if href not in m.hosts:
         return ev(key, cls, UNKNOWN, None, title, 'its control domain is not resident on a known host', evidence)
     hv = a.view(href)
@@ -7786,7 +7870,8 @@ def dependencies(final, audits):
             e['verdict'], e['item'] = UNKNOWN, None
             e['reason'] = 'whether its datapath name has a dead duplicate in storage.db is not established'
             continue
-        left = [d for d in dead if not (by.get(('DP0', it['host'], d[0], d[1], d[2])) or {}).get('item')]
+        left = [d for d in dead if ((by.get(('DP0', it['host'], d[0], d[1], d[2])) or {}).get('item') or {})
+                .get('action') != 'storage-db']
         if left:
             e['verdict'], e['item'] = WAIT, None
             e['reason'] = ('its datapath name %s has a dead duplicate in storage.db (C01, VDI %s) that is not removed '
@@ -8147,6 +8232,9 @@ def describe_item(model, it):
             txt += u', after making its stale backend node /dev/sm/backend/%s/%s (tap minor %d) inert' % (
                 it['sr'], it['vdi'], it['inert']['rdev'][1])
         return txt
+    if a == 'dp0-destroy':
+        return (u'xe host-sm-dp-destroy %s of VDI %s on %s (no leak allowed, no xapi restart), with its device name '
+                u'held by a placeholder dom0 VBD meanwhile' % (it['dp'], it['vdi'], hn))
     if a == 'dp-destroy':
         return u'xe host-sm-dp-destroy %s of VDI %s on %s%s%s' % (
             it['dp'], it['vdi'], hn, (u' (once dom0 VBD(s) %s are released)' % ', '.join(it['needs']))
@@ -8228,6 +8316,12 @@ def print_plan(ctx, audit, plan, ha):
             say(u'    by hand, it is:')
             for line in ha.commands():
                 say(u'        ' + line)
+    n_dp0 = len([it for it in plan if it['action'] == 'dp0-destroy'])
+    if n_dp0:
+        say(u'  - %d dom0 datapath(s) that a refused activation left Attached are removed by xapi itself (xe '
+            u'host-sm-dp-destroy, no leak allowed), with no xapi restart. While each one is removed, a placeholder dom0 '
+            u'VBD that is never plugged holds its device name, so that no other disk can be given that name '
+            u'meanwhile.' % n_dp0)
     n_vbd = len([it for it in plan if it['action'] == 'release-vbd'])
     if n_vbd:
         say(u'  - %d dom0 VBD(s) are unplugged and destroyed (the VDIs themselves are not touched).' % n_vbd)
@@ -8307,6 +8401,7 @@ def capture_ha(model):
 
 
 HA_MARKER = 'storage-state-fixer-ha-off'
+RESERVE_KEY = 'storage-state-fixer-reserve'
 
 
 def ha_operations(pool):
@@ -8545,7 +8640,7 @@ class Engine(object):
         self.j.rec('event_token', error=_text(err))
         return None
 
-    def changed(self, fresh, h, vdis=(), vbds=(), srs=()):
+    def changed(self, fresh, h, vdis=(), vbds=(), srs=(), mine=()):
         token = getattr(fresh, 'token', None)
         if token is None:
             return 'the event check failed: no event token could be taken before the read'
@@ -8584,6 +8679,8 @@ class Engine(object):
                                     any(n in (snap.get('name_description') or '') for n in names)):
                     out.append('task "%s" started' % label)
             elif cls == 'vbd':
+                if ref in mine:
+                    continue
                 if ref in known or (dom0 and snap.get('VM') == dom0) or snap.get('VDI') in vdi_refs:
                     out.append('VBD %s: %s' % (snap.get('uuid') or ref, op))
             elif cls == 'vm':
@@ -8728,7 +8825,7 @@ class Engine(object):
 
     def same_target(self, e, it):
         k = e['key']
-        if it['action'] == 'storage-db':
+        if it['action'] in ('storage-db', 'dp0-destroy'):
             return k[0] == 'DP0' and k[1:] == [it['host'], it['sr'], it['vdi'], it['dp']]
         if it['action'] == 'release-vbd':
             return k == ['VBD', it['vbd']]
@@ -9714,6 +9811,9 @@ class Engine(object):
             if self.halt:
                 break
             checkpoint()
+            if it['action'] == 'dp0-destroy':
+                self.release_dp0(it)
+                continue
             h = self.host(it['host'])
             fresh, e, why = self.fresh_check(h, it, recheck=self.recheck_c03)
             if e is None:
@@ -9784,6 +9884,124 @@ class Engine(object):
                 done = forgot + '; ' + done
             out = r.out.strip()
             self.result(it, 'fixed', done + ('; xe printed: %s' % out[:300] if out else ''))
+
+    def release_dp0(self, it):
+        h = self.host(it['host'])
+        fresh, e, why = self.fresh_check(h, it)
+        if e is None:
+            hv = fresh.view(fresh.model.host_by_uuid[h.uuid])
+            if hv.claim is not None and not any(c[1] == it['vdi'] for c in hv.claim.get(it['dp'], [])):
+                return self.result(it, 'already-fixed', 'the datapath is gone')
+            return self.result(it, 'skipped', why)
+        moved = self.changed(fresh, h, vdis=[it['vdi']], srs=[it['sr']])
+        if moved:
+            return self.result(it, 'skipped', 'something changed since it was re-checked (%s); run check again' % moved)
+        hold, why = self.hold_name(fresh, h, it)
+        if hold is None:
+            return self.result(it, 'skipped', 'not removed: %s' % why)
+        keep = False
+        try:
+            fresh, e, why = self.fresh_check(h, it)
+            if e is None:
+                return self.result(it, 'skipped', 'not removed: %s' % why)
+            moved = self.changed(fresh, h, vdis=[it['vdi']], srs=[it['sr']], mine=[hold[0]])
+            if moved:
+                return self.result(it, 'skipped', 'not removed: something changed since it was re-checked (%s); run '
+                                                  'check again' % moved)
+            since = self.host_now(fresh, h)
+            self.act_on(it)
+            self.j.rec('dp0_destroy', seq=it['seq'], host=h.uuid, dp=it['dp'], vdi=it['vdi'], vbd=hold[1])
+            r = xe('host-sm-dp-destroy', 'uuid=' + h.uuid, 'dp=' + it['dp'], 'allow-leak=false',
+                   timeout=DP_DESTROY_TIMEOUT)
+            if not r.ok:
+                tail, lines = self.smlog_tail(h, it['vdi'], since)
+                if r.timed_out:
+                    keep = True
+                    self.j.rec('reserve_kept', seq=it['seq'], vbd=hold[1], why='the teardown did not finish')
+                    self.fail_item(it, 'xe host-sm-dp-destroy did not finish within %ds, so whether xapi removed it is '
+                                   'not established (%s). Placeholder dom0 VBD %s keeps holding its device name: once '
+                                   'xe host-get-sm-diagnostics uuid=%s no longer lists %s for VDI %s, remove it with '
+                                   'xe vbd-destroy uuid=%s%s' % (DP_DESTROY_TIMEOUT, r.why(), hold[1], h.uuid,
+                                                                it['dp'], it['vdi'], hold[1], tail))
+                self.fail_item(it, 'xapi did not remove it (%s); it was not told to allow a leak, so it still records '
+                               'the datapath and nothing was forgotten%s' % (r.why(), tail))
+            check = self.audit(hosts=[h.uuid], smlog=False)
+            cv = check.view(check.model.host_by_uuid[h.uuid])
+            if cv.claim is None:
+                self.fail_item(it, 'storage.db on %s cannot be read back: %s' % (h.name, cv.sdb_error))
+            if any(c[1] == it['vdi'] for c in cv.claim.get(it['dp'], [])):
+                self.fail_item(it, 'xe host-sm-dp-destroy answered, but the datapath is still in storage.db')
+            left, unknown = self.footprint(cv, it['sr'], it['vdi'], strict=True)
+            if left or unknown:
+                self.fail_item(it, 'xapi removed the datapath, but on %s: %s' % (h.name, '; '.join((left + unknown)[:6])))
+            side = it['dp'].replace('/', '-')
+            note = ''
+            if cv.dps_files is not None and side in cv.dps_files:
+                note = '; its storage-dps/%s record is still there, although xapi removes it with the datapath' % side
+            self.result(it, 'fixed', 'removed by xapi\'s own teardown (no leak allowed), without a xapi restart; '
+                                     'placeholder dom0 VBD %s held its device name meanwhile%s' % (hold[1], note))
+        finally:
+            if not keep:
+                self.free_name(h, it, hold)
+
+    def hold_name(self, fresh, h, it):
+        x = self.ctx.api.x
+        m = fresh.model
+        dom0 = m.dom0_of(m.host_by_uuid.get(h.uuid))
+        vref = m.vdi_by_uuid.get(it['vdi'])
+        if dom0 is None or vref is None:
+            return None, 'the control domain of %s or the VDI is not found' % h.name
+        want = int(it['userdevice'])
+        hold = None
+        for r, vbd in sorted(m.vbds.items()):
+            if vbd['VM'] == dom0 and vbd['VDI'] == vref and not vbd['currently_attached'] and \
+                    (vbd.get('other_config') or {}).get(RESERVE_KEY) and userdevice_number(vbd['userdevice']) == want:
+                hold = (r, vbd['uuid'])
+                self.j.rec('reserve_adopted', seq=it['seq'], host=h.uuid, vbd=vbd['uuid'])
+                break
+        if hold is None:
+            self.j.rec('reserve', seq=it['seq'], host=h.uuid, vdi=it['vdi'], dp=it['dp'], userdevice=it['userdevice'])
+            try:
+                r = x.VBD.create({'VM': dom0, 'VDI': vref, 'userdevice': it['userdevice'], 'bootable': False,
+                                  'mode': 'RO', 'type': 'Disk', 'unpluggable': True, 'empty': False,
+                                  'other_config': {RESERVE_KEY: '%s %s' % (self.run_id, it['dp'])},
+                                  'qos_algorithm_type': '', 'qos_algorithm_params': {}})
+            except Exception as exc:
+                self.j.rec('reserve_failed', seq=it['seq'], error=_text(exc))
+                return None, ('its device name could not be held (VBD.create userdevice=%s: %s)'
+                              % (it['userdevice'], _text(exc)))
+            try:
+                u = x.VBD.get_uuid(r)
+            except Exception as exc:
+                u = _text(r)
+            hold = (r, u)
+            self.j.rec('reserved', seq=it['seq'], host=h.uuid, vbd=u)
+        try:
+            recs = sanitize(x.VBD.get_all_records())
+        except Exception as exc:
+            self.free_name(h, it, hold)
+            return None, 'the dom0 VBDs could not be read after its device name was held: %s' % _text(exc)
+        rivals = sorted(v['uuid'] for r, v in recs.items() if r != hold[0] and v['VM'] == dom0 and
+                        userdevice_number(v['userdevice']) == want)
+        if rivals:
+            self.free_name(h, it, hold)
+            return None, 'dom0 VBD %s has the same device name' % rivals[0]
+        return hold, None
+
+    def free_name(self, h, it, hold):
+        x = self.ctx.api.x
+        try:
+            if x.VBD.get_currently_attached(hold[0]):
+                self.j.rec('reserve_kept', seq=it['seq'], vbd=hold[1], why='attached')
+                warn('placeholder dom0 VBD %s on %s is attached, although this tool never plugs it: it is left as it '
+                     'is; look at it' % (hold[1], h.name))
+                return
+            x.VBD.destroy(hold[0])
+            self.j.rec('reserve_released', seq=it['seq'], vbd=hold[1])
+        except Exception as exc:
+            self.j.rec('reserve_kept', seq=it['seq'], vbd=hold[1], why=_text(exc))
+            warn('placeholder dom0 VBD %s on %s could not be removed (%s): remove it with xe vbd-destroy uuid=%s'
+                 % (hold[1], h.name, _text(exc), hold[1]))
 
     def teardown_left(self, h, cv, it, since, grep=True):
         left, unknown = [], []
@@ -10484,7 +10702,7 @@ def read_password(prompt_needed):
     import getpass
     if sys.stdin.isatty():
         try:
-            return getpass.getpass('Root password for the pool hosts (only handed to ssh; Enter alone = ssh keys): ')
+            return getpass.getpass('pool root password (hit enter to use ssh keys): ')
         except EOFError:
             return None
     line = sys.stdin.readline()
@@ -10564,9 +10782,6 @@ def preflight(opts):
     others = [h for h in hosts if not h.local]
     if others:
         ensure_run_root()
-        say(u'ssh: the other hosts are reached only with a host key already known here (%s or %s); an unknown key '
-            u'is shown and has to be confirmed first, and a changed key stops the connection before the password is '
-            u'sent.' % (' or '.join(user_known_hosts()), GLOBAL_KNOWN_HOSTS))
         trust_hosts(ctx.transport, others, getattr(opts, 'trust_host_keys', False))
         get_password(ctx.transport, others)
     return ctx
@@ -11130,6 +11345,39 @@ def ha_not_ours(recs, name, pool):
     return None
 
 
+def free_placeholder(ctx, model, vbref, vbd, dp, never_asked=()):
+    vm = model.vms.get(vbd['VM']) or {}
+    href = vm.get('resident_on')
+    hu = model.hosts[href]['uuid'] if href in model.hosts else None
+    vdi = (model.vdis.get(vbd['VDI']) or {}).get('uuid')
+    if vbd['currently_attached']:
+        error('  placeholder dom0 VBD %s is attached, although this tool never plugs it: it is left as it is'
+              % vbd['uuid'])
+        return
+    held = None
+    if (hu, dp) in never_asked:
+        held = False
+    elif hu and vdi:
+        r = xe('host-get-sm-diagnostics', 'uuid=' + hu, timeout=XE_TIMEOUT)
+        if r.ok:
+            try:
+                held = any(x_[1] == vdi and x_[2] == dp for x_ in parse_sm_diagnostics(r.out))
+            except ValueError:
+                held = None
+    if held is not False:
+        warn('  placeholder dom0 VBD %s is kept: %s. Once xe host-get-sm-diagnostics uuid=%s no longer lists %s for '
+             'VDI %s, remove it with xe vbd-destroy uuid=%s'
+             % (vbd['uuid'], ('xapi still holds %s for VDI %s' % (dp, vdi)) if held else
+                ('whether xapi still holds %s is not established' % dp), hu, dp, vdi, vbd['uuid']))
+        return
+    try:
+        ctx.api.x.VBD.destroy(vbref)
+        say(u'  placeholder dom0 VBD %s removed' % vbd['uuid'])
+    except Exception as exc:
+        warn('  placeholder dom0 VBD %s could not be removed (%s): xe vbd-destroy uuid=%s'
+             % (vbd['uuid'], _text(exc), vbd['uuid']))
+
+
 def recover_run(opts, inv, name, path, recs, state):
     run_dir = os.path.dirname(path)
     unreadable = [r for r in recs if r.get('event') == 'unreadable']
@@ -11257,6 +11505,12 @@ def recover_run(opts, inv, name, path, recs, state):
         return 3
     checkpoint()
     model = Model(pool_snapshot(ctx.api))
+    asked = set((r.get('host'), r.get('dp')) for r in recs if r.get('event') == 'dp0_destroy')
+    reserved = set((r.get('host'), r.get('dp')) for r in recs if r.get('event') == 'reserve')
+    for vbref, vbd in sorted(model.vbds.items()):
+        tag = _text((vbd.get('other_config') or {}).get(RESERVE_KEY) or '').split(' ')
+        if tag[0] == name and len(tag) == 2:
+            free_placeholder(ctx, model, vbref, vbd, tag[1], reserved - asked)
     mark = ha_marker_of(model.pool)
     ours = mark is not None and (mark.get('run') == name or ('raw' in mark and ha_off and not ha_on))
     not_ours = ha_not_ours(recs, name, model.pool) if ha_off and not ha_on and not ours else None

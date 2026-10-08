@@ -27,41 +27,30 @@ python snapshot-fixer.py dry-run
 python snapshot-fixer.py rewrite
 ```
 
-# xo-config-recover
-
-Exports Xen Orchestra's configuration from the command line - the same file as
-*Settings → Config → Export* in the web UI - without needing xo-server. For when an update
-has broken XOA and the UI you would normally export from is dead.
+## xo-config-recover
+Gets your Xen Orchestra config out when an update broke XOA and the UI is dead. Same file
+as *Settings → Config → Export*, no working xo-server needed. Run it on XOA as root:
 
 ```
-# on the XOA, as root
 python3 <(curl -fsSL https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/xo-config-recover.py)
 ```
 
-That writes `XO-config_<UTC>.json.gz` in the current directory. Restore it later with
-*Settings → Config → Import*, exactly like a web UI export.
-
-It reads the two places xo-server keeps its config, redis and a small leveldb, straight
-from the stores. Nothing has to be running except redis, and if redis is down too it reads
-the last saved `dump.rdb` and tells you how old that is. One file, Python 3 standard
-library only, read-only: the only thing it writes is the output.
+It drops `XO-config_<date>.json.gz` in the current dir, which you import back with
+*Settings → Config → Import*. Only redis has to be up, and if it isn't it reads the last
+`dump.rdb` instead. It doesn't change anything. Be aware the config file has every pool's root password in
+it, same as a UI export.
 
 | | |
 |---|---|
-| `--check` | show what would be exported and from where, write nothing |
-| `--bundle` | also write a `.tar.gz` with a fresh redis dump, a copy of the leveldb and the config files - everything a rebuild might want |
-| `--passphrase-file FILE` | encrypt the export like the web UI's passphrase option (imports the same way) |
-| `--entries a,b` | only some sections, dependencies added like the API does |
-| `-o FILE` / `-o -` | name the file, or stream it to stdout |
+| `--check` | show what it would export, write nothing |
+| `--bundle` | also save a `.tar.gz` with a redis dump, the leveldb and the config files |
+| `--passphrase-file FILE` | encrypt it like the UI's passphrase option |
+| `--entries a,b` | only some sections |
+| `-o FILE` | pick the file name, `-` for stdout |
+| `-h` | full help |
 
-Exit code is **0** when the file was written, **1** with `--partial` when a section had to
-be left out, **2** when nothing could be written. The export contains every pool's root
-password, the same as the web UI's does - treat the file accordingly.
-
-Verified against a real web UI export with xo-server running, with xo-server and
-xoa-updater stopped, and with redis stopped: same records in every section. If XO's
-credential database is encrypted (`redis.encryptCredentialDatabase`) the tool stops and
-says so; decrypting it is not implemented yet.
+Doesn't handle an encrypted credential database (`redis.encryptCredentialDatabase`) yet, it
+just stops and tells you.
 
 ## Infra Health Check
 Checks for 100+ of the most common XOA and XCP-ng issues across entire pools. Paste this on XOA as root:
