@@ -14,7 +14,8 @@ curl -fsSLO https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/storage-s
 python3 storage-state-fixer.py check
 python3 storage-state-fixer.py fix
 ```
-If a run gets cut off, `python3 storage-state-fixer.py recover` puts xapi and HA back.
+If a run gets cut off, `python3 storage-state-fixer.py recover` puts xapi and HA back. The first
+time it reaches a pool host whose ssh key isn't already known, it shows the fingerprints and asks.
 
 **snapshot-fixer.py** (8.2 and 8.3) - fixes broken snapshot links in xapi's database: a VM or
 disk that isn't a snapshot but still claims to be a snapshot of something, or a disk that's a
