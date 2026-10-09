@@ -16,6 +16,8 @@ python3 storage-state-fixer.py fix
 ```
 If a run gets cut off, `python3 storage-state-fixer.py recover` puts xapi and HA back. The first
 time it reaches a pool host whose ssh key isn't already known, it shows the fingerprints and asks.
+It asks for the pool root password too, unless `XCP_POOL_PASSWORD` is set (for wrappers that already
+have it); if that one is refused, it falls back to asking.
 Run records and storage.db backups go in `storage-state-fixer-data/` next to the script. The locks
 it holds keep SM out; anything else that edits sm-config is caught by a last xapi event check.
 
