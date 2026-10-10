@@ -6,7 +6,8 @@ Both run as root on the pool master, look before they touch anything, and
 ask first. Download the file and run it, don't pipe it in from curl.
 
 **storage-state-fixer.py** (8.3 only) - for when exports, backups or VBD unplugs start failing
-because of storage junk left behind (dead dom0 datapaths, stale dom0 VBDs, stuck GC flags).
+because of storage junk left behind (dead dom0 datapaths, stale dom0 VBDs, leaked datapaths and
+the paused or wedged tapdisks behind them, stuck GC flags).
 `check` just reports, `fix` shows the list and asks y/N. Editing storage.db restarts xapi on
 that host (VMs keep running), with HA turned off and back on around it.
 ```
