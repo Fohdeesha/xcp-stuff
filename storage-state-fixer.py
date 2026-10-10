@@ -5851,6 +5851,10 @@ def agent_entry(request, source):
     return 0
 
 ASKPASS_ENV = 'SSF_SSH_PASSWORD'
+# The pool root password, for wrappers that already hold it (a support
+# toolkit reading it from XO): no prompt to type it into. Taken out of the
+# environment as soon as it's read, so nothing started later inherits it.
+PASSWORD_ENV = 'XCP_POOL_PASSWORD'
 
 
 class CallError(Exception):
@@ -13652,14 +13656,21 @@ def get_password(transport, hosts, known=None):
         transport.set_password(known)
         return known
     live = [h for h in hosts if h.live and not h.local]
+    from_env = os.environ.pop(PASSWORD_ENV, None) or None
     for tries in range(3):
-        known = read_password(True) or ''
+        if from_env is not None and tries == 0:
+            known = from_env
+        else:
+            known = read_password(True) or ''
         transport.set_password(known)
         bad = unreached(transport, live) if live else []
         if not bad:
             return known
         if ' was refused' in bad[0][1] and tries < 2 and sys.stdin.isatty():
-            error(bad[0][1])
+            if from_env is not None and tries == 0:
+                error('%s (the password from %s)' % (bad[0][1], PASSWORD_ENV))
+            else:
+                error(bad[0][1])
             continue
         for h, e in bad:
             warn('%s cannot be reached: %s' % (h.name, e))
