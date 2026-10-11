@@ -14,9 +14,9 @@ import errno
 import gzip
 import hashlib
 import json
-import math
 import os
 import re
+import select
 import shutil
 import signal
 import socket
@@ -28,7 +28,7 @@ import time
 import xml.parsers.expat
 import zlib
 
-VERSION = '1.9'
+VERSION = '2.0'
 PYTHON = sys.version.split()[0]
 PROG = 'storage-state-fixer'
 STORAGE_DB = '/var/run/nonpersistent/xapi/storage.db'
@@ -120,7 +120,7 @@ GUARDIAN_POLL = 10
 GUARDIAN_BACKSTOP = 2700
 GUARDIAN_STALL = 600
 GUARD_LOCK_WAIT = 600
-ACT_WAIT = 1800
+ACT_WAIT = 3600
 LONE_WAIT = 30
 ENSURE_TIMEOUT = 1800
 ENSURE_MARGIN = 60
@@ -150,7 +150,8 @@ FENCE_ACQUIRE = 10
 FENCE_POLL = 0.2
 FENCE_MARGIN = 15
 C12_FENCE_HOLD = 55
-TOOLSTACK_HOLD = 900
+LV_FENCE_HOLD = 150
+TOOLSTACK_HOLD = ACT_WAIT + ACT_START_TIMEOUT + 300
 UNPAUSE_WAIT = 300
 NODE_AFTER_START = 120
 KILL_WAIT = 15
@@ -184,7 +185,6 @@ def _quote(value):
 
 _AUDIT = [False]
 _SYSLOG = [None]
-_OUT = {'quiet': False, 'json': False}
 
 
 def _write(stream, text):
@@ -215,7 +215,7 @@ def _log(level, text):
 
 
 def say(text=u''):
-    _write(sys.stderr if _OUT['json'] else sys.stdout, _text(text))
+    _write(sys.stdout, _text(text))
     _log('info', text)
 
 
@@ -248,10 +248,6 @@ class Interrupted(Exception):
 
 
 class Skip(Exception):
-    pass
-
-
-class Usage(Exception):
     pass
 
 
@@ -1375,6 +1371,17 @@ def f_xenstore():
     return dict((k, v) for k, v in allv.items() if k.endswith('/physical-device') or k.endswith('/params'))
 
 
+def keep_argv(argv, count, width):
+    out = []
+    for a in argv[:count]:
+        if '<methodCall>' in a or '<?xml' in a:
+            found = SM_METHOD_RE.search(a)
+            a = u'<methodName>%s</methodName> (an XML-RPC call of %d characters, not kept)' % (
+                found.group(1) if found else '?', len(a))
+        out.append(a[:width])
+    return out
+
+
 def is_sm_argv(argv):
     if not argv:
         return False
@@ -1410,7 +1417,7 @@ def f_procs():
         rec = {'pid': pid, 'comm': comm, 'state': st['state'], 'ticks': st['ticks'],
                'start': btime + st['start_ticks'] / float(clk_tck()), 'sm': sm}
         if comm != 'tapdisk':
-            rec['argv'] = [a[:300] for a in argv[:24]]
+            rec['argv'] = keep_argv(argv, 24, 300)
             rec['io'] = proc_io(pid)
         out.append(rec)
     return out
@@ -1494,7 +1501,7 @@ def pid_info(pid):
     if st['state'] == 'Z':
         return {'pid': pid, 'alive': False}
     return {'pid': pid, 'alive': True, 'start': boot_time() + st['start_ticks'] / float(clk_tck()),
-            'argv': [a[:200] for a in argv[:8]], 'sm': is_sm_argv(argv) or any('cleanup.py' in a for a in argv)}
+            'argv': keep_argv(argv, 8, 200), 'sm': is_sm_argv(argv) or any('cleanup.py' in a for a in argv)}
 
 
 def f_pids(want):
@@ -2182,7 +2189,7 @@ def f_openers(backend, phy, blktap, budget=20.0, generic=False, roots=None):
                 comm, start = ps['comm'], btime + ps['start_ticks'] / float(clk_tck())
             except (EnvironmentError, ValueError, IndexError):
                 comm, start, argv = comm_of(pid) or '?', None, []
-            rec = {'pid': pid, 'comm': comm, 'argv': [a[:200] for a in argv[:12]], 'start': start, 'hits': hits}
+            rec = {'pid': pid, 'comm': comm, 'argv': keep_argv(argv, 12, 200), 'start': start, 'hits': hits}
             if comm.startswith('qemu-system'):
                 rec['xen_domid'] = qemu_domid(argv)
             if unread:
@@ -4079,6 +4086,10 @@ def spec_removed(spec):
     return [[i['sr'], i['vdi'], i['dp']] for i in (spec or {}).get('items') or []]
 
 
+def stop_to_start():
+    return STOP_TIMEOUT + GONE_WAIT + QUIET_WAIT + 60
+
+
 def roll_back(d, old, units, why, spec, written_sha):
     host_uuid = spec['host_uuid']
     act_log(d, '%s: rolling back' % why)
@@ -4090,17 +4101,17 @@ def roll_back(d, old, units, why, spec, written_sha):
             rb['start'] = {'ready': False, 'answering': False, 'complete': False, 'detail': 'xapi was left running'}
             act_log(d, 'no rollback: %s' % rb['note'])
             return rb
-        if _ENSURE_END[0] is not None and _ENSURE_END[0] - _now() < STOP_TIMEOUT + GONE_WAIT + START_TIMEOUT + 60:
+        if _ENSURE_END[0] is not None and _ENSURE_END[0] - _now() < stop_to_start() + START_TIMEOUT:
             rb['deferred'] = True
             rb['note'] = ('xapi was not stopped for it: too little of this call\'s time is left to stop xapi and start '
-                          'it again before the call is given up; run recover again to finish it')
+                          'it again before the call is given up; run the tool again to finish it')
             rb['start'] = {'ready': False, 'answering': False, 'complete': False, 'detail': 'xapi was left running'}
             act_log(d, 'no rollback yet: %s' % rb['note'])
             return rb
         busy = quiet_here(dict(spec, is_master=pool_role() == 'master'), need_api=False)
         if busy:
             rb['deferred'] = True
-            rb['note'] = ('xapi was not stopped for it, because %s; run recover again to finish it'
+            rb['note'] = ('xapi was not stopped for it, because %s; run the tool again to finish it'
                           % '; '.join(busy[:4]))
             rb['start'] = {'ready': False, 'answering': False, 'complete': False, 'detail': 'xapi was left running'}
             act_log(d, 'no rollback yet: %s' % rb['note'])
@@ -4116,6 +4127,8 @@ def roll_back(d, old, units, why, spec, written_sha):
         elif sha256_bytes(cur) != written_sha:
             rb['note'] = ('%s was written again after the rollback was decided, so it is left as it is (the backup '
                           'stays in the run record)' % STORAGE_DB)
+        elif not xapi_stopped():
+            rb['note'] = 'xapi is running again, so the original was not put back'
         else:
             if busy:
                 act_log(d, '%s; the original is put back all the same: it is the file xapi wrote itself'
@@ -4194,7 +4207,7 @@ def finish_start(d, state, spec):
     if state.get('error'):
         detail = 'error: %s; then %s' % (state['error'], detail)
     elif state.get('unverified'):
-        detail = ('%s, so whether xapi loaded it is checked again by settle or recover; xapi: %s'
+        detail = ('%s, so whether xapi loaded it is checked again before the run closes, or by the next run; xapi: %s'
                   % (state['unverified'], detail))
     safe_status(d, final, detail=detail, start=res)
     act_log(d, 'finished: %s (%s)' % (final, res['detail'] or 'xapi answering'))
@@ -4444,7 +4457,8 @@ def guard_takeover(d, spec):
     if lockfd is None:
         safe_status(d, 'unverified', detail='the action died in state %s, and %s stayed held by another process for '
                     '%ds (xe-toolstack-restart or another tool restarting xapi), so the guardian left xapi to it; '
-                    'settle or recover checks xapi and the edit once it is free' % (was, lockpath, GUARD_LOCK_WAIT))
+                    'xapi and the edit are checked again before the run closes, or by the next run'
+                    % (was, lockpath, GUARD_LOCK_WAIT))
         act_log(d, 'guardian: %s stayed held for %ds: xapi left to its holder' % (lockpath, GUARD_LOCK_WAIT))
         return 0
     try:
@@ -4465,8 +4479,8 @@ def guard_locked(d, spec, st, was):
         if left is not None:
             safe_status(d, 'unverified' if wrote else 'failed',
                         detail='the action died in state %s; %s, so the guardian left it as it is%s'
-                        % (was, left, ('; whether it loaded the edited file is checked again by settle or recover'
-                                       if wrote else '')))
+                        % (was, left, ('; whether it loaded the edited file is checked again before the run '
+                                       'closes, or by the next run' if wrote else '')))
             act_log(d, 'guardian: the action died in state %s; %s: left as it is' % (was, left))
             return 0
         v, rb = check_running(d, st or {}, units, spec, 'guardian')
@@ -4792,7 +4806,7 @@ def tap_end_locked(args, sr, vdi, pid, minor):
         problems.append('it holds tap minor(s) %s, not just %d' % (fds['minors'], minor))
     kind, val = tap_verdict(pid, minor)
     if args.get('kind') == 'wedged' and kind != 'refused':
-        problems.append('it does not refuse tap-ctl stats now (%s), so it is not wedged as audited: run check again'
+        problems.append('it does not refuse tap-ctl stats now (%s), so it is not wedged as audited: run the tool again'
                         % kind)
     elif args.get('kind') == 'deadring':
         if kind == 'ok' and isinstance(val, dict):
@@ -4800,7 +4814,7 @@ def tap_end_locked(args, sr, vdi, pid, minor):
             if 'xenbus' in val:
                 problems.append('a guest ring is connected to it now')
             elif not val.get('reqs_outstanding') and not ring:
-                problems.append('it has no request outstanding and no guest ring now, so SM can close it: run check '
+                problems.append('it has no request outstanding and no guest ring now, so SM can close it: run the tool '
                                 'again')
         elif kind not in ('refused',):
             problems.append('its tap-ctl stats answer %s now (%s)' % (kind, val))
@@ -4834,7 +4848,7 @@ def tap_end_locked(args, sr, vdi, pid, minor):
                                 % (path, os.major(node.st_rdev), os.minor(node.st_rdev), minor))
             if not exp:
                 problems.append('%s is a block node now, and the audit saw none: something activated the VDI here '
-                                'since; run check again' % path)
+                                'since; run the tool again' % path)
             elif exp.get('ino') is not None and node.st_ino != exp['ino']:
                 problems.append('%s is inode %d now, not the inode %d audited' % (path, node.st_ino, exp['ino']))
         elif not (stat.S_ISREG(node.st_mode) and read_file(path).startswith(INERT_MARK)):
@@ -4905,7 +4919,8 @@ def tap_end_locked(args, sr, vdi, pid, minor):
                              % (d, ', '.join(lost))]}
     if _now() > deadline:
         return {'done': False, 'forensics': d, 'saved': saved,
-                'problems': ['its checks took longer than %ds, so it is not ended now: run check again' % TAP_END_BUDGET]}
+                'problems': ['its checks took longer than %ds, so it is not ended now: run the tool again'
+                             % TAP_END_BUDGET]}
     inert = None
     if node is not None and stat.S_ISBLK(node.st_mode):
         inert = make_inert(path, node, sr, vdi, args['run_id'], {'pid': pid, 'minor': minor, 'path': None})
@@ -5012,7 +5027,10 @@ def agent_tap_free(args, source):
         problems.append('tap-ctl lists tapdisk pid %s on it' % ', '.join(str(r['pid']) for r in rows
                                                                           if r['pid'] is not None))
     for p in tapdisk_pids():
-        if minor in (tap_fds(p).get('minors') or []):
+        fds = tap_fds(p)
+        if fds.get('unread'):
+            problems.append('the open files of tapdisk pid %d were not read (%s)' % (p, fds['unread']))
+        elif minor in (fds.get('minors') or []):
             problems.append('tapdisk pid %d has it open' % p)
     for p in pids():
         try:
@@ -5697,6 +5715,20 @@ def ssf_processes(flags=('--ssf-act', '--ssf-guard')):
     return found
 
 
+def run_stopped_xapi(d, st):
+    if d is None:
+        return True
+    if not os.path.isdir(d) or (st or {}).get('state') in SETTLED_STATES:
+        return False
+    for h in (st or {}).get('history') or []:
+        if isinstance(h, list) and len(h) > 1 and h[1] in ('stopping', 'stopped', 'writing'):
+            return True
+    try:
+        return 'stopping xapi' in read_text(os.path.join(d, 'action.log'))
+    except EnvironmentError:
+        return False
+
+
 def agent_xapi_ensure(args, source):
     _ENSURE_END[0] = _now() + ENSURE_TIMEOUT - ENSURE_MARGIN
     try:
@@ -5751,9 +5783,9 @@ def xapi_ensure(args):
         if not xapi_stopped():
             left = xapi_left_as_is(state)
             if left is not None:
-                detail = ('%s: it is left as it is (not started again, nothing rolled back); run recover again once '
+                detail = ('%s: it is left as it is (not started again, nothing rolled back); run the tool again once '
                           'it answers' % left)
-                act_log(log_dir, 'recover: %s' % detail)
+                act_log(log_dir, 'the recovery: %s' % detail)
                 return {'started': False, 'busy': None, 'ready': False, 'running': True, 'detail': detail,
                         'storage': 'unverified' if wrote else 'n/a', 'storage_detail': detail}
             v = none
@@ -5765,14 +5797,14 @@ def xapi_ensure(args):
                             'detail': 'xapi is running but did not load the edited file (%s); %s'
                                       % (v['detail'], rb['note'])}
                 if rb is not None:
-                    why = 'recover: xapi was running but did not load the edited file (%s)' % v['detail']
+                    why = 'the recovery: xapi was running but did not load the edited file (%s)' % v['detail']
                     rollback_status(d, rb, why, recover_storage=v)
                     return {'started': False, 'busy': None, 'result': rb['start'], 'rolled_back': rb['ok'],
                             'ready': bool(rb['ok'] and rb['start'].get('complete')),
                             'storage': 'restored' if rb['ok'] else 'failed', 'storage_detail': rollback_text(rb),
                             'detail': 'xapi was running but did not load the edited file; %s' % rollback_text(rb)}
                 safe_status(d, verdict_state(v, keep), **verdict_fields(
-                    v, spec, recover_storage=v, detail='%s; recover found xapi running: %s' % (
+                    v, spec, recover_storage=v, detail='%s; the recovery found xapi running: %s' % (
                         'its load was not established' if st.get('state') == 'unverified' else
                         'the action did not finish', v['detail'])))
             deadline = _now() + INIT_WAIT
@@ -5785,10 +5817,18 @@ def xapi_ensure(args):
                     'storage_detail': v['detail'],
                     'detail': 'xapi is running and answering%s' % (
                         '' if ready else ', but has not finished initialising after %ds' % INIT_WAIT)}
+        if not run_stopped_xapi(d, st):
+            detail = ('xapi is stopped here, and this run did not leave it stopped (%s), so it is not started: start '
+                      'it with systemctl start xapi if that is wanted, then run the tool again'
+                      % ('its action here ended %s' % st['state'] if st.get('state') else
+                         'it has no action record here'))
+            act_log(log_dir, 'the recovery: %s' % detail)
+            return {'started': False, 'busy': None, 'ready': False, 'detail': detail,
+                    'storage': 'unverified' if wrote else 'n/a', 'storage_detail': detail}
         old = edited = note = None
         if recheck:
             old, edited, note = edited_by_action(st, log_dir, 'recover')
-        act_log(log_dir, 'recover: starting xapi (it was %s)' % state)
+        act_log(log_dir, 'the recovery: starting xapi (it was %s)' % state)
         res = start_xapi_local(log_dir, units)
         why = None
         v = none
@@ -5803,19 +5843,19 @@ def xapi_ensure(args):
             v = {'verdict': 'unverified', 'detail': 'xapi is not up, so what it holds cannot be checked (%s)'
                                                     % res['detail']}
         if why is not None:
-            rb = roll_back(log_dir, old, units, 'recover: ' + why, dict(spec, host_uuid=args['host_uuid']),
+            rb = roll_back(log_dir, old, units, 'the recovery: ' + why, dict(spec, host_uuid=args['host_uuid']),
                            st.get('written_sha256'))
             if rb.get('deferred'):
                 return {'started': True, 'busy': None, 'ready': False, 'result': res, 'storage': 'failed',
                         'storage_detail': why, 'detail': '%s; %s' % (why, rb['note'])}
-            rollback_status(d, rb, 'recover: ' + why, recover_start=res)
+            rollback_status(d, rb, 'the recovery: ' + why, recover_start=res)
             return {'started': True, 'busy': None, 'result': rb['start'], 'rolled_back': rb['ok'],
                     'ready': bool(rb['ok'] and rb['start'].get('complete')),
                     'storage': 'restored' if rb['ok'] else 'failed', 'storage_detail': rollback_text(rb),
                     'detail': '%s; %s' % (why, rollback_text(rb))}
         if recheck:
             safe_status(d, verdict_state(v, keep), **verdict_fields(
-                v, spec, recover_start=res, detail='recover started xapi (%s); %s%s' % (
+                v, spec, recover_start=res, detail='the recovery started xapi (%s); %s%s' % (
                     res['detail'] or 'answering', v['detail'], ('; ' + note) if note else '')))
         return {'started': True, 'busy': None, 'result': res, 'ready': bool(res['answering'] and res['complete']),
                 'storage': v['verdict'], 'storage_detail': v['detail'],
@@ -5902,9 +5942,19 @@ def key_known(address):
     return False
 
 
+SCAN_ADDRESS_RE = re.compile(r'^[0-9A-Za-z][0-9A-Za-z.:-]*$')
+KEY_TYPE_RE = re.compile(r'^(ssh-(rsa|dss|ed25519)|ecdsa-sha2-nistp(256|384|521)|sk-[0-9A-Za-z@.-]+)$')
+
+
 def scan_keys(address, workdir):
+    if not SCAN_ADDRESS_RE.match(address or ''):
+        raise CallError('%s is not an address its host keys can be asked from' % canon(address))
     r = run(['ssh-keyscan', '-T', '10', address], 40)
-    lines = [l for l in r.out.splitlines() if l.strip() and not l.startswith('#')]
+    lines = []
+    for l in r.out.splitlines():
+        f = l.split()
+        if len(f) >= 3 and f[0] == address and KEY_TYPE_RE.match(f[1]):
+            lines.append(' '.join(f[:3]))
     if not lines:
         raise CallError('ssh-keyscan found no host key for %s (%s)' % (address, r.why()))
     tmp = os.path.join(workdir, 'scan-%s' % re.sub(r'[^0-9A-Za-z.]', '_', address))
@@ -5917,7 +5967,7 @@ def scan_keys(address, workdir):
     return lines, fps
 
 
-def trust_hosts(transport, hosts, assume):
+def trust_hosts(transport, hosts, strict=True):
     new = [h for h in hosts if h.live and not h.local and not key_known(h.address)]
     if not new:
         return []
@@ -5939,23 +5989,34 @@ def trust_hosts(transport, hosts, assume):
         return new
     say(u'Compare them with what each host prints on its own console for: '
         u'for f in /etc/ssh/ssh_host_*_key.pub; do ssh-keygen -lf $f; done')
-    if assume:
-        say(u'They are recorded without asking (--trust-host-keys).')
-    elif not sys.stdin.isatty():
-        warn('there is no terminal to confirm them on, so those hosts are not reached (pass --trust-host-keys to '
-             'record them without asking)')
-        return new
-    elif not ask(u'Do the fingerprints match, and are these keys to be trusted? [y/N] '):
-        warn('the keys were not trusted, so those hosts are not reached')
+    data = ('\n'.join(l for h, lines in found for l in lines) + '\n').encode('utf-8')
+    left = [h for h in new if h not in [x[0] for x in found]]
+    if not sys.stdin.isatty():
+        say(u'There is no terminal to confirm them on, so they are used as they answer now, for this run only: they '
+            u'are not recorded, and a run at a terminal asks about them again.')
+        path = os.path.join(transport.workdir, 'known_hosts.run')
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            append_all(fd, data)
+        finally:
+            os.close(fd)
+        transport.run_known = path
+        return left
+    if not ask(u'Do the fingerprints match, and are these keys to be trusted? [yes/no] '):
+        if strict:
+            raise Refused('the keys were not trusted, so the pool cannot be checked whole: run this again once they '
+                          'have been compared')
+        warn('the keys were not trusted, so %s %s not reached' % (
+            ', '.join(h.name for h, l in found), 'is' if len(found) == 1 else 'are'))
         return new
     ensure_run_root()
     fd = os.open(known_hosts_file(), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
-        append_all(fd, ('\n'.join(l for h, lines in found for l in lines) + '\n').encode('utf-8'))
+        append_all(fd, data)
         os.fsync(fd)
     finally:
         os.close(fd)
-    return [h for h in new if h not in [x[0] for x in found]]
+    return left
 
 
 def ensure_run_root():
@@ -5977,6 +6038,7 @@ class Transport(object):
         self.askpass = None
         self.paths = None
         self.calls = 0
+        self.run_known = None
 
     def set_password(self, password):
         self.password = password or None
@@ -5995,7 +6057,9 @@ class Transport(object):
         self.askpass = path
 
     def ssh_argv(self, host):
-        argv = ['ssh', '-o', 'StrictHostKeyChecking=yes', '-o', 'UserKnownHostsFile=' + ' '.join(user_known_hosts()),
+        known = user_known_hosts() + ([self.run_known] if getattr(self, 'run_known', None) else [])
+        argv = ['ssh', '-o', 'StrictHostKeyChecking=yes',
+                '-o', 'UserKnownHostsFile=' + ' '.join('"%s"' % p for p in known),
                 '-o', 'LogLevel=ERROR',
                 '-o', 'ConnectTimeout=%d' % SSH_CONNECT, '-o', 'ServerAliveInterval=15',
                 '-o', 'ServerAliveCountMax=4', '-o', 'NumberOfPasswordPrompts=1',
@@ -7054,16 +7118,16 @@ def host_gate(audit, href, opts, exclude=()):
                 text += (' (it is not established as the device model of a VM running here with those disks '
                          'attached: %s)' % qwhy)
             if age is not None and age > limit:
-                stuck.append(text + ': it has held it for longer than --stuck-export-age, so this is not waited on; '
-                             'deal with that process first')
+                stuck.append(text + ': it has held it for longer than %s, so this is not waited on; deal with that '
+                             'process first' % format_age(limit))
             else:
                 block.append(text)
     for p in stuck_sm(audit, href):
         text = 'SM process %d has run for %s: %s' % (p['pid'], format_age(now - p['start']),
-                                                    ' '.join((p.get('argv') or [])[:3])[:160])
+                                                    sm_what(p.get('argv')))
         if now - p['start'] > limit:
-            stuck.append(text + ' (longer than --stuck-export-age: it will not end by itself; a reboot of this host '
-                         'or a fix of what it waits on is needed first)')
+            stuck.append(text + ' (longer than %s: it will not end by itself; a reboot of this host or a fix of what '
+                         'it waits on is needed first)' % format_age(limit))
         else:
             block.append(text)
     if hv.phantoms and not hv.phantoms_explained:
@@ -7074,6 +7138,25 @@ def host_gate(audit, href, opts, exclude=()):
             unknown.append('tapdisk pid %d is not listed by tap-ctl, and it does not refuse requests either, so why '
                            'is not established' % row['pid'])
     return Gate(block, unknown, stuck, notes)
+
+
+def sm_what(argv):
+    argv = [_text(x) for x in argv or []]
+    i = 0
+    if argv and os.path.basename(argv[0]).startswith('python'):
+        i = 1
+        while i < len(argv) and argv[i].startswith('-') and argv[i] not in ('-c', '-m'):
+            i += 1
+    if i >= len(argv):
+        return '?'
+    rest = argv[i + 1:i + 4]
+    found = SM_METHOD_RE.search(' '.join(rest))
+    if found:
+        return '%s %s' % (os.path.basename(argv[i]), found.group(1))
+    return ' '.join([os.path.basename(argv[i])] + [x[:40] for x in rest[:2] if '<' not in x])
+
+
+SM_METHOD_RE = re.compile(r'<methodName>([^<]{1,80})</methodName>')
 
 
 def stuck_sm(audit, href):
@@ -7181,22 +7264,22 @@ PHASES = (('S', 'storage.db (xapi restarted on the host)'), ('V', 'dom0 VBD rele
           ('P', 'paused tapdisks'),
           ('G', 'garbage collector'))
 CLASS_TITLES = {
-    'C01': 'dead dom0 datapath that duplicates another', 'C02': 'dead dom0 datapath',
-    'C03': 'leaked guest datapath', 'C04': 'stale dom0 VBD (snapshot / template / unused disk)',
-    'C05': 'stale dom0 VBD on a VM\'s live disk', 'C06': 'dom0 VBD in use', 'C08': 'stale GC abort flag',
-    'C09': 'stale relinking key', 'C10': 'stale activating key', 'C11': 'paused key',
-    'C12': 'paused tapdisk', 'C13': 'stale host_ attach marker', 'C14': 'orphan tapdisk',
+    'C01': 'dom0 datapath with a duplicate', 'C02': 'dom0 datapath',
+    'C03': 'guest datapath', 'C04': 'dom0 VBD on a snapshot, template or unused disk',
+    'C05': 'dom0 VBD on a VM\'s disk', 'C06': 'dom0 VBD in use', 'C08': 'GC abort flag',
+    'C09': 'relinking key', 'C10': 'activating key', 'C11': 'paused key',
+    'C12': 'paused tapdisk', 'C13': 'host_ attach marker', 'C14': 'tapdisk with no backend node',
     'C15': 'tapdisk not answering', 'C16': 'leftover', 'C17': 'backup / export activity',
     'C18': 'environment', 'C19': 'garbage collector health',
     'C20': 'backend node pointing at another disk\'s tapdisk', 'C21': 'tapdisk in an abnormal state',
-    'C22': 'dying domain (zombie)', 'C00': 'not audited'}
+    'C22': 'dying domain', 'C00': 'not audited'}
 
 
-def ev(key, cls, verdict, host, title, reason, evidence=None, sig=None, item=None):
+def ev(key, cls, verdict, host, title, reason, evidence=None, sig=None, item=None, roll=None):
     if item is not None:
         item = dict(item, sig=sig)
     return {'key': list(key), 'cls': cls, 'verdict': verdict, 'host': host, 'title': title, 'reason': reason,
-            'evidence': list(evidence or []), 'sig': sig, 'item': item}
+            'evidence': list(evidence or []), 'sig': sig, 'item': item, 'roll': list(roll) if roll else None}
 
 
 def verdict_of(problems, unknowns, waits):
@@ -7311,7 +7394,9 @@ def eval_hosts(a, opts):
                           'twinstor is installed on %s (service %s)' % (h['name_label'], tw.get('unit')),
                           'it can restart toolstacks and re-enable HA by itself, and clears activating keys without '
                           'SM\'s lock. This tool holds the toolstack lock on the other hosts while the master\'s xapi '
-                          'is down, and changes nothing while twinstor reports a recovery in progress'))
+                          'is down, and changes nothing while twinstor reports a recovery in progress',
+                          roll=('twinstor is installed (nothing is changed while it reports a recovery)',
+                                h['name_label'], 'service %s' % tw.get('unit'))))
         rpm = a.rpm.get(h['uuid'])
         if rpm and ident.get('btime'):
             late = sorted(k for k, v in rpm.items() if v > ident['btime'])
@@ -7319,7 +7404,9 @@ def eval_hosts(a, opts):
                 out.append(ev(('ENV', 'rpm', h['uuid']), 'C18', REPORT, h['uuid'],
                               'host %s was updated and not rebooted' % h['name_label'],
                               'installed after the last boot: %s. New SM code runs against old daemons until '
-                              'it reboots' % ', '.join(late)))
+                              'it reboots' % ', '.join(late),
+                              roll=('updated and not rebooted (new SM code runs against old daemons until then)',
+                                    h['name_label'], ', '.join(late))))
         keys, why, notes = xapi_move(a, href)
         if keys:
             out.append(ev(('ENV', 'xapi-update', h['uuid']), 'C18', REPORT, h['uuid'],
@@ -7329,8 +7416,9 @@ def eval_hosts(a, opts):
         for p in stuck_sm(a, href):
             out.append(ev(('ENV', 'stuck', h['uuid'], p['pid']), 'C18', REPORT, h['uuid'],
                           'stuck SM operation on %s' % h['name_label'],
-                          'pid %d has run for %s: %s' % (p['pid'], format_age(host_time(hv, a) - p['start']),
-                                                         ' '.join((p.get('argv') or [])[:4])[:200]),
+                          'pid %d has run for %s: %s. Nothing is fixed on this host, and its xapi is not stopped, '
+                          'while it runs' % (p['pid'], format_age(host_time(hv, a) - p['start']),
+                                             sm_what(p.get('argv'))),
                           ['no fix on this host, and no xapi stop on it, while it runs']))
         if hv.smlog and hv.smlog.get('refusal_count'):
             last = hv.smlog['refusals'][-1]
@@ -7380,8 +7468,9 @@ def eval_ha(a, opts):
         split = version_split(m)
         if split:
             out.append(ev(('HA', 'split'), 'C18', REPORT, None, 'the hosts run different xapi or platform versions',
-                          'xapi refuses to enable HA while they differ (NOT_SUPPORTED_DURING_UPGRADE), so HA is not '
-                          'turned off by this tool and storage.db is not edited: %s' % UPGRADE_REMEDY, split))
+                          '%s. xapi refuses to enable HA while they differ (NOT_SUPPORTED_DURING_UPGRADE), so HA is '
+                          'not turned off by this tool and storage.db is not edited: %s'
+                          % ('; '.join(split[:3]) + ('; ...' if len(split) > 3 else ''), UPGRADE_REMEDY), split))
     return out
 
 
@@ -7927,7 +8016,7 @@ def paused_stale(a, opts, hv, vref, tap):
         for p in busy:
             if not any(x.endswith('cleanup.py') for x in p.get('argv') or []):
                 waits.append('SM process %d runs on %s (%s)' % (p['pid'], h2.name,
-                                                               ' '.join((p.get('argv') or [])[:2])[:120]))
+                                                               sm_what(p.get('argv'))))
     found, unread, partial = [], [], []
     for href in sorted(set(m.plugged_hosts(sref)) | set([hv.href]) | (set([mref]) if mref else set())):
         h2 = a.view(href)
@@ -8269,17 +8358,24 @@ def eval_guest_dp(a, opts, hv, dp, cl, sr, vdi, st):
         if mn is not None and hv.tapinfo is not None and any(r['minor'] == mn for r in hv.empty_minors):
             steps.append('free')
             minor = mn
-            evidence.append('tap minor %d is allocated with no tapdisk behind it: it is released once nothing names '
-                            'it' % mn)
+            evidence.append('tap minor %d is allocated with no tapdisk behind it: it is released once nothing '
+                            'names it' % mn)
     steps = [s for s in C03_STEPS if s in steps]
+    run_steps = steps
+    if 'free' in steps:
+        age, why = minor_age(a, hv, minor)
+        if why or age < ABORT_MIN_AGE:
+            run_steps = [s for s in steps if s != 'free']
+            evidence.append('tap minor %d is not released in this run: %s' % (
+                minor, why or 'it was allocated only %s ago, and a later run releases it' % format_age(age)))
     verdict, reason = verdict_of(problems, unknowns, waits)
     if verdict == FIX:
         reason = 'no running VM on %s with domid %s has it attached' % (hv.name, domid)
-        if len(steps) > 1:
-            reason += '; in order: %s' % ', then '.join(STEP_TEXT[s] for s in steps)
+        if len(run_steps) > 1:
+            reason += '; in order: %s' % ', then '.join(STEP_TEXT[s] for s in run_steps)
     tsig = [tap['pid'], tap['minor'], int(tap['start'] or 0), tap['kind']] if tap else None
     item = {'cls': 'C03', 'phase': 'L', 'action': 'dp-destroy', 'host': hv.uuid, 'sr': sr, 'vdi': vdi, 'dp': dp,
-            'needs': needs, 'inert': inert, 'steps': steps, 'tap': tap, 'lv': lv, 'minor': minor, 'domid': domid,
+            'needs': needs, 'inert': inert, 'steps': run_steps, 'tap': tap, 'lv': lv, 'minor': minor, 'domid': domid,
             'pins': pin_pids,
             'vbds': sorted([vbd['uuid'], (m.vms.get(vbd['VM']) or {}).get('uuid'), vbd['userdevice']]
                            for r, vbd in vdi_vbds(m, vref)) if vref else []}
@@ -8540,7 +8636,7 @@ def eval_vbd(a, opts, vbd, vm, vdi):
                 unknowns.append('its age is not established (no backend node, no attach record, no vdi_activate '
                                 'in SMlog)')
         if ages and min(ages) < opts.min_vbd_age:
-            waits.append('it is only %s old (--min-vbd-age %s)' % (format_age(min(ages)),
+            waits.append('it is only %s old (under %s)' % (format_age(min(ages)),
                                                                      format_age(opts.min_vbd_age)))
     if hv.claim is None and not local:
         unknowns.append('storage.db on %s is not usable, so whether an attach is in progress is not established'
@@ -8853,7 +8949,7 @@ def relink_override(a, opts, v, sr):
         return None, 'SMlog shows it removed after it was last set'
     age = host_time(hv, a) - last[0]
     if age < opts.relink_min_age:
-        return None, 'it was set %s ago, less than --relink-min-age %s' % (format_age(age), format_age(opts.relink_min_age))
+        return None, 'it was set %s ago, less than %s' % (format_age(age), format_age(opts.relink_min_age))
     pinfo = a.pidinfo.get((hv.uuid, last[2]))
     if pinfo is None:
         return None, 'whether its setter, pid %d, is alive was not established' % last[2]
@@ -8927,6 +9023,7 @@ def eval_marker(a, opts, vref, v, key):
     sr = m.srs.get(v['SR'])
     if hv.tap_vdis.get(v['uuid']) or (sr and (sr['uuid'], v['uuid']) in hv.back_node):
         return None
+    title = 'C13 host_ key of %s on VDI %s' % (hv.name, m.name_vdi(vref))
     vbds = []
     for r, vbd in vdi_vbds(m, vref):
         vm = m.vms.get(vbd['VM'])
@@ -8938,21 +9035,15 @@ def eval_marker(a, opts, vref, v, key):
                                                     'attached' if vbd['currently_attached'] else 'not attached'))
     others = sorted(x for x in v['sm_config'] if x.startswith('host_') and x != key)
     if v['sm_config'].get(key) == 'RO':
-        restart = ('xapi removes it itself when it next starts on %s (its startup sync drops the host_ keys of VDIs it '
-                   'has not activated there), so an xe-toolstack-restart on %s clears it' % (hv.name, hv.name))
-        if others:
-            restart += (', but that sync also drops %s, which another host may still need, so do not use that way '
-                        'while it is there' % ', '.join(others))
-        reason = ('nothing on %s has it attached. Read-only, it still blocks one thing: activating it read-only on %s '
-                  '(%s there) fails while the key is set, since SM asserts a host it activates on has no key yet; a '
-                  'read-write activation anywhere clears it through SM\'s own reset, and other hosts are not '
-                  'affected. %s. It is never removed by hand'
-                  % (hv.name, hv.name, 'inserting this ISO in a VM' if sr and sr['type'] == 'iso' else
-                     'a read-only attach', restart))
+        reason = ('read-only, and nothing on that host has it attached. It blocks only %s on that host. A read-write '
+                  'activation anywhere clears it through SM\'s own reset; %s. Never remove it by hand'
+                  % ('inserting this ISO in a VM' if sr and sr['type'] == 'iso' else 'a read-only attach of it',
+                     'an xe-toolstack-restart on that host would too, but it would also drop %s, which another host '
+                     'may still need' % ', '.join(others) if others else 'so does an xe-toolstack-restart on that '
+                     'host (xapi drops the host_ keys of disks it has not activated when it starts)'))
     else:
-        reason = ('nothing on %s has it attached: a proper deactivate (releasing its dom0 VBD) or SM\'s own reset (a '
-                  'read-write activation of it, which asks %s and clears the key once nothing there has it open) '
-                  'removes it; it is never removed by hand' % (hv.name, hv.name))
+        reason = ('nothing on that host has it attached. A proper deactivate (releasing its dom0 VBD), or SM\'s own '
+                  'reset on its next read-write activation, removes it. Never remove it by hand')
     return ev(k, 'C13', REPORT, None, title, reason, vbds or ['it has no VBDs'])
 
 
@@ -9181,8 +9272,9 @@ def eval_taps(a, opts):
                 out.append(ev(('C21', hv.uuid, row['pid'], row['minor']), 'C21', REPORT, hv.uuid,
                               'C21 tapdisk pid %s minor %s on %s is in state %s'
                               % (row['pid'], row['minor'], hv.name, tap_state_text(row['state'])),
-                              'nothing that touches its disk is done while it is in that state. A requested pause, '
-                              'quiesce or shutdown clears by itself; anything else needs a look (tapdisk-inspect.sh)',
+                              'it serves %s:%s. Nothing that touches its disk is done while it is in that state. A '
+                              'requested pause, quiesce or shutdown clears by itself; anything else needs a look '
+                              '(tapdisk-inspect.sh)' % (row.get('type'), row.get('path')),
                               ['args %s:%s' % (row.get('type'), row.get('path'))]))
         for row in orphan_rows(hv):
             info = (hv.tapinfo or {}).get(str(row['pid']))
@@ -9230,7 +9322,9 @@ def eval_taps(a, opts):
                               ', '.join(rec.get('ctl') or []) or 'no control socket',
                               (' and %s' % ', '.join(rec['shm'][:3])) if rec.get('shm') else '', pid),
                           ['ctl%s dates from %s ago' % (pid, format_age(host_time(hv, a) - rec['mtime']))]
-                          if rec.get('mtime') else []))
+                          if rec.get('mtime') else [],
+                          roll=('files left in %s by tapdisks that died (harmless, left alone)' % BLKTAP_CTL,
+                                'pid %s' % pid, hv.name)))
         if hv.backend is not None:
             for (sr, vdi), node in hv.back_node.items():
                 if node['kind'] != 'block' or node['rdev'][0] != hv.tap_major:
@@ -9242,7 +9336,9 @@ def eval_taps(a, opts):
                 out.append(ev(('C16', 'node', hv.uuid, sr, vdi), 'C16', INFO, hv.uuid,
                               'C16 backend node %s/%s on %s' % (sr, vdi, hv.name),
                               'it points at tap minor %d, which has no tapdisk, and no datapath names it'
-                              % node['rdev'][1]))
+                              % node['rdev'][1],
+                              roll=('backend nodes pointing at a tap minor with no tapdisk, which no datapath names '
+                                    '(left alone)', 'VDI %s (minor %d)' % (vdi, node['rdev'][1]), hv.name)))
         for name, f in sorted((hv.dps_files or {}).items() if hv.claim is not None else ()):
             c = f.get('content') or {}
             vdi = c.get('vdi')
@@ -9250,11 +9346,15 @@ def eval_taps(a, opts):
             if vdi and dp and not any(vdi in (cl[1], cl[3]) for cl in hv.claim.get(dp, [])):
                 out.append(ev(('C16', 'dpsfile', hv.uuid, name), 'C16', INFO, hv.uuid,
                               'C16 storage-dps/%s on %s' % (name, hv.name),
-                              'it names VDI %s, which no longer holds %s; left alone' % (vdi, dp)))
+                              'it names VDI %s, which no longer holds %s; left alone' % (vdi, dp),
+                              roll=('storage-dps files naming a VDI that no longer holds that datapath (left alone)',
+                                    name, hv.name)))
         errs = len(((hv.sdb or {}).get('obj') or {}).get('errors') or [])
         if errs:
             out.append(ev(('C16', 'errors', hv.uuid), 'C16', INFO, hv.uuid, 'C16 storage.db errors on %s' % hv.name,
-                          '%d past storage errors are recorded; never edited' % errs))
+                          '%d past storage errors are recorded; never edited' % errs,
+                          roll=('past storage errors recorded in storage.db (never edited)', '%s %d' % (hv.name, errs),
+                                None)))
     return out
 
 
@@ -9290,6 +9390,16 @@ def minor_named(hv, minor):
     return out, unknown
 
 
+def minor_age(a, hv, minor):
+    if hv.blktap is None:
+        return None, 'the tap device nodes were not read'
+    rec = (hv.blktap.get('blktap') or {}).get(str(minor))
+    if not rec or rec.get('mtime') is None:
+        return None, ('%s/blktap%d is missing, so when it was allocated is not established and this tool does not '
+                      'release it; once that has been checked, tap-ctl free -m %d does' % (BLKTAP_DIR, minor, minor))
+    return host_time(hv, a) - rec['mtime'], None
+
+
 def eval_minor(a, opts, hv, row):
     k = ('C16', 'minor', hv.uuid, row['minor'])
     title = 'C16 tap minor %s on %s has no tapdisk' % (row['minor'], hv.name)
@@ -9299,9 +9409,15 @@ def eval_minor(a, opts, hv, row):
     if named:
         return ev(k, 'C16', INFO, hv.uuid, title, 'tap-ctl lists it as allocated with no tapdisk behind it (what a '
                   'killed tapdisk leaves), and it is still named (%s): left alone' % '; '.join(named[:3]))
+    age, why = minor_age(a, hv, row['minor'])
+    if why:
+        unknown.append(why)
     if unknown:
         return ev(k, 'C16', UNKNOWN, hv.uuid, title, 'tap-ctl lists it as allocated with no tapdisk behind it, and '
-                  'whether anything still names it is not established: %s' % '; '.join(unknown[:3]))
+                  'whether it can be released is not established: %s' % '; '.join(unknown[:3]))
+    if age < ABORT_MIN_AGE:
+        return ev(k, 'C16', WAIT, hv.uuid, title, 'it was allocated only %s ago, so a tapdisk may still be starting '
+                  'on it: it is released only once it is %s old' % (format_age(age), format_age(ABORT_MIN_AGE)))
     item = {'cls': 'C16', 'phase': 'L', 'action': 'tap-free', 'host': hv.uuid, 'minor': row['minor']}
     return ev(k, 'C16', FIX, hv.uuid, title,
               'tap-ctl lists it as allocated with no tapdisk behind it (what a killed tapdisk leaves), and nothing '
@@ -9546,7 +9662,7 @@ def lv_put_proof(a, hv, sr, vdi, want):
         problems.append('the processes on %s were not read' % hv.name)
     else:
         for p in busy:
-            waits.append('SM process %d runs on %s (%s)' % (p['pid'], hv.name, ' '.join((p.get('argv') or [])[:2])[:120]))
+            waits.append('SM process %d runs on %s (%s)' % (p['pid'], hv.name, sm_what(p.get('argv'))))
     if m.pending_tasks(work=True):
         waits.append('%d task(s) are pending in the pool' % len(m.pending_tasks(work=True)))
     return problems, waits
@@ -9615,7 +9731,7 @@ def eval_lvrefs(a, opts):
                 else:
                     for p in busy:
                         waits.append('SM process %d runs on %s (%s)' % (p['pid'], hv.name,
-                                                                       ' '.join((p.get('argv') or [])[:2])[:120]))
+                                                                       sm_what(p.get('argv'))))
                 if m.pending_tasks(work=True):
                     waits.append('%d task(s) are pending in the pool' % len(m.pending_tasks(work=True)))
                 verdict, reason = verdict_of(problems, unknowns, waits)
@@ -9841,7 +9957,7 @@ def eval_paused_tap(a, opts, hv, row):
         for p in busy:
             if not any(x.endswith('cleanup.py') for x in p.get('argv') or []):
                 waits.append('SM process %d runs on %s (%s)' % (p['pid'], h2.name,
-                                                                ' '.join((p.get('argv') or [])[:2])[:120]))
+                                                                sm_what(p.get('argv'))))
     hold = hv.holders(sr['uuid'], vu)
     if hold is None:
         unknowns.append('openers not established')
@@ -9972,8 +10088,10 @@ def eval_gc(a, opts):
         recovered = latest.get('outcome') == 'exited' and not latest.get('aborted') and not latest.get('error')
         out.append(ev(('C19', sr['uuid']), 'C19', INFO if recovered else REPORT, hv.uuid,
                       'C19 GC on SR %s' % m.name_sr(sref),
-                      '%d of its last %d runs failed%s%s' % (
+                      '%d of its last %d runs failed%s%s%s' % (
                           len(bad), len(last), (': ' + '; '.join(why)) if why else '',
+                          ('; the last error: %s' % _text([r['error'] for r in bad if r.get('error')][-1])[:160])
+                          if any(r.get('error') for r in bad) else '',
                           '; its latest run ended normally, so the GC works again' if recovered else ''),
                       ['%s ago %s%s' % (format_age(host_time(hv, a) - r['last']), r.get('outcome') or 'failed',
                                          (': %s' % r['error']) if r.get('error') else '')
@@ -10024,11 +10142,11 @@ def eval_hazards(a, opts):
             out.append(ev(('C20', hv.uuid, sr, vdi), 'C20', REPORT, hv.uuid,
                           'C20 backend node of VDI %s on %s points at another disk\'s tapdisk'
                           % (m.name_vdi(vref) if vref else vdi, hv.name),
-                          'its own tapdisk is gone and tap minor %d now belongs to %s. Anything that deactivates, '
-                          'pauses or unpauses this VDI on %s - unplugging its VBD, shutting down its VM, a snapshot, '
-                          'the GC coalescing it - acts on that tapdisk instead and takes that disk away from its '
-                          'user. Touch nothing that uses this VDI until its node is made inert' %
-                          (node['rdev'][1], hv.row_label(at), hv.name),
+                          'it is attached here by %s. Its own tapdisk is gone and tap minor %d now belongs to %s. '
+                          'Anything that deactivates, pauses or unpauses this VDI on %s - unplugging its VBD, shutting '
+                          'down its VM, a snapshot, the GC coalescing it - acts on that tapdisk instead and takes that '
+                          'disk away from its user. Touch nothing that uses this VDI until its node is made inert' %
+                          (', '.join(users) or 'nothing in xapi', node['rdev'][1], hv.row_label(at), hv.name),
                           ['attached here by: %s' % (', '.join(users) or 'nothing in xapi'),
                            '/dev/sm/backend/%s/%s is block %d:%d' % (sr, vdi, node['rdev'][0], node['rdev'][1])]))
     return out
@@ -10223,8 +10341,10 @@ def classify(audits, opts):
     for e in final:
         if e['cls'] == 'C11':
             seen = [i for i, p in enumerate(per) if tuple(e['key']) in p]
-            e['evidence'] = list(e['evidence']) + ['seen in %d of %d audit(s), over %s' % (
-                len(seen), len(per), format_age((audits[-1].t or 0) - (audits[seen[0]].t or 0)))]
+            note = 'seen in %d of %d audit(s), over %s' % (
+                len(seen), len(per), format_age((audits[-1].t or 0) - (audits[seen[0]].t or 0)))
+            e['evidence'] = list(e['evidence']) + [note]
+            e['reason'] = '%s (%s)' % (e['reason'], note)
         elif e['cls'] == 'C22' and e['verdict'] == REPORT and not all(tuple(e['key']) in p for p in per):
             e['verdict'] = INFO
             e['reason'] = ('it was not dying in every audit: a domain is briefly dying whenever a VM shuts down. %s'
@@ -10532,28 +10652,76 @@ def collect_audit(ctx, n, first=False, only_hosts=None, probes=True, smlog=True,
     return a
 
 
-def print_findings(ctx, final, plan, title=u'Findings'):
-    if _OUT['json']:
-        return
-    order = {FIX: 0, UNKNOWN: 1, WAIT: 2, REPORT: 3, INFO: 4}
-    shown = [e for e in final]
+SECTIONS = ((FIX, u'to fix', u'Can be fixed:'),
+            (UNKNOWN, u'not established', u'Not established, so nothing that depends on them is changed:'),
+            (WAIT, u'waiting', u'Waiting, so left alone for now (run this again later):'),
+            (REPORT, u'to look at', u'To look at (this tool does not change these):'),
+            (INFO, u'notes', u'Notes:'))
+
+
+def print_findings(ctx, final, plan, title=u'Findings', after=False):
+    planned = set(id(it) for it in plan or [])
+    shown = [e for e in final if not (e['verdict'] == FIX and id(e.get('item')) in planned)]
     say(u'')
     say(u'== %s ==' % title)
-    if not shown:
+    if not final:
         say(u'  Nothing found: every check came back clean.')
         return
-    for e in sorted(shown, key=lambda e: (order[e['verdict']], e['cls'], e['title'])):
-        say(u'  %-7s %s  %s' % (e['verdict'], e['cls'], e['title']))
-        if e['reason']:
-            for line in wrap(e['reason'], 96):
-                say(u'                %s' % line)
-        for x in e['evidence']:
-            for line in wrap(x, 94):
-                say(u'                  %s' % line)
+    counts = collections.Counter(e['verdict'] for e in final)
+    say(u'  %s%s' % (u', '.join(u'%d %s' % (counts[v], word) for v, word, head in SECTIONS if counts.get(v)),
+                     u' (the fixes are listed under Changes)' if len(shown) < len(final) else u''))
+    for verdict, word, head in SECTIONS:
+        group = [e for e in shown if e['verdict'] == verdict]
+        if group:
+            if verdict == FIX:
+                head = (u'Would be fixed by running this again:' if after else
+                        u'Can be fixed, but not among the changes below:')
+            say(u'')
+            say(u'  %s' % head)
+            for line in finding_lines(group):
+                say(line)
+
+
+def bare_title(e):
+    t = e['title']
+    return t[len(e['cls']) + 1:] if t.startswith(e['cls'] + ' ') else t
+
+
+def paragraph(cls, text):
+    return [(u'  %-4s ' % cls if i == 0 else u'       ') + l for i, l in enumerate(wrap(text, 93))]
+
+
+def finding_lines(group):
+    group = sorted(group, key=lambda e: (e['cls'], e['title']))
+    out, done = [], set()
+    for i, e in enumerate(group):
+        if i in done:
+            continue
+        roll = e.get('roll')
+        same = [j for j in range(i, len(group)) if group[j]['cls'] == e['cls'] and
+                ((group[j].get('roll') or [None])[0] == roll[0] if roll else
+                 not group[j].get('roll') and group[j]['reason'] == e['reason'])]
+        done.update(same)
+        if roll:
+            members = collections.OrderedDict()
+            for j in same:
+                members.setdefault(group[j]['roll'][2], []).append(group[j]['roll'][1])
+            out.extend(paragraph(e['cls'], u'%s: %s' % (roll[0], u'; '.join(
+                u', '.join(names) + (u' (%s)' % d if d else u'') for d, names in members.items()))))
+        elif len(same) == 1:
+            out.extend(paragraph(e['cls'], bare_title(e)))
+            out.extend(u'       ' + l for l in wrap(e['reason'], 93) if e['reason'])
+        else:
+            out.extend(paragraph(e['cls'], u'%s (%d): %s' % (CLASS_TITLES.get(e['cls'], e['cls']), len(same),
+                                                            e['reason'])))
+            for j in same:
+                out.extend((u'         ' if k == 0 else u'           ') + l
+                           for k, l in enumerate(wrap(bare_title(group[j]), 91)))
+    return out
 
 
 def wrap(text, width):
-    words = _text(text).split()
+    words = re.sub(u'[\t\r\n]', u' ', _text(text)).strip(u' ').split(u' ')
     lines, cur = [], u''
     for w in words:
         if cur and len(cur) + 1 + len(w) > width:
@@ -10566,29 +10734,50 @@ def wrap(text, width):
     return lines or [u'']
 
 
+def vdi_text(model, uuid):
+    ref = model.vdi_by_uuid.get(uuid)
+    return model.name_vdi(ref) if ref else _text(uuid)
+
+
+def disk_owners(model, vdi_uuid):
+    vref = model.vdi_by_uuid.get(vdi_uuid)
+    out = set()
+    for r, vbd in vdi_vbds(model, vref) if vref else []:
+        vm = model.vms.get(vbd['VM']) or {}
+        if not vm or vm.get('is_control_domain') or vm.get('is_a_template') or vm.get('is_a_snapshot'):
+            continue
+        state = _text(vm.get('power_state') or '?')
+        out.add(u'VM "%s", %s%s' % (vm.get('name_label'), state.lower(), (u' on %s' % model.name_host(
+            vm.get('resident_on'))) if state == 'Running' else u''))
+    return sorted(out)
+
+
 def describe_item(model, it):
     hn = model.name_host(model.host_by_uuid.get(it.get('host'))) if it.get('host') else None
     a = it['action']
     if a == 'storage-db':
-        return u'remove datapath %s of VDI %s from storage.db on %s' % (it['dp'], it['vdi'], hn)
+        master = model.host_by_uuid.get(it.get('host')) == model.pool.get('master')
+        return u'remove datapath %s of VDI %s from storage.db on %s%s' % (
+            it['dp'], vdi_text(model, it['vdi']), hn, u' (the pool master: the pool\'s API is down while its xapi '
+                                                      u'restarts)' if master else u'')
     if a == 'release-vbd':
-        txt = u'%s dom0 VBD %s on %s (VDI %s)' % ('unplug and destroy' if it['attached'] else 'destroy',
-                                                  it['vbd'], hn, model.name_vdi(model.vdi_by_uuid.get(it['vdi'])))
+        owners = disk_owners(model, it['vdi'])
+        txt = u'%s dom0 VBD %s on %s (VDI %s%s)' % ('unplug and destroy' if it['attached'] else 'destroy',
+                                                    it['vbd'], hn, vdi_text(model, it['vdi']),
+                                                    (u', the disk of %s' % u'; '.join(owners)) if owners else u'')
         if it.get('inert'):
             txt += u', after making its stale backend node /dev/sm/backend/%s/%s (tap minor %d) inert' % (
                 it['sr'], it['vdi'], it['inert']['rdev'][1])
         return txt
     if a == 'dp0-destroy':
         return (u'xe host-sm-dp-destroy %s of VDI %s on %s (no leak allowed, no xapi restart), with its device name '
-                u'held by a placeholder dom0 VBD meanwhile' % (it['dp'], it['vdi'], hn))
+                u'held by a placeholder dom0 VBD meanwhile' % (it['dp'], vdi_text(model, it['vdi']), hn))
     if a == 'dp-destroy':
         txt = u'xe host-sm-dp-destroy %s of VDI %s on %s%s%s' % (
-            it['dp'], it['vdi'], hn, (u' (once dom0 VBD(s) %s are released)' % ', '.join(it['needs']))
+            it['dp'], vdi_text(model, it['vdi']), hn, (u' (once dom0 VBD(s) %s are released)' % ', '.join(it['needs']))
             if it.get('needs') else u'', (u', after making its stale backend node (tap minor %d) inert'
                                          % it['inert']['rdev'][1]) if it.get('inert') else u'')
         steps = it.get('steps') or ['destroy']
-        if len(steps) == 1:
-            return txt
         tp, lv = it.get('tap') or {}, it.get('lv') or {}
         parts = []
         for s in steps:
@@ -10618,20 +10807,24 @@ def describe_item(model, it):
                 % (it['pid'], hn, it.get('domid'), it['minor']))
     if a == 'lv-deactivate':
         return u'put back %d stale activation count(s) of the LV of VDI %s on %s through SM (on-slave deactivate)' % (
-            (it['lv'].get('refcount') or [0])[0], model.name_vdi(model.vdi_by_uuid.get(it['vdi'])), hn)
+            (it['lv'].get('refcount') or [0])[0], vdi_text(model, it['vdi']), hn)
     if a == 'remove-key':
-        return u'remove sm-config:%s from VDI %s' % (it['key'], model.name_vdi(model.vdi_by_uuid.get(it['vdi'])))
+        return u'remove sm-config:%s from VDI %s, under SM\'s locks on every host that has its SR plugged%s' % (
+            it['key'], vdi_text(model, it['vdi']), u', then start the GC of its SR again (xe sr-scan) once it is '
+                                                    u'idle' if it.get('kick') else u'')
     if a == 'unpause':
-        return u'unpause tapdisk pid %s on %s (VDI %s) with SM\'s tapdisk-pause code, under the VDI\'s SM lock' % (
-            it['pid'], hn, model.name_vdi(model.vdi_by_uuid.get(it['vdi'])))
+        frozen = it.get('frozen') or []
+        return (u'unpause tapdisk pid %s on %s (VDI %s) with SM\'s tapdisk-pause code, under the VDI\'s SM lock and '
+                u'with the GC of its SR held off%s' % (it['pid'], hn, vdi_text(model, it['vdi']), (
+                    u'; %s %s on it, frozen until then: %s disk resumes' % (
+                        ', '.join('VM "%s"' % v for v in frozen), 'runs' if len(frozen) == 1 else 'run',
+                        'its' if len(frozen) == 1 else 'their')) if frozen else u''))
     if a == 'unlink-abort':
         return u'remove %s/%s/abort on %s, then xe sr-scan the SR' % (IPC_DIR, it['sr'], hn)
     return canon(it)
 
 
 def print_plan(ctx, audit, plan, ha):
-    if _OUT['json']:
-        return
     model = audit.model
     say(u'')
     say(u'== Changes ==')
@@ -10647,7 +10840,7 @@ def print_plan(ctx, audit, plan, ha):
             for i, line in enumerate(wrap(describe_item(model, it), 92)):
                 say((u'   %3d. %s' % (it['seq'], line)) if i == 0 else (u'        %s' % line))
     if ha is not None and any(it['action'] == 'storage-db' for it in plan):
-        say(u'  HA is turned off for the xapi restart(s) and on again after.')
+        say(u'  HA is turned off for the whole pool for the xapi restart(s), and on again after.')
 
 
 class HaCapture(object):
@@ -10803,8 +10996,47 @@ def read_journal(path):
     return out
 
 
+DATA_GLOBS = ('/root/*/', '/root/*/*/', '/tmp/', '/var/tmp/', '/opt/', '/opt/*/', '/home/*/', '/home/*/*/')
+
+
+def trusted_root(path, parent=False):
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0:
+        return False
+    return not st.st_mode & 0o022 or bool(parent and st.st_mode & stat.S_ISVTX)
+
+
+def data_roots():
+    import glob
+    out = [RUN_ROOT]
+    seen = set([os.path.realpath(RUN_ROOT)])
+    for pat in ('/root/',) + tuple(DATA_GLOBS):
+        for p in sorted(glob.glob(pat + DATA_DIR)):
+            real = os.path.realpath(p)
+            if real not in seen and trusted_root(p) and trusted_root(os.path.dirname(p), True):
+                seen.add(real)
+                out.append(p)
+    return out
+
+
 def open_journals():
-    return journals_in(RUN_ROOT)
+    out = []
+    for root in data_roots():
+        out.extend(journals_in(root))
+    return out
+
+
+def journal_closed(run_id):
+    for root in data_roots() + [LEGACY_ROOT]:
+        p = os.path.join(root, 'runs', run_id, 'journal.jsonl')
+        if os.path.exists(p):
+            recs = read_journal(p)
+            if recs and recs[-1].get('event') == 'closed':
+                return p
+    return None
 
 
 def journals_in(base):
@@ -10843,6 +11075,8 @@ def prune_runs(keep=20):
     closed = []
     for name in _listdir(root):
         d = os.path.join(root, name)
+        if not RUN_ID_RE.match(name) or os.path.islink(d) or not os.path.isdir(d):
+            continue
         p = os.path.join(d, 'journal.jsonl')
         has_backup = False
         for dirpath, dirs, files in os.walk(d):
@@ -11154,7 +11388,8 @@ class Engine(object):
         if key is not None:
             return None, '%s: %s' % (key['verdict'], key['reason'])
         if changed is not None:
-            return None, 'its state changed since it was planned (it still qualifies, but not as planned): run check again'
+            return None, ('its state changed since it was planned (it still qualifies, but not as planned): run the '
+                          'tool again')
         return None, 'it is no longer found'
 
     def same_target(self, e, it):
@@ -11250,7 +11485,7 @@ class Engine(object):
             else:
                 for p in busy:
                     reasons.append('SM is busy on %s: pid %d %s' % (sv.name, p['pid'],
-                                                                   ' '.join((p.get('argv') or [])[:3])[:120]))
+                                                                   sm_what(p.get('argv'))))
             if sv.locks is None:
                 reasons.append('the SM locks on %s were not read' % sv.name)
             else:
@@ -11426,7 +11661,7 @@ class Engine(object):
             self.settled[h.uuid] = True
             for it in items:
                 self.result(it, 'skipped', 'not stopped: something changed since the host was re-checked (%s); run '
-                                           'check again' % moved)
+                                           'the tool again' % moved)
             return
         holds = []
         if h.is_master:
@@ -11450,6 +11685,10 @@ class Engine(object):
             self.act_on(*items)
             self.ctx.transport.call(h, 'act-start', {'spec': spec}, timeout=ACT_START_TIMEOUT)
             st = self.poll_act(h, attempt)
+            lost = self.fence_check(holds, 0) if holds else None
+            if lost:
+                self.fail('the toolstack of the other hosts was not held for the whole time xapi on the master was '
+                          'down: %s' % lost)
         finally:
             if holds:
                 self.fence_down(holds)
@@ -11680,7 +11919,7 @@ class Engine(object):
     def set_marker(self):
         pref, pool = self.pool_record()
         value = json.dumps({'run': self.run_id, 'host': self.ctx.my_uuid, 'hostname': socket.gethostname(),
-                            'time': int(time.time()), 'commands': self.ha.commands(),
+                            'time': int(time.time()), 'commands': self.ha.commands(), 'root': RUN_ROOT,
                             'ha': dict((k, self.ha.d.get(k)) for k in HA_SETTINGS + ('enabled', 'plan'))},
                            sort_keys=True)
         self.j.rec('ha_marker', value=value)
@@ -11793,7 +12032,7 @@ class Engine(object):
             ops = ha_operations(m.pool)
             if ops:
                 raise Failed('xapi is still running %s on the pool, started before this step: HA is left as it is '
-                             'until that ends%s; run recover once xe pool-param-get uuid=%s '
+                             'until that ends%s; run the tool again once xe pool-param-get uuid=%s '
                              'param-name=current-operations shows nothing'
                              % (', '.join(ops), ('. xapi retries an HA disable every 30s until it reaches the HA '
                                                  'statefile or every host, so bring back the host or the statefile '
@@ -11915,14 +12154,15 @@ class Engine(object):
                             ['xe pool-ha-disable'] + self.ha.commands())
         else:
             intro, lines = 'Once every host is up, put it back with:', self.ha.commands(enable=not on)
-        self.fail('%s%s\n%s\nthen run: %s recover. If HA was changed on purpose, remove the pool-wide note instead '
-                  '(xe pool-param-remove uuid=%s param-name=other-config param-key=%s): recover then leaves HA as it '
-                  'is' % (self.upgrade_note(_text(why)), intro, u'\n'.join(u'    ' + l for l in lines), sys.argv[0],
-                          self.ha.d['pool'], HA_MARKER))
+        self.fail('%s%s\n%s\nthen run %s again. If HA was changed on purpose, remove the pool-wide note instead '
+                  '(xe pool-param-remove uuid=%s param-name=other-config param-key=%s): finishing the run then '
+                  'leaves HA as it is' % (self.upgrade_note(_text(why)), intro,
+                                          u'\n'.join(u'    ' + l for l in lines), sys.argv[0], self.ha.d['pool'],
+                                          HA_MARKER))
         try:
             self.j.rec('ha_restore_pending', why=_text(why), stage=stage)
         except Exception as exc:
-            warn('the run record could not be written (%s): run %s recover all the same' % (_text(exc), sys.argv[0]))
+            warn('the run record could not be written (%s): run %s again all the same' % (_text(exc), sys.argv[0]))
 
     def compare_ha(self):
         try:
@@ -11991,7 +12231,7 @@ class Engine(object):
         for stage in ('before', 'after') if attached else ('after',):
             moved = self.changed(fresh, h, vdis=[it['vdi']], vbds=[it['vbd']], srs=[it['sr']])
             if moved:
-                return self.result(it, 'skipped', 'something changed since it was re-checked (%s); run check '
+                return self.result(it, 'skipped', 'something changed since it was re-checked (%s); run the tool '
                                    'again%s' % (moved, self.inert_note(h, it) if stage == 'after' else ''))
             if stage == 'before':
                 why = self.before_sm(h, it)
@@ -12200,10 +12440,10 @@ class Engine(object):
         err = _text(err)
         text = err + u'\n' + u'\n'.join(_text(l) for l in lines)
         if 'Expected 0 or 1 VDI with datapath' in text:
-            return ' (a duplicate dom0 datapath that was not predicted: run check again)'
+            return ' (a duplicate dom0 datapath that was not predicted: run the tool again)'
         if lsof_failed(lines) or 'lsof' in err or 'Operation not permitted' in err:
             return (' (SM\'s lsof found no process behind the blktap device of a tapdisk that is gone: leftover '
-                    'blktap files that were not predicted; run check again)')
+                    'blktap files that were not predicted; run the tool again)')
         if 'Paused key found' in text or 'Paused or host_ref key found' in text:
             return ' (the VDI carries sm-config paused, so SM refused to deactivate it: see C11)'
         if re.search(r'VDI \S+ locked|SR locked, retrying', text):
@@ -12212,10 +12452,10 @@ class Engine(object):
             return ' (the device is still open: something on the host still uses it)'
         if 'Connection timed out' in text and 'tap-ctl' in text:
             return (' (tap-ctl got no answer from the tapdisk: it is deaf, or wedged in a close that never returns, and '
-                    'a tapdisk whose close timed out refuses every request afterwards. Run check again: it is reported '
-                    'as C15, and fix ends the tapdisk of a leaked datapath)')
+                    'a tapdisk whose close timed out refuses every request afterwards. Run the tool again: it is '
+                    'reported as C15, and the fix ends the tapdisk of a leaked datapath)')
         if 'no answer within' in err:
-            return ' (the call did not finish in time, so its state is not known: run check again)'
+            return ' (the call did not finish in time, so its state is not known: run the tool again)'
         return ''
 
     def phase_l(self, items):
@@ -12298,9 +12538,9 @@ class Engine(object):
         if e['verdict'] != FIX:
             return None, '%s: %s' % (e['verdict'], e['reason'])
         rest = [s for s in it['steps'] if s not in done]
-        if e['item']['steps'] != rest:
-            return None, 'what is left to do is now %s, where %s was planned' % (
-                ', '.join(e['item']['steps']), ', '.join(rest))
+        now = [s for s in e['item']['steps'] if s != 'free' or 'free' in it['steps']]
+        if now != rest:
+            return None, 'what is left to do is now %s, where %s was planned' % (', '.join(now), ', '.join(rest))
         pick = lambda s: [s[0], s[1], s[2], s[5]]
         if canon(pick(e['sig'])) != canon(pick(it['sig'])):
             return None, 'its claimants or its storage-dps routing record changed'
@@ -12365,7 +12605,7 @@ class Engine(object):
         node = hv.back_node.get((it['sr'], it['vdi'])) if it.get('vdi') else None
         moved = self.changed(fresh, h, vdis=[it['vdi']] if it.get('vdi') else [], srs=[it['sr']] if it.get('sr') else [])
         if moved:
-            return self.chain_stop(it, h, done, 'something changed since it was re-checked (%s); run check again'
+            return self.chain_stop(it, h, done, 'something changed since it was re-checked (%s); run the tool again'
                                    % moved)
         h_ = hv.tap_health([r for r in hv.live_taps() if r['pid'] == tp['pid']][0])
         args = {'sr': it.get('sr'), 'vdi': it.get('vdi'), 'pid': tp['pid'], 'minor': tp['minor'], 'start': tp['start'],
@@ -12423,10 +12663,17 @@ class Engine(object):
         names = self.refresh_lvs(it)
         moved = self.changed(fresh, h, vdis=[it['vdi']], srs=[it['sr']])
         if moved:
-            return self.chain_stop(it, h, done, 'something changed since it was re-checked (%s); run check again'
+            return self.chain_stop(it, h, done, 'something changed since it was re-checked (%s); run the tool again'
                                    % moved)
-        self.act_on(it)
-        ok, r = self.on_slave(h, lv['vg'], [{'action': 'refresh', 'lvName': n} for n in names])
+        fences, why = self.fence_up(it, [(h, [['vdi', it['vdi']]])], hold=LV_FENCE_HOLD)
+        try:
+            why = why or self.fence_check(fences, FENCE_MARGIN) or self.count_moved(h, it, lv['refcount'])
+            if why:
+                return self.chain_stop(it, h, done, '%s not activated: %s' % (', '.join(names), why))
+            self.act_on(it)
+            ok, r = self.on_slave(h, lv['vg'], [{'action': 'refresh', 'lvName': n} for n in names])
+        finally:
+            self.fence_down(fences)
         if not ok:
             rb = self.refresh_back(h, it)
             self.fail_item(it, 'the on-slave refresh of %s on %s answered %s (%s); %s'
@@ -12485,33 +12732,50 @@ class Engine(object):
             bad.append('its SM activation count reads %s now, not %s' % (canon(raw), canon(lv['refcount'])))
         return bad
 
+    def count_moved(self, h, it, want):
+        a = self.audit(hosts=[h.uuid], smlog=False)
+        rc, why = refcount_of(a.view(a.model.host_by_uuid[h.uuid]), it['sr'], it['vdi'])
+        if rc != want:
+            return ('its activation count reads %s under SM\'s VDI lock, not %s'
+                    % (canon(rc) if rc is not None else why, canon(want)))
+        return None
+
     def refresh_back(self, h, it):
         lv = it['lv']
         names = self.refresh_lvs(it)
-        a = self.audit(hosts=[h.uuid], smlog=False, vgs={h.uuid: [lv['vg']]})
-        hv = a.view(a.model.host_by_uuid[h.uuid])
-        rc, why = refcount_of(hv, it['sr'], it['vdi'])
-        found = a.lvnames.get((hv.uuid, lv['vg']))
-        if rc != lv['refcount'] or found is None:
-            return ('%s left as %s (its activation count reads %s, and its volume group was %s), so nothing is '
-                    'deactivated by this tool: look at it' % (', '.join(names), 'it is' if len(names) == 1 else 'they are',
-                                                             canon(rc), 'listed' if found is not None else 'not listed'))
-        attrs = dict((n, attr) for n, attr in found)
-        back, kept = [], []
-        for n in names:
-            attr = attrs.get(n)
-            if attr is None or (len(attr) > 5 and attr[5] == 'o'):
-                kept.append('%s (%s)' % (n, 'not listed' if attr is None else 'open'))
-            elif len(attr) > 4 and attr[4] == 'a':
-                back.append(n)
-        text = []
-        if back:
-            ok, r = self.on_slave(h, lv['vg'], [{'action': 'deactivateNoRefcount', 'lvName': n} for n in back])
-            text.append('%s deactivated again through SM (on-slave deactivateNoRefcount)' % ', '.join(back) if ok else
-                        'deactivating %s again failed too (%s)' % (', '.join(back), r.why()))
-        if kept:
-            text.append('left active: %s; look at it' % ', '.join(kept))
-        return '; '.join(text) or 'none of %s is active, so it is as it was' % ', '.join(names)
+        left = '%s left as %s' % (', '.join(names), 'it is' if len(names) == 1 else 'they are')
+        fences, why = self.fence_up(it, [(h, [['vdi', it['vdi']]])], hold=LV_FENCE_HOLD)
+        try:
+            why = why or self.fence_check(fences, FENCE_MARGIN)
+            if why:
+                return ('%s (SM\'s VDI lock could not be held: %s), so nothing is deactivated by this tool: look at '
+                        'it' % (left, why))
+            a = self.audit(hosts=[h.uuid], smlog=False, vgs={h.uuid: [lv['vg']]})
+            hv = a.view(a.model.host_by_uuid[h.uuid])
+            rc, why = refcount_of(hv, it['sr'], it['vdi'])
+            found = a.lvnames.get((hv.uuid, lv['vg']))
+            if rc != lv['refcount'] or found is None:
+                return ('%s (its activation count reads %s under SM\'s VDI lock, and its volume group was %s), so '
+                        'nothing is deactivated by this tool: look at it'
+                        % (left, canon(rc), 'listed' if found is not None else 'not listed'))
+            attrs = dict((n, attr) for n, attr in found)
+            back, kept = [], []
+            for n in names:
+                attr = attrs.get(n)
+                if attr is None or (len(attr) > 5 and attr[5] == 'o'):
+                    kept.append('%s (%s)' % (n, 'not listed' if attr is None else 'open'))
+                elif len(attr) > 4 and attr[4] == 'a':
+                    back.append(n)
+            text = []
+            if back:
+                ok, r = self.on_slave(h, lv['vg'], [{'action': 'deactivateNoRefcount', 'lvName': n} for n in back])
+                text.append('%s deactivated again through SM (on-slave deactivateNoRefcount)' % ', '.join(back)
+                            if ok else 'deactivating %s again failed too (%s)' % (', '.join(back), r.why()))
+            if kept:
+                text.append('left active: %s; look at it' % ', '.join(kept))
+            return '; '.join(text) or 'none of %s is active, so it is as it was' % ', '.join(names)
+        finally:
+            self.fence_down(fences)
 
     def step_unkey(self, it, h, fresh, done):
         x = self.ctx.api.x
@@ -12585,13 +12849,7 @@ class Engine(object):
             return None
         fences, why = self.fence_up(it, [(h, [['vdi', it['vdi']]])])
         try:
-            why = why or self.fence_check(fences, FENCE_MARGIN)
-            if not why:
-                a2 = self.audit(hosts=[h.uuid], smlog=False)
-                rc2, rwhy = refcount_of(a2.view(a2.model.host_by_uuid[h.uuid]), it['sr'], it['vdi'])
-                if rc2 != want:
-                    why = ('its activation count reads %s under SM\'s VDI lock, not %s'
-                           % (canon(rc2) if rc2 is not None else rwhy, canon(want)))
+            why = why or self.fence_check(fences, FENCE_MARGIN) or self.count_moved(h, it, want)
             if why:
                 if standalone:
                     self.result(it, 'skipped', why)
@@ -12702,14 +12960,14 @@ class Engine(object):
     def c03_destroy(self, it, h, fresh, done):
         moved = self.changed(fresh, h, vdis=[it['vdi']], srs=[it['sr']])
         if moved:
-            return self.chain_stop(it, h, done, 'something changed since it was re-checked (%s); run check again'
+            return self.chain_stop(it, h, done, 'something changed since it was re-checked (%s); run the tool again'
                                    % moved)
         why = self.before_sm(h, it)
         if why:
             return self.chain_stop(it, h, done, why)
         moved = self.changed(fresh, h, vdis=[it['vdi']], srs=[it['sr']])
         if moved:
-            return self.chain_stop(it, h, done, 'something changed since it was re-checked (%s); run check again%s'
+            return self.chain_stop(it, h, done, 'something changed since it was re-checked (%s); run the tool again%s'
                                    % (moved, self.inert_note(h, it)))
         allow = [it['lv']['refcount'][0], 0] if 'deactivate' in (it.get('steps') or []) else None
         since = self.host_now(fresh, h)
@@ -12777,7 +13035,8 @@ class Engine(object):
             return self.result(it, 'skipped', why)
         moved = self.changed(fresh, h, vdis=[it['vdi']], srs=[it['sr']])
         if moved:
-            return self.result(it, 'skipped', 'something changed since it was re-checked (%s); run check again' % moved)
+            return self.result(it, 'skipped', 'something changed since it was re-checked (%s); run the tool again'
+                               % moved)
         hold, why = self.hold_name(fresh, h, it)
         if hold is None:
             return self.result(it, 'skipped', 'not removed: %s' % why)
@@ -12789,7 +13048,7 @@ class Engine(object):
             moved = self.changed(fresh, h, vdis=[it['vdi']], srs=[it['sr']], mine=[hold[0]])
             if moved:
                 return self.result(it, 'skipped', 'not removed: something changed since it was re-checked (%s); run '
-                                                  'check again' % moved)
+                                                  'the tool again' % moved)
             since = self.host_now(fresh, h)
             self.act_on(it)
             self.j.rec('dp0_destroy', seq=it['seq'], host=h.uuid, dp=it['dp'], vdi=it['vdi'], vbd=hold[1])
@@ -13018,7 +13277,7 @@ class Engine(object):
                 continue
             moved = self.changed(fresh, None, vdis=[it['vdi']], srs=[it['sr']])
             if moved:
-                self.result(it, 'skipped', 'something changed since it was re-checked (%s); run check again' % moved)
+                self.result(it, 'skipped', 'something changed since it was re-checked (%s); run the tool again' % moved)
                 continue
             plan, why = self.flag_fence_plan(fresh, it)
             if plan is None:
@@ -13118,7 +13377,7 @@ class Engine(object):
                 ', '.join(extra), 'has' if len(extra) == 1 else 'have', 'is' if len(extra) == 1 else 'are')
         moved = self.changed(fresh, None, vdis=[it['vdi']], srs=[it['sr']])
         if moved:
-            return 'something changed since it was re-checked (%s); run check again' % moved
+            return 'something changed since it was re-checked (%s); run the tool again' % moved
         return None
 
     def sr_hosts(self, sr_uuid, h, model=None):
@@ -13150,7 +13409,7 @@ class Engine(object):
                 continue
             moved = self.changed(fresh, h, vdis=[it['vdi']], srs=[it['sr']])
             if moved:
-                self.result(it, 'skipped', 'something changed since it was re-checked (%s); run check again' % moved)
+                self.result(it, 'skipped', 'something changed since it was re-checked (%s); run the tool again' % moved)
                 continue
             action, why = self.unpause_target(fresh, h, it)
             if action is None:
@@ -13326,7 +13585,7 @@ class Engine(object):
                 continue
             moved = self.changed(fresh, None, srs=[it['sr']])
             if moved:
-                self.result(it, 'skipped', 'something changed since it was re-checked (%s); run check again' % moved)
+                self.result(it, 'skipped', 'something changed since it was re-checked (%s); run the tool again' % moved)
                 continue
             self.act_on(it)
             res = self.ctx.transport.call(h, 'unlink-abort', {'sr': it['sr'], 'expect': it['expect']}, timeout=120)
@@ -13462,12 +13721,25 @@ class Engine(object):
         if alive.get('action') or alive.get('guardian'):
             self.fail('the action on %s did not finish: %s' % (h.name, hung_action_text(h, st)))
             return
+        holds = []
+        if h.is_master and self.audits:
+            m = self.audits[-1].model
+            plan = [(self.host(m.hosts[r]['uuid']), [['toolstack', m.hosts[r]['uuid']]]) for r in sorted(m.hosts)
+                    if m.hosts[r]['uuid'] != uuid and m.host_live(r)]
+            if plan:
+                holds, why = self.fence_up({'seq': 0}, plan, hold=TOOLSTACK_HOLD)
+                if why:
+                    warn('the toolstack of the other hosts is not held while xapi on the master is made sure of: %s'
+                         % why)
         try:
             res = self.ctx.transport.call(h, 'xapi-ensure', {'run_id': self.run_id, 'host_uuid': uuid,
                                                              'attempt': attempt}, timeout=ENSURE_TIMEOUT)
         except CallError as exc:
             self.fail('cannot make sure xapi runs on %s: %s' % (h.name, _text(exc)))
             return
+        finally:
+            if holds:
+                self.fence_down(holds)
         if res.get('started'):
             step('  started xapi on %s: %s' % (h.name, res.get('detail')))
         elif res.get('ready'):
@@ -13498,13 +13770,14 @@ def hung_action_text(h, st):
     pids_ = (st or {}).get('pids') or {}
     alive = (st or {}).get('alive') or {}
     if alive.get('action') and pids_.get('action'):
-        return ('the action, pid %d on %s, is still alive (state %s). If it is hung, kill it there with kill -9 %d: its '
-                'guardian then starts xapi and records what it found. Then run %s recover'
-                % (pids_['action'], h.name, ((st or {}).get('status') or {}).get('state'), pids_['action'],
-                   sys.argv[0]))
+        return ('the action, pid %d on %s, is still running (state %s): let it finish, then run %s again. Only if its '
+                'action.log shows no progress for a long time, kill it there with kill -9 %d: its guardian then starts '
+                'xapi and records what it found'
+                % (pids_['action'], h.name, ((st or {}).get('status') or {}).get('state'), sys.argv[0],
+                   pids_['action']))
     if alive.get('guardian'):
-        return 'the guardian on %s still watches xapi; run %s recover once it is done' % (h.name, sys.argv[0])
-    return ('neither the action nor a guardian was seen alive on %s (state %s); run %s recover'
+        return 'the guardian on %s still watches xapi; run %s again once it is done' % (h.name, sys.argv[0])
+    return ('neither the action nor a guardian was seen alive on %s (state %s); run %s again'
             % (h.name, ((st or {}).get('status') or {}).get('state'), sys.argv[0]))
 
 
@@ -13571,12 +13844,14 @@ def save_check(audits, final, plan, keep=20):
 
 
 def execute(ctx, plan, audits, ha, final):
+    check_lock()
     arm_signals()
     run_id, run_dir = new_run_dir()
     eng = Engine(ctx, plan, audits, ha, run_id, run_dir)
     eng.j.rec('open', run_id=run_id, version=VERSION, argv=sys.argv, plan=plan,
               ha=ha.d if ha is not None else None)
     _AUDIT[0] = True
+    lock_note('applying the changes (run %s)' % run_id)
     if ha is not None:
         write_json_atomic(os.path.join(run_dir, 'ha.json'), ha.d)
     save_audits(run_dir, audits)
@@ -13605,23 +13880,88 @@ def own_source():
     return data
 
 
-def take_run_lock():
+_LOCK = [None, None]
+
+
+def try_run_lock():
     import fcntl
-    fd = os.open(RUN_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except (IOError, OSError):
+    for _ in range(3):
+        fd = os.open(RUN_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (IOError, OSError):
+            os.close(fd)
+            return None
+        try:
+            mine, now = os.fstat(fd), os.stat(RUN_LOCK)
+            same = (mine.st_dev, mine.st_ino) == (now.st_dev, now.st_ino)
+        except OSError:
+            same = False
+        if same:
+            _LOCK[0], _LOCK[1] = fd, time.strftime('%H:%M:%S')
+            lock_note('started')
+            return fd
         os.close(fd)
-        raise Refused('another run of %s holds %s' % (PROG, RUN_LOCK))
-    return fd
+    return None
 
 
-def unarmed_prompt(fn, *args):
+def lock_note(what):
+    if _LOCK[0] is None:
+        return
+    try:
+        os.ftruncate(_LOCK[0], 0)
+        os.lseek(_LOCK[0], 0, 0)
+        append_all(_LOCK[0], ('pid %d, since %s: %s\n' % (os.getpid(), _LOCK[1], what)).encode('utf-8'))
+    except EnvironmentError:
+        pass
+
+
+def lock_intact():
+    if _LOCK[0] is None:
+        return True
+    try:
+        mine, now = os.fstat(_LOCK[0]), os.stat(RUN_LOCK)
+    except OSError:
+        return False
+    return (mine.st_dev, mine.st_ino) == (now.st_dev, now.st_ino)
+
+
+def check_lock():
+    if not lock_intact():
+        raise Refused('the run lock %s was removed or replaced while this run held it, so another run of this tool may '
+                      'be working too: nothing more is done; run this again once no other run is left' % RUN_LOCK)
+
+
+def run_lock_note():
+    try:
+        note = read_text(RUN_LOCK).strip().splitlines()[0][:200]
+    except (EnvironmentError, IndexError):
+        return ''
+    m = re.match(r'^pid (\d+), ', note)
+    return note if m and pid_alive(int(m.group(1))) else ''
+
+
+def lock_free():
+    import fcntl
+    try:
+        fd = os.open(RUN_LOCK, os.O_RDONLY)
+    except OSError:
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        return True
+    except (IOError, OSError):
+        return False
+    finally:
+        os.close(fd)
+
+
+def unarmed_prompt(what, fn, *args):
     old = signal.signal(signal.SIGINT, signal.default_int_handler)
     try:
         return fn(*args)
     except KeyboardInterrupt:
-        raise Interrupted('interrupted at the password prompt')
+        raise Interrupted('interrupted at %s' % what)
     finally:
         signal.signal(signal.SIGINT, old)
 
@@ -13694,7 +14034,8 @@ def preflight(opts):
         master_uuid = ctx.api.x.host.get_uuid(pool['master'])
     except Exception as exc:
         raise Refused('xapi on this host is not answering (%s). This tool never starts xapi before you have '
-                      'confirmed anything: if an earlier run of it stopped xapi, run %s recover' % (_text(exc), sys.argv[0]))
+                      'confirmed anything: if an earlier run of it stopped xapi, run %s again and let it finish '
+                      'that run' % (_text(exc), sys.argv[0]))
     if master_uuid != ctx.my_uuid:
         raise Refused('xapi says the pool master is %s, but this host is %s' % (master_uuid, ctx.my_uuid))
     ctx.workdir = make_workdir()
@@ -13702,17 +14043,18 @@ def preflight(opts):
     snap = pool_snapshot(ctx.api)
     model = Model(snap)
     hosts = ctx.host_objs(model)
-    say(u'Pool "%s": %d host(s), master %s' % (model.pool['name_label'] or model.pool['uuid'], len(hosts),
-                                               model.name_host(model.pool['master'])))
+    say(u'Pool "%s": %d host(s), master %s, HA %s' % (
+        model.pool['name_label'] or model.pool['uuid'], len(hosts), model.name_host(model.pool['master']),
+        'on' if model.pool['ha_enabled'] is True else 'off' if model.pool['ha_enabled'] is False
+        else canon(model.pool['ha_enabled'])))
     for h in hosts:
-        say(u'  %-20s %-15s %s%s%s' % (h.name, h.address, 'live' if h.live else 'NOT LIVE',
-                                       ', master' if h.is_master else '', '' if h.enabled else ', disabled'))
-    say(u'HA: %s' % ('on' if model.pool['ha_enabled'] is True else 'off' if model.pool['ha_enabled'] is False
-                     else canon(model.pool['ha_enabled'])))
+        if not h.live or not h.enabled:
+            say(u'  %s (%s): %s' % (h.name, h.address, ', '.join(
+                x for x, bad in (('NOT LIVE', not h.live), ('disabled', not h.enabled)) if bad)))
     others = [h for h in hosts if not h.local]
     if others:
         ensure_run_root()
-        trust_hosts(ctx.transport, others, getattr(opts, 'trust_host_keys', False))
+        trust_hosts(ctx.transport, others)
         get_password(ctx.transport, others)
     return ctx
 
@@ -13765,7 +14107,6 @@ def public(final, plan):
 def show_open(journals):
     for name, path, recs in journals:
         error('run %s did not finish (%s): %s' % (name, path, ', '.join(sorted(set(r.get('event', '?') for r in recs)))))
-    error('run %s recover to finish it' % sys.argv[0])
 
 
 def plan_ha(audits, plan, final):
@@ -13788,63 +14129,111 @@ def plan_ha(audits, plan, final):
     return plan, ha
 
 
-def run_in_progress():
-    import fcntl
-    try:
-        fd = os.open(RUN_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
-    except OSError:
-        return None
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except (IOError, OSError):
-        return True
-    finally:
-        os.close(fd)
-    return False
-
-
-def marker_where(mark, me):
+def marker_where(mark, me, gone):
     if me is not None and mark.get('host') == me:
-        return ('It was started on this host, but its record is not here any more (%s): finish it from here with %s '
-                'recover --run %s' % (os.path.join(RUN_ROOT, 'runs', _text(mark.get('run'))), sys.argv[0],
-                                      mark.get('run')))
-    return ('Run recover on that host (if that host is gone: %s recover --run %s on this one)'
-            % (sys.argv[0], mark.get('run')))
+        return ('It was started on this host, but its record is not here any more (%s): it can be finished from '
+                'here' % os.path.join(RUN_ROOT, 'runs', _text(mark.get('run'))))
+    if gone:
+        return 'That host is not in the pool or not live now: it can be finished from here'
+    return 'Run %s on that host to finish it' % os.path.basename(sys.argv[0])
 
 
 def marker_problem(model, jr, me=None):
     mark = ha_marker_of(model.pool)
     if mark is None:
-        return None, None
-    who = 'run %s on host %s (%s)' % (mark.get('run'), mark.get('hostname'), mark.get('host'))
+        return None, None, None
+    run_id = mark.get('run')
+    who = 'run %s on host %s (%s)' % (run_id, mark.get('hostname'), mark.get('host'))
     if model.pool.get('ha_enabled') is True:
         return None, ('the pool carries other-config:%s from %s, but HA is on: the note is stale; remove it with xe '
                       'pool-param-remove uuid=%s param-name=other-config param-key=%s'
-                      % (HA_MARKER, who, model.pool['uuid'], HA_MARKER))
-    if mark.get('run') in [name for name, path, recs in jr]:
-        return None, None
+                      % (HA_MARKER, who, model.pool['uuid'], HA_MARKER)), None
+    if run_id in [name for name, path, recs in jr]:
+        return None, None, None
     lines = mark.get('commands') if isinstance(mark.get('commands'), list) else []
+    by_hand = (':\n' + '\n'.join('    ' + _text(l) for l in lines)) if lines else ''
+    remove = ('xe pool-param-remove uuid=%s param-name=other-config param-key=%s' % (model.pool['uuid'], HA_MARKER))
+    if not isinstance(run_id, _TEXT) or not RUN_ID_RE.match(run_id):
+        return ('the pool carries other-config:%s, which says a run of this tool turned HA off, but it names no run '
+                'this tool can finish (%s). Put HA back by hand%s\nThen remove the note: %s'
+                % (HA_MARKER, canon(mark)[:200], by_hand, remove)), None, None
+    closed = journal_closed(run_id)
+    if closed:
+        return ('%s turned HA off; that run is closed (%s), but its note other-config:%s was left and HA is still off. '
+                'Put HA back by hand%s\nThen remove the note: %s'
+                % (who, closed, HA_MARKER, by_hand, remove)), None, None
+    href = model.host_by_uuid.get(mark.get('host'))
+    gone = href is None or not model.host_live(href)
+    offer = run_id if (me is not None and mark.get('host') == me) or gone else None
     return ('%s turned HA off and did not put it back (other-config:%s). %s, or put HA back by hand%s\nIf HA is to '
-            'stay off, remove the note (recover then leaves HA off): xe pool-param-remove uuid=%s '
-            'param-name=other-config param-key=%s'
-            % (who, HA_MARKER, marker_where(mark, me),
-               (':\n' + '\n'.join('    ' + _text(l) for l in lines)) if lines else '', model.pool['uuid'],
-               HA_MARKER)), None
+            'stay off, remove the note (finishing the run then leaves HA off): %s'
+            % (who, HA_MARKER, marker_where(mark, me, gone), by_hand, remove)), None, offer
 
 
-def cmd_check(opts):
-    ctx = preflight(opts)
+def open_note(jr):
+    names = sorted(set(name for name, p, r in jr))
+    return ('Nothing is applied while %s %s open: run %s in a terminal and answer yes to finish %s first.'
+            % ('run %s' % names[0] if len(names) == 1 else 'runs %s' % ', '.join(names),
+               'is' if len(names) == 1 else 'are', sys.argv[0], 'it' if len(names) == 1 else 'them'))
+
+
+def cmd_run(opts):
+    if os.geteuid() != 0:
+        raise Refused('run this as root')
+    tty = sys.stdin.isatty()
+    lockfd = try_run_lock() if tty else None
+    busy = lockfd is None and (tty or not lock_free())
+    try:
+        return run_locked(opts, lockfd, busy)
+    finally:
+        if lockfd is not None:
+            _LOCK[0] = None
+            try:
+                os.ftruncate(lockfd, 0)
+            except EnvironmentError:
+                pass
+            os.close(lockfd)
+
+
+def run_locked(opts, lockfd, busy=False):
+    tty = sys.stdin.isatty() and lockfd is not None
     jr = open_journals() + legacy_journals()
-    busy = run_in_progress() if jr else False
-    if jr and busy:
-        warn('a fix or recover of this tool is running on this host now (it holds %s): run %s is that run, so what '
-             'is found below may be its work in progress' % (RUN_LOCK, ', '.join(name for name, p, r in jr)))
-    elif jr:
+    if busy:
+        warn('another run of this tool is working on this host (%s), so this one only reports'
+             % (run_lock_note() or 'it holds %s' % RUN_LOCK))
+    if jr:
         show_open(jr)
+        if tty:
+            lock_note('waiting for an answer at a terminal')
+            try:
+                yes = ask(u'Finish %s now? xapi and HA are put back where %s left them, and what %s left is cleaned '
+                          u'up. [yes/no] ' % (('it', 'it', 'it') if len(jr) == 1 else ('them',) + ('they',) * 2))
+            except KeyboardInterrupt:
+                error('interrupted. %s' % open_note(jr))
+                return 3
+            if yes:
+                check_lock()
+                lock_note('finishing %s' % ', '.join(name for name, p, r in jr))
+                rc = recover_locked(opts)
+                if rc == 0:
+                    say(u'Run %s again to check the pool.' % sys.argv[0])
+                return rc
+    lock_note('checking the pool')
+    try:
+        ctx = preflight(opts)
+    except Refused as exc:
+        if busy:
+            raise Refused('%s. Another run of this tool is working on this host now and may have stopped xapi on '
+                          'purpose: do not start it by hand; run this again once that run has finished'
+                          % _text(exc), exc.code)
+        if jr:
+            raise Refused('%s. %s' % (_text(exc), open_note(jr)), 3)
+        raise
     audits = run_audits(ctx)
     final, plan = classify(audits, opts)
     plan, ha = plan_ha(audits, plan, final)
-    mark, stale = marker_problem(audits[-1].model, jr, ctx.my_uuid)
+    model = audits[-1].model
+    mark, stale, offer = marker_problem(model, jr, ctx.my_uuid)
     if stale:
         warn(stale)
     if mark:
@@ -13854,27 +14243,100 @@ def cmd_check(opts):
     try:
         save_check(audits, final, plan)
     except Exception as exc:
-        warn('the audit record could not be saved: %s' % _text(exc))
-    if _OUT['json']:
-        _write(sys.stdout, json.dumps(public(final, plan), sort_keys=True, indent=1))
-    elif plan:
+        warn('the details of these findings could not be saved (%s), so the evidence of the changes is shown here:'
+             % _text(exc))
+        planned = set(id(it) for it in plan)
+        for e in final:
+            if id(e.get('item')) in planned:
+                for line in e['evidence']:
+                    say(u'    %s' % line)
+    if busy:
+        return 3 if (mark or jr) else exit_for(final)
+    if jr:
         say(u'')
-        say(u'To apply: python3 %s fix' % sys.argv[0])
-    if (jr and not busy) or mark:
+        say(open_note(jr))
         return 3
-    return exit_for(final)
+    if mark:
+        if tty and offer:
+            lock_note('waiting for an answer at a terminal')
+            try:
+                yes = ask(u'Finish run %s (started on %s) from this host? [yes/no] ' % (
+                    offer, (ha_marker_of(model.pool) or {}).get('hostname') or 'another host'))
+            except KeyboardInterrupt:
+                error('interrupted: run %s is still not finished' % offer)
+                return 3
+            if yes:
+                check_lock()
+                opts.run = offer
+                lock_note('finishing run %s' % offer)
+                return recover_locked(opts, ctx.transport.password or '')
+        return 3
+    if not plan:
+        return exit_for(final)
+    say(u'')
+    if not tty:
+        say(u'To apply: run python3 %s in a terminal and answer yes.' % sys.argv[0])
+        return exit_for(final)
+    lock_note('waiting for an answer at a terminal')
+    if not ask(u'Apply these %d change(s)? [yes/no] ' % len(plan)):
+        say(u'Nothing was changed.')
+        return 1
+    check_lock()
+    lock_note('applying the changes')
+    return apply_plan(ctx, opts, audits, final, plan, ha)
+
+
+ASK_TIMEOUT = 3600
+
+
+def flush_input():
+    try:
+        import termios
+    except ImportError:
+        return
+    try:
+        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except (AttributeError, ValueError, EnvironmentError, termios.error):
+        pass
+
+
+def read_answer(timeout):
+    try:
+        fd = sys.stdin.fileno()
+    except (AttributeError, ValueError, EnvironmentError):
+        fd = None
+    if fd is None:
+        return getattr(sys.stdin, 'buffer', sys.stdin).readline()
+    if not select.select([fd], [], [], timeout)[0]:
+        return None
+    return os.read(fd, 4096)
 
 
 def ask(question):
-    stream = sys.stderr if _OUT['json'] else sys.stdout
-    out = getattr(stream, 'buffer', stream)
     try:
-        out.write(_text(question).encode('utf-8', 'replace'))
-        out.flush()
-    except (IOError, OSError, ValueError, RuntimeError):
-        pass
-    line = getattr(sys.stdin, 'buffer', sys.stdin).readline()
-    return _text(line).strip().lower() in ('y', 'yes')
+        shown = sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        shown = False
+    stream = sys.stdout if shown else sys.stderr
+    out = getattr(stream, 'buffer', stream)
+    while True:
+        flush_input()
+        try:
+            out.write(_text(question).encode('utf-8', 'replace'))
+            out.flush()
+        except (IOError, OSError, ValueError, RuntimeError, TypeError):
+            pass
+        line = read_answer(ASK_TIMEOUT)
+        if line is None:
+            say(u'')
+            say(u'No answer for %s: taken as no.' % format_age(ASK_TIMEOUT))
+            return False
+        answer = _text(line).strip().lower()
+        if answer == 'yes':
+            return True
+        if not line or answer not in ('y', 'ye'):
+            return False
+        say(u'Type yes in full, or no.')
 
 
 def drop_stage_s(plan, why, final, audits):
@@ -13888,44 +14350,7 @@ def drop_stage_s(plan, why, final, audits):
     return settle_plan(plan, final)
 
 
-def cmd_fix(opts):
-    if os.geteuid() != 0:
-        raise Refused('run this as root')
-    lockfd = take_run_lock()
-    try:
-        return fix_locked(opts)
-    finally:
-        os.close(lockfd)
-
-
-def fix_locked(opts):
-    if not sys.stdin.isatty():
-        raise Refused('fix asks before it changes anything and needs a terminal; check gives the same report '
-                      'without one')
-    ctx = preflight(opts)
-    jr = open_journals() + legacy_journals()
-    if jr:
-        show_open(jr)
-        raise Refused('an earlier run did not finish', 3)
-    audits = run_audits(ctx)
-    final, plan = classify(audits, opts)
-    model = audits[-1].model
-    plan, ha = plan_ha(audits, plan, final)
-    mark, stale = marker_problem(model, jr, ctx.my_uuid)
-    if stale:
-        warn(stale)
-    if mark:
-        error(mark)
-        raise Refused('HA was left off by an earlier run: put it back (or remove the note if HA is to stay off), '
-                      'then run fix again', 3)
-    print_findings(ctx, final, plan)
-    print_plan(ctx, audits[-1], plan, ha)
-    if not plan:
-        return exit_for(final)
-    say(u'')
-    if not ask(u'Apply these %d change(s)? [y/N] ' % len(plan)):
-        say(u'Nothing was changed.')
-        return 1
+def apply_plan(ctx, opts, audits, final, plan, ha):
     step('Re-checking everything before the first change...')
     audits3 = audits + [collect_audit(ctx, len(audits) + 1)]
     a3 = audits3[-1]
@@ -13934,7 +14359,7 @@ def fix_locked(opts):
     if any(it['action'] == 'storage-db' for it in plan3) and not same_ha(ha, ha2):
         plan3 = drop_stage_s(plan3, 'the pool\'s HA settings changed since they were shown', final3, audits3)
         warn('the pool\'s HA settings changed since they were shown: the storage.db steps, and what depends on '
-             'them, are dropped; run fix again for them')
+             'them, are dropped; run this again for them')
     keys3 = set(item_key(i) for i in plan3)
     shown = set(item_key(i) for i in plan)
     run_ = [i for i in plan if item_key(i) in keys3]
@@ -13958,7 +14383,7 @@ def fix_locked(opts):
         if not run_:
             say(u'Nothing is left to apply. Nothing was changed.')
             return 1
-        if not ask(u'Apply the remaining %d change(s)? [y/N] ' % len(run_)):
+        if not ask(u'Apply the remaining %d change(s)? [yes/no] ' % len(run_)):
             say(u'Nothing was changed.')
             return 1
     eng = execute(ctx, run_, audits3, ha2 if any(i['action'] == 'storage-db' for i in run_) else None, final3)
@@ -13971,7 +14396,7 @@ def finish(ctx, eng):
     _PENDING[0] = None
     if eng.ha_pending or eng.unsettled() or eng.storage_open:
         _STOP_NOTE[0] = (u'the final audit will be skipped once its running round returns; xapi, HA or a storage.db '
-                         u'edit is not settled, which is left to recover')
+                         u'edit is not settled, which is left to the next run')
     else:
         _STOP_NOTE[0] = (u'the final audit will be skipped once its running round returns; xapi and HA are already '
                          u'settled')
@@ -13983,16 +14408,18 @@ def finish(ctx, eng):
         if needs_second(b1, ctx.opts):
             settle_wait(ctx.opts.settle, 'the report below shows only state that persists')
             last = collect_audit(ctx, 102)
-            final, plan = classify([b1, last], ctx.opts)
+            done = [b1, last]
         else:
             last = b1
-            final, plan = classify([b1], ctx.opts)
+            done = [b1]
+        final, again = classify(done, ctx.opts)
+        plan_ha(done, again, final)
     except Interrupted as exc:
-        eng.fail('the final audit was skipped (%s): run check to see the state now' % _text(exc))
-        last, final, plan = None, [], []
+        eng.fail('the final audit was skipped (%s): run the tool again to see the state now' % _text(exc))
+        last, final = None, []
     except Exception as exc:
         eng.fail('the final audit could not be taken: %s' % _text(exc))
-        last, final, plan = None, [], []
+        last, final = None, []
     waiting(None)
     say(u'')
     say(u'== Result ==')
@@ -14046,13 +14473,17 @@ def finish(ctx, eng):
         eng.fail('the GC of SR %s was not started again after its activating key(s) were removed, because the run '
                  'stopped first: run xe sr-scan uuid=%s once nothing else runs on the SR' % (sr, sr))
     if last is not None:
-        print_findings(ctx, final, plan, u'Final audit')
+        print_findings(ctx, final, [], u'Final audit', after=True)
+        try:
+            save_check([b1] if last is b1 else [b1, last], final, [])
+        except Exception as exc:
+            warn('the details of the final audit could not be saved: %s' % _text(exc))
     open_ = bool(eng.ha_pending) or bool(eng.unsettled()) or bool(eng.storage_open)
     if open_:
         for u, why in sorted(eng.storage_open.items()):
-            error('the storage.db edit on %s is not verified: %s. Its backup is kept in the run record; recover '
+            error('the storage.db edit on %s is not verified: %s. Its backup is kept in the run record; the next run '
                   'checks it again' % (eng.name_of(u), why))
-        error('the run is left open: run %s recover' % sys.argv[0])
+        error('the run is left open: run %s again to finish it' % sys.argv[0])
         try:
             eng.j.rec('left-open', problems=eng.problems)
         except EnvironmentError as exc:
@@ -14061,7 +14492,7 @@ def finish(ctx, eng):
     try:
         eng.j.rec('closed', results=dict((str(k), v) for k, v in eng.results.items()), problems=eng.problems)
     except EnvironmentError as exc:
-        error('the run record %s cannot be closed (%s), so the run stays open: run %s recover once it can be '
+        error('the run record %s cannot be closed (%s), so the run stays open: run %s again once it can be '
               'written' % (eng.j.path, _text(exc), sys.argv[0]))
         return 3
     try:
@@ -14073,16 +14504,6 @@ def finish(ctx, eng):
     if counts.get('fixed', 0) + counts.get('already-fixed', 0) == len(eng.plan) and exit_for(final) == 0:
         return 0
     return 1
-
-
-def cmd_recover(opts):
-    if os.geteuid() != 0:
-        raise Refused('run this as root')
-    lockfd = take_run_lock()
-    try:
-        return recover_locked(opts)
-    finally:
-        os.close(lockfd)
 
 
 def report_act(hu, hname, st, copies, ha_lines=None, sv=None):
@@ -14104,7 +14525,7 @@ def report_act(hu, hname, st, copies, ha_lines=None, sv=None):
     say(u'    If xapi there lost datapaths it should hold (compare xe host-get-sm-diagnostics uuid=%s with that '
         u'file), put it back on that host with:' % hu)
     if ha_lines is not None:
-        say(u'      (HA is on, or is put back by this recover: xapi must not be stopped while HA is armed, so turn HA '
+        say(u'      (HA is on, or is put back by this recovery: xapi must not be stopped while HA is armed, so turn HA '
             u'off first, on the pool master:)')
         say(u'        xe pool-ha-disable')
     for line in ('systemctl stop xapi', 'cp %s %s' % (_quote(backup), STORAGE_DB), 'systemctl start xapi'):
@@ -14126,7 +14547,7 @@ def ensure_xapi(transport, host, args, wait=None):
         if _now() + 10 > deadline:
             if res.get('busy') == 'action' and res.get('pid'):
                 res['detail'] = ('%s. If it is hung, kill it on %s with kill -9 %d: its guardian then starts xapi and '
-                                 'records what it found. Then run %s recover again'
+                                 'records what it found. Then run %s again'
                                  % (res.get('detail'), host.name, res['pid'], sys.argv[0]))
             return res
         if res.get('detail') != shown:
@@ -14153,9 +14574,14 @@ def pool_marker_here():
             pass
 
 
+def safe_root(path):
+    return (isinstance(path, _TEXT) and path.startswith('/') and '\n' not in path and '"' not in path and
+            '..' not in path.split('/') and os.path.basename(path) in (DATA_DIR, os.path.basename(LEGACY_ROOT)))
+
+
 def adopt_run(run_id):
-    if not RUN_ID_RE.match(run_id or ''):
-        raise Refused('%s is not a run id' % run_id, 2)
+    if not isinstance(run_id, _TEXT) or not RUN_ID_RE.match(run_id):
+        raise Refused('%s is not a run id' % canon(run_id), 3)
     d = os.path.join(RUN_ROOT, 'runs', run_id)
     path = os.path.join(d, 'journal.jsonl')
     if os.path.exists(path):
@@ -14174,44 +14600,26 @@ def adopt_run(run_id):
           adopted_from=mark.get('host'))
     j.rec('ha_marker', value=canon(mark))
     j.rec('adopted', note='the run record stayed on %s (%s); this host finishes it from the pool-wide note and the '
-                          'action records on the hosts' % (mark.get('hostname'), mark.get('host')))
+                          'action records on the hosts' % (mark.get('hostname'), mark.get('host')),
+          root=mark.get('root') if safe_root(mark.get('root')) else None)
     return run_id, path, read_journal(path)
 
 
-def recover_locked(opts):
+def recover_locked(opts, password=None):
     jr = open_journals() + legacy_journals()
     if getattr(opts, 'run', None):
         jr = [x for x in jr if x[0] == opts.run]
         if not jr:
             got = adopt_run(opts.run)
             if got is None:
-                say(u'Run %s is closed: nothing to recover.' % opts.run)
-                return 0
+                say(u'Run %s is closed here: nothing of it is left to finish from this host.' % opts.run)
+                return 3
             jr = [got]
     if not jr:
-        mark, why = pool_marker_here()
-        if mark is not None and mark.get('run'):
-            try:
-                me = parse_inventory(read_text(INVENTORY)).get('INSTALLATION_UUID')
-            except EnvironmentError:
-                me = None
-            if me is not None and mark.get('host') == me:
-                error('no unfinished run is recorded on this host, but the pool carries other-config:%s from run %s, '
-                      'which this host started and which turned HA off; its record is not here any more (%s). '
-                      'Finish the run from here with: %s recover --run %s'
-                      % (HA_MARKER, mark.get('run'), os.path.join(RUN_ROOT, 'runs', _text(mark.get('run'))),
-                         sys.argv[0], mark.get('run')))
-            else:
-                error('no unfinished run is recorded on this host, but the pool carries other-config:%s from run %s, '
-                      'started on %s (%s), which turned HA off. If that host is gone, finish the run from here with: '
-                      '%s recover --run %s' % (HA_MARKER, mark.get('run'), mark.get('hostname'), mark.get('host'),
-                                               sys.argv[0], mark.get('run')))
-            return 3
-        say(u'No unfinished run: nothing to recover.%s' % ((u' (%s, so a run left open elsewhere could not be '
-                                                            u'looked for.)' % why) if why else u''))
+        say(u'No unfinished run: nothing to finish.')
         return 0
     _AUDIT[0] = True
-    _STOP_NOTE[0] = u'recover stops before its next step and exits 3; run it again to finish'
+    _STOP_NOTE[0] = u'the recovery stops before its next step and exits 3; run this again to finish it'
     arm_signals()
     inv = parse_inventory(read_text(INVENTORY))
     try:
@@ -14222,7 +14630,7 @@ def recover_locked(opts):
         say(u'This host is not the pool master now (%s says %s): the runs it started are finished from here all the '
             u'same, through the master.' % (POOL_CONF, canon(role)))
     worst = 0
-    state = {'pw': None}
+    state = {'pw': password, 'closing': set()}
     root = RUN_ROOT
     for name, path, recs in jr:
         state['adopted'] = any(r.get('event') == 'adopted' for r in recs)
@@ -14231,10 +14639,11 @@ def recover_locked(opts):
         try:
             worst = max(worst, recover_run(opts, inv, name, path, recs, state))
         except Interrupted as exc:
-            error('  %s: recover stopped here; run it again to finish' % _text(exc))
+            error('  %s: the recovery stopped here; run %s again to finish it' % (_text(exc), sys.argv[0]))
             return 3
         except Exception as exc:
-            error('  the run could not be finished: %s: %s; run recover again' % (exc.__class__.__name__, _text(exc)))
+            error('  the run could not be finished: %s: %s; run %s again'
+                  % (exc.__class__.__name__, _text(exc), sys.argv[0]))
             worst = 3
         finally:
             apply_paths({'RUN_ROOT': root})
@@ -14312,9 +14721,13 @@ def recover_run(opts, inv, name, path, recs, state):
     ctx.my_uuid = inv.get('INSTALLATION_UUID')
     ctx.workdir = make_workdir()
     ctx.transport = new_transport(ctx.workdir)
+    roots = [r.get('root') for r in recs if r.get('event') == 'adopted' and safe_root(r.get('root'))]
+    if roots:
+        ctx.transport.paths['RUN_ROOT'] = roots[-1]
     local = Host(None, {'uuid': ctx.my_uuid, 'name_label': 'this host', 'hostname': socket.gethostname(),
                         'address': '127.0.0.1', 'enabled': True}, True, True)
     settled, storage = {}, {}
+    exists = []
 
     def discover(h):
         try:
@@ -14322,6 +14735,8 @@ def recover_run(opts, inv, name, path, recs, state):
         except CallError as exc:
             error('  %s: the action records of this run cannot be listed there: %s' % (h.name, _text(exc)))
             return False
+        if got.get('acts') or (got.get('exists') and not h.local):
+            exists.append(h.name)
         for odd in got.get('odd') or []:
             warn('%s: %s' % (h.name, odd))
         for a in got.get('acts') or []:
@@ -14353,7 +14768,7 @@ def recover_run(opts, inv, name, path, recs, state):
     try:
         ctx.api.relogin(ANSWER_WAIT)
     except Failed as exc:
-        error('  xapi on this host does not answer: %s; run recover again once it does' % _text(exc))
+        error('  xapi on this host does not answer: %s; run %s again once it does' % (_text(exc), sys.argv[0]))
         return 3
     model = Model(pool_snapshot(ctx.api))
     hosts = ctx.host_objs(model)
@@ -14361,11 +14776,12 @@ def recover_run(opts, inv, name, path, recs, state):
     ours = mark is not None and (mark.get('run') == name or ('raw' in mark and ha_off and not ha_on))
     if ha_d is None and ours and isinstance(mark.get('ha'), dict):
         ha_d = dict(mark['ha'], vms={})
-    look = bool(unreadable) or bool(state.get('adopted'))
+    adopted = bool(state.get('adopted')) or any(r.get('event') == 'adopted' for r in recs)
+    look = bool(unreadable) or adopted
     others = [k for k in acts if k[0] != ctx.my_uuid]
     if (others or look or ours or (ha_off and not ha_on)) and len(hosts) > 1:
-        unarmed_prompt(trust_hosts, ctx.transport, hosts, getattr(opts, 'trust_host_keys', False))
-        state['pw'] = unarmed_prompt(get_password, ctx.transport, hosts, state['pw'])
+        unarmed_prompt('the host key question', trust_hosts, ctx.transport, hosts, False)
+        state['pw'] = unarmed_prompt('the password prompt', get_password, ctx.transport, hosts, state['pw'])
     if look:
         for h in hosts:
             if h.uuid == ctx.my_uuid:
@@ -14379,9 +14795,8 @@ def recover_run(opts, inv, name, path, recs, state):
     for hu, at in others:
         hs = [h for h in hosts if h.uuid == hu]
         if not hs:
-            error('  host %s is not in the pool' % hu)
-            settled[hu] = False
-            storage[(hu, at)] = ('unverified', 'the host is not in the pool')
+            error('  host %s is not in the pool any more, so what this run did there cannot be checked' % hu)
+            storage[(hu, at)] = ('unverified', 'the host is not in the pool any more')
             continue
         ensure(hs[0], hu, at)
     copies = dict(((r.get('host'), r.get('remote')), r.get('local')) for r in recs
@@ -14408,7 +14823,7 @@ def recover_run(opts, inv, name, path, recs, state):
         report_act(hu, (target.name if target is not None else hu), st, copies, ha_lines, storage.get((hu, at)))
     bad = sorted(u for u, ok in settled.items() if not ok)
     if bad:
-        error('  xapi is not proven up and initialised on %s: run recover again once it is' % ', '.join(bad))
+        error('  xapi is not proven up and initialised on %s: run %s again once it is' % (', '.join(bad), sys.argv[0]))
         return 3
     checkpoint()
     model = Model(pool_snapshot(ctx.api))
@@ -14436,6 +14851,7 @@ def recover_run(opts, inv, name, path, recs, state):
             eng.enable_ha()
         finally:
             _SETTLING[0] = False
+            waiting(None)
         if not eng.ha_restored:
             return 3
     elif not_ours:
@@ -14448,8 +14864,12 @@ def recover_run(opts, inv, name, path, recs, state):
             for line in HaCapture(ha_d).commands():
                 say(u'    %s' % line)
     unsure = [(hu, at, v) for (hu, at), v in sorted(storage.items()) if v[0] not in STORAGE_OK]
-    if unsure or unreadable or (look and not listed):
+    orphan = adopted and listed and not exists
+    accepted = False
+    if unsure or unreadable or (look and not listed) or orphan:
         why = []
+        if orphan:
+            why.append('no host has any action record of it under %s' % ctx.transport.paths['RUN_ROOT'])
         if unsure:
             why.append('%d storage.db edit(s) are not verified (%s)' % (len(unsure), '; '.join(
                 '%s/%d: %s' % (hu, at, v[0]) for hu, at, v in unsure[:4])))
@@ -14457,31 +14877,22 @@ def recover_run(opts, inv, name, path, recs, state):
             why.append('%d line(s) of its record cannot be read' % len(unreadable))
         if look and not listed:
             why.append('not every host could be asked for the actions this run left')
-        if getattr(opts, 'close', None) != name:
-            error('  the run is left open: %s. When this has been checked and is accepted as it is, close it with: '
-                  '%s recover --close %s' % ('; '.join(why), sys.argv[0], name))
-            return 3
-        warn('closing run %s as asked (--close), although %s' % (name, '; '.join(why)))
-    Journal(run_dir).rec('closed', recovered=True, accepted=getattr(opts, 'close', None) == name,
+        error('  the run is left open: %s' % '; '.join(why))
+        closing = state.setdefault('closing', set())
+        if path not in closing:
+            if not sys.stdin.isatty() or not unarmed_prompt(
+                    'the close question', ask, u'  Once that has been checked, the run can be closed as it is. Close '
+                                               u'it now? [yes/no] '):
+                error('  run %s again to close it once that has been checked' % sys.argv[0])
+                return 3
+            checkpoint()
+            closing.add(path)
+        accepted = True
+        warn('closing run %s as asked, although %s' % (name, '; '.join(why)))
+    Journal(run_dir).rec('closed', recovered=True, accepted=accepted,
                          unsure=[[hu, at, v[0]] for hu, at, v in unsure], unreadable=len(unreadable))
-    say(u'  closed.')
-    return 0
-
-
-def minutes(lo, hi):
-    def conv(text):
-        try:
-            v = float(text)
-        except ValueError:
-            raise argparse.ArgumentTypeError('%s is not a number' % text)
-        if not math.isfinite(v):
-            raise argparse.ArgumentTypeError('%s is not a finite number' % text)
-        if v < lo:
-            raise argparse.ArgumentTypeError('%s is below the floor of %s' % (text, lo))
-        if v > hi:
-            raise argparse.ArgumentTypeError('%s is above the ceiling of %s' % (text, hi))
-        return v
-    return conv
+    say(u'  closed%s.' % (' as it is, unverified' if accepted else ''))
+    return 1 if accepted else 0
 
 
 def legacy_journals():
@@ -14496,75 +14907,28 @@ def build_parser():
         description='Find stale storage coordination state in an XCP-ng 8.3 pool (dead dom0 datapaths, stale '
                     'dom0 VBDs, leaked datapaths, stale relinking/activating keys, GC abort flags, backend nodes '
                     'pointing at another disk\'s tapdisk, paused tapdisks), prove each piece stale, and repair what '
-                    'is proven. Run it as root on the pool master. check changes nothing in the pool; fix shows '
-                    'every change and asks first.',
+                    'is proven. Run it as root on the pool master, with no arguments: it audits the pool (twice, %ds '
+                    'apart, when the first audit finds anything that may need fixing), shows what it found and the '
+                    'changes it would make, and makes them only once yes is typed in full. Without a terminal it only '
+                    'reports.' % SETTLE_FLOOR,
         epilog='On a pool with more than one host it asks for the pool\'s root password, to reach the other hosts '
-               'over ssh; it is kept in memory and handed to ssh through the environment only. A host is reached '
-               'only with an ssh host key already known here (%s/known_hosts, ~/.ssh/known_hosts or %s); an unknown '
-               'one is shown and must be confirmed. Run records, and the backup of every storage.db it edits, are '
-               'kept in %s. Exit status: 0 nothing found, or everything fixed and verified; 1 findings remain or '
-               'something was skipped; 2 usage error; 3 a run was left open (xapi, HA or a storage.db edit not '
-               'confirmed): run recover.' % (RUN_ROOT, GLOBAL_KNOWN_HOSTS, RUN_ROOT))
+               'over ssh; it is kept in memory and handed to ssh through the environment only. Each host\'s '
+               'ssh host key is checked against those known here (%s/known_hosts, ~/.ssh/known_hosts or %s): an '
+               'unknown one is shown and confirmed at the terminal (without a terminal it is used for that run only '
+               'and not recorded), and a changed one is refused. If an earlier run was cut off, it offers to finish '
+               'that run first (start xapi where it stopped it, put HA back). Run records, the full details of every '
+               'check, and the backup of every storage.db it edits are kept in %s. Exit status: 0 nothing found, '
+               'everything fixed and verified, or a cut-off run finished; 1 findings remain, something was skipped, '
+               'or nothing was applied; 2 usage error; 3 a run is still open (xapi, HA or a storage.db edit not '
+               'confirmed): run it again at a terminal to finish it.'
+               % (RUN_ROOT, GLOBAL_KNOWN_HOSTS, RUN_ROOT))
     p.add_argument('--version', action='version', version='%(prog)s ' + VERSION + ' (python ' + PYTHON + ')')
-    sub = p.add_subparsers(dest='cmd', metavar='COMMAND')
-    sub.required = True
-    for name, func, text in (('check', cmd_check, 'audit the pool twice, settle apart, and report; changes nothing in the pool'),
-                             ('fix', cmd_fix, 'audit, show the changes, ask, then apply them (HA handled)')):
-        c = sub.add_parser(name, help=text, description=text)
-        c.add_argument('--settle', type=minutes(SETTLE_FLOOR, 3600), default=SETTLE_FLOOR, metavar='SECONDS',
-                       help='seconds between the two audits (default and floor %d, at most 3600)' % SETTLE_FLOOR)
-        c.add_argument('--min-vbd-age', type=minutes(15, 10080), default=60, metavar='MINUTES',
-                       help='a dom0 VBD with an attach on its host must be this old (default 60, floor 15, at most '
-                            '10080)')
-        c.add_argument('--relink-min-age', type=minutes(1, 720), default=6, metavar='HOURS',
-                       help='a relinking key proven stale from SMlog must be this old (default 6, floor 1, at most '
-                            '720)')
-        c.add_argument('--stuck-export-age', type=minutes(1, 720), default=24, metavar='HOURS',
-                       help='an export older than this is reported as stuck (default 24, floor 1, at most 720)')
-        if name == 'check':
-            c.add_argument('--json', action='store_true', help='print the findings and the plan as JSON')
-        else:
-            c.add_argument('--wait', type=minutes(0, 1440), default=15, metavar='MINUTES',
-                           help='how long to wait, re-checking every minute, for a host to become safe to stop '
-                                'before HA is touched, and for each change that has to wait before it is skipped '
-                                '(default 15, at most 1440)')
-            c.add_argument('--ha-off-wait', type=minutes(0, 1440), default=2, metavar='MINUTES',
-                           help='how long to wait per host once HA is off (default 2, at most --wait)')
-        c.add_argument('--trust-host-keys', action='store_true', help=TRUST_HELP)
-        c.set_defaults(func=func)
-    r = sub.add_parser('recover', help='finish a run that was interrupted: start xapi where it stopped it, put '
-                                       'HA back', description='finish a run that was interrupted')
-    r.add_argument('--run', metavar='RUN_ID', type=run_id_arg,
-                   help='finish this run only; if its record is not on this host (the host that started it is gone), '
-                        'it is finished from the pool-wide note it left and the action records on the hosts')
-    r.add_argument('--close', metavar='RUN_ID', type=run_id_arg,
-                   help='close this run although a storage.db edit could not be verified or part of its record cannot '
-                        'be read, once you have checked it; xapi must still be up and HA settled')
-    r.add_argument('--trust-host-keys', action='store_true', help=TRUST_HELP)
-    r.set_defaults(func=cmd_recover)
     return p
 
 
-TRUST_HELP = ('record the ssh host keys of pool members this tool has not reached before without asking (their '
-              'fingerprints are still printed). Without it, an unknown key is shown and must be confirmed, or the '
-              'host is not reached')
-
-
-def run_id_arg(text):
-    if not RUN_ID_RE.match(text or ''):
-        raise argparse.ArgumentTypeError('%s is not a run id (like 20261007-101500-a1b2c3)' % text)
-    return text
-
-
-def normalise(opts):
-    if hasattr(opts, 'min_vbd_age'):
-        opts.min_vbd_age = opts.min_vbd_age * 60
-        opts.relink_min_age = opts.relink_min_age * 3600
-        opts.stuck_export_age = opts.stuck_export_age * 3600
-    if hasattr(opts, 'wait'):
-        opts.wait = opts.wait * 60
-        opts.ha_off_wait = min(opts.ha_off_wait * 60, opts.wait)
-    return opts
+def default_opts():
+    return argparse.Namespace(settle=SETTLE_FLOOR, min_vbd_age=3600, relink_min_age=6 * 3600,
+                              stuck_export_age=24 * 3600, wait=900, ha_off_wait=120, run=None)
 
 
 def main(argv=None):
@@ -14577,18 +14941,15 @@ def main(argv=None):
         return fence_main(argv[1])
     apply_paths({'RUN_ROOT': data_root()})
     parser = build_parser()
-    if not argv:
-        parser.print_help()
+    if [a for a in argv if a not in ('-h', '--help', '--version')]:
+        _write(sys.stderr, u'%s takes no arguments any more: run it alone. It checks, shows the changes, and asks '
+                           u'before making them' % PROG)
         return 2
-    try:
-        opts = normalise(parser.parse_args(argv))
-    except Usage as exc:
-        _write(sys.stderr, u'%s: %s' % (PROG, _text(exc)))
-        return 2
-    _OUT['json'] = bool(getattr(opts, 'json', False))
+    parser.parse_args(argv)
+    opts = default_opts()
     say(u'%s %s (python %s)' % (PROG, VERSION, PYTHON))
     try:
-        return opts.func(opts)
+        return cmd_run(opts)
     except Refused as exc:
         error(_text(exc))
         if not _AUDIT[0]:
@@ -14596,15 +14957,24 @@ def main(argv=None):
         return exc.code
     except (Failed, CallError, EnvironmentError) as exc:
         error(_text(exc))
-        if not _AUDIT[0]:
-            say(u'Nothing was changed.')
+        if _AUDIT[0]:
+            error('run %s again to finish what this run started' % sys.argv[0])
+            return 3
+        say(u'Nothing was changed.')
         return 1
     except (KeyboardInterrupt, Interrupted):
         if _AUDIT[0]:
-            error('interrupted. Run %s recover to finish what this run started.' % sys.argv[0])
+            error('interrupted. Run %s again to finish what this run started.' % sys.argv[0])
             return 3
         error('interrupted. Nothing was changed.')
         return 1
+    except Exception:
+        if not _AUDIT[0]:
+            raise
+        import traceback
+        traceback.print_exc()
+        error('run %s again to finish what this run started' % sys.argv[0])
+        return 3
 
 
 if __name__ == '__main__':

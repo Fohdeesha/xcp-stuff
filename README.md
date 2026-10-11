@@ -8,14 +8,14 @@ ask first. Download the file and run it, don't pipe it in from curl.
 **storage-state-fixer.py** (8.3 only) - for when exports, backups or VBD unplugs start failing
 because of storage junk left behind (dead dom0 datapaths, stale dom0 VBDs, leaked datapaths and
 the paused or wedged tapdisks behind them, stuck GC flags).
-`check` just reports, `fix` shows the list and asks y/N. Editing storage.db restarts xapi on
-that host (VMs keep running), with HA turned off and back on around it.
+Run it with no arguments: it checks, lists what it found and what it would change, and only
+changes anything once you type `yes`. Editing storage.db restarts xapi on that host (VMs keep
+running), with HA turned off and back on around it.
 ```
 curl -fsSLO https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/storage-state-fixer.py
-python3 storage-state-fixer.py check
-python3 storage-state-fixer.py fix
+python3 storage-state-fixer.py
 ```
-If a run gets cut off, `python3 storage-state-fixer.py recover` puts xapi and HA back. The first
+If a run gets cut off, run it again: it offers to put xapi and HA back first. The first
 time it reaches a pool host whose ssh key isn't already known, it shows the fingerprints and asks.
 Run records and storage.db backups go in `storage-state-fixer-data/` next to the script. The locks
 it holds keep SM out; anything else that edits sm-config is caught by a last xapi event check.
