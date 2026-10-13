@@ -16,7 +16,8 @@ curl -fsSLO https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/storage-s
 python3 storage-state-fixer.py
 ```
 If a run gets cut off, run it again: it offers to put xapi and HA back first. The first
-time it reaches a pool host whose ssh key isn't already known, it shows the fingerprints and asks.
+time it reaches a pool host whose ssh key isn't already known, it shows the fingerprints and asks
+(with `--yes` it uses that key for the run without recording it).
 Run records and storage.db backups go in `storage-state-fixer-data/` next to the script. The locks
 it holds keep SM out; anything else that edits sm-config is caught by a last xapi event check.
 
