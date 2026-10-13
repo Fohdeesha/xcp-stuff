@@ -95,6 +95,8 @@ XAPI_UNIT = 'xapi.service'
 NBD_PORT = 10809
 UUID_PAT = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 UUID_RE = re.compile('^' + UUID_PAT + '$')
+VHD_CHECK_BAD = re.compile(r'(?i)\b(invalid|error|fail(ed|s|ure)?|bad|corrupt(ed)?|mismatch|unable|cannot|missing|'
+                           r'out of (range|bounds)|too (big|small|large))\b')
 NULL_REF = 'OpaqueRef:NULL'
 LETTERS = 'abcdefghijklmnopqrstuvwxyz'
 PAUSED = 0x20
@@ -136,6 +138,8 @@ HOUSEKEEPING_TASKS = ('SR.scan',)
 DAEMON_HOLDERS = ('xapi-nbd',)
 HOLD_OPS = ('start', 'start_on', 'resume', 'resume_on', 'pool_migrate', 'migrate_send')
 SR_HOUSEKEEPING = ('scan', 'update')
+SR_VDI_OPS = ('vdi_create', 'vdi_introduce', 'vdi_destroy', 'vdi_resize', 'vdi_clone', 'vdi_snapshot', 'vdi_mirror',
+              'vdi_enable_cbt', 'vdi_disable_cbt', 'vdi_data_destroy', 'vdi_list_changed_blocks', 'vdi_set_on_boot')
 UNPLUG_TIMEOUT = 300
 CANCEL_WAIT = 60
 DP_DESTROY_TIMEOUT = 300
@@ -159,6 +163,7 @@ FENCE_HOLD = 45
 FENCE_ACQUIRE = 10
 FENCE_POLL = 0.2
 FENCE_MARGIN = 15
+GC_ABORT_WAIT = 90
 C12_FENCE_HOLD = 55
 LV_FENCE_HOLD = 150
 TOOLSTACK_HOLD = ACT_WAIT + ACT_START_TIMEOUT + 300
@@ -1321,7 +1326,7 @@ PATH_KEYS = ('STORAGE_DB', 'STORAGE_DPS', 'SM_BACKEND', 'SM_PHY', 'BLKTAP_DIR', 
              'START_TIMEOUT', 'READY_WAIT', 'ANSWER_WAIT',
              'INIT_WAIT', 'GUARDIAN_POLL', 'GUARDIAN_BACKSTOP', 'GUARDIAN_STALL', 'GUARD_LOCK_WAIT', 'XHAD_GONE_WAIT',
              'API_TIMEOUT', 'QUIET_WAIT', 'ENSURE_TIMEOUT', 'ENSURE_MARGIN', 'FENCE_HOLD',
-             'FENCE_ACQUIRE', 'FENCE_POLL')
+             'FENCE_ACQUIRE', 'FENCE_POLL', 'GC_ABORT_WAIT')
 
 
 def apply_paths(paths):
@@ -1807,7 +1812,11 @@ def f_vhdcheck(paths):
             continue
         r = run([VHD_UTIL, 'check', '--debug', '-p', '-n', p], 120)
         lines = [l.strip() for l in (r.out + u'\n' + r.err).splitlines() if l.strip()]
-        rec = {'ok': r.ok, 'detail': ('; '.join(lines[-3:]) or r.why())[:400]}
+        bad = [l for l in lines if VHD_CHECK_BAD.search(l)]
+        detail = '; '.join(bad[:3] if bad else lines[-3:])
+        if not r.ok and not bad:
+            detail = '%s (%s)' % (detail, r.why()) if detail else r.why()
+        rec = {'ok': r.ok, 'detail': detail[:400]}
         q = run([VHD_UTIL, 'query', '--debug', '-n', p, '-p', '-u'], 60)
         text = q.out.strip()
         last = text.splitlines()[-1] if text else ''
@@ -4056,7 +4065,7 @@ def quiet_problems(x, me, spec):
         raise Failed('tap-ctl list: %s' % _text(exc))
     busy.extend(newly_paused(spec, rows))
     if x is None:
-        busy.extend(bounded(local_sm_activity, SCAN_BUDGET))
+        busy.extend(bounded(local_sm_activity, SCAN_BUDGET, spec.get('gc_held') or [], spec.get('run_id')))
         return busy
     try:
         served = served_vdis(rows)
@@ -4088,15 +4097,19 @@ def quiet_problems(x, me, spec):
         ops = sorted(set((vm.get('current_operations') or {}).values()))
         if ops and me in (vm.get('resident_on'), vm.get('scheduled_to_be_resident_on')):
             busy.append('VM "%s" has %s in progress on this host' % (vm.get('name_label'), ', '.join(ops)))
+    mine = bounded(gc_holds_here, SCAN_BUDGET, set(spec.get('gc_held') or ()), spec.get('run_id'))
     for ref, t in x.task.get_all_records().items():
         if t['status'] != 'pending' or t['name_label'] in HOUSEKEEPING_TASKS:
+            continue
+        if t['name_label'] == 'Garbage Collection' and \
+                any((t.get('name_description') or '').endswith(u) for u in mine):
             continue
         if spec.get('is_master') or t['resident_on'] == me:
             busy.append('task %s "%s" is pending' % (t['uuid'], t['name_label']))
         elif t['name_label'] == 'Garbage Collection' and \
                 any(u and (t.get('name_description') or '').endswith(u) for u in served_srs):
             busy.append('task %s "%s" is pending for an SR with a disk served here' % (t['uuid'], t['name_label']))
-    busy.extend(bounded(local_sm_activity, SCAN_BUDGET))
+    busy.extend(bounded(local_sm_activity, SCAN_BUDGET, spec.get('gc_held') or [], spec.get('run_id')))
     return busy
 
 
@@ -4167,8 +4180,26 @@ def gc_lock_sr(path):
     return m.group(1) if m else None
 
 
-def local_sm_activity():
+def gc_holds_here(srs, run_id):
+    out = set()
+    if not srs or not run_id:
+        return out
+    for l in f_locks():
+        sr = gc_lock_sr(l['path'])
+        if sr not in srs or not l['path'].endswith('/gc_active'):
+            continue
+        try:
+            argv = proc_cmdline(l['pid'])
+        except EnvironmentError:
+            continue
+        if '--ssf-fence' in argv and any(run_id in a for a in argv):
+            out.add(sr)
+    return out
+
+
+def local_sm_activity(held=(), run_id=None):
     busy = []
+    mine = gc_holds_here(set(held or ()), run_id)
     for pid in pids():
         if pid == os.getpid():
             continue
@@ -4181,6 +4212,8 @@ def local_sm_activity():
             continue
         if is_sm_argv(argv):
             gc = [a for a in argv if UUID_RE.match(a)] if any(a.endswith('cleanup.py') for a in argv) else []
+            if gc and gc[0] in mine:
+                continue
             if gc:
                 busy.append('the GC of SR %s runs (pid %d); a coalesce can take hours' % (gc[0], pid))
             else:
@@ -4188,6 +4221,8 @@ def local_sm_activity():
     try:
         for l in f_locks():
             sr = gc_lock_sr(l['path'])
+            if sr and sr in mine:
+                continue
             if sr:
                 busy.append('the GC of SR %s holds %s (pid %d); a coalesce can take hours' % (sr, l['path'], l['pid']))
             else:
@@ -4201,7 +4236,10 @@ def local_sm_activity():
         for line in r.out.splitlines():
             f = line.split()
             if len(f) >= 3 and f[2] in ('active', 'activating', 'deactivating', 'reloading'):
-                busy.append('%s is %s' % (f[0].replace('\\x2d', '-'), f[2]))
+                unit = f[0].replace('\\x2d', '-')
+                if any(u in unit for u in mine):
+                    continue
+                busy.append('%s is %s' % (unit, f[2]))
     return busy
 
 
@@ -4417,7 +4455,7 @@ def stopped_quiet(spec):
         if late:
             return late, []
         try:
-            busy = bounded(local_sm_activity, SCAN_BUDGET)
+            busy = bounded(local_sm_activity, SCAN_BUDGET, spec.get('gc_held') or [], spec.get('run_id'))
         except Failed as exc:
             return [], [_text(exc)]
         if not busy:
@@ -5963,11 +6001,65 @@ def fence_locks(locks):
     return out
 
 
-def take_fence(locks, until):
+def set_abort_flag(sr):
+    d = os.path.join(IPC_DIR, sr)
+    if not os.path.isdir(d):
+        os.makedirs(d, 0o755)
+    path = os.path.join(d, 'abort')
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except OSError as exc:
+        if exc.errno == errno.EEXIST:
+            return False
+        raise
+    try:
+        append_all(fd, ('%d\n' % os.getpid()).encode('ascii'))
+    finally:
+        os.close(fd)
+    return True
+
+
+def clear_abort_flag(sr):
+    path = os.path.join(IPC_DIR, sr, 'abort')
+    try:
+        if read_text(path).strip() == str(os.getpid()):
+            os.unlink(path)
+    except EnvironmentError:
+        pass
+
+
+def gc_active_now(uuid, until):
+    import fcntl
+    srfd, who = try_sm_lock(uuid, 'sr', until)
+    if srfd is None:
+        return None, False
+    try:
+        return try_sm_lock(uuid, 'gc_active', 0)[0], True
+    finally:
+        try:
+            fcntl.lockf(srfd, fcntl.LOCK_UN)
+        finally:
+            os.close(srfd)
+
+
+def take_fence(locks, until, aborted=None):
     import fcntl
     held = []
+    pre, flags = {}, []
     try:
         for kind, uuid in locks:
+            if kind == 'gc' and uuid not in pre:
+                fd, asked = gc_active_now(uuid, until)
+                if fd is not None:
+                    pre[uuid] = fd
+                elif asked and set_abort_flag(uuid):
+                    flags.append(uuid)
+                    if aborted is not None:
+                        aborted.append(uuid)
+        for kind, uuid in locks:
+            if kind == 'gc' and uuid in pre:
+                held.append(pre.pop(uuid))
+                continue
             if kind == 'toolstack':
                 me = parse_inventory(read_text(INVENTORY)).get('INSTALLATION_UUID')
                 if me != uuid:
@@ -6003,7 +6095,8 @@ def take_fence(locks, until):
                 if fd is not None:
                     break
                 if _now() >= until:
-                    return held, 'the GC of SR %s holds gc_active (%s): it runs' % (uuid, who)
+                    return held, ('the GC of SR %s holds gc_active (%s) and did not stop within %ds of SM\'s abort '
+                                  'request: it is in a step SM does not abort' % (uuid, who, GC_ABORT_WAIT))
                 time.sleep(FENCE_POLL)
             held.append(fd)
         return held, None
@@ -6011,6 +6104,18 @@ def take_fence(locks, until):
         for fd in held:
             os.close(fd)
         raise
+    finally:
+        for fd in pre.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        for uuid in flags:
+            clear_abort_flag(uuid)
+
+
+def fence_acquire(locks):
+    return GC_ABORT_WAIT if any(lk[0] == 'gc' for lk in locks or []) else FENCE_ACQUIRE
 
 
 def fence_paths(locks):
@@ -6048,7 +6153,7 @@ def agent_fence_start(args, source):
     agent_path = os.path.join(d, 'agent.py')
     write_new(agent_path, source, 0o700)
     pid = spawn_detached([sys.executable, agent_path, '--ssf-fence', spec_path], os.path.join(d, 'fence.out'))
-    deadline = _now() + FENCE_ACQUIRE + 10
+    deadline = _now() + fence_acquire(spec.get('locks')) + 10
     while _now() < deadline:
         st = read_status(d)
         if st is not None and st.get('state') not in ('starting', 'acquiring'):
@@ -6098,11 +6203,12 @@ def fence_main(spec_path):
     request_paths(spec.get('paths'))
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    cap = TOOLSTACK_HOLD if all(lk[0] == 'toolstack' for lk in spec['locks']) else 300.0
+    cap = (TOOLSTACK_HOLD + 600 if all(lk[0] in ('toolstack', 'gc') for lk in spec['locks']) else 300.0)
     hold = min(float(spec.get('hold') or FENCE_HOLD), cap)
     action = spec.get('action')
+    acquire = fence_acquire(spec['locks'])
     if not action and hasattr(signal, 'alarm'):
-        signal.alarm(int(FENCE_ACQUIRE + hold + 60))
+        signal.alarm(int(acquire + hold + 60))
     elif action and hasattr(signal, 'alarm'):
         limit = int(FENCE_ACQUIRE + UNPAUSE_WAIT - 60)
 
@@ -6119,7 +6225,8 @@ def fence_main(spec_path):
     final = None
     try:
         locks = fence_locks(spec['locks'])
-        held, why = take_fence(locks, _now() + FENCE_ACQUIRE)
+        aborted = []
+        held, why = take_fence(locks, _now() + acquire, aborted)
         if why:
             final = ('refused', {'detail': why})
             return 0
@@ -6133,7 +6240,8 @@ def fence_main(spec_path):
             res = fence_action(action, held)
             final = ('acted', {'detail': res.get('detail') or '', 'result': res})
             return 0
-        write_status(d, 'held', detail='holding %s' % canon(spec['locks']), until=time.time() + hold)
+        write_status(d, 'held', detail='holding %s' % canon(spec['locks']), until=time.time() + hold,
+                     gc_aborted=aborted)
         end = _now() + hold
         release = os.path.join(d, 'release')
         while _now() < end and not os.path.exists(release):
@@ -9189,18 +9297,19 @@ def paused_stale(a, opts, hv, vref, tap):
                                                                           tap_state_text(row['state'])))
     gstate, greasons = gc_state(a, sref)
     if gstate == 'running':
-        waits.append('the GC of its SR runs (%s)' % '; '.join(greasons[:2]))
+        evidence.append('the GC of its SR runs (%s): the change aborts it the way SM does and holds it off while it '
+                        'acts' % '; '.join(greasons[:2]))
     elif gstate != 'idle':
         unknowns.append('whether the GC of its SR runs is not established (%s)' % '; '.join(greasons[:2]))
     if v.get('current_operations'):
         waits.append('the VDI has %s in progress' % ', '.join(sorted(set(v['current_operations'].values()))))
-    ops = sorted(set((sr.get('current_operations') or {}).values()) - set(SR_HOUSEKEEPING))
+    allops = set((sr.get('current_operations') or {}).values()) - set(SR_HOUSEKEEPING)
+    ops = sorted(allops - set(SR_VDI_OPS))
     if ops:
         waits.append('its SR has %s in progress' % ', '.join(ops))
-    tasks = m.pending_tasks(work=True)
-    if tasks:
-        waits.append('%d task(s) are pending in the pool (%s)' % (len(tasks), ', '.join('"%s"' % t['name_label']
-                                                                                     for t in tasks[:3])))
+    if allops & set(SR_VDI_OPS):
+        evidence.append('its SR has %s in progress on other disks; the change acts under the SM locks that keep '
+                        'those away from this one' % ', '.join(sorted(allops & set(SR_VDI_OPS))))
     mref = m.sr_master(sref)
     for href in sorted(set([hv.href] + ([mref] if mref else []))):
         h2 = a.view(href)
@@ -9706,6 +9815,10 @@ def eval_vbd(a, opts, vbd, vm, vdi):
                   'a placeholder this tool makes to hold the device name of a datapath while xapi removes that '
                   'datapath (run %s); it is never plugged. If no run of this tool is open, it is left over: xe '
                   'vbd-destroy uuid=%s' % (tag.split(' ')[0], vbd['uuid']), evidence)
+    if tag:
+        return ev(key, cls, REPORT, m.hosts[href]['uuid'] if href in m.hosts else None, title,
+                  'a placeholder this tool makes to hold a device name (run %s), which is never plugged, is plugged: '
+                  'something other than this tool uses it, so it is left alone' % tag.split(' ')[0], evidence)
     if href not in m.hosts:
         return ev(key, cls, UNKNOWN, None, title, 'its control domain is not resident on a known host', evidence)
     hv = a.view(href)
@@ -9745,11 +9858,11 @@ def eval_vbd(a, opts, vbd, vm, vdi):
         waits.append('xapi-nbd lists it as its own (an NBD export of this disk); it unplugs it itself when the '
                      'export ends')
     elif not oc.get('task_id'):
-        problems.append('it was not made by xapi\'s own disk helpers (it has no other-config:task_id) and xapi-nbd '
-                        'does not list it: it may be someone\'s recovery or maintenance attach, so it is left alone. '
-                        'Once nobody uses it: %sxe vbd-destroy uuid=%s'
-                        % ('xe vbd-unplug uuid=%s, then ' % vbd['uuid'] if vbd['currently_attached'] else '',
-                           vbd['uuid']))
+        evidence.append('it has no other-config:task_id and xapi-nbd does not list it, so whoever made it (an NBD '
+                        'export that could not clean up, or a hand attach) no longer tracks it; %s'
+                        % ('it is released only once nothing in dom0 has it open and it is older than %s'
+                           % format_age(opts.min_vbd_age) if vbd['currently_attached'] else
+                           'it is not plugged, so only its record is destroyed'))
     smc = vdi['sm_config']
     if vbd['currently_attached'] and 'paused' in smc:
         problems.append('the VDI carries sm-config paused, so SM would refuse to deactivate it (see C11)')
@@ -10169,8 +10282,9 @@ def eval_flag(a, opts, vref, v, key, abort_srs, activating_srs):
             proof, why = relink_override(a, opts, v, sr)
             if proof is None:
                 if gstate == 'running':
-                    waits.append('GC is running on the SR (%s) and SMlog does not prove the key stale: %s'
-                                 % ('; '.join(greasons), why))
+                    evidence.append('GC is running on the SR (%s) and SMlog does not prove the key stale (%s): the '
+                                    'change aborts that GC the way SM does and holds it off, so no relink of this VDI '
+                                    'is in flight when the key is removed' % ('; '.join(greasons[:2]), why))
                 else:
                     unknowns.append('whether a GC runs on the SR is not established (%s), and SMlog does not '
                                     'prove the key stale: %s' % ('; '.join(greasons), why))
@@ -10183,7 +10297,9 @@ def eval_flag(a, opts, vref, v, key, abort_srs, activating_srs):
     verdict, reason = verdict_of(problems, unknowns, waits)
     if verdict == FIX:
         reason = 'no host has it open, no VBD is attached, and %s' % (
-            'no GC runs on its SR' if gstate == 'idle' else 'SMlog proves the GC that set it is gone')
+            'no GC runs on its SR' if gstate == 'idle' else 'SMlog proves the GC that set it is gone'
+            if key != 'relinking' or relink_override(a, opts, v, sr)[0] is not None else
+            'the GC of its SR is aborted and held off while it is removed')
     item = {'cls': cls, 'phase': 'F', 'action': 'remove-key', 'vdi': v['uuid'], 'key': key, 'sr': sr_uuid,
             'host': None}
     item.update(item_extra)
@@ -10993,19 +11109,29 @@ def lv_put_proof(a, hv, sr, vdi, want):
         problems.append('its SR is not an LVM SR known to xapi')
     else:
         gstate, greasons = gc_state(a, sref)
-        if gstate == 'running':
-            waits.append('the GC of its SR runs (%s)' % '; '.join(greasons[:2]))
-        elif gstate != 'idle':
+        if gstate not in ('idle', 'running'):
             problems.append('whether the GC of its SR runs is not established (%s)' % '; '.join(greasons[:2]))
-    busy = hv.sm_busy()
+    busy = lv_put_busy(m, hv)
     if busy is None:
         problems.append('the processes on %s were not read' % hv.name)
     else:
-        for p in busy:
-            waits.append('SM process %d runs on %s (%s)' % (p['pid'], hv.name, sm_what(p.get('argv'))))
-    if m.pending_tasks(work=True):
-        waits.append('%d task(s) are pending in the pool' % len(m.pending_tasks(work=True)))
+        waits.extend(busy)
     return problems, waits
+
+
+def lv_put_busy(m, hv):
+    busy = hv.sm_busy()
+    if busy is None:
+        return None
+    out = []
+    for p in busy:
+        argv = p.get('argv') or []
+        if not any(x.endswith('cleanup.py') for x in argv):
+            out.append('SM process %d runs on %s (%s)' % (p['pid'], hv.name, sm_what(argv)))
+    for t in m.pending_tasks(hv.href, work=True):
+        if not m.is_gc_task(t):
+            out.append('task "%s" (%s) is pending on %s' % (t['name_label'], t['uuid'], hv.name))
+    return out
 
 
 def eval_lvrefs(a, opts):
@@ -11074,18 +11200,15 @@ def eval_lvrefs(a, opts):
                 if sref is not None:
                     gstate, greasons = gc_state(a, sref)
                     if gstate == 'running':
-                        waits.append('the GC of its SR runs (%s)' % '; '.join(greasons[:2]))
+                        evidence.append('the GC of its SR runs (%s): the put-back aborts it the way SM does and holds '
+                                        'it off while it acts' % '; '.join(greasons[:2]))
                     elif gstate != 'idle':
                         unknowns.append('whether the GC of its SR runs is not established')
-                busy = hv.sm_busy()
+                busy = lv_put_busy(m, hv)
                 if busy is None:
                     unknowns.append('the processes on %s were not read' % hv.name)
                 else:
-                    for p in busy:
-                        waits.append('SM process %d runs on %s (%s)' % (p['pid'], hv.name,
-                                                                       sm_what(p.get('argv'))))
-                if m.pending_tasks(work=True):
-                    waits.append('%d task(s) are pending in the pool' % len(m.pending_tasks(work=True)))
+                    waits.extend(busy)
                 verdict, reason = verdict_of(problems, unknowns, waits)
                 if verdict == FIX:
                     reason = ('an interrupted operation left it counted, so SM keeps its LV active here: the count is '
@@ -11312,14 +11435,13 @@ def eval_paused_tap(a, opts, hv, row):
     elif not st.get('ok'):
         unknowns.append('the tapdisk gave no stats: %s%s' % (st.get('error'), ' (its process is gone)'
                                                              if st.get('gone') else ''))
-    if m.pending_tasks(work=True):
-        waits.append('%d task(s) are pending in the pool' % len(m.pending_tasks(work=True)))
     gstate, greasons = gc_state(a, v['SR'])
     if gstate == 'unknown':
         unknowns.append('the state of the GC on the SR is not established%s'
                         % ((' (%s)' % '; '.join(greasons)) if greasons else ''))
     elif gstate != 'idle':
-        waits.append('GC on the SR is %s' % gstate)
+        evidence.append('the GC of its SR is %s (%s): the unpause aborts it the way SM does and holds it off while it '
+                        'acts' % (gstate, '; '.join(greasons[:2])))
     gate = host_gate(a, hv.href, opts)
     waits.extend(gate.block)
     unknowns.extend(gate.unknown)
@@ -12789,8 +12911,7 @@ class Engine(object):
                         out.append('a GC started (%s)' % (snap.get('name_description') or 'no SR named'))
                 elif h is not None and (h.is_master or snap.get('resident_on') == href):
                     out.append('task "%s" started' % label)
-                elif h is None and (label.startswith(('VDI.', 'SR.')) or
-                                    any(n in (snap.get('name_description') or '') for n in names)):
+                elif h is None and any(n in (snap.get('name_description') or '') for n in names):
                     out.append('task "%s" started' % label)
             elif cls == 'vbd':
                 if ref in mine:
@@ -12815,9 +12936,11 @@ class Engine(object):
             elif cls == 'sr':
                 if ref in sr_refs and (op == 'del' or sorted(snap.get('PBDs') or []) != sorted(m.srs[ref]['PBDs'])):
                     out.append('SR %s: %s' % (snap.get('uuid') or ref, op))
-                elif ref in sr_refs and set((snap.get('current_operations') or {}).values()) - set(SR_HOUSEKEEPING):
+                elif ref in sr_refs and set((snap.get('current_operations') or {}).values()) - set(SR_HOUSEKEEPING) - (
+                        set(SR_VDI_OPS) if h is None else set()):
                     out.append('SR %s has %s in progress' % (snap.get('uuid') or ref, ', '.join(sorted(
-                        set((snap.get('current_operations') or {}).values()) - set(SR_HOUSEKEEPING)))))
+                        set((snap.get('current_operations') or {}).values()) - set(SR_HOUSEKEEPING) - (
+                            set(SR_VDI_OPS) if h is None else set())))))
             elif cls == 'pool':
                 if op == 'del' or snap.get('master') != m.pool.get('master') or \
                         snap.get('ha_enabled') != m.pool.get('ha_enabled'):
@@ -12842,8 +12965,9 @@ class Engine(object):
         self.j.rec('fence_up', seq=it['seq'], tag=tag, hosts=[h.uuid for h, s in specs],
                    locks=[s['locks'] for h, s in specs], action=action)
         res = parallel(lambda hs: self.ctx.transport.call(hs[0], 'fence-start', {'spec': hs[1]},
-                                                          timeout=FENCE_ACQUIRE + 60), specs)
+                                                          timeout=fence_acquire(hs[1]['locks']) + 60), specs)
         fences, why, states = [], None, {}
+        self.fence_aborted = []
         for (h, spec), (st, val) in res:
             fences.append((h, spec))
             if st != 'ok':
@@ -12851,6 +12975,7 @@ class Engine(object):
                 continue
             status = (val or {}).get('status') or {}
             states[h.uuid] = status.get('state')
+            self.fence_aborted.extend(status.get('gc_aborted') or [])
             if action is None and status.get('state') != 'held':
                 why = why or 'the exclusion could not be taken on %s: %s' % (
                     h.name, status.get('detail') or status.get('state') or 'no answer from its holder')
@@ -13004,7 +13129,51 @@ class Engine(object):
                 bad.append('%s runs xhad (pid %s)' % (name, ', '.join(str(p) for p in xh)))
         return bad
 
-    def stop_gate(self, h, items, ha_off):
+    def gc_hold_srs(self, fresh, h):
+        m = fresh.model
+        href = m.host_by_uuid.get(h.uuid)
+        srs = set()
+        if href is None:
+            return srs
+        if h.is_master:
+            for sref, sr in m.srs.items():
+                if sr['PBDs'] and m.plugged_hosts(sref) and sr['type'] in JUDGED_SR_TYPES:
+                    srs.add(sref)
+        for vdi_uuid in fresh.view(href).tap_vdis:
+            vref = m.vdi_by_uuid.get(vdi_uuid)
+            if vref is not None and m.vdis[vref]['SR'] in m.srs and \
+                    m.srs[m.vdis[vref]['SR']]['type'] in JUDGED_SR_TYPES:
+                srs.add(m.vdis[vref]['SR'])
+        return srs
+
+    def hold_gc(self, h, items):
+        fresh = self.audit(smlog=False)
+        m = fresh.model
+        plan = collections.OrderedDict()
+        names = []
+        for sref in sorted(self.gc_hold_srs(fresh, h), key=lambda r: m.srs[r]['uuid']):
+            mref = m.sr_master(sref)
+            if mref is None or mref not in m.hosts or not m.host_live(mref):
+                return [], set(), 'SR %s has no live master, so its GC cannot be held off' % m.srs[sref]['name_label']
+            plan.setdefault(m.hosts[mref]['uuid'], []).append(['gc', m.srs[sref]['uuid']])
+            names.append(m.srs[sref]['name_label'])
+        if not plan:
+            return [], set(), None
+        fences, why = self.fence_up(items[0], [(self.host(u), locks) for u, locks in plan.items()],
+                                    hold=TOOLSTACK_HOLD + self.opts.ha_off_wait + 180)
+        if why:
+            self.fence_down(fences)
+            return [], set(), why
+        held = set(lk[1] for locks in plan.values() for lk in locks)
+        aborted = sorted(set(self.fence_aborted) & held)
+        self.j.rec('gc_hold', host=h.uuid, srs=sorted(held), aborted=aborted)
+        step('  %s: the GC of %s is held off until xapi answers again%s' % (
+            h.name, ', '.join(sorted(names)), '; it was running on %s and was aborted the way SM aborts it, and SM '
+            'starts it again at its next kick' % ', '.join(m.name_sr(m.sr_by_uuid[u]) for u in aborted)
+            if aborted else ''))
+        return fences, held, None
+
+    def stop_gate(self, h, items, ha_off, gc=None):
         fresh = self.audit(smlog=True)
         m = fresh.model
         reasons = []
@@ -13035,8 +13204,16 @@ class Engine(object):
         elif hv.room['free'] < 2 * hv.sdb['size'] + (1 << 20):
             reasons.append('%s has %d bytes free, too little for the storage.db backup' % (hv.room['path'],
                                                                                          hv.room['free']))
+        skip = set(gc) if isinstance(gc, (set, frozenset)) else set()
+
+        def gc_sr(sr_uuid):
+            return gc == 'defer' and sr_uuid is not None or sr_uuid in skip
+
         tasks = m.pending_tasks(None if h.is_master else href, work=True)
         for t in tasks:
+            if m.is_gc_task(t) and gc_sr(([u for u in re.findall(UUID_PAT, t.get('name_description') or '')]
+                                          or [None])[-1]):
+                continue
             reasons.append('task "%s" (%s) is pending%s' % (t['name_label'], t['uuid'],
                                                             '' if h.is_master else ' on this host'))
         scope = list(m.hosts) if h.is_master else [href]
@@ -13047,17 +13224,23 @@ class Engine(object):
                 reasons.append('the processes on %s were not read' % sv.name)
             else:
                 for p in busy:
+                    argv = p.get('argv') or []
+                    if any(a.endswith('cleanup.py') for a in argv) and \
+                            gc_sr(([a for a in argv if UUID_RE.match(a)] or [None])[0]):
+                        continue
                     reasons.append('SM is busy on %s: pid %d %s' % (sv.name, p['pid'],
                                                                    sm_what(p.get('argv'))))
             if sv.locks is None:
                 reasons.append('the SM locks on %s were not read' % sv.name)
             else:
                 for l in sv.locks:
+                    if gc_sr(gc_lock_sr(l['path'])):
+                        continue
                     reasons.append('%s is held by pid %d on %s' % (l['path'] or 'an unlinked SM lock file', l['pid'],
                                                                    sv.name))
         if h.is_master:
             for sref2, sr in m.srs.items():
-                if not sr['PBDs']:
+                if not sr['PBDs'] or gc_sr(sr['uuid']):
                     continue
                 st, why = gc_state(fresh, sref2)
                 if st != 'idle' and m.plugged_hosts(sref2):
@@ -13067,7 +13250,8 @@ class Engine(object):
             if vref is None:
                 continue
             v = m.vdis[vref]
-            st, why = gc_state(fresh, v['SR'])
+            st, why = ('idle', []) if gc_sr(m.srs[v['SR']]['uuid'] if v['SR'] in m.srs else None) else \
+                gc_state(fresh, v['SR'])
             if st != 'idle':
                 reasons.append('GC on SR %s, which has a disk served here: %s' % (m.srs[v['SR']]['name_label'], st))
             for k in ('paused', 'relinking', 'activating'):
@@ -13111,11 +13295,11 @@ class Engine(object):
                 reasons.append('%s %s of %s: %s' % (it['cls'], it['dp'], it['vdi'], why))
         return sorted(set(reasons)), fresh
 
-    def wait_gate(self, h, items, ha_off, limit, every):
+    def wait_gate(self, h, items, ha_off, limit, every, gc=None):
         deadline = _now() + limit
         shown = None
         while True:
-            reasons, fresh = self.stop_gate(h, items, ha_off)
+            reasons, fresh = self.stop_gate(h, items, ha_off, gc)
             if not reasons:
                 return [], fresh
             if _now() + every > deadline:
@@ -13133,7 +13317,7 @@ class Engine(object):
         hosts = sorted((self.host(u) for u in by), key=lambda h: (h.is_master, h.name))
         ready = []
         for h in hosts:
-            reasons, _ = self.wait_gate(h, by[h.uuid], False, self.opts.wait, RETEST_EVERY)
+            reasons, _ = self.wait_gate(h, by[h.uuid], False, self.opts.wait, RETEST_EVERY, 'defer')
             if reasons:
                 for it in by[h.uuid]:
                     self.result(it, 'skipped', 'not stopped: %s' % '; '.join(reasons[:6]))
@@ -13145,7 +13329,7 @@ class Engine(object):
         if self.ha is not None:
             again = []
             for h in ready:
-                reasons, _ = self.stop_gate(h, by[h.uuid], False)
+                reasons, _ = self.stop_gate(h, by[h.uuid], False, 'defer')
                 if reasons:
                     for it in by[h.uuid]:
                         self.result(it, 'skipped', 'not stopped: %s' % '; '.join(reasons[:6]))
@@ -13173,12 +13357,30 @@ class Engine(object):
                 for it in by[h.uuid]:
                     self.result(it, 'not-attempted', self.halt or late)
                 continue
-            reasons, fresh = self.wait_gate(h, by[h.uuid], True, min(self.opts.ha_off_wait, self.opts.wait), 5)
-            if reasons:
-                for it in by[h.uuid]:
-                    self.result(it, 'skipped', 'not stopped: %s' % '; '.join(reasons[:6]))
-                continue
-            self.stop_edit_start(h, by[h.uuid], fresh)
+            gc_fences, gc_held, why = self.hold_gc(h, by[h.uuid])
+            try:
+                if why:
+                    for it in by[h.uuid]:
+                        self.result(it, 'skipped', 'not stopped: %s' % why)
+                    continue
+                reasons, fresh = self.wait_gate(h, by[h.uuid], True, min(self.opts.ha_off_wait, self.opts.wait), 5,
+                                                frozenset(gc_held))
+                if not reasons and gc_fences:
+                    lost = self.fence_check(gc_fences, FENCE_MARGIN)
+                    if lost:
+                        reasons = ['the GC hold-off is not in place: %s' % lost]
+                if reasons:
+                    for it in by[h.uuid]:
+                        self.result(it, 'skipped', 'not stopped: %s' % '; '.join(reasons[:6]))
+                    continue
+                self.stop_edit_start(h, by[h.uuid], fresh, sorted(gc_held))
+            finally:
+                if gc_fences and getattr(self, 'act_may_run', False):
+                    self.j.rec('gc_hold_kept', host=h.uuid)
+                    warn('the GC hold-off stays (it lapses by itself within %s): the action on %s may still run, with '
+                         'xapi there down' % (format_age(TOOLSTACK_HOLD), h.name))
+                elif gc_fences:
+                    self.fence_down(gc_fences)
             if h.uuid in self.unsettled() or h.name in self.init_late:
                 late = ('xapi on %s is not proven up and initialised after its restart, so xapi is not stopped on '
                         'another host' % h.name)
@@ -13204,7 +13406,8 @@ class Engine(object):
             raise Failed('xapi on %s is not proven up and initialised after its restart, so nothing else is changed '
                          'in this run' % ', '.join(bad))
 
-    def stop_edit_start(self, h, items, fresh):
+    def stop_edit_start(self, h, items, fresh, gc_held=()):
+        self.act_may_run = False
         m = fresh.model
         href = m.host_by_uuid[h.uuid]
         hv = fresh.view(href)
@@ -13221,7 +13424,8 @@ class Engine(object):
                 'items': [{'sr': it['sr'], 'vdi': it['vdi'], 'dp': it['dp'],
                            'lvm': hv.sr_type(it['sr']) in LVM_SR_TYPES} for it in items],
                 'backed': sorted([list(b) for b in backed]),
-                'paused': [[r['pid'], r['minor']] for r in hv.taps or [] if r['state'] is not None and r['state'] & PAUSED]}
+                'paused': [[r['pid'], r['minor']] for r in hv.taps or [] if r['state'] is not None and r['state'] & PAUSED],
+                'gc_held': list(gc_held)}
         if self.ctx.transport.paths:
             spec['paths'] = self.ctx.transport.paths
         served, served_vdis = set(), set()
@@ -13266,9 +13470,10 @@ class Engine(object):
                 self.fail('the toolstack of the other hosts was not held for the whole time xapi on the master was '
                           'down: %s' % lost)
         finally:
+            end = ((st or {}).get('status') or {}).get('state')
+            self.act_may_run = st is None or end in ('hung', 'host-down')
             if holds:
-                end = ((st or {}).get('status') or {}).get('state')
-                if st is None or end in ('hung', 'host-down'):
+                if self.act_may_run:
                     self.j.rec('holds_kept', host=h.uuid, state=end)
                     warn('the toolstack of the other hosts stays held (the hold lapses by itself within %s): the '
                          'action on %s may still run, with xapi there down' % (format_age(TOOLSTACK_HOLD), h.name))
