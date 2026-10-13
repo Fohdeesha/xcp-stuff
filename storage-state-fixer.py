@@ -3411,6 +3411,54 @@ def drbd_health(rec):
     return 'bad', 'disk:%s' % d['disk']
 
 
+DRBD_MINOR = re.compile(r'\bminor:(\d+)')
+
+
+def parse_drbd_status(text):
+    out = collections.OrderedDict()
+    cur = sect = None
+    for raw in text.splitlines():
+        if not raw.strip():
+            cur = None
+            continue
+        ind = len(raw) - len(raw.lstrip(' '))
+        line = raw.strip()
+        if ind == 0:
+            cur = {'exists': True, 'role': None, 'suspended': None, 'disk': None, 'open': None, 'quorum': None,
+                   'minor': None, 'peers': [], 'raw': ''}
+            out[line.split()[0]] = cur
+            sect = 'res'
+        elif cur is None:
+            continue
+        elif ind == 2:
+            if 'connection:' in line:
+                cm, rm = DRBD_CONN.search(line), DRBD_ROLE.search(line)
+                cur['peers'].append({'name': line.split()[0], 'connection': cm.group(1) if cm else None,
+                                     'role': rm.group(1) if rm else None, 'disk': None})
+                sect = 'peer'
+            elif line.startswith('volume:') and cur['disk'] is None:
+                sect = 'vol'
+            else:
+                sect = 'other'
+        if len(cur['raw']) < 1500:
+            cur['raw'] += raw[:300] + '\n'
+        if sect == 'res':
+            for key, rx in (('role', DRBD_ROLE), ('suspended', DRBD_SUSP)):
+                mm = rx.search(line)
+                if mm and cur[key] is None:
+                    cur[key] = mm.group(1)
+        elif sect == 'vol':
+            for key, rx in (('disk', DRBD_DISK), ('open', DRBD_OPEN), ('quorum', DRBD_QUORUM), ('minor', DRBD_MINOR)):
+                mm = rx.search(line)
+                if mm and cur[key] is None:
+                    cur[key] = mm.group(1)
+        elif sect == 'peer' and ind > 2:
+            pd = DRBD_PDISK.search(line)
+            if pd and cur['peers'][-1]['disk'] is None:
+                cur['peers'][-1]['disk'] = pd.group(1)
+    return out
+
+
 def f_drbd(resources):
     out = {}
     if not resources:
@@ -3428,33 +3476,22 @@ def f_drbd(resources):
         elif not r.ok:
             out[res] = {'ok': False, 'error': 'drbdsetup status %s' % r.why()}
         else:
-            lines = r.out.splitlines()
-            role = DRBD_ROLE.search(lines[0]) if lines else None
-            susp = DRBD_SUSP.search(lines[0]) if lines else None
-            disk = opn = quo = None
-            seen = False
-            peers = []
-            for line in lines[1:]:
-                if line.startswith('    '):
-                    pd = DRBD_PDISK.search(line)
-                    if peers and pd and peers[-1]['disk'] is None:
-                        peers[-1]['disk'] = pd.group(1)
-                    continue
-                if not line.startswith('  '):
-                    continue
-                if 'connection:' in line:
-                    cm = DRBD_CONN.search(line)
-                    peers.append({'name': line.split()[0], 'connection': cm.group(1) if cm else None, 'disk': None})
-                elif not seen and (line.startswith('  volume:') or 'disk:' in line and 'peer' not in line):
-                    seen = True
-                    disk, opn, quo = DRBD_DISK.search(line), DRBD_OPEN.search(line), DRBD_QUORUM.search(line)
-            out[res] = {'ok': True, 'value': {'exists': True, 'role': role.group(1) if role else None,
-                                              'suspended': susp.group(1) if susp else None,
-                                              'disk': disk.group(1) if disk else None,
-                                              'open': opn.group(1) if opn else None,
-                                              'quorum': quo.group(1) if quo else None, 'peers': peers,
-                                              'raw': r.out[:1500]}}
+            got = parse_drbd_status(r.out).get(res)
+            if got is None:
+                out[res] = {'ok': False, 'error': 'drbdsetup status %s did not name the resource (%s)'
+                                                  % (res, canon(r.out[:200]))}
+            else:
+                out[res] = {'ok': True, 'value': got}
     return out
+
+
+def f_drbd_all():
+    if not os.path.exists(DRBDSETUP):
+        raise Failed('%s is not installed' % DRBDSETUP)
+    r = run([DRBDSETUP, 'status', '--verbose'], 30)
+    if not r.ok:
+        raise Failed('drbdsetup status %s' % r.why())
+    return parse_drbd_status(r.out)
 
 
 FACTS_BUDGET = AGENT_TIMEOUT - 40
@@ -3542,6 +3579,8 @@ def facts_doc(args):
         doc['smlog'] = fact(f_smlog, args.get('smlog') or {})
     if 'drbd' in want:
         doc['drbd'] = fact(f_drbd, args.get('drbd') or [])
+    if 'drbdall' in want:
+        doc['drbd_all'] = fact(f_drbd_all)
     if 'taplog' in want:
         doc['taplog'] = fact(f_taplog, args.get('taplog') or {})
     if 'extra' in want:
@@ -6991,7 +7030,7 @@ def trust_hosts(transport, hosts, strict=True):
             os.close(fd)
         transport.run_known = path
         return left
-    if not ask(u'Do the fingerprints match, and are these keys to be trusted? [yes/no] '):
+    if not answer(u'Do the fingerprints match, and are these keys to be trusted? [yes/no] '):
         if strict:
             raise Refused('the keys were not trusted, so the pool cannot be checked whole: run this again once they '
                           'have been compared')
@@ -7367,6 +7406,7 @@ class Audit(object):
         self.errors = {}
         self.smlog = {}
         self.drbd = {}
+        self.drbd_all = {}
         self.probes = {}
         self.caps = {}
         self.rpm = {}
@@ -8518,6 +8558,21 @@ def verdict_of(problems, unknowns, waits):
     return FIX, ''
 
 
+def verdict_later(problems, unknowns, waits, soft):
+    verdict, reason = verdict_of(problems, unknowns, [w for w in waits if w not in soft])
+    later = [w for w in waits if w in soft] if verdict == FIX else []
+    return verdict, reason, later
+
+
+def passing(block):
+    return [b for b in block if '(C15)' not in b]
+
+
+def later_text(hname, later):
+    return ('; it is applied once %s is quiet, which the run waits for (now: %s)'
+            % (hname, '; '.join(later[:3]) + ('; and %d more' % (len(later) - 3) if len(later) > 3 else '')))
+
+
 def host_time(hv, audit):
     if hv.identity and hv.identity.get('time'):
         return hv.identity['time']
@@ -8788,7 +8843,7 @@ def eval_dps(a, opts):
         for vdi, dp in sorted(backed):
             cl = hv.claim.get(dp) or []
             if not any(c[1] == vdi for c in cl):
-                selfcheck.append('attached dom0 VBD of VDI %s has no %s in storage.db' % (vdi, dp))
+                selfcheck.append((dp, 'attached dom0 VBD of VDI %s has no %s in storage.db' % (vdi, dp)))
         gate = None
         guest = []
         for dp, cl in sorted(hv.claim.items()):
@@ -8862,7 +8917,14 @@ def dom0_dp_proofs(a, hv, dp, sr, vdi, sr_type, vref, naming, selfcheck, evidenc
         unknowns.append('SR %s is not known to xapi, so how this datapath was attached is not established' % sr)
     if naming:
         unknowns.append(naming)
-    unknowns.extend(selfcheck)
+    for sdp, text in selfcheck:
+        if sdp != dp:
+            continue
+        if edit:
+            evidence.append('%s: the edit is planned again from the file xapi writes when it stops, so a record of '
+                            'that attach xapi still holds in memory is seen and kept' % text)
+        else:
+            unknowns.append(text)
     if vref and m.vdis[vref].get('current_operations'):
         waits.append('the VDI has %s in progress' % ', '.join(sorted(set(m.vdis[vref]['current_operations'].values()))))
     rows, why = hv.serving(sr_type, vdi)
@@ -8917,8 +8979,12 @@ def dom0_dp_proofs(a, hv, dp, sr, vdi, sr_type, vref, naming, selfcheck, evidenc
             evs = (hv.smlog or {}).get('events', {}).get('phy:' + vdi) or []
             vols = sorted(set(e[1] for e in evs))
             if not vols:
-                unknowns.append('its LINSTOR volume could not be named from SMlog, so its DRBD state is not '
-                                'established')
+                proof, why = drbd_unnamed_proof(a, hv, vdi)
+                if proof:
+                    evidence.append(proof)
+                else:
+                    unknowns.append('its LINSTOR volume could not be named from SMlog, and %s, so its DRBD state is '
+                                    'not established' % why)
             for vol in vols:
                 d = (a.drbd.get(hv.uuid) or {}).get(vol)
                 if not d or not d.get('ok'):
@@ -8932,6 +8998,28 @@ def dom0_dp_proofs(a, hv, dp, sr, vdi, sr_type, vref, naming, selfcheck, evidenc
                 else:
                     problems.append('%s is open here (%s)' % (vol, canon(d['value'].get('open'))))
     return problems, unknowns, waits
+
+
+def drbd_unnamed_proof(a, hv, vdi):
+    rec = a.drbd_all.get(hv.uuid)
+    if not rec or not rec.get('ok'):
+        return None, 'the DRBD resources on %s were not listed%s' % (
+            hv.name, (' (%s)' % rec.get('error')) if rec and rec.get('error') else '')
+    if hv.taps is None:
+        return None, 'the tapdisks on %s were not listed' % hv.name
+    served = {}
+    for row in hv.taps:
+        mm = re.search(r'(xcp-volume-' + UUID_PAT + ')', row.get('path') or '')
+        if mm:
+            served.setdefault(mm.group(1), set()).update(hv.row_ident.get((row['pid'], row['minor'])) or ())
+    opened = [(res, d) for res, d in sorted(rec['value'].items()) if d.get('open') != 'no']
+    bad = ['%s (open:%s)' % (res, d.get('open')) for res, d in opened if not served.get(res) or vdi in served[res]]
+    if bad:
+        return None, ('DRBD resource(s) %s %s open on %s without a tapdisk of another disk serving them'
+                      % (', '.join(bad[:4]), 'is' if len(bad) == 1 else 'are', hv.name))
+    return ('its LINSTOR volume could not be named from SMlog, but every DRBD resource open on %s (%d of %d) is served '
+            'by a tapdisk of another disk, so whichever it is, it is not open there'
+            % (hv.name, len(opened), len(rec['value']))), None
 
 
 def eval_dom0_dp(a, opts, hv, dp, cl, sr, vdi, st, naming, selfcheck, gate):
@@ -8966,24 +9054,30 @@ def eval_dom0_dp(a, opts, hv, dp, cl, sr, vdi, st, naming, selfcheck, gate):
     elif keys:
         waits.append('a xapi restart on %s would change its version (%s): %s' % (hv.name, '; '.join(keys),
                                                                                 UPGRADE_REMEDY))
+    soft = []
     for row in hv.live_taps() if hv.taps is not None else []:
         if row['state'] is not None and row['state'] & PAUSED:
-            waits.append('tapdisk pid %s minor %s on %s is paused (see C12), and xapi is not restarted next to a '
-                         'paused tapdisk' % (row['pid'], row['minor'], hv.name))
+            soft.append('tapdisk pid %s minor %s on %s is paused (see C12), and xapi is not restarted next to a '
+                        'paused tapdisk' % (row['pid'], row['minor'], hv.name))
         elif row['state'] is not None and row['state'] & ~LOG_DROPPED:
-            waits.append('tapdisk pid %s minor %s on %s is in state %s, and xapi is not restarted next to it'
-                         % (row['pid'], row['minor'], hv.name, tap_state_text(row['state'])))
-    waits.extend(gate.block)
+            soft.append('tapdisk pid %s minor %s on %s is in state %s, and xapi is not restarted next to it'
+                        % (row['pid'], row['minor'], hv.name, tap_state_text(row['state'])))
+    soft.extend(passing(gate.block))
+    waits.extend(soft + [b for b in gate.block if b not in soft])
     unknowns.extend(gate.unknown)
     problems.extend(gate.stuck)
     evidence.extend(gate.notes)
-    verdict, reason = verdict_of(problems, unknowns, waits)
+    verdict, reason, later = verdict_later(problems, unknowns, waits, soft)
     if verdict == FIX:
         reason = ('nothing on %s serves or holds it, and no attached dom0 VBD names it; xapi\'s own teardown cannot '
                   'remove it (%s), so it is removed from storage.db with xapi stopped on %s'
                   % (hv.name, '; '.join(via) if via else 'another VDI claims the same name', hv.name))
+        if later:
+            reason += later_text(hv.name, later)
     item = {'cls': cls, 'phase': 'S', 'action': 'storage-db', 'host': hv.uuid, 'sr': sr, 'vdi': vdi, 'dp': dp,
             'state': st}
+    if later:
+        item['later'] = later
     return ev(key, cls, verdict, hv.uuid, title, reason, evidence,
               sig=[dp, st, sorted([c[0], c[1], c[2]] for c in cl)], item=item if verdict == FIX else None)
 
@@ -9066,20 +9160,25 @@ def eval_dom0_attached(a, hv, dp, cl, sr, vdi, st, naming, selfcheck, gate, cls,
         evidence.append('its device name is held by placeholder dom0 VBD %s of this tool' % placeholder)
     if fallback and route_only and all(p in route_only for p in problems + unknowns):
         return None, route_only
+    soft = passing(gate.block)
     waits.extend(gate.block)
     unknowns.extend(gate.unknown)
     problems.extend(gate.stuck)
     evidence.extend(gate.notes)
-    verdict, reason = verdict_of(problems, unknowns, waits)
+    verdict, reason, later = verdict_later(problems, unknowns, waits, soft)
     if verdict == FIX:
         reason = ('an activation that was refused left it Attached: nothing on %s serves or holds it, and no dom0 VBD '
                   'there holds its device name; xapi\'s own teardown removes it, without a xapi restart%s'
                   % (hv.name, (', once %s %s gone' % (', '.join(after), 'is' if len(after) == 1 else 'are'))
                      if after else ''))
+        if later:
+            reason += later_text(hv.name, later)
     item = {'cls': cls, 'phase': 'L', 'action': 'dp0-destroy', 'host': hv.uuid, 'sr': sr, 'vdi': vdi, 'dp': dp,
             'userdevice': str(userdevice), 'state': st}
     if after:
         item['after'] = after
+    if later:
+        item['later'] = later
     e = ev(key, cls, verdict, hv.uuid, title, reason, evidence,
            sig=[dp, st, sorted([c[0], c[1], c[2]] for c in cl), route], item=item if verdict == FIX else None)
     if after and verdict == FIX:
@@ -9824,7 +9923,7 @@ def eval_vbd(a, opts, vbd, vm, vdi):
     hv = a.view(href)
     if not hv.live or hv.doc is None:
         return ev(key, cls, UNKNOWN, hv.uuid, title, 'host %s was not audited' % hname, evidence)
-    problems, unknowns, waits = [], [], []
+    problems, unknowns, waits, soft = [], [], [], []
     if vdi['type'] in SPECIAL_VDI_TYPES:
         return ev(key, cls, REPORT, hv.uuid, title, 'the VDI is an %s VDI: never touched' % vdi['type'], evidence)
     if sr is None:
@@ -9840,9 +9939,9 @@ def eval_vbd(a, opts, vbd, vm, vdi):
         return ev(key, cls, REPORT, hv.uuid, title, 'it is plugged as %s, not %s: whoever reads it opens a device '
                   'this tool does not watch, so it is not released' % (canon(vbd.get('device')), want_dev), evidence)
     if vbd.get('current_operations'):
-        waits.append('the VBD has %s in progress' % ', '.join(sorted(set(vbd['current_operations'].values()))))
+        soft.append('the VBD has %s in progress' % ', '.join(sorted(set(vbd['current_operations'].values()))))
     if vdi.get('current_operations'):
-        waits.append('the VDI has %s in progress' % ', '.join(sorted(set(vdi['current_operations'].values()))))
+        soft.append('the VDI has %s in progress' % ', '.join(sorted(set(vdi['current_operations'].values()))))
     oc = vbd.get('other_config') or {}
     if oc.get('task_id'):
         t = m.tasks.get(oc['task_id'])
@@ -9870,7 +9969,7 @@ def eval_vbd(a, opts, vbd, vm, vdi):
         problems.append('the VDI carries sm-config relinking (see C09): the GC pauses and refreshes its tapdisk to '
                         'relink it, and a deactivate would race that')
     if 'activating' in smc:
-        waits.append('the VDI carries sm-config activating: an activation of it is in progress (or see C10)')
+        soft.append('the VDI carries sm-config activating: an activation of it is in progress (or see C10)')
     if vbd['currently_attached']:
         why, later = shared_teardown(m, vbd['VDI'], href, skip=(vbd['uuid'],))
         if why:
@@ -10018,7 +10117,8 @@ def eval_vbd(a, opts, vbd, vm, vdi):
             if refusal:
                 problems.append('%s; %s go(es) first' % (refusal, ', '.join(after) or 'the other datapath(s)'))
     gate = host_gate(a, href, opts)
-    waits.extend(gate.block)
+    soft.extend(passing(gate.block))
+    waits.extend(b for b in gate.block if b not in soft)
     unknowns.extend(gate.unknown)
     problems.extend(gate.stuck)
     evidence.extend(gate.notes)
@@ -10064,14 +10164,18 @@ def eval_vbd(a, opts, vbd, vm, vdi):
         elif state != 'own' and mine:
             problems.append('tapdisk pid %s serves it, but its backend node is %s, so SM would not close it'
                             % (mine[0]['pid'], 'missing' if state == 'none' else state))
-    verdict, reason = verdict_of(problems, unknowns, waits)
+    verdict, reason, later = verdict_later(problems, unknowns, waits + soft, soft)
     if verdict == FIX:
         reason = ('nothing reads it, it is %s' % ('a snapshot' if vdi['is_a_snapshot'] else
                                                   'not a disk of any running or halted VM' if cls == 'C04'
                                                   else 'the disk of a VM that is halted or runs elsewhere'))
+        if later:
+            reason += later_text(hname, later)
     item = {'cls': cls, 'phase': 'V', 'action': 'release-vbd', 'host': hv.uuid, 'vbd': vbd['uuid'],
             'vdi': vdi['uuid'], 'sr': sr_uuid, 'attached': vbd['currently_attached'], 'inert': inert,
             'victim': [at['pid'], at['minor'], at.get('path')] if inert and state == 'other' else None}
+    if later:
+        item['later'] = later
     return ev(key, cls, verdict, hv.uuid, title, reason, evidence,
               sig=[vbd['currently_attached'], vdi['uuid'], state, inert], item=item if verdict == FIX else None)
 
@@ -11970,7 +12074,7 @@ def classify(audits, opts):
 
 
 def item_key(it):
-    keep = dict((k, v) for k, v in it.items() if k not in ('seq', 'after'))
+    keep = dict((k, v) for k, v in it.items() if k not in ('seq', 'after', 'later'))
     return canon(keep)
 
 
@@ -12214,7 +12318,8 @@ def collect_audit(ctx, n, first=False, only_hosts=None, probes=True, smlog=True,
 
     def round2(h):
         qq = q[h.ref]
-        args = {'want': ['smlog', 'extra'] + (['drbd'] if qq['drbdres'] else []) + (['taplog'] if qq['taplog'] else []),
+        args = {'want': ['smlog', 'extra'] + (['drbd'] if qq['drbdres'] else []) + (['taplog'] if qq['taplog'] else []) +
+                (['drbdall'] if qq['smlog']['drbd'] else []),
                 'taplog': {'pids': qq['taplog']},
                 'smlog': {'relink': sorted(qq['smlog']['relink']), 'abort': sorted(qq['smlog']['abort']),
                           'activate': sorted(qq['smlog']['activate']), 'pause': sorted(qq['smlog']['pause']),
@@ -12244,6 +12349,8 @@ def collect_audit(ctx, n, first=False, only_hosts=None, probes=True, smlog=True,
         d = val.get('drbd') or {}
         if d.get('ok'):
             a.drbd.setdefault(h.uuid, {}).update(d['value'])
+        if 'drbd_all' in val:
+            a.drbd_all[h.uuid] = val['drbd_all']
         for key, store in (('statfiles', a.statfiles), ('lvnames', a.lvnames), ('srdir', a.srdirs),
                            ('xsread', a.xsread)):
             f = val.get(key) or {}
@@ -12466,7 +12573,12 @@ def print_plan(ctx, audit, plan, ha):
             continue
         say(u'  %s:' % label)
         for it in items:
-            for i, line in enumerate(wrap(describe_item(model, it), 92)):
+            txt = describe_item(model, it)
+            if it.get('later'):
+                txt += u'; first the run waits, for up to %s, until %s is quiet (now: %s)' % (
+                    format_age(ctx.opts.wait), model.name_host(model.host_by_uuid.get(it.get('host'))),
+                    it['later'][0] + (u'; and %d more' % (len(it['later']) - 1) if len(it['later']) > 1 else u''))
+            for i, line in enumerate(wrap(txt, 92)):
                 say((u'   %3d. %s' % (it['seq'], line)) if i == 0 else (u'        %s' % line))
     if ha is not None and any(it['action'] == 'storage-db' for it in plan):
         say(u'  HA is turned off for the whole pool for the xapi restart(s), and on again after.')
@@ -12787,6 +12899,7 @@ class Engine(object):
         self.fixed_c10_srs = set()
         self.inert_made = set()
         self.chains = {}
+        self.busy_hosts = set()
         self.storage_open = {}
         self.act_items = {}
         self.journal_broken = False
@@ -13062,6 +13175,8 @@ class Engine(object):
                     return None, leaked_text(x)
                 if e['item'].get('after'):
                     return None, after_text(e)
+                if e['item'].get('later'):
+                    return None, '%s: %s' % (WAIT, '; '.join(e['item']['later']))
                 return e, None
             if self.same_target(e, it):
                 if e['verdict'] != FIX:
@@ -14058,13 +14173,18 @@ class Engine(object):
             self.release(it)
 
     def fresh_check(self, h, it, recheck=None, **kw):
-        deadline = _now() + self.opts.wait
+        deadline = _now() + (0 if it.get('later') and h.uuid in self.busy_hosts else self.opts.wait)
         hosts = self.sr_hosts(it['sr'], h, self.audits[-1].model if self.audits else None) if it.get('sr') else \
             [h.uuid]
         while True:
             fresh = self.audit(hosts=hosts, **kw)
             e, why = (recheck or self.recheck)(fresh, it)
             if e is not None or not (why or '').startswith(WAIT + ':') or _now() + RETEST_EVERY > deadline:
+                if e is None and it.get('later') and (why or '').startswith(WAIT + ':'):
+                    why = ('%s did not get quiet in this run (%s)' if h.uuid in self.busy_hosts else
+                           '%%s did not get quiet within %s (%%s)' % format_age(self.opts.wait)) % (
+                        h.name, why[len(WAIT) + 2:])
+                    self.busy_hosts.add(h.uuid)
                 return fresh, e, why
             step('  %d. %s: waiting - %s' % (it['seq'], it['cls'], why))
             pause(RETEST_EVERY)
@@ -16385,7 +16505,7 @@ def cmd_run(opts):
              '%s untouched (on this host and, for a run that acts on them, on the other hosts too): a run left open '
              'longer loses its record and its storage.db backups. Keep the script outside %s'
              % (RUN_ROOT, aged[0][1], aged[0][0]))
-    tty = sys.stdin.isatty()
+    tty = sys.stdin.isatty() or _YES[0]
     lockfd = try_run_lock() if tty else None
     busy = lockfd is None and (tty or not lock_free())
     try:
@@ -16401,7 +16521,7 @@ def cmd_run(opts):
 
 
 def run_locked(opts, lockfd, busy=False):
-    tty = sys.stdin.isatty() and lockfd is not None
+    tty = (sys.stdin.isatty() or _YES[0]) and lockfd is not None
     jr = open_journals() + legacy_journals()
     if busy:
         note, alive = lock_note_state()
@@ -16423,7 +16543,7 @@ def run_locked(opts, lockfd, busy=False):
         if tty:
             lock_note('waiting for an answer at a terminal')
             try:
-                yes = ask(u'Finish %s now? xapi and HA are put back where %s left them, and what %s left is cleaned '
+                yes = answer(u'Finish %s now? xapi and HA are put back where %s left them, and what %s left is cleaned '
                           u'up. [yes/no] ' % (('it', 'it', 'it') if len(jr) == 1 else ('them',) + ('they',) * 2))
             except KeyboardInterrupt:
                 error('interrupted. %s' % open_note(jr))
@@ -16478,7 +16598,7 @@ def run_locked(opts, lockfd, busy=False):
         if tty and offer:
             lock_note('waiting for an answer at a terminal')
             try:
-                yes = ask(u'Finish run %s (started on %s) from this host? [yes/no] ' % (
+                yes = answer(u'Finish run %s (started on %s) from this host? [yes/no] ' % (
                     offer, (ha_marker_of(model.pool) or {}).get('hostname') or 'another host'))
             except KeyboardInterrupt:
                 error('interrupted: run %s is still not finished' % offer)
@@ -16493,10 +16613,10 @@ def run_locked(opts, lockfd, busy=False):
         return exit_for(final)
     say(u'')
     if not tty:
-        say(u'To apply: run python3 %s in a terminal and answer yes.' % sys.argv[0])
+        say(u'To apply: run python3 %s in a terminal and answer yes, or run it with --yes.' % sys.argv[0])
         return exit_for(final)
     lock_note('waiting for an answer at a terminal')
-    if not ask(u'Apply these %d change(s)? [yes/no] ' % len(plan)):
+    if not answer(u'Apply these %d change(s)? [yes/no] ' % len(plan)):
         say(u'Nothing was changed.')
         return 1
     check_lock()
@@ -16505,6 +16625,14 @@ def run_locked(opts, lockfd, busy=False):
 
 
 ASK_TIMEOUT = 3600
+_YES = [False]
+
+
+def answer(question, auto=True):
+    if _YES[0]:
+        say(u'%s%s (--yes)' % (_text(question), 'yes' if auto else 'no, which --yes never answers yes'))
+        return auto
+    return ask(question)
 
 
 def flush_input():
@@ -16623,7 +16751,7 @@ def apply_plan(ctx, opts, audits, final, plan, ha):
         if not run_:
             say(u'Nothing is left to apply. Nothing was changed.')
             return 1
-        if not ask(u'Apply the remaining %d change(s)? [yes/no] ' % len(run_)):
+        if not answer(u'Apply the remaining %d change(s)? [yes/no] ' % len(run_)):
             say(u'Nothing was changed.')
             return 1
         why = master_problem(ctx)
@@ -16993,7 +17121,7 @@ def recover_run(opts, inv, name, path, recs, state):
     if started and _text(started[0]).split('.')[0] != VERSION.split('.')[0]:
         warn('run %s was started by version %s of this tool, and this is %s: its records may mean other things to '
              'this version' % (name, started[0], VERSION))
-        if not ask(u'Finish it with this version anyway? [yes/no] '):
+        if not answer(u'Finish it with this version anyway? [yes/no] ', False):
             say(u'Run %s is left as it is: finish it with version %s of this tool.' % (name, started[0]))
             return 3
     unreadable = [r for r in recs if r.get('event') == 'unreadable']
@@ -17214,8 +17342,8 @@ def recover_run(opts, inv, name, path, recs, state):
         closing = state.setdefault('closing', set())
         if path not in closing:
             if not sys.stdin.isatty() or not unarmed_prompt(
-                    'the close question', ask, u'  Once that has been checked, the run can be closed as it is. Close '
-                                               u'it now? [yes/no] '):
+                    'the close question', answer, u'  Once that has been checked, the run can be closed as it is. Close '
+                                                  u'it now? [yes/no] ', False):
                 error('  run %s again to close it once that has been checked' % sys.argv[0])
                 return 3
             checkpoint()
@@ -17240,10 +17368,10 @@ def build_parser():
         description='Find stale storage coordination state in an XCP-ng 8.3 pool (dead dom0 datapaths, stale '
                     'dom0 VBDs, leaked datapaths, stale relinking/activating keys, GC abort flags, backend nodes '
                     'pointing at another disk\'s tapdisk, paused tapdisks), prove each piece stale, and repair what '
-                    'is proven. Run it as root on the pool master, with no arguments: it audits the pool (twice, %ds '
-                    'apart, when the first audit finds anything that may need fixing), shows what it found and the '
-                    'changes it would make, and makes them only once yes is typed in full. Without a terminal it only '
-                    'reports.' % SETTLE_FLOOR,
+                    'is proven. Run it as root on the pool master: it audits the pool (twice, %ds apart, when the '
+                    'first audit finds anything that may need fixing), shows what it found and the changes it would '
+                    'make, and makes them only once yes is typed in full, or at once with --yes. Without a terminal '
+                    'and without --yes it only reports.' % SETTLE_FLOOR,
         epilog='On a pool with more than one host it asks for the pool\'s root password, to reach the other hosts '
                'over ssh; it is kept in memory and handed to ssh through the environment only. Each host\'s '
                'ssh host key is checked against those known here (%s/known_hosts, ~/.ssh/known_hosts or %s): an '
@@ -17255,6 +17383,13 @@ def build_parser():
                'or nothing was applied; 2 usage error; 3 a run is still open (xapi, HA or a storage.db edit not '
                'confirmed): run it again at a terminal to finish it.'
                % (RUN_ROOT, GLOBAL_KNOWN_HOSTS, RUN_ROOT))
+    p.add_argument('--yes', action='store_true',
+                   help='answer yes to every question, with or without a terminal: the audits run as always, and '
+                        'every change they prove is then made without asking; a run that was cut off is finished '
+                        'first, and host keys not seen before are trusted (a changed one is still refused). It never '
+                        'closes a cut-off run whose edits it could not verify, nor finishes one recorded by another '
+                        'major version. The pool root password is still asked for at a terminal, or read from stdin '
+                        'when piped in (an empty one uses ssh keys)')
     p.add_argument('--version', action='version', version='%(prog)s ' + VERSION + ' (python ' + PYTHON + ')')
     return p
 
@@ -17274,11 +17409,11 @@ def main(argv=None):
         return fence_main(argv[1])
     apply_paths({'RUN_ROOT': data_root()})
     parser = build_parser()
-    if [a for a in argv if a not in ('-h', '--help', '--version')]:
-        _write(sys.stderr, u'%s takes no arguments any more: run it alone. It checks, shows the changes, and asks '
-                           u'before making them' % PROG)
+    if [a for a in argv if a not in ('-h', '--help', '--version', '--yes')]:
+        _write(sys.stderr, u'%s takes no arguments but --yes: run it alone, and it checks, shows the changes, and '
+                           u'asks before making them; with --yes it makes them without asking' % PROG)
         return 2
-    parser.parse_args(argv)
+    _YES[0] = parser.parse_args(argv).yes
     opts = default_opts()
     say(u'%s %s (python %s)' % (PROG, VERSION, PYTHON))
     try:

@@ -9,7 +9,7 @@ ask first. Download the file and run it, don't pipe it in from curl.
 because of storage junk left behind (dead dom0 datapaths, stale dom0 VBDs, leaked datapaths and
 the paused or wedged tapdisks behind them, stuck GC flags).
 Run it with no arguments: it checks, lists what it found and what it would change, and only
-changes anything once you type `yes`. Editing storage.db restarts xapi on that host (VMs keep
+changes anything once you type `yes`; with `--yes` it makes them without asking. Editing storage.db restarts xapi on that host (VMs keep
 running), with HA turned off and back on around it.
 ```
 curl -fsSLO https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/storage-state-fixer.py
