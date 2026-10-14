@@ -28,7 +28,7 @@ import time
 import xml.parsers.expat
 import zlib
 
-VERSION = '2.2'
+VERSION = '2.3'
 PYTHON = sys.version.split()[0]
 PROG = 'storage-state-fixer'
 STORAGE_DB = '/var/run/nonpersistent/xapi/storage.db'
@@ -135,10 +135,11 @@ ENSURE_MARGIN = 60
 ACT_START_TIMEOUT = 120
 FETCH_TIMEOUT = 120
 TASK_WAIT = 120
-HOUSEKEEPING_TASKS = ('SR.scan',)
+HOUSEKEEPING_TASKS = ('SR.scan', 'Async.SR.scan', 'SR.update', 'Async.SR.update')
 DAEMON_HOLDERS = ('xapi-nbd',)
 HOLD_OPS = ('start', 'start_on', 'resume', 'resume_on', 'pool_migrate', 'migrate_send')
 SR_HOUSEKEEPING = ('scan', 'update')
+SM_HOUSEKEEPING = ('sr_scan', 'sr_update', 'sr_probe')
 SR_VDI_OPS = ('vdi_create', 'vdi_introduce', 'vdi_destroy', 'vdi_resize', 'vdi_clone', 'vdi_snapshot', 'vdi_mirror',
               'vdi_enable_cbt', 'vdi_disable_cbt', 'vdi_data_destroy', 'vdi_list_changed_blocks', 'vdi_set_on_boot')
 UNPLUG_TIMEOUT = 300
@@ -1657,6 +1658,16 @@ def is_sm_argv(argv):
     return sm_script(argv) is not None
 
 
+def sm_housekeeping(argv):
+    argv = [_text(x) for x in argv or []]
+    script = sm_script(argv)
+    if script is None or not script.startswith(SM_DIR + '/') or script.endswith('cleanup.py'):
+        return False
+    i = argv.index(script)
+    found = SM_METHOD_RE.search(' '.join(argv[i + 1:i + 4]))
+    return bool(found) and found.group(1) in SM_HOUSEKEEPING
+
+
 def f_cmduuids():
     out = {}
     for pid in pids():
@@ -1741,10 +1752,24 @@ def f_locks():
     for l in parse_proc_locks(read_text(PROC + '/locks')):
         key = (l['dev'][0], l['dev'][1], l['ino'])
         if key in files:
-            held.append({'path': files[key], 'pid': l['pid'], 'kind': l['kind'], 'mode': l['mode']})
-        elif ldev is not None and l['dev'] == ldev and l['pid'] > 0 and pid_info(l['pid']).get('sm'):
-            held.append({'path': None, 'pid': l['pid'], 'kind': l['kind'], 'mode': l['mode'], 'ino': l['ino']})
+            held.append({'path': files[key], 'pid': l['pid'], 'kind': l['kind'], 'mode': l['mode'],
+                         'argv': holder_argv(l['pid'])})
+        elif ldev is not None and l['dev'] == ldev and l['pid'] > 0:
+            info = pid_info(l['pid'])
+            if info.get('sm'):
+                held.append({'path': None, 'pid': l['pid'], 'kind': l['kind'], 'mode': l['mode'], 'ino': l['ino'],
+                             'argv': info.get('argv')})
     return held
+
+
+def holder_argv(pid):
+    if pid <= 0:
+        return None
+    try:
+        info = pid_info(pid)
+    except EnvironmentError:
+        return None
+    return info.get('argv') if info.get('alive') else None
 
 
 def f_lockwaits():
@@ -4392,6 +4417,22 @@ def gc_holds_here(srs, run_id):
     return out
 
 
+def holder_kind(l, mine=()):
+    argv = l.get('argv')
+    if not argv:
+        try:
+            argv = proc_cmdline(l['pid'])
+        except EnvironmentError:
+            return None
+    if sm_housekeeping(argv):
+        return 'chore'
+    if any(a.endswith('cleanup.py') for a in argv):
+        u = [a for a in argv if UUID_RE.match(a)]
+        if u and u[0] in mine:
+            return 'gc'
+    return None
+
+
 def local_sm_activity(held=(), run_id=None):
     busy = []
     mine = gc_holds_here(set(held or ()), run_id)
@@ -4406,6 +4447,8 @@ def local_sm_activity(held=(), run_id=None):
                             % (pid, _text(exc)))
             continue
         if is_sm_argv(argv):
+            if sm_housekeeping(argv):
+                continue
             gc = [a for a in argv if UUID_RE.match(a)] if any(a.endswith('cleanup.py') for a in argv) else []
             if gc and gc[0] in mine:
                 continue
@@ -4418,9 +4461,12 @@ def local_sm_activity(held=(), run_id=None):
             sr = gc_lock_sr(l['path'])
             if sr and sr in mine:
                 continue
+            who = holder_kind(l, mine)
+            if who == 'gc':
+                continue
             if sr:
                 busy.append('the GC of SR %s holds %s (pid %d); a coalesce can take hours' % (sr, l['path'], l['pid']))
-            else:
+            elif who != 'chore':
                 busy.append('lock %s held by pid %d' % (l['path'] or '(an unlinked SM lock file)', l['pid']))
     except Exception as exc:
         busy.append('the SM lock holders cannot be read: %s' % _text(exc))
@@ -7521,6 +7567,7 @@ class Api(object):
 
 SNAP_CLASSES = ('pool', 'host', 'host_metrics', 'SR', 'PBD', 'VM', 'VBD', 'VDI', 'task', 'PIF')
 EVENT_CLASSES = ['vbd', 'vm', 'vdi', 'task', 'pbd', 'sr', 'pool']
+PBD_STATE = ('SR', 'host', 'currently_attached')
 
 
 def snapshot_torn(snap):
@@ -8713,7 +8760,7 @@ def stuck_sm(audit, href):
     now = hv.identity['time'] if hv.identity and hv.identity.get('time') else audit.t
     alive = dict((p['pid'], p) for p in hv.procs or [])
     for p in hv.procs or []:
-        if not p.get('sm') or not storage_sm(p.get('argv')):
+        if not p.get('sm') or not storage_sm(p.get('argv')) or sm_housekeeping(p.get('argv')):
             continue
         argv = p.get('argv') or []
         if any(a.endswith('cleanup.py') for a in argv):
@@ -9787,7 +9834,7 @@ def paused_stale(a, opts, hv, vref, tap):
             unknowns.append('the processes on %s were not read' % h2.name)
             continue
         for p in busy:
-            if not any(x.endswith('cleanup.py') for x in p.get('argv') or []):
+            if not any(x.endswith('cleanup.py') for x in p.get('argv') or []) and not sm_housekeeping(p.get('argv')):
                 waits.append('SM process %d runs on %s (%s)' % (p['pid'], h2.name,
                                                                sm_what(p.get('argv'))))
     found, unread, partial = [], [], []
@@ -11624,7 +11671,7 @@ def lv_put_busy(m, hv):
     out = []
     for p in busy:
         argv = p.get('argv') or []
-        if not any(x.endswith('cleanup.py') for x in argv):
+        if not any(x.endswith('cleanup.py') for x in argv) and not sm_housekeeping(argv):
             out.append('SM process %d runs on %s (%s)' % (p['pid'], hv.name, sm_what(argv)))
     for t in m.pending_tasks(hv.href, work=True):
         if not m.is_gc_task(t):
@@ -11974,7 +12021,7 @@ def eval_paused_tap(a, opts, hv, row):
             unknowns.append('the processes on %s were not read' % h2.name)
             continue
         for p in busy:
-            if not any(x.endswith('cleanup.py') for x in p.get('argv') or []):
+            if not any(x.endswith('cleanup.py') for x in p.get('argv') or []) and not sm_housekeeping(p.get('argv')):
                 waits.append('SM process %d runs on %s (%s)' % (p['pid'], h2.name,
                                                                 sm_what(p.get('argv'))))
     hold = hv.holders(sr['uuid'], vu)
@@ -13504,9 +13551,13 @@ class Engine(object):
                         k in (snap.get('sm_config') or {}) for k in ('paused', 'relinking', 'activating'))):
                     out.append('VDI %s, served on the host, is busy (%s)' % (snap.get('uuid') or ref, op))
             elif cls == 'pbd':
-                if snap.get('SR') in sr_refs or (op == 'del' and any(ref in m.srs[s]['PBDs'] for s in sr_refs)):
-                    out.append('PBD %s of SR %s: %s' % (snap.get('uuid') or ref, m.srs.get(snap.get('SR'), {})
-                                                         .get('uuid') or '?', op))
+                was = m.pbds.get(ref)
+                if op == 'mod' and was is not None and all(snap.get(k) == was.get(k) for k in PBD_STATE):
+                    continue
+                if snap.get('SR') in sr_refs or (was or {}).get('SR') in sr_refs or \
+                        (op == 'del' and any(ref in m.srs[s]['PBDs'] for s in sr_refs)):
+                    out.append('PBD %s of SR %s: %s' % (snap.get('uuid') or ref, m.srs.get(
+                        snap.get('SR') or (was or {}).get('SR'), {}).get('uuid') or '?', op))
             elif cls == 'sr':
                 if ref in sr_refs and (op == 'del' or sorted(snap.get('PBDs') or []) != sorted(m.srs[ref]['PBDs'])):
                     out.append('SR %s: %s' % (snap.get('uuid') or ref, op))
@@ -13831,6 +13882,7 @@ class Engine(object):
         for sref in scope:
             sv = fresh.view(sref)
             busy = sv.sm_busy()
+            argvs = dict((p['pid'], p.get('argv') or []) for p in busy or [])
             if busy is None:
                 reasons.append('the processes on %s were not read' % sv.name)
             else:
@@ -13839,6 +13891,8 @@ class Engine(object):
                     if any(a.endswith('cleanup.py') for a in argv) and \
                             gc_sr(([a for a in argv if UUID_RE.match(a)] or [None])[0]):
                         continue
+                    if sm_housekeeping(argv):
+                        continue
                     reasons.append('SM is busy on %s: pid %d %s' % (sv.name, p['pid'],
                                                                    sm_what(p.get('argv'))))
             if sv.locks is None:
@@ -13846,6 +13900,12 @@ class Engine(object):
             else:
                 for l in sv.locks:
                     if gc_sr(gc_lock_sr(l['path'])):
+                        continue
+                    argv = l.get('argv') or argvs.get(l['pid']) or []
+                    if gc_lock_sr(l['path']) is None and sm_housekeeping(argv):
+                        continue
+                    if any(a.endswith('cleanup.py') for a in argv) and \
+                            gc_sr(([a for a in argv if UUID_RE.match(a)] or [None])[0]):
                         continue
                     reasons.append('%s is held by pid %d on %s' % (l['path'] or 'an unlinked SM lock file', l['pid'],
                                                                    sv.name))
@@ -13970,7 +14030,7 @@ class Engine(object):
             if self.ha is not None:
                 again = []
                 for h in ready:
-                    reasons, _ = self.stop_gate(h, by[h.uuid], False, 'defer')
+                    reasons, _ = self.wait_gate(h, by[h.uuid], False, self.ha_wait(), 5, 'defer')
                     if reasons:
                         self.skip_host(h, by[h.uuid], 'not stopped: %s' % '; '.join(reasons[:6]), True)
                     else:
@@ -14506,7 +14566,7 @@ class Engine(object):
         deadline = _now() + TASK_WAIT
         waited = False
         while True:
-            busy = [t for t in m.pending_tasks() if not m.is_gc_task(t)]
+            busy = [t for t in m.pending_tasks(work=True) if not m.is_gc_task(t)]
             if not busy:
                 break
             if _now() > deadline:
