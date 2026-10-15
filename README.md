@@ -7,13 +7,13 @@ ask first. Download the file and run it, don't pipe it in from curl.
 
 **storage-state-fixer.py** (8.3 only) - for when exports, backups or VBD unplugs start failing
 because of storage junk left behind (dead dom0 datapaths, stale dom0 VBDs, leaked datapaths and
-the paused or wedged tapdisks behind them, stuck GC flags).
+the paused or wedged tapdisks behind them, stale sm-config keys, stuck GC flags, dead NBD exports).
 Run it with no arguments: it checks, lists what it found and what it would change, and only
 changes anything once you type `yes`; with `--yes` it makes them without asking. Editing storage.db restarts xapi on that host (VMs keep
 running), with HA turned off and back on around it.
 When one VM or disk is the problem (snapshots failing, "VDI in use" in backups), give it that VM's or
 VDI's uuid: it then checks only those disks and every disk in their chains, deeper (chain health,
-stuck operations, dead NBD exports), and reports and fixes only what concerns them.
+stuck operations), and reports and fixes only what concerns them.
 ```
 curl -fsSLO https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/storage-state-fixer.py
 python3 storage-state-fixer.py
