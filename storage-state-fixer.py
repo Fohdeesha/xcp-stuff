@@ -28,7 +28,7 @@ import time
 import xml.parsers.expat
 import zlib
 
-VERSION = '2.3'
+VERSION = '2.4'
 PYTHON = sys.version.split()[0]
 PROG = 'storage-state-fixer'
 STORAGE_DB = '/var/run/nonpersistent/xapi/storage.db'
@@ -638,7 +638,21 @@ def proc_stat(pid):
     comm = data[data.index('(') + 1:rp]
     rest = data[rp + 2:].split()
     return {'comm': comm, 'state': rest[0], 'ticks': int(rest[11]) + int(rest[12]),
-            'start_ticks': int(rest[19]), 'flags': int(rest[6]), 'pgrp': int(rest[2])}
+            'start_ticks': int(rest[19]), 'flags': int(rest[6]), 'pgrp': int(rest[2]), 'ppid': int(rest[1])}
+
+
+def own_lineage(pid=None):
+    pid = os.getpid() if pid is None else pid
+    out = set([pid])
+    while pid > 1:
+        try:
+            pid = proc_stat(pid)['ppid']
+        except (EnvironmentError, ValueError, IndexError):
+            break
+        if pid < 1 or pid in out:
+            break
+        out.add(pid)
+    return out
 
 
 def proc_start(pid, btime):
@@ -1195,7 +1209,20 @@ def local_epoch(fields):
     return max(fits) if fits else t
 
 
+_EPOCHS = {}
+
+
 def syslog_epoch(mon, day, hh, mm, ss, now):
+    key = (mon, day, hh, mm, ss, now)
+    if key in _EPOCHS:
+        return _EPOCHS[key]
+    if len(_EPOCHS) > 200000:
+        _EPOCHS.clear()
+    _EPOCHS[key] = t = _syslog_epoch(mon, day, hh, mm, ss, now)
+    return t
+
+
+def _syslog_epoch(mon, day, hh, mm, ss, now):
     year = time.localtime(now).tm_year
     for y in (year, year - 1):
         try:
@@ -1670,8 +1697,9 @@ def sm_housekeeping(argv):
 
 def f_cmduuids():
     out = {}
+    mine = own_lineage()
     for pid in pids():
-        if pid == os.getpid():
+        if pid in mine:
             continue
         try:
             raw = read_file('%s/%d/cmdline' % (PROC, pid))
@@ -1885,34 +1913,80 @@ def f_xsread(paths):
     return out
 
 
+def is_image_path(p):
+    return p.startswith('/dev/VG_XenStorage-') or p.startswith('/var/run/sr-mount/') or p.startswith('/run/sr-mount/')
+
+
+def vhd_check_one(p, parents=True):
+    r = run([VHD_UTIL, 'check', '--debug'] + (['-p'] if parents else []) + ['-n', p], 120)
+    lines = [l.strip() for l in (r.out + u'\n' + r.err).splitlines() if l.strip()]
+    bad = [l for l in lines if VHD_CHECK_BAD.search(l)]
+    detail = '; '.join(bad[:3] if bad else lines[-3:])
+    if not r.ok and not bad:
+        detail = '%s (%s)' % (detail, r.why()) if detail else r.why()
+    rec = {'ok': r.ok, 'detail': detail[:400]}
+    if r.timed_out:
+        rec['timed_out'] = True
+    q = run([VHD_UTIL, 'query', '--debug', '-n', p, '-p', '-u'], 60)
+    text = q.out.strip()
+    last = text.splitlines()[-1] if text else ''
+    names = re.findall(UUID_PAT, os.path.basename(last))
+    if not q.ok:
+        rec['parent_error'] = 'vhd-util query -p %s' % q.why()
+    elif last.endswith(' has no parent'):
+        rec['parent'] = ''
+    elif len(names) == 1:
+        rec['parent'] = names[0]
+        rec['parent_raw'] = last[:300]
+    else:
+        rec['parent_error'] = 'the parent cannot be named from %s' % canon(last[:200])
+    return rec
+
+
 def f_vhdcheck(paths):
     out = {}
     for p in paths or []:
-        if not (p.startswith('/dev/VG_XenStorage-') or p.startswith('/var/run/sr-mount/') or
-                p.startswith('/run/sr-mount/')):
+        if not is_image_path(p):
             out[p] = {'ok': False, 'detail': 'not an SR image path'}
             continue
-        r = run([VHD_UTIL, 'check', '--debug', '-p', '-n', p], 120)
-        lines = [l.strip() for l in (r.out + u'\n' + r.err).splitlines() if l.strip()]
-        bad = [l for l in lines if VHD_CHECK_BAD.search(l)]
-        detail = '; '.join(bad[:3] if bad else lines[-3:])
-        if not r.ok and not bad:
-            detail = '%s (%s)' % (detail, r.why()) if detail else r.why()
-        rec = {'ok': r.ok, 'detail': detail[:400]}
-        q = run([VHD_UTIL, 'query', '--debug', '-n', p, '-p', '-u'], 60)
-        text = q.out.strip()
-        last = text.splitlines()[-1] if text else ''
-        names = re.findall(UUID_PAT, os.path.basename(last))
-        if not q.ok:
-            rec['parent_error'] = 'vhd-util query -p %s' % q.why()
-        elif last.endswith(' has no parent'):
-            rec['parent'] = ''
-        elif len(names) == 1:
-            rec['parent'] = names[0]
-            rec['parent_raw'] = last[:300]
-        else:
-            rec['parent_error'] = 'the parent cannot be named from %s' % canon(last[:200])
-        out[p] = rec
+        out[p] = vhd_check_one(p)
+    return out
+
+
+CHAIN_RESERVE = 60
+CHAIN_JOBS = 4
+
+
+def f_chain(q):
+    out = {'lvnames': f_lvnames(q.get('vgs') or []), 'srdir': f_srdir(q.get('srdirs') or []), 'vhd': {},
+           'unchecked': []}
+    todo = [p for p in q.get('vhd') or [] if is_image_path(p)]
+    lock = threading.Lock()
+
+    def worker():
+        while True:
+            with lock:
+                if not todo:
+                    return
+                p = todo.pop(0)
+            rec = None
+            if _DEADLINE[0] is None or _DEADLINE[0] - _now() >= CHAIN_RESERVE:
+                try:
+                    rec = vhd_check_one(p, parents=False)
+                except Failed:
+                    rec = None
+            with lock:
+                if rec is None:
+                    out['unchecked'].append(p)
+                else:
+                    out['vhd'][p] = rec
+    threads = [threading.Thread(target=worker) for _ in range(min(CHAIN_JOBS, len(todo)))]
+    for t in threads:
+        t.daemon = True
+        t.start()
+    for t in threads:
+        t.join()
+    out['unchecked'].sort()
     return out
 
 
@@ -2003,6 +2077,126 @@ def f_nbd_vbds():
                 and len(data) == st2.st_size and not fresh:
             return [l.strip() for l in _text(data).splitlines() if l.strip()]
     raise Failed('%s was being rewritten while it was read (xapi-nbd rewrites it in place)' % NBD_VBDS)
+
+
+SS_SOCK = re.compile(r'^(\S+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)(?:\s+(.*))?$')
+SS_USER = re.compile(r'\("([^"]*)",pid=(\d+),fd=(\d+)\)')
+SS_INFO = re.compile(r'(?:^|\s)(lastsnd|lastrcv|lastack|bytes_acked|bytes_received):(\d+)(?=\s|$)')
+NBD_IDLE = ('lastsnd', 'lastrcv', 'lastack')
+NBD_DAEMON = 'xapi-nbd'
+
+
+def split_addr(text):
+    host, _, port = _text(text).rpartition(':')
+    return host.strip('[]'), port
+
+
+def parse_ss(text):
+    lines = [l for l in _text(text).splitlines() if l.strip()]
+    if not lines or not lines[0].startswith('State'):
+        raise ValueError('ss printed no header: %s' % canon((lines or [''])[0][:200]))
+    out, cur = [], None
+    for line in lines[1:]:
+        if line[0] in ' \t':
+            if cur is None:
+                raise ValueError('an ss info line came before any socket: %s' % line.strip()[:200])
+            for k, v in SS_INFO.findall(line):
+                cur[k] = int(v)
+            continue
+        m = SS_SOCK.match(line)
+        if not m:
+            raise ValueError('cannot read the ss line: %s' % line[:200])
+        cur = {'state': m.group(1), 'recvq': int(m.group(2)), 'sendq': int(m.group(3)), 'local': m.group(4),
+               'peer': m.group(5), 'users': [[c, int(p), int(f)] for c, p, f in SS_USER.findall(m.group(6) or '')]}
+        out.append(cur)
+    return out
+
+
+def f_nbd_conns():
+    r = run([SS, '-tnpi', '( sport = :%d )' % NBD_PORT], 20)
+    if not r.ok:
+        raise Failed('ss -tnpi %s' % r.why())
+    return [c for c in parse_ss(r.out) if split_addr(c['local'])[1] == str(NBD_PORT)]
+
+
+def nbd_open(conns):
+    return [c for c in conns or [] if c['state'] == 'ESTAB']
+
+
+def nbd_stale(c, limit_ms):
+    if c['state'] != 'ESTAB' or c['recvq'] or c['sendq'] or not c['users']:
+        return False
+    if any(u[0] != NBD_DAEMON for u in c['users']):
+        return False
+    return all(isinstance(c.get(k), int) and not isinstance(c.get(k), bool) and c[k] > limit_ms for k in NBD_IDLE)
+
+
+def nbd_idle(c):
+    vals = [c.get(k) for k in NBD_IDLE]
+    return min(vals) / 1000.0 if all(isinstance(v, int) for v in vals) else None
+
+
+def ss_match(local, peer):
+    ip, port = split_addr(peer)
+    return ['( sport = :%s and dst %s and dport = :%s )' % (split_addr(local)[1], ip, port)]
+
+
+def agent_nbd_end(args, source):
+    limit = int(args['limit_ms'])
+    out = {'conns': [], 'restarted': False, 'problems': []}
+    try:
+        now = f_nbd_conns()
+    except (Failed, ValueError) as exc:
+        out['problems'].append('the NBD connections could not be read again: %s' % _text(exc))
+        return out
+    by = dict(((c['local'], c['peer']), c) for c in now)
+    for local, peer in args.get('conns') or []:
+        c = by.get((local, peer))
+        if c is None:
+            out['conns'].append([local, peer, 'gone', ''])
+            continue
+        if not nbd_stale(c, limit):
+            out['conns'].append([local, peer, 'moved', 'it is not idle any more (%s)' % canon(
+                dict((k, c.get(k)) for k in ('state', 'recvq', 'sendq') + NBD_IDLE))])
+            continue
+        r = run([SS, '-tn'] + ss_match(local, peer), 20)
+        try:
+            hits = parse_ss(r.out) if r.ok else None
+        except ValueError:
+            hits = None
+        if hits is None or len(hits) != 1 or (hits[0]['local'], hits[0]['peer']) != (local, peer) or \
+                hits[0]['state'] != 'ESTAB':
+            out['conns'].append([local, peer, 'refused', 'its filter does not match it alone: %s' % (
+                r.why() if not r.ok else canon([[h['local'], h['peer']] for h in hits or []])[:300])])
+            continue
+        r = run([SS, '-K', '-tn'] + ss_match(local, peer), 20)
+        out['conns'].append([local, peer, 'asked' if r.ok else 'failed', '' if r.ok else 'ss -K %s' % r.why()])
+    try:
+        after = f_nbd_conns()
+    except (Failed, ValueError) as exc:
+        out['problems'].append('whether the connections are gone could not be read: %s' % _text(exc))
+        return out
+    left = set((c['local'], c['peer']) for c in after)
+    for row in out['conns']:
+        if row[2] == 'asked':
+            row[2] = 'still there' if (row[0], row[1]) in left else 'ended'
+    stuck = [r for r in out['conns'] if r[2] in ('still there', 'failed')]
+    if args.get('restart') or stuck:
+        live = [c for c in nbd_open(after) if not nbd_stale(c, limit)]
+        if live:
+            out['problems'].append('xapi-nbd was not restarted: %d connection(s) on port %d are live (%s)' % (
+                len(live), NBD_PORT, ', '.join(c['peer'] for c in live[:4])))
+        else:
+            r = run([SYSTEMCTL, 'restart', 'xapi-nbd'], 120)
+            out['restarted'] = r.ok
+            if not r.ok:
+                out['problems'].append('systemctl restart xapi-nbd %s' % r.why())
+            else:
+                try:
+                    out['after_restart'] = len(nbd_open(f_nbd_conns()))
+                except (Failed, ValueError) as exc:
+                    out['problems'].append('the connections after the restart could not be read: %s' % _text(exc))
+    return out
 
 
 def f_smrefs():
@@ -3402,6 +3596,46 @@ TAPLOG_LINE = re.compile(r'tapdisk\[(\d+)\]: (.*)$')
 CLOCK_STEP = re.compile(r'(?:chronyd\[\d+\]: System clock was stepped by|ntpdate\[\d+\]: step time server \S+ offset) '
                         r'(-?[0-9.]+)')
 TAPLOG_TAIL = 40
+TAPLOG_MARKS = (b'stepped by', b'step time server')
+
+
+def taplog_stream(path, deadline):
+    n = 0
+    with _open_log(path) as h:
+        for raw in h:
+            n += 1
+            if not n % 4096 and _now() > deadline:
+                raise OutOfTime(path)
+            yield n, raw
+
+
+def taplog_lines(path, toks, deadline):
+    try:
+        with _open_log(path) as h:
+            data = h.read()
+    except (EnvironmentError, EOFError, zlib.error):
+        for item in taplog_stream(path, deadline):
+            yield item
+        return
+    if _now() > deadline:
+        raise OutOfTime(path)
+    starts = set([0]) if data else set()
+    for tok in list(toks) + list(TAPLOG_MARKS):
+        i = data.find(tok)
+        while i >= 0:
+            starts.add(data.rfind(b'\n', 0, i) + 1)
+            j = data.find(b'\n', i)
+            if j < 0:
+                break
+            i = data.find(tok, j + 1)
+    n, last = 1, 0
+    for k, s in enumerate(sorted(starts)):
+        if k and not k % 4096 and _now() > deadline:
+            raise OutOfTime(path)
+        n += data.count(b'\n', last, s)
+        last = s
+        e = data.find(b'\n', s)
+        yield n, (data[s:] if e < 0 else data[s:e + 1])
 
 
 def f_taplog(q):
@@ -3427,6 +3661,7 @@ def f_taplog(q):
         size += sz
     kinds = dict((str(p), {}) for p in want)
     tails = dict((str(p), []) for p in want)
+    toks = [('tapdisk[%d]' % p).encode('ascii') for p in sorted(want)]
     stopped = None
     since = None
     read = 0
@@ -3443,46 +3678,44 @@ def f_taplog(q):
             if os.stat(path).st_ino != ino:
                 stopped = '%s (rotated while it was being read)' % path
                 break
-            with _open_log(path) as h:
-                for raw in h:
-                    n += 1
-                    if not n % 4096 and _now() > deadline:
-                        raise OutOfTime(path)
-                    if n == 1:
-                        m0 = SYSLOG_TS.match(raw.decode('utf-8', 'replace'))
-                        start_t = syslog_epoch(*(m0.groups() + (ref,))) if m0 else None
-                    if b'tapdisk[' not in raw:
-                        if b'stepped by' in raw or b'step time server' in raw:
-                            line = raw.rstrip(b'\n').decode('utf-8', 'replace')
-                            mc = CLOCK_STEP.search(line)
-                            ts = SYSLOG_TS.match(line)
-                            if mc and ts:
-                                steps.append([syslog_epoch(*(ts.groups() + (ref,))), abs(float(mc.group(1)))])
-                        continue
-                    line = raw.rstrip(b'\n').decode('utf-8', 'replace')
-                    m = TAPLOG_LINE.search(line)
-                    if not m or int(m.group(1)) not in want:
-                        continue
-                    ts = SYSLOG_TS.match(line)
-                    t = syslog_epoch(*(ts.groups() + (ref,))) if ts else None
-                    born = want[int(m.group(1))]
-                    msg = m.group(2)
-                    hit = [(kind, mm) for kind, mm in ((k, rx.search(msg)) for k, rx in TAPLOG_EVENTS) if mm][:1]
-                    if hit and born is not None and t is not None and abs(t - born) <= 3600:
-                        if len(near[m.group(1)]) < 2000:
-                            near[m.group(1)].append(t)
-                        else:
-                            crowded.add(m.group(1))
-                    if born is not None and (t is None or t < born - 2):
-                        continue
-                    for kind, mm in hit:
-                        evs = pieces[m.group(1)]
-                        if evs and evs[-1][3] == kind:
-                            evs[-1][0], evs[-1][2], evs[-1][4] = base + n, t, list(mm.groups())
-                            evs[-1][5] += 1
-                        else:
-                            evs.append([base + n, t, t, kind, list(mm.groups()), 1, msg[-200:]])
-                        break
+            for n, raw in taplog_lines(path, toks, deadline):
+                if n == 1:
+                    m0 = SYSLOG_TS.match(raw.decode('utf-8', 'replace'))
+                    start_t = syslog_epoch(*(m0.groups() + (ref,))) if m0 else None
+                if b'tapdisk[' not in raw:
+                    if b'stepped by' in raw or b'step time server' in raw:
+                        line = raw.rstrip(b'\n').decode('utf-8', 'replace')
+                        mc = CLOCK_STEP.search(line)
+                        ts = SYSLOG_TS.match(line)
+                        if mc and ts:
+                            steps.append([syslog_epoch(*(ts.groups() + (ref,))), abs(float(mc.group(1)))])
+                    continue
+                if not any(tok in raw for tok in toks):
+                    continue
+                line = raw.rstrip(b'\n').decode('utf-8', 'replace')
+                m = TAPLOG_LINE.search(line)
+                if not m or int(m.group(1)) not in want:
+                    continue
+                ts = SYSLOG_TS.match(line)
+                t = syslog_epoch(*(ts.groups() + (ref,))) if ts else None
+                born = want[int(m.group(1))]
+                msg = m.group(2)
+                hit = [(kind, mm) for kind, mm in ((k, rx.search(msg)) for k, rx in TAPLOG_EVENTS) if mm][:1]
+                if hit and born is not None and t is not None and abs(t - born) <= 3600:
+                    if len(near[m.group(1)]) < 2000:
+                        near[m.group(1)].append(t)
+                    else:
+                        crowded.add(m.group(1))
+                if born is not None and (t is None or t < born - 2):
+                    continue
+                for kind, mm in hit:
+                    evs = pieces[m.group(1)]
+                    if evs and evs[-1][3] == kind:
+                        evs[-1][0], evs[-1][2], evs[-1][4] = base + n, t, list(mm.groups())
+                        evs[-1][5] += 1
+                    else:
+                        evs.append([base + n, t, t, kind, list(mm.groups()), 1, msg[-200:]])
+                    break
         except OutOfTime:
             stopped = '%s (out of time)' % path
             break
@@ -3743,6 +3976,10 @@ def facts_doc(args):
         doc['drbd_all'] = fact(f_drbd_all)
     if 'taplog' in want:
         doc['taplog'] = fact(f_taplog, args.get('taplog') or {})
+    if 'chain' in want:
+        doc['chain'] = fact(f_chain, args.get('chain') or {})
+    if 'nbdss' in want:
+        doc['nbd_conns'] = fact(f_nbd_conns)
     if 'extra' in want:
         doc['statfiles'] = fact(f_statfiles, args.get('statfiles') or [])
         doc['lvnames'] = fact(f_lvnames, args.get('vgs') or [])
@@ -7187,7 +7424,7 @@ VERBS = {'facts': lambda a, s: agent_facts(a), 'act-start': agent_act_start, 'ac
          'act-list': agent_act_list, 'inert-node': agent_inert_node, 'mount-probe': agent_mount_probe,
          'fetch-backup': agent_fetch_backup, 'unlink-abort': agent_unlink_abort, 'xapi-ensure': agent_xapi_ensure,
          'smlog-tail': agent_smlog_tail, 'xlog-grep': agent_xlog_grep, 'tap-stats': agent_tap_stats,
-         'tap-end': agent_tap_end, 'tap-free': agent_tap_free,
+         'tap-end': agent_tap_end, 'tap-free': agent_tap_free, 'nbd-end': agent_nbd_end,
          'fence-start': agent_fence_start, 'fence-status': agent_fence_status, 'fence-release': agent_fence_release}
 
 
@@ -7725,6 +7962,10 @@ class Audit(object):
         self.taplog = {}
         self.c03_ends = {}
         self._views = {}
+        self.scope = None
+        self.chain = {}
+        self.chain_plan = None
+        self.stale_ops = None
 
     def view(self, href):
         hv = self._views.get(href)
@@ -7851,6 +8092,7 @@ class HostView(object):
         self.tap_stats = f('tap_stats')
         self.ctl_backlog = f('ctl_backlog')
         self.nbd_vbds = f('nbd_vbds')
+        self.nbd_conns = f('nbd_conns')
         self.cmduuids = f('cmduuids')
         self.smrefs = f('smrefs')
         self.domains = f('domains')
@@ -8592,7 +8834,11 @@ def host_gate(audit, href, opts, exclude=()):
     if hv.nbd is None:
         unknown.append('NBD connections not established: %s' % hv.why('nbd'))
     elif hv.nbd:
-        block.append('%d NBD connection(s) are open on port %d (a backup is reading disks)' % (len(hv.nbd), NBD_PORT))
+        dead = [c for c in nbd_open(hv.nbd_conns) if nbd_stale(c, int(limit * 1000))] if hv.nbd_conns else []
+        block.append('%d NBD connection(s) are open on port %d (%s)' % (
+            len(hv.nbd), NBD_PORT, 'a backup is reading disks' if not dead else
+            '%d of them moved nothing for over %s: a dead export, ended by C25 when the disks it holds are checked'
+            % (len(dead), format_age(limit))))
     if hv.openers is None:
         unknown.append('the openers of disk devices were not established: %s' % hv.why('openers'))
     else:
@@ -8902,7 +9148,15 @@ CLASS_TITLES = {
     'C15': 'tapdisk not answering', 'C16': 'leftover', 'C17': 'backup / export activity',
     'C18': 'environment', 'C19': 'garbage collector health',
     'C20': 'backend node pointing at another disk\'s tapdisk', 'C21': 'tapdisk in an abnormal state',
-    'C22': 'dying domain', 'C00': 'not audited'}
+    'C22': 'dying domain', 'C23': 'disk chain', 'C24': 'stuck operation', 'C25': 'dead NBD export',
+    'C00': 'not audited'}
+TARGET_CLASSES = ('C23', 'C24', 'C25')
+NBD_SLACK = 60
+NBD_CLEAN_WAIT = 60
+MAX_CHAIN = 30
+CHAIN_NEAR = 25
+CHAIN_CHECKS = 40
+STUCK_TASK_AGE = 6 * 3600
 
 
 def ev(key, cls, verdict, host, title, reason, evidence=None, sig=None, item=None, roll=None):
@@ -10451,6 +10705,10 @@ def eval_vbd(a, opts, vbd, vm, vdi):
                 age = None
                 how = ('an NBD export: xapi-nbd serves every export from its one long-running process, so how long '
                        'this one has run is not known')
+                dead = [c for c in nbd_open(hv.nbd_conns) if nbd_stale(c, int(opts.stuck_export_age * 1000))]
+                if dead:
+                    how += ('; %d of its connections have moved nothing for over %s, a dead export that C25 ends'
+                            % (len(dead), format_age(opts.stuck_export_age)))
             txt = '%s (pid %d, %s) holds %s' % (h['comm'], h['pid'], how, ', '.join(x['target'] for x in exp[0][1]))
             if age is not None and age > opts.stuck_export_age:
                 return ev(key, 'C06', REPORT, hv.uuid, title, 'stuck export: ' + txt +
@@ -12266,8 +12524,334 @@ def eval_held_vms(a, opts):
     return out
 
 
+def sr_listing(a, sr):
+    m = a.model
+    sref = m.sr_by_uuid.get(sr)
+    mref = m.sr_master(sref) if sref is not None else None
+    if mref is None:
+        return None, 'the host that lists SR %s is not known' % sr
+    hv = a.view(mref)
+    rec = a.chain.get(hv.uuid)
+    if rec is None:
+        return None, 'SR %s was not listed on %s' % (sr, hv.name)
+    if rec.get('error'):
+        return None, 'SR %s could not be listed on %s: %s' % (sr, hv.name, rec['error'])
+    typ = m.srs[sref]['type']
+    res = ((rec.get('lvnames') or {}).get('VG_XenStorage-' + sr) if typ in LVM_SR_TYPES else
+           (rec.get('srdir') or {}).get(sr))
+    if not res:
+        return None, 'SR %s was not listed on %s' % (sr, hv.name)
+    if not res.get('ok'):
+        return None, 'SR %s could not be listed on %s: %s' % (sr, hv.name, res.get('error'))
+    if typ in LVM_SR_TYPES:
+        return set(n for n, attr in res['value']), None
+    return set(res['value']), None
+
+
+def image_listed(names, v, sr_type, u):
+    if sr_type in LVM_SR_TYPES:
+        return any(p + u in names for p in LV_PREFIXES)
+    loc = v.get('location') or u
+    return any(loc + x in names for x in IMAGE_SUFFIXES)
+
+
+def chain_depth(m, u):
+    d, seen, x = 0, set(), u
+    while x and x not in seen:
+        seen.add(x)
+        ref = m.vdi_by_uuid.get(x)
+        if ref is None:
+            return d, False
+        d += 1
+        x = m.vdis[ref]['sm_config'].get('vhd-parent')
+    return d, not x
+
+
+def gc_note(a, sref):
+    if gc_state(a, sref)[0] == 'running':
+        return (' (the GC is running on the SR now and may be in the middle of changing this chain: run this again '
+                'once it has finished)')
+    return ''
+
+
+def eval_chain(a, opts):
+    s = audit_scope(a, opts)
+    if s is None:
+        return []
+    m = a.model
+    out = []
+    lists = {}
+    gone = collections.defaultdict(list)
+    for u in sorted(s['vdis']):
+        v = m.vdis[m.vdi_by_uuid[u]]
+        sr = m.srs.get(v['SR'])
+        if sr is None or sr['type'] not in PATH_SR_TYPES:
+            continue
+        if sr['uuid'] not in lists:
+            lists[sr['uuid']] = sr_listing(a, sr['uuid'])
+        names, why = lists[sr['uuid']]
+        if v.get('missing') is True:
+            out.append(ev(('C23', 'missing', u), 'C23', REPORT, None,
+                          'C23 VDI %s is marked missing' % m.name_vdi(m.vdi_by_uuid[u]),
+                          'xapi marks it missing: the last scan of SR "%s" did not find its image, so nothing can '
+                          'attach it' % sr['name_label']))
+        elif names is not None and not image_listed(names, v, sr['type'], u):
+            gone[sr['uuid']].append(u)
+    for sru, us in sorted(gone.items()):
+        sref = m.sr_by_uuid[sru]
+        for u in us:
+            out.append(ev(('C23', 'image', u), 'C23', REPORT, None,
+                          'C23 the image of VDI %s is not on its SR' % m.name_vdi(m.vdi_by_uuid[u]),
+                          'SR "%s" was listed and no image of it is there, while xapi still has its record%s'
+                          % (m.srs[sref]['name_label'], gc_note(a, sref))))
+    for sru, (names, why) in sorted(lists.items()):
+        if names is None:
+            out.append(ev(('C23', 'listing', sru), 'C23', UNKNOWN, None,
+                          'C23 the images on SR "%s"' % m.srs[m.sr_by_uuid[sru]]['name_label'],
+                          'whether every disk of the chain tree has its image there is not established: %s' % why))
+    for p in sorted(s['missing']):
+        kids = sorted(u for u in s['vdis'] if m.vdis[m.vdi_by_uuid[u]]['sm_config'].get('vhd-parent') == p)
+        if not kids:
+            continue
+        sref = m.vdis[m.vdi_by_uuid[kids[0]]]['SR']
+        sr = m.srs.get(sref)
+        if sr is None:
+            continue
+        names, why = lists.get(sr['uuid'], (None, 'SR "%s" is not one whose images this tool lists'
+                                             % sr['name_label']))
+        if names is None:
+            there = 'whether its image is still on the SR is not established (%s)' % why
+        elif image_listed(names, {'location': p}, sr['type'], p):
+            there = ('its image is still on SR "%s", so a scan of the SR (xe sr-scan uuid=%s) should give it a record '
+                     'again' % (sr['name_label'], sr['uuid']))
+        else:
+            there = ('its image is not on SR "%s" either, so the chain is broken there and %s cannot be read past it'
+                     % (sr['name_label'], 'that disk' if len(kids) == 1 else 'those disks'))
+        out.append(ev(('C23', 'parent', p), 'C23', REPORT, None,
+                      'C23 parent %s of %s has no record in xapi' % (
+                          p, ', '.join(kids[:3]) + (' and %d more' % (len(kids) - 3) if len(kids) > 3 else '')),
+                      'the sm-config vhd-parent of %s names it, and xapi does not know it (Xen Orchestra lists such '
+                      'disks under "VDIs with invalid parent VHD"); %s%s'
+                      % ('that disk' if len(kids) == 1 else 'those disks', there, gc_note(a, sref))))
+    deepest = 0
+    for u in sorted(s['vdis']):
+        ref = m.vdi_by_uuid[u]
+        v = m.vdis[ref]
+        if m.children.get((v['SR'], u)):
+            continue
+        depth, whole = chain_depth(m, u)
+        deepest = max(deepest, depth)
+        if depth >= CHAIN_NEAR:
+            out.append(ev(('C23', 'depth', u), 'C23', REPORT, None,
+                          'C23 the chain of VDI %s is %s%d images deep' % (m.name_vdi(ref), '' if whole else 'at least ',
+                                                                             depth),
+                          ('SM refuses to snapshot or clone a disk whose chain is %d deep or more (SnapshotChainTooLong)'
+                           % MAX_CHAIN) + (', so snapshots and backups of it fail now' if depth >= MAX_CHAIN else
+                                           ', so it is close to where snapshots and backups of it fail') +
+                          '. The garbage collector shortens a chain by coalescing a base copy into its only child; '
+                          'a base copy with two children (a kept snapshot) cannot be, so deleting snapshots of it '
+                          'that are no longer needed lets the chain shrink'))
+    passed, skipped = 0, collections.Counter()
+    for u, p in sorted((a.chain_plan or {}).items()):
+        ref = m.vdi_by_uuid.get(u)
+        if ref is None:
+            continue
+        if 'why' in p:
+            skipped[p['why']] += 1
+            continue
+        rec = a.chain.get(p['host']) or {}
+        hname = m.name_host(m.host_by_uuid.get(p['host']))
+        got = (rec.get('vhd') or {}).get(p['path'])
+        if got is None or got.get('timed_out'):
+            if got is not None or p['path'] in (rec.get('unchecked') or []):
+                skipped['%s did not finish checking it in time' % hname] += 1
+            else:
+                skipped['%s did not answer: %s' % (hname, rec.get('error') or 'no record')] += 1
+            continue
+        if not got.get('ok'):
+            out.append(ev(('C23', 'check', u), 'C23', REPORT, p['host'],
+                          'C23 vhd-util check fails on VDI %s' % m.name_vdi(ref),
+                          'on %s, vhd-util check -n %s says: %s%s' % (hname, p['path'], got.get('detail') or 'nothing',
+                                                                     gc_note(a, m.vdis[ref]['SR']))))
+            continue
+        passed += 1
+        want = m.vdis[ref]['sm_config'].get('vhd-parent') or ''
+        if 'parent' in got and got['parent'] != want:
+            out.append(ev(('C23', 'header', u), 'C23', REPORT, p['host'],
+                          'C23 VDI %s has a different parent on disk' % m.name_vdi(ref),
+                          'its VHD header names parent %s, while sm-config vhd-parent in xapi says %s%s' % (
+                              got['parent'] or '(none)', want or '(none)', gc_note(a, m.vdis[ref]['SR']))))
+    srs = sorted('"%s"' % m.srs[m.sr_by_uuid[x]]['name_label'] for x in s['srs'] if x in m.sr_by_uuid)
+    out.append(ev(('C23', 'summary'), 'C23', INFO, None, 'C23 disk chain',
+                  '%d disk(s) in the chain tree%s; the deepest chain is %d of the %d SM allows; vhd-util check passed '
+                  'on %d%s' % (len(s['vdis']), (' on SR %s' % ', '.join(srs)) if srs else '', deepest, MAX_CHAIN,
+                               passed, ('; not checked: %s' % '; '.join('%d (%s)' % (n, w) for w, n in
+                                                                        sorted(skipped.items()))) if skipped else '')))
+    return out
+
+
+def op_target(m, cls, ref, rec):
+    if cls == 'VM':
+        return 'VM "%s"' % rec['name_label']
+    if cls == 'VDI':
+        return 'VDI %s' % m.name_vdi(ref)
+    vm = m.vms.get(rec['VM'])
+    who = ('dom0 of %s' % m.name_host(vm['resident_on'])) if vm and vm['is_control_domain'] else \
+        'VM "%s"' % (vm or {}).get('name_label')
+    return 'VBD %s (%s, device %s)' % (rec['uuid'], who, rec.get('userdevice'))
+
+
+def eval_ops(a, opts):
+    s = audit_scope(a, opts)
+    if s is None:
+        return []
+    m = a.model
+    now = a.t or time.time()
+    out = []
+    holds = collections.defaultdict(list)
+    for cls, table, uuids in (('VM', m.vms, s['vms']), ('VDI', m.vdis, s['vdis']), ('VBD', m.vbds, s['vbds'])):
+        for ref, rec in sorted(table.items(), key=lambda kv: kv[1]['uuid']):
+            if rec['uuid'] not in uuids:
+                continue
+            for task, op in sorted((rec.get('current_operations') or {}).items()):
+                what = op_target(m, cls, ref, rec)
+                if task in m.tasks:
+                    holds[task].append('"%s" on %s' % (op, what))
+                    continue
+                st = (a.stale_ops or {}).get('%s %s' % (rec['uuid'], task))
+                if st is not None and st['state'] in ('cleared', 'live'):
+                    continue
+                k = ('C24', 'op', rec['uuid'], task)
+                if st is None or st['state'] != 'stale':
+                    out.append(ev(k, 'C24', UNKNOWN, None, 'C24 operation "%s" on %s' % (op, what),
+                                  'it is held for task %s, which was not in the pool read, and whether that task is gone '
+                                  'is not established%s' % (task, (': ' + st['error']) if st and st.get('error') else '')))
+                    continue
+                out.append(ev(k, 'C24', REPORT, None,
+                              'C24 %s still holds operation "%s" of a task that is gone' % (what, op),
+                              'xapi lists "%s" under its current operations for task %s, which no longer exists, so '
+                              'xapi refuses or queues other operations on it (a snapshot or an export fails with '
+                              'OTHER_OPERATION_IN_PROGRESS) until the entry is dropped. xapi drops entries of tasks '
+                              'that are gone when its toolstack restarts: xe-toolstack-restart on the pool master '
+                              'clears it' % (op, task)))
+    prev = getattr(a, 'prev', None)
+    for task, what in sorted(holds.items()):
+        t = m.tasks[task]
+        born = task_time(t)
+        if t.get('status') != 'pending' or born is None or now - born < STUCK_TASK_AGE:
+            continue
+        p0 = (prev.model.tasks.get(task) or {}).get('progress') if prev is not None and prev.model else None
+        if p0 is None:
+            moved = ''
+        elif p0 == t.get('progress'):
+            moved = ', unchanged over the last %s' % format_age(now - prev.t)
+        else:
+            moved = ', up from %.0f%% over the last %s' % (100 * float(p0), format_age(now - prev.t))
+        out.append(ev(('C24', 'task', t['uuid']), 'C24', REPORT, None,
+                      'C24 task "%s" has been pending for %s' % (t['name_label'], format_age(now - born)),
+                      'task %s (on %s) is at %.0f%%%s, and it holds %s, so other operations on %s wait for it or '
+                      'fail. If it is not doing anything, xe task-cancel uuid=%s asks xapi to cancel it' % (
+                          t['uuid'], m.name_host(t.get('resident_on')), 100 * float(t.get('progress') or 0), moved,
+                          ', '.join(what), 'it' if len(what) == 1 else 'them', t['uuid'])))
+    return out
+
+
+def nbd_held(a, hv, s):
+    m = a.model
+    dom0 = m.dom0_of(hv.href)
+    out = []
+    for vb in (m.vms[dom0]['VBDs'] if dom0 else []):
+        vbd = m.vbds.get(vb)
+        v = m.vdis.get(vbd['VDI']) if vbd else None
+        if v is None or v['uuid'] not in s['vdis']:
+            continue
+        sr = m.srs.get(v['SR'])
+        hold = hv.holders(sr['uuid'], v['uuid']) if sr is not None else None
+        if vbd['uuid'] in (hv.nbd_vbds or []) or any(h['comm'] in DAEMON_HOLDERS for h, hits in hold or []):
+            out.append(vbd['uuid'])
+    return sorted(out)
+
+
+def nbd_text(c):
+    idle = nbd_idle(c)
+    sent = c.get('bytes_acked')
+    return '%s (%s, %s)' % (c['peer'], ('idle %s' % format_age(idle)) if idle is not None else 'idle time unknown',
+                            ('%.1f MB sent' % (sent / 1e6)) if isinstance(sent, int) else 'bytes sent unknown')
+
+
+def eval_nbd(a, opts):
+    s = audit_scope(a, opts)
+    if s is None:
+        return []
+    m = a.model
+    limit = int(opts.stuck_export_age * 1000)
+    out = []
+    for href, h in sorted(m.hosts.items(), key=lambda kv: kv[1]['name_label']):
+        hv = a.view(href)
+        if hv.doc is None:
+            continue
+        held = nbd_held(a, hv, s)
+        if not held:
+            continue
+        k = ('C25', hv.uuid)
+        title = 'C25 NBD export of dom0 VBD %s on %s' % (', '.join(held[:3]) + (' and %d more' % (len(held) - 3)
+                                                                              if len(held) > 3 else ''), hv.name)
+        if hv.nbd_conns is None:
+            out.append(ev(k, 'C25', UNKNOWN, hv.uuid, title,
+                          'xapi-nbd serves it, and whether its connections are alive is not established: %s'
+                          % hv.why('nbd_conns')))
+            continue
+        conns = nbd_open(hv.nbd_conns)
+        stale = [c for c in conns if nbd_stale(c, limit)]
+        live = [c for c in conns if not nbd_stale(c, limit)]
+        evidence = ['NBD connection %s -> %s: %s' % (c['peer'], c['local'], canon(dict(
+            (x, c.get(x)) for x in ('state', 'recvq', 'sendq', 'users', 'bytes_acked', 'bytes_received') + NBD_IDLE)))
+            for c in conns]
+        if not conns:
+            out.append(ev(k, 'C25', REPORT, hv.uuid, title,
+                          'xapi-nbd holds it with no NBD connection open on port %d: an export ended and xapi-nbd did '
+                          'not finish its cleanup. systemctl restart xapi-nbd on %s makes it close its devices and '
+                          'unplug and destroy the VBDs it lists; nothing is exported there now'
+                          % (NBD_PORT, hv.name), evidence))
+            continue
+        if not stale:
+            out.append(ev(k, 'C25', INFO, hv.uuid, title,
+                          'xapi-nbd serves it for a live export (%s); it unplugs it itself when the export ends'
+                          % '; '.join(nbd_text(c) for c in live[:4]), evidence))
+            continue
+        waits = []
+        if not xapi_ready(hv.xapi, hv.cookies):
+            waits.append('xapi on %s is not established as up, and xapi-nbd needs it to unplug its VBDs' % hv.name)
+        prev = getattr(a, 'prev', None)
+        if prev is not None:
+            pref = prev.model.host_by_uuid.get(hv.uuid) if prev.model is not None else None
+            pv = prev.view(pref) if pref is not None else None
+            before = dict(((c['local'], c['peer']), c) for c in nbd_open(pv.nbd_conns if pv is not None else None))
+            gap = (a.t or 0) - (prev.t or 0) - NBD_SLACK
+            for c in stale:
+                p = before.get((c['local'], c['peer']))
+                if p is None or not nbd_stale(p, limit) or nbd_idle(c) - nbd_idle(p) < gap:
+                    waits.append('the connection from %s did not stay idle between the audits' % c['peer'])
+        item = {'cls': 'C25', 'phase': 'V', 'action': 'nbd-end', 'host': hv.uuid, 'vbds': held, 'limit_ms': limit,
+                'conns': sorted([c['local'], c['peer']] for c in stale)}
+        base = ('%d connection(s) to xapi-nbd on port %d have moved nothing for over %s: %s. xapi-nbd keeps the dom0 '
+                'VBDs of an export plugged and their devices open until its client closes the connection, and sets no '
+                'idle timeout, so a client that went away holds them forever%s'
+                % (len(stale), NBD_PORT, format_age(opts.stuck_export_age), '; '.join(nbd_text(c) for c in stale),
+                   ('; %d other connection(s) are live and left alone (%s)' % (len(live), '; '.join(
+                       nbd_text(c) for c in live[:3]))) if live else ''))
+        if waits:
+            out.append(ev(k, 'C25', WAIT, hv.uuid, title, '%s. Not ended while %s' % (base, '; '.join(waits)),
+                          evidence))
+            continue
+        out.append(ev(k, 'C25', FIX, hv.uuid, title,
+                      '%s. Ending them (ss -K) makes xapi-nbd unplug and destroy its VBDs itself' % base, evidence,
+                      sig=item['conns'], item=item))
+    return out
+
+
 EVALUATORS = (eval_hosts, eval_ha, eval_dps, eval_vbds, eval_vdis, eval_aborts, eval_taps, eval_hazards, eval_gc,
-              eval_lvrefs, eval_held_vms)
+              eval_lvrefs, eval_held_vms, eval_chain, eval_ops, eval_nbd)
 
 
 def evaluate(a, opts):
@@ -12565,14 +13149,266 @@ def classify(audits, opts):
             e['reason'] = ('it was not dying in every audit: a domain is briefly dying whenever a VM shuts down. %s'
                            % e['reason'])
     order = {'S': 0, 'V': 1, 'L': 2, 'F': 3, 'P': 4, 'G': 5}
-    cls_order = {'C04': 1, 'C05': 2, 'C10': 0, 'C09': 1, 'C16': 6}
+    cls_order = {'C04': 1, 'C05': 2, 'C10': 0, 'C09': 1, 'C16': 6, 'C25': 0}
     plan = [e['item'] for e in final if e['verdict'] == FIX and e.get('item')]
     plan.sort(key=lambda it: (order[it['phase']], (it.get('host') or '') if it['phase'] == 'V' else '',
                               cls_order.get(it['cls'], 5), 1 if it.get('after') else 0, it.get('host') or '',
                               it.get('vbd') or it.get('vdi') or it.get('sr') or ''))
     for i, it in enumerate(plan):
         it['seq'] = i + 1
+    if getattr(opts, 'target', None):
+        final, plan = scope_filter(audits, final, plan, opts)
     return final, plan
+
+
+def target_scope(model, uuid):
+    m = model
+    seeds, vms = set(), set()
+    vm_ref = None
+    for r, v in m.vms.items():
+        if v['uuid'] == uuid:
+            vm_ref = r
+            break
+    if vm_ref is not None:
+        vm = m.vms[vm_ref]
+        if vm['is_control_domain']:
+            return None
+        kind, name = 'VM', vm['name_label']
+        for r in [vm_ref] + [s for s in vm.get('snapshots') or [] if s in m.vms]:
+            rec = m.vms[r]
+            vms.add(rec['uuid'])
+            for vb in rec.get('VBDs') or []:
+                vbd = m.vbds.get(vb)
+                if vbd is not None and vbd['VDI'] in m.vdis:
+                    seeds.add(m.vdis[vbd['VDI']]['uuid'])
+            if rec.get('suspend_VDI') in m.vdis:
+                seeds.add(m.vdis[rec['suspend_VDI']]['uuid'])
+    elif uuid in m.vdi_by_uuid:
+        kind, name = 'VDI', m.vdis[m.vdi_by_uuid[uuid]]['name_label']
+        seeds.add(uuid)
+    else:
+        return None
+    own = set(vms)
+    snaps = collections.defaultdict(list)
+    for r, v in m.vdis.items():
+        if v.get('snapshot_of') in m.vdis:
+            snaps[v['snapshot_of']].append(r)
+    vdis, missing = set(), set()
+    todo = sorted(seeds)
+    while todo:
+        u = todo.pop()
+        if u in vdis or u in missing:
+            continue
+        ref = m.vdi_by_uuid.get(u)
+        if ref is None:
+            missing.add(u)
+            continue
+        vdis.add(u)
+        v = m.vdis[ref]
+        if v['sm_config'].get('vhd-parent'):
+            todo.append(v['sm_config']['vhd-parent'])
+        todo.extend(m.vdis[c]['uuid'] for c in m.children.get((v['SR'], u), []))
+        todo.extend(m.vdis[r]['uuid'] for r in [v.get('snapshot_of')] + list(v.get('snapshots') or []) + snaps[ref]
+                    if r in m.vdis)
+    vbds = set()
+    for r, vbd in m.vbds.items():
+        v = m.vdis.get(vbd['VDI'])
+        if v is not None and v['uuid'] in vdis:
+            vbds.add(vbd['uuid'])
+            vm = m.vms.get(vbd['VM'])
+            if vm is not None and not vm['is_control_domain']:
+                vms.add(vm['uuid'])
+    srs = set(m.srs[m.vdis[m.vdi_by_uuid[u]]['SR']]['uuid'] for u in vdis if m.vdis[m.vdi_by_uuid[u]]['SR'] in m.srs)
+    return {'kind': kind, 'uuid': uuid, 'name': name, 'seeds': seeds, 'vdis': vdis, 'missing': missing,
+            'vbds': vbds, 'vms': vms, 'own': own, 'srs': srs}
+
+
+SCOPE_SETS = ('seeds', 'vdis', 'missing', 'vbds', 'vms', 'own', 'srs')
+
+
+def scope_text(model, s):
+    m = model
+    srs = sorted('"%s"' % m.srs[m.sr_by_uuid[u]]['name_label'] for u in s['srs'] if u in m.sr_by_uuid)
+    others = sorted('"%s"' % vm['name_label'] for vm in m.vms.values()
+                    if vm['uuid'] in s['vms'] and vm['uuid'] not in s['own'] and not vm['is_a_snapshot'])
+    return (u'Checking only %s "%s" (%s): %d disk(s) of its own, %d in the chain tree%s%s' % (
+        s['kind'], s['name'], s['uuid'], len(s['seeds']), len(s['vdis']),
+        (u' on SR %s' % ', '.join(srs)) if srs else u'',
+        (u'; the tree is shared with VM(s) %s' % ', '.join(others[:5]) +
+         (u' and %d more' % (len(others) - 5) if len(others) > 5 else u'')) if others else u''))
+
+
+def resolve_target(model, opts):
+    if not getattr(opts, 'target', None):
+        return None
+    scope = target_scope(model, opts.target)
+    if scope is None:
+        dom0 = [vm for vm in model.vms.values() if vm['uuid'] == opts.target and vm['is_control_domain']]
+        raise Refused('%s is %s' % (opts.target, 'a control domain: give the uuid of a guest VM or of a VDI' if dom0
+                                    else 'neither a VM nor a VDI of this pool'), 2)
+    opts.scope0 = scope
+    say(scope_text(model, scope))
+    return scope
+
+
+def findings_title(opts, base):
+    s = getattr(opts, 'scope0', None)
+    return base if not s else u'%s for %s "%s"' % (base, s['kind'], s['name'])
+
+
+def merge_scopes(scopes):
+    scopes = [s for s in scopes if s]
+    if not scopes:
+        return None
+    out = dict(scopes[-1])
+    for k in SCOPE_SETS:
+        out[k] = set()
+        for s in scopes:
+            out[k] |= set(s.get(k) or ())
+    return out
+
+
+def audit_scope(a, opts):
+    target = getattr(opts, 'target', None)
+    if not target:
+        return None
+    s = getattr(a, 'scope', None)
+    if s is None:
+        s = a.scope = target_scope(a.model, target) or getattr(opts, 'scope0', None)
+    return s
+
+
+def finding_subjects(e, a):
+    m = a.model
+    k = list(e['key'])
+    vdis, vbds, vms, srs = set(), set(), set(), set()
+
+    def view(host_uuid):
+        href = m.host_by_uuid.get(host_uuid)
+        return a.view(href) if href is not None else None
+
+    def taps(host_uuid, pid=None, minor=None):
+        hv = view(host_uuid)
+        if hv is None:
+            return
+        for u, rows in hv.tap_vdis.items():
+            if u not in m.sr_by_uuid and any((pid is None or r['pid'] == pid) and (minor is None or r['minor'] == minor)
+                                             for r in rows):
+                vdis.add(u)
+        for (p, mn), ident in hv.row_ident.items():
+            if (pid is None or p == pid) and (minor is None or mn == minor):
+                vdis.update(ident)
+        if minor is not None:
+            vdis.update(r['vdi'] for r in hv.back_minor.get(minor, []))
+
+    head, n = (k[0] if k else None), len(k)
+    if head in ('DP0', 'C03') and n >= 4:
+        vdis.add(k[3])
+    elif head in ('DPL', 'DPX') and n >= 4:
+        vdis.add(k[3])
+        hv = view(k[1])
+        if hv is not None and hv.keys.get((k[2], k[3])):
+            vdis.add(hv.keys[(k[2], k[3])])
+    elif head in ('C09', 'C10', 'C11', 'C13') and n >= 2:
+        vdis.add(k[1])
+    elif head == 'C16' and n >= 5 and k[1] in ('node', 'attachinfo', 'lvref'):
+        vdis.add(k[4])
+    elif head == 'C16' and n >= 4 and k[1] == 'minor':
+        taps(k[2], minor=k[3])
+    elif head == 'C16' and n >= 4 and k[1] == 'ctl':
+        taps(k[2], pid=k[3])
+    elif head == 'C20' and n >= 4:
+        vdis.add(k[3])
+    elif head == 'VBD' and n >= 2:
+        vbds.add(k[1])
+    elif head == 'C08' and n >= 3:
+        srs.add(k[2])
+    elif head == 'C19' and n == 2:
+        srs.add(k[1])
+    elif head == 'C19' and n >= 3 and k[1] == 'task':
+        srs.add(k[2])
+    elif head in ('C12', 'C14', 'C21') and n >= 4:
+        taps(k[1], pid=k[2], minor=k[3])
+    elif head == 'C15' and n >= 5 and k[2] == 'wedged':
+        taps(k[1], pid=k[3], minor=k[4])
+    elif head == 'C15' and n >= 4 and k[2] == 'ctl':
+        taps(k[1], pid=k[3])
+    elif head == 'C15' and n == 3:
+        pid, _, minor = _text(k[2]).partition(':')
+        if pid.isdigit() and minor.isdigit():
+            taps(k[1], pid=int(pid), minor=int(minor))
+    elif head == 'C22' and n >= 3:
+        href = m.host_by_uuid.get(k[1])
+        vms.update(m.vms[r]['uuid'] for r in m.domids.get((href, _text(k[2])), []))
+        hv = view(k[1])
+        for row in (hv.pinners(_text(k[2])) if hv is not None else ()):
+            taps(k[1], pid=row['pid'], minor=row.get('minor'))
+    elif head == 'ENV' and n >= 3 and k[1] == 'held':
+        vms.add(k[2])
+    elif head == 'ENV' and n >= 3 and k[1] == 'gen':
+        hv = view(k[2])
+        for r in ((hv.smlog or {}).get('refusals') or []) if hv is not None else ():
+            vdis.update(re.findall(UUID_PAT, _text(r[-1])))
+    it = e.get('item') or {}
+    vdis.add(it.get('vdi'))
+    vbds.add(it.get('vbd'))
+    tp = it.get('tap') or {}
+    if tp.get('pid') is not None and it.get('host'):
+        taps(it['host'], pid=tp['pid'], minor=tp.get('minor'))
+    named = set(re.findall(UUID_PAT, u'%s %s' % (_text(e.get('title')), _text(e.get('reason')))))
+    return vdis - set([None]), vbds - set([None]), vms, srs, named
+
+
+def in_scope(e, a, scope):
+    if e['cls'] in TARGET_CLASSES:
+        return True
+    vdis, vbds, vms, srs, named = finding_subjects(e, a)
+    if vdis & scope['vdis'] or vbds & scope['vbds'] or vms & scope['vms'] or srs & scope['srs']:
+        return True
+    if named & (scope['vdis'] | scope['missing'] | scope['vbds'] | scope['vms']):
+        return True
+    return e['cls'] in ('C17', 'C18') and e['verdict'] == UNKNOWN
+
+
+def plan_needs(e, by, audit):
+    it = e['item']
+    deps = []
+    if it['action'] == 'release-vbd' and it.get('attached') and audit is not None:
+        for sr, vdi, dp in dead_duplicates(audit, it['host'], it['vbd'], it['vdi']) or []:
+            deps.append(by.get(('DP0', it['host'], sr, vdi, dp)))
+    for vbd in it.get('needs') or []:
+        deps.append(by.get(('VBD', vbd)))
+    for dp2 in it.get('after') or []:
+        deps.append(by.get(('DP0', it['host'], it['sr'], it['vdi'], dp2)) or
+                    by.get(('C03', it['host'], it['sr'], it['vdi'], dp2)))
+    return [d for d in deps if d is not None and d['verdict'] == FIX and d.get('item')]
+
+
+def scope_filter(audits, final, plan, opts):
+    a = audits[-1]
+    scope = merge_scopes([audit_scope(x, opts) for x in audits])
+    if scope is None:
+        return [ev(('ENV', 'target'), 'C18', UNKNOWN, None, 'VM or VDI %s' % opts.target,
+                   'it is in none of the pool reads of this run, so nothing about its storage is established')], []
+    by = dict((tuple(e['key']), e) for e in final)
+    keep = [e for e in final if in_scope(e, a, scope)]
+    kept = set(id(e) for e in keep)
+    todo = [e for e in keep if e['verdict'] == FIX and e.get('item')]
+    while todo:
+        e = todo.pop()
+        for d in plan_needs(e, by, a):
+            if id(d) in kept:
+                continue
+            kept.add(id(d))
+            d['reason'] = '%s (needed by the fix of %s)' % (d['reason'], bare_title(e))
+            keep.append(d)
+            todo.append(d)
+    ids = set(id(e['item']) for e in keep if e['verdict'] == FIX and e.get('item'))
+    plan = [it for it in plan if id(it) in ids]
+    for i, it in enumerate(plan):
+        it['seq'] = i + 1
+    order = dict((id(e), i) for i, e in enumerate(final))
+    return sorted(keep, key=lambda e: order[id(e)]), plan
 
 
 def item_key(it):
@@ -12619,7 +13455,7 @@ def candidates_round2(a, opts):
                                                    'pause': set(), 'phy': set(), 'drbd': False},
                                          'statfiles': set(), 'vgs': set(), 'srdirs': set(),
                                          'xsread': set(), 'vhdcheck': set(), 'drbdres': set(), 'dmcheck': set(),
-                                         'taplog': {}})
+                                         'taplog': {}, 'chain': {'vgs': set(), 'srdirs': set(), 'vhd': []}})
     for sref, sr in m.srs.items():
         if sr['type'] in LVM_SR_TYPES and sr.get('PBDs'):
             journal_query(q, m.sr_master(sref), sr)
@@ -12734,7 +13570,127 @@ def candidates_round2(a, opts):
                     if vbd['currently_attached']:
                         q[href]['smlog']['drbd'] = True
                         q[href]['drbdres'] |= set(hv.linstor_vols(sr['uuid'], v['uuid']))
+    scope = audit_scope(a, opts)
+    if scope is not None:
+        a.chain_plan = chain_queries(a, scope, q)
     return q
+
+
+def chain_order(m, s):
+    first = []
+    for u in sorted(s['seeds']):
+        up, seen, x = [], set(), u
+        while x and x not in seen:
+            seen.add(x)
+            up.append(x)
+            ref = m.vdi_by_uuid.get(x)
+            x = m.vdis[ref]['sm_config'].get('vhd-parent') if ref is not None else None
+        first.extend(reversed(up))
+    out, seen = [], set()
+    for u in first + sorted(s['vdis']):
+        if u in s['vdis'] and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def chain_queries(a, s, q):
+    m = a.model
+    plan, gc = {}, {}
+    n = 0
+    for u in chain_order(m, s):
+        ref = m.vdi_by_uuid[u]
+        v = m.vdis[ref]
+        sr = m.srs.get(v['SR'])
+        if sr is None:
+            continue
+        lvm = sr['type'] in LVM_SR_TYPES
+        mref = m.sr_master(v['SR'])
+        if mref is not None and lvm:
+            q[mref]['chain']['vgs'].add('VG_XenStorage-' + sr['uuid'])
+        elif mref is not None and sr['type'] in PATH_SR_TYPES:
+            q[mref]['chain']['srdirs'].add(sr['uuid'])
+        if not is_vhd(v, sr['type']):
+            continue
+        if sr['type'] not in PATH_SR_TYPES:
+            plan[u] = {'why': 'vhd-util is not run on %s SRs' % sr['type']}
+            continue
+        if v['SR'] not in gc:
+            gc[v['SR']] = gc_state(a, v['SR'])[0]
+        if gc[v['SR']] != 'idle':
+            plan[u] = {'why': 'the GC runs on its SR' if gc[v['SR']] == 'running' else
+                       'whether the GC runs on its SR is not established'}
+            continue
+        if any(a.view(h).tap_vdis.get(u) for h in m.hosts) or \
+                any(m.vbds[r]['currently_attached'] for r in v.get('VBDs') or [] if r in m.vbds):
+            plan[u] = {'why': 'in use, so not read under its user'}
+            continue
+        if n >= CHAIN_CHECKS:
+            plan[u] = {'why': 'only %d are checked in one run' % CHAIN_CHECKS}
+            continue
+        plugged = m.plugged_hosts(v['SR'])
+        where = None
+        if lvm:
+            dm = lv_dm_names(sr['uuid'], u)[0]
+            for h in ([mref] if mref in plugged else []) + [h for h in plugged if h != mref]:
+                if dm in ((a.view(h).blockmap or {}).get('dm') or {}):
+                    where = h
+                    break
+            if where is None:
+                plan[u] = {'why': 'its LV is not active on any host'}
+                continue
+            path = '/dev/VG_XenStorage-%s/VHD-%s' % (sr['uuid'], u)
+        else:
+            where = mref if mref in plugged else (plugged[0] if plugged else None)
+            if where is None:
+                plan[u] = {'why': 'its SR is not plugged on any host'}
+                continue
+            path = '%s/%s/%s.vhd' % (SR_MOUNT, sr['uuid'], v.get('location') or u)
+        if a.view(where).doc is None:
+            plan[u] = {'why': '%s was not audited' % m.name_host(where)}
+            continue
+        q[where]['chain']['vhd'].append(path)
+        plan[u] = {'host': m.hosts[where]['uuid'], 'path': path}
+        n += 1
+    return plan
+
+
+def stale_operations(api, model, scope):
+    m = model
+    out = {}
+    for cls, table, uuids in (('VM', m.vms, scope['vms']), ('VDI', m.vdis, scope['vdis']),
+                              ('VBD', m.vbds, scope['vbds'])):
+        for ref, rec in sorted(table.items(), key=lambda kv: kv[1]['uuid']):
+            if rec['uuid'] not in uuids:
+                continue
+            for task in sorted(rec.get('current_operations') or {}):
+                if task in m.tasks:
+                    continue
+                key = '%s %s' % (rec['uuid'], task)
+                try:
+                    ops = getattr(api.x, cls).get_current_operations(ref)
+                except Exception as exc:
+                    out[key] = {'state': 'error', 'error': 'its current operations could not be read again (%s)'
+                                % _text(exc)[:200]}
+                    continue
+                if task not in (ops or {}):
+                    out[key] = {'state': 'cleared'}
+                    continue
+                try:
+                    api.x.task.get_status(task)
+                    out[key] = {'state': 'live'}
+                except Exception as exc:
+                    if 'HANDLE_INVALID' in _text(exc):
+                        out[key] = {'state': 'stale'}
+                    else:
+                        out[key] = {'state': 'error', 'error': 'the task could not be read (%s)' % _text(exc)[:200]}
+    return out
+
+
+def scope_record(s):
+    if not s:
+        return None
+    return dict((k, sorted(v) if isinstance(v, set) else v) for k, v in s.items())
 
 
 def collect_probes(ctx, a, only=None):
@@ -12781,7 +13737,8 @@ def collect_audit(ctx, n, first=False, only_hosts=None, probes=True, smlog=True,
     hosts = ctx.host_objs(a.model)
     targets = [h for h in hosts if (h.live or h.local) and (only_hosts is None or h.uuid in only_hosts)]
     srs = sorted(r['uuid'] for r in a.model.srs.values())
-    want = ['core', 'xapi_pkg'] + (['caps', 'rpm'] if first or not ctx.caps else ['caps'] if caps else [])
+    want = ['core', 'xapi_pkg'] + (['caps', 'rpm'] if first or not ctx.caps else ['caps'] if caps else []) + \
+        (['nbdss'] if getattr(opts, 'target', None) else [])
 
     def round1(h):
         return ctx.transport.call(h, 'facts', {'want': want, 'srs': srs, 'roots': sr_roots(a.model, h.ref)})
@@ -12805,6 +13762,9 @@ def collect_audit(ctx, n, first=False, only_hosts=None, probes=True, smlog=True,
     a.rpm = ctx.rpm
     a.xapi_pkg = ctx.xapi_pkg
     a.vbd2 = sanitize(ctx.api.x.VBD.get_all_records())
+    scope = audit_scope(a, opts)
+    if scope is not None:
+        a.stale_ops = stale_operations(ctx.api, a.model, scope)
     dom0s = set(r for r, vm in a.model.vms.items() if vm['is_control_domain'])
     a.vdi2 = {}
     for vbd in a.vbd2.values():
@@ -12821,8 +13781,10 @@ def collect_audit(ctx, n, first=False, only_hosts=None, probes=True, smlog=True,
 
     def round2(h):
         qq = q[h.ref]
+        ch = qq['chain']
         args = {'want': ['smlog', 'extra'] + (['drbd'] if qq['drbdres'] else []) + (['taplog'] if qq['taplog'] else []) +
-                (['drbdall'] if qq['smlog']['drbd'] else []),
+                (['drbdall'] if qq['smlog']['drbd'] else []) + (['chain'] if ch['vgs'] or ch['srdirs'] or ch['vhd'] else []),
+                'chain': {'vgs': sorted(ch['vgs']), 'srdirs': sorted(ch['srdirs']), 'vhd': list(ch['vhd'])},
                 'taplog': {'pids': qq['taplog']},
                 'smlog': {'relink': sorted(qq['smlog']['relink']), 'abort': sorted(qq['smlog']['abort']),
                           'activate': sorted(qq['smlog']['activate']), 'pause': sorted(qq['smlog']['pause']),
@@ -12874,6 +13836,9 @@ def collect_audit(ctx, n, first=False, only_hosts=None, probes=True, smlog=True,
         f = val.get('taplog')
         if f is not None:
             a.taplog[h.uuid] = f.get('value') if f.get('ok') else {'error': f.get('error'), 'pids': {}}
+        f = val.get('chain')
+        if f is not None:
+            a.chain[h.uuid] = f.get('value') if f.get('ok') else {'error': f.get('error')}
     a._views = {}
     if probes:
         collect_probes(ctx, a)
@@ -13060,6 +14025,11 @@ def describe_item(model, it):
                         'its' if len(frozen) == 1 else 'their')) if frozen else u''))
     if a == 'unlink-abort':
         return u'remove %s/%s/abort on %s, then xe sr-scan the SR' % (IPC_DIR, it['sr'], hn)
+    if a == 'nbd-end':
+        return (u'end %d dead NBD connection(s) to xapi-nbd on %s (from %s) with ss -K, each re-measured first, so that '
+                u'xapi-nbd unplugs and destroys dom0 VBD(s) %s itself; if one cannot be ended and every connection '
+                u'there is dead, restart xapi-nbd' % (len(it['conns']), hn, ', '.join(c[1] for c in it['conns']),
+                                                     ', '.join(it['vbds'])))
     return canon(it)
 
 
@@ -13730,6 +14700,8 @@ class Engine(object):
             return k == ['C15', it['host'], 'wedged', it['pid'], it['minor']]
         if it['action'] == 'lv-deactivate':
             return k == ['C16', 'lvref', it['host'], it['sr'], it['vdi']]
+        if it['action'] == 'nbd-end':
+            return k == ['C25', it['host']]
         return False
 
     def all_hosts_ha(self, with_ready=False):
@@ -14806,7 +15778,63 @@ class Engine(object):
             if self.halt:
                 break
             checkpoint()
-            self.release(it)
+            if it['action'] == 'nbd-end':
+                self.nbd_end(it)
+            else:
+                self.release(it)
+
+    def nbd_end(self, it):
+        h = self.host(it['host'])
+        fresh, e, why = self.fresh_check(h, it)
+        if e is None:
+            hv = fresh.view(fresh.model.host_by_uuid[h.uuid])
+            if hv.nbd_conns is not None and not [c for c in nbd_open(hv.nbd_conns)
+                                                 if [c['local'], c['peer']] in it['conns']]:
+                return self.result(it, 'already-fixed', 'the connection(s) are gone')
+            return self.result(it, 'skipped', why)
+        self.act_on(it)
+        try:
+            res = self.ctx.transport.call(h, 'nbd-end', {'conns': it['conns'], 'limit_ms': it['limit_ms']},
+                                          timeout=240)
+        except CallError as exc:
+            self.fail_item(it, call_outcome(exc, 'ends the dead NBD connection(s) on %s' % h.name))
+        self.j.rec('nbd_end', seq=it['seq'], host=h.uuid, result=res)
+        rows = res.get('conns') or []
+        ended = [r for r in rows if r[2] in ('ended', 'gone')]
+        bad = ['%s %s%s' % (r[1], r[2], (' (%s)' % r[3]) if r[3] else '') for r in rows if r[2] not in ('ended', 'gone')]
+        done = res.get('restarted') or (rows and len(ended) == len(rows))
+        parts = []
+        if ended:
+            parts.append('ended %s' % ', '.join('%s (%s)' % (r[1], r[2]) for r in ended))
+        if bad:
+            parts.append('not ended: %s' % '; '.join(bad))
+        if res.get('restarted'):
+            parts.append('xapi-nbd was restarted (%s connection(s) open after it)' % res.get('after_restart', '?'))
+        parts.extend(res.get('problems') or [])
+        if not done:
+            return self.result(it, 'failed' if not ended else 'partial', '; '.join(parts) or 'no answer')
+        left = self.nbd_vbds_left(it['vbds'])
+        parts.append(('xapi-nbd unplugged and destroyed %s' % ', '.join(it['vbds'])) if not left else
+                     ('still there after %ds: %s; it is released by a later run once nothing holds it'
+                      % (NBD_CLEAN_WAIT, ', '.join(left))))
+        self.result(it, 'fixed' if not left else 'partial', '; '.join(parts))
+
+    def nbd_vbds_left(self, vbds):
+        deadline = _now() + NBD_CLEAN_WAIT
+        while True:
+            left = []
+            for u in vbds:
+                try:
+                    r = self.ctx.api.x.VBD.get_by_uuid(u)
+                    left.append('dom0 VBD %s (%s)' % (u, 'attached' if self.ctx.api.x.VBD.get_currently_attached(r)
+                                                      else 'unplugged'))
+                except Exception as exc:
+                    if 'UUID_INVALID' in _text(exc) or 'HANDLE_INVALID' in _text(exc):
+                        continue
+                    left.append('dom0 VBD %s (not read: %s)' % (u, _text(exc)[:120]))
+            if not left or _now() > deadline:
+                return left
+            pause(2)
 
     def fresh_check(self, h, it, recheck=None, **kw):
         deadline = _now() + (0 if it.get('later') and h.uuid in self.busy_hosts else self.opts.wait)
@@ -16742,7 +17770,8 @@ def save_audits(d, audits):
         try:
             save_json_gz(os.path.join(d, 'audit-%d.json.gz' % a.n),
                          {'t': a.t, 'snap': a.snap, 'facts': a.facts, 'errors': a.errors, 'smlog': a.smlog,
-                          'taplog': a.taplog,
+                          'taplog': a.taplog, 'chain': a.chain, 'chain_plan': a.chain_plan,
+                          'stale_ops': a.stale_ops, 'scope': scope_record(a.scope),
                           'probes': dict(('%s@%s' % k, v) for k, v in a.probes.items())})
         except Exception as exc:
             warn('the audit record could not be saved: %s' % _text(exc))
@@ -17027,6 +18056,7 @@ def preflight(opts):
         if not h.live or not h.enabled:
             say(u'  %s (%s): %s' % (h.name, h.address, ', '.join(
                 x for x, bad in (('NOT LIVE', not h.live), ('disabled', not h.enabled)) if bad)))
+    resolve_target(model, opts)
     others = [h for h in hosts if not h.local]
     if others:
         ensure_run_root()
@@ -17041,7 +18071,15 @@ def settle_wait(seconds, why='only state that persists is acted on'):
 
 
 def needs_second(a, opts):
-    for e in evaluate(a, opts).values():
+    scope = audit_scope(a, opts)
+    per = evaluate(a, opts)
+    if scope is not None:
+        by = dict((tuple(e['key']), e) for e in per.values())
+        mine = [e for e in per.values() if in_scope(e, a, scope)]
+        mine += [d for e in mine if e['verdict'] == FIX and e.get('item') for d in plan_needs(e, by, a)]
+    else:
+        mine = per.values()
+    for e in mine:
         if e['verdict'] in (FIX, WAIT) or e['cls'] in ('C11', 'C12'):
             return True
     return False
@@ -17256,7 +18294,7 @@ def run_locked(opts, lockfd, busy=False):
         warn(stale)
     if mark:
         error(mark)
-    print_findings(ctx, final, plan)
+    print_findings(ctx, final, plan, findings_title(opts, u'Findings'))
     print_plan(ctx, audits[-1], plan, ha)
     try:
         save_check(audits, final, plan)
@@ -17293,7 +18331,8 @@ def run_locked(opts, lockfd, busy=False):
         return exit_for(final)
     say(u'')
     if not tty:
-        say(u'To apply: run python3 %s in a terminal and answer yes, or run it with --yes.' % sys.argv[0])
+        say(u'To apply: run python3 %s in a terminal and answer yes, or run it with --yes.'
+            % ' '.join([sys.argv[0]] + ([opts.target] if getattr(opts, 'target', None) else [])))
         return exit_for(final)
     lock_note(asking())
     if not answer(u'Apply these %d change(s)? [yes/no] ' % len(plan)):
@@ -17533,7 +18572,7 @@ def finish(ctx, eng):
         eng.fail('the GC of SR %s was not started again after its activating key(s) were removed, because the run '
                  'stopped first: run xe sr-scan uuid=%s once nothing else runs on the SR' % (sr, sr))
     if last is not None:
-        print_findings(ctx, final, [], u'Final audit', after=True)
+        print_findings(ctx, final, [], findings_title(ctx.opts, u'Final audit'), after=True)
         try:
             save_check([b1] if last is b1 else [b1, last], final, [])
         except Exception as exc:
@@ -18141,12 +19180,21 @@ def build_parser():
                         'major version. The pool root password is still asked for at a terminal, or read from stdin '
                         'when piped in (an empty one uses ssh keys)')
     p.add_argument('--version', action='version', version='%(prog)s ' + VERSION + ' (python ' + PYTHON + ')')
+    p.add_argument('uuid', nargs='?',
+                   help='the uuid of a VM or a VDI: check only its storage, deeper. That is every disk of the VM and '
+                        'of its snapshots (or the VDI), and every disk in the same chain tree: their base copies, '
+                        'and every other disk made from those (snapshots, and the fast clones of other VMs). The '
+                        'pool is still read whole, because what holds a disk can be on any host, but only what '
+                        'concerns those disks is reported and fixed, along with anything that keeps the run from '
+                        'establishing it. It also checks the chain itself (missing parents and images, chain depth, '
+                        'vhd-util check) and operations stuck on them, and reports those')
     return p
 
 
 def default_opts():
     return argparse.Namespace(settle=SETTLE_FLOOR, min_vbd_age=3600, relink_min_age=6 * 3600,
-                              stuck_export_age=24 * 3600, wait=900, ha_off_wait=120, run=None)
+                              stuck_export_age=24 * 3600, wait=900, ha_off_wait=120, run=None, target=None,
+                              scope0=None)
 
 
 def main(argv=None):
@@ -18159,12 +19207,17 @@ def main(argv=None):
         return fence_main(argv[1])
     apply_paths({'RUN_ROOT': data_root()})
     parser = build_parser()
-    if [a for a in argv if a not in ('-h', '--help', '--version', '--yes')]:
-        _write(sys.stderr, u'%s takes no arguments but --yes: run it alone, and it checks, shows the changes, and '
-                           u'asks before making them; with --yes it makes them without asking' % PROG)
+    rest = [a for a in argv if a not in ('-h', '--help', '--version', '--yes')]
+    if len(rest) > 1 or (rest and not UUID_RE.match(rest[0].lower())):
+        _write(sys.stderr, u'%s takes no arguments but --yes and the uuid of one VM or VDI: run it alone to check the '
+                           u'pool, or give it a uuid to check only that VM\'s or VDI\'s disks and every disk in their '
+                           u'chains; it shows the changes and asks before making them, and with --yes it makes them '
+                           u'without asking' % PROG)
         return 2
-    _YES[0] = parser.parse_args(argv).yes
+    args = parser.parse_args(argv)
+    _YES[0] = args.yes
     opts = default_opts()
+    opts.target = args.uuid.lower() if args.uuid else None
     say(u'%s %s (python %s)' % (PROG, VERSION, PYTHON))
     try:
         return main_run(opts)
