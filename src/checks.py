@@ -1152,10 +1152,19 @@ def migration_network(pool):
     return ok("Migration Network", "Configured")
 
 
-def backup_network(pool, run_env, pinger):
+def backup_network(pool, run_env, pinger, routes=None):
     """The ping half asks 'can the XOA reach every host on this network', because that is
     what XO needs to move backup traffic. Asking it from a pool host answers a different
-    question, so host mode does not ask it at all rather than mislabelling the answer."""
+    question, so host mode does not ask it at all rather than mislabelling the answer.
+
+    For the same reason a silent ping is only a finding when it is the XOA that moves the
+    traffic. A job pinned to an XO Proxy runs there and reaches the hosts from there, and
+    an HTTP proxy on the pool's server record carries every request the XOA itself makes,
+    exports included - so a pool whose backups all go one of those ways can be unreachable
+    from the XOA by design (issue #71). `routes(pool_uuid, vm_uuids, sr_uuids)` says which
+    it is; it is only asked once a ping has gone unanswered, so a pool the XOA reaches
+    costs nothing more than it did.
+    """
     line, net = _network_line(pool, "backup", "Backup Network", "xo:backupNetwork")
     if line is not None:
         return line
@@ -1173,10 +1182,39 @@ def backup_network(pool, run_env, pinger):
     silent = pinger(ips.value)
     if not silent:
         return ok("Backup Network", "Configured and reachable from XOA")
+    elsewhere = _backup_moved_elsewhere(pool, routes)
+    if elsewhere:
+        # nothing was learned about the path the traffic really takes, and the line says
+        # so: what is green is the configuration, the way host mode's line is
+        return ok("Backup Network", "Configured, %s (not tested from here) - No ping answer "
+                                    "from XOA itself for: %s" % (elsewhere, ", ".join(silent)))
     # ICMP only, so a ping-filtering network reads yellow - the wording claims exactly
     # what was tested and nothing more
     return flag("Backup Network", "Configured but not fully reachable",
                 " - No ping answer from XOA for: " + ", ".join(silent))
+
+
+def _backup_moved_elsewhere(pool, routes):
+    """What carries this pool's backup traffic instead of the XOA's own connection, as a
+    phrase - or '' when the XOA moves it itself, or when XO's configuration could not be
+    read, which leaves the finding exactly as it was."""
+    if routes is None:
+        return ""
+    scope = pool.payload.get("backup_scope") or {}
+    vms, srs = result.wrap(scope, "vms"), result.wrap(scope, "srs")
+    uuid = pool.fact("pool_uuid")
+    info = routes(uuid.value if uuid.ok else "",
+                  set(vms.value) if vms.ok else None,
+                  set(srs.value) if srs.ok else None)
+    if info.get("error") or (info["xoa"] and not info["http_proxy"]):
+        return ""
+    parts = []
+    if info["proxies"]:
+        parts.append("backups run through XO Proxy %s"
+                     % ", ".join("'%s'" % name for name in info["proxies"]))
+    if info["xoa"]:
+        parts.append("XOA connects to this pool through HTTP proxy %s" % info["http_proxy"])
+    return " and ".join(parts)
 
 
 # --------------------------------------------------------------------------------------

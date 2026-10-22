@@ -167,6 +167,7 @@ def have_xo_server_db():
 _ALL_SERVERS = None     # the one `xo-server-db ls server` scan; None until it is read
 _READ_ERROR = ""        # why that scan failed, when it did; "" while it has not
 _RESOLVED = {}          # db host name -> frozenset of its addresses, looked up once a run
+_COLLECTIONS = {}       # namespace -> (records, why not), for the collections read on demand
 
 
 def _describe_failure(rc, err):
@@ -266,6 +267,7 @@ def reset_cache():
     _ALL_SERVERS = None
     _READ_ERROR = ""
     _RESOLVED.clear()
+    _COLLECTIONS.clear()
 
 
 def enabled_servers():
@@ -450,6 +452,59 @@ def pool_name_for_host(want, resolve_want=True):
     """
     row, _how = enabled_server_for(want, resolve_want)
     return row.name if row is not None else ""
+
+
+# --------------------------------------------------------------------------------------
+# the other collections, read only when a check needs one
+# --------------------------------------------------------------------------------------
+
+def collection(namespace):
+    """(records, "" or why not) for one more xo collection - job, schedule, proxy.
+
+    Read at most once per run and only when asked: nothing in an ordinary run needs them,
+    and on an appliance whose credential db is encrypted each one costs another 3.3s of
+    xo-server-db. Redis directly when that can be trusted, as for the servers.
+    """
+    if namespace not in _COLLECTIONS:
+        records, why = None, ""
+        cli_path = transport.which("xo-server-db")
+        if cli_path:
+            try:
+                records = xoredis.read_records(cli_path, namespace)
+            except xoredis.RedisError as exc:
+                transport.debug("xo-db %s: redis declined (%s); asking xo-server-db"
+                                % (namespace, exc))
+        if records is None:
+            out, why = _ls([namespace])
+            records = scan_records(out) if out is not None else []
+        _COLLECTIONS[namespace] = (records, why)
+    return _COLLECTIONS[namespace]
+
+
+def backup_routes(server, pool_uuid, vm_uuids, sr_uuids):
+    """Where XO moves this pool's backup traffic from, as XO is configured to.
+
+      xoa         the XOA itself moves some of it (or nothing is configured to, which
+                  leaves whatever somebody starts from XOA)
+      proxies     the names of the XO Proxies that move the rest
+      http_proxy  host[:port] of the HTTP proxy the XOA's own connection to this pool goes
+                  through ('' for none) - xen-api sends every request through it, exports
+                  to the backup network included
+      error       why none of that could be told; the other keys are absent then
+    """
+    jobs, why = collection("job")
+    if why:
+        return {"error": "could not read XO's backup jobs (%s)" % why}
+    schedules, why = collection("schedule")
+    xoa, proxy_ids = parsers.backup_runners(jobs, None if why else schedules,
+                                            pool_uuid, vm_uuids, sr_uuids)
+    names = []
+    if proxy_ids:
+        proxies, why = collection("proxy")
+        known = {} if why else dict((p.get("id"), p.get("name")) for p in proxies)
+        names = [known.get(i) or i for i in proxy_ids]
+    return {"xoa": xoa, "proxies": names, "error": "",
+            "http_proxy": parsers.http_proxy_address((server or {}).get("httpProxy"))}
 
 
 SELECT_OK = 0

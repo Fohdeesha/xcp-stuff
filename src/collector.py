@@ -1425,6 +1425,19 @@ def _pif_ips(network_uuid):
     return fact(ips)
 
 
+def _backup_scope():
+    """Every VM and SR uuid in the pool. The single-param --minimal form, which is the one
+    that answers correctly across many objects (see the trap ledger on --minimal)."""
+    scope = {}
+    for key, command in (("vms", "vm-list"), ("srs", "sr-list")):
+        r = xe([command, "params=uuid", "--minimal"])
+        if r.ok:
+            scope[key] = fact(sorted(set(u.strip() for u in r.out.split(",") if u.strip())))
+        else:
+            scope[key] = err("xe %s failed (%s)" % (command, r.why()))
+    return scope
+
+
 def _network_info(network_uuid, want_ips):
     """bond-slave-of for every PIF on a network, plus (for backup) their IPs.
 
@@ -1659,6 +1672,12 @@ def collect_pool(spec, self_uuid):
         if uuid:
             resolved[key] = _network_info(uuid, want_ips)
     out["networks"] = resolved
+
+    # asked for by the XOA only, and only worth asking with a backup network to judge:
+    # which of its backup jobs move this pool's data is a question about uuids, since a
+    # job names VMs and SRs by uuid and nothing on the XOA says which pool one lives in
+    if spec.get("backup_scope") and "xo:backupNetwork" in resolved:
+        out["backup_scope"] = _backup_scope()
 
     if sr_uuids:
         controllers = spec.get("controllers") or []

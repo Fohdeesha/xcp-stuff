@@ -177,11 +177,14 @@ def _host_spec(with_smapi):
     }
 
 
-def _pool_spec(controllers):
+def _pool_spec(controllers, backup_scope=False):
     return {
         "want": ["pool", "yumcheck"],
         "controllers": controllers,
         "qcow2_max": config.XOSTOR_QCOW2_MAX_LINES,
+        # the pool's VM and SR uuids, for telling which XO backup jobs touch it - asked
+        # only from XOA, the one place that has the jobs to compare them with
+        "backup_scope": backup_scope,
     }
 
 
@@ -383,6 +386,14 @@ def _known_as(server, how):
         return ("an address of pool '%s' (xo-server-db has it as %s, which resolves to it)"
                 % (server.name, xodb.db_address(server.record)))
     return "the address of pool '%s' in xo-server-db" % server.name
+
+
+def _server_record(run):
+    """The pool's xo-db record, looked up the first time something needs it: a run given
+    a host and its password never had to, and most runs never ask."""
+    if run.server is None:
+        run.server = xodb.server_for_host(run.seed)[0] or {}
+    return run.server
 
 
 def resolve_target_xoa(run, args):
@@ -790,7 +801,7 @@ def collect_hosts(run):
     document - so gathering them concurrently changes nothing but the wall clock.
     """
     controllers = run.all_addresses if run.host_solo() else [h.address for h in run.hosts]
-    pool_spec = _pool_spec(controllers)
+    pool_spec = _pool_spec(controllers, backup_scope=(run.run_env != "host"))
 
     workers = parallel_workers(len(run.hosts))
     transport.debug("collecting %d host(s), %d at a time" % (len(run.hosts), workers))
@@ -904,7 +915,9 @@ def pool_status_section(run, rep):
     rep.check("VLAN 0 Check", checks.vlan0, run.pool)
     rep.check("Migration Network", checks.migration_network, run.pool)
     rep.check("Backup Network", checks.backup_network, run.pool, run.run_env,
-              xoa.ping_silent)
+              xoa.ping_silent,
+              lambda pool_uuid, vm_uuids, sr_uuids: xodb.backup_routes(
+                  _server_record(run), pool_uuid, vm_uuids, sr_uuids))
     # inside the section, so that under -f a pool with nothing to report takes its own
     # separator with it instead of leaving a blank line where the section was
     rep.blank()

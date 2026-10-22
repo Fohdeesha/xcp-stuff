@@ -259,6 +259,73 @@ def read_server_records(cli_path, addr=DEFAULT_ADDR, timeout=None):
 
 
 # --------------------------------------------------------------------------------------
+# any other collection: backup jobs, their schedules, XO Proxies
+# --------------------------------------------------------------------------------------
+
+def read_records(cli_path, namespace, addr=DEFAULT_ADDR, timeout=None):
+    """Every record of one more xo collection, as the dicts XO stored, plus its `id`.
+
+    The same two declines as the server records, for the same reasons: an endpoint not
+    established from the config files, and `enc:` (jobs, schedules and proxy
+    registrations are all encrypted along with the servers when encryption is on). Unlike
+    the server ids, an empty set is an answer here - an appliance with no backup job or no
+    proxy is the usual case, not a sign of the wrong redis.
+
+    Values are left as XO wrote them, unlike _flatten: a schedule's `enabled` is a real
+    boolean in redis, and a job's patterns are JSON strings the caller decodes.
+    """
+    if timeout is None:
+        timeout = config.XO_REDIS_TIMEOUT
+    if _mentions_redis(cli_path):
+        raise RedisError("xo-server config mentions redis; not assuming %s:%d" % DEFAULT_ADDR)
+    try:
+        return _fetch_collection(addr, timeout, namespace)
+    except OSError as exc:
+        raise RedisError("%s:%d: %s" % (addr[0], addr[1], exc))
+    except UnicodeDecodeError as exc:
+        raise RedisError("undecodable answer from redis: %s" % exc)
+    except ValueError as exc:
+        raise RedisError("unreadable answer from redis: %s" % exc)
+
+
+def _fetch_collection(addr, timeout, namespace):
+    ids_key = "xo:%s_ids" % namespace
+    prefix = "xo:%s:" % namespace
+    sock = socket.create_connection(addr, timeout=timeout)
+    try:
+        handle = sock.makefile("rb")
+        try:
+            sock.sendall(_encode(["SMEMBERS", ids_key]))
+            ids = _read_reply(handle)
+            if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+                raise RedisError("%s is not a set of ids" % ids_key)
+            if not ids:
+                return []
+            sock.sendall(_encode(["MGET"] + [prefix + i for i in ids]))
+            blobs = _read_reply(handle)
+            if not isinstance(blobs, list) or len(blobs) != len(ids):
+                got = len(blobs) if isinstance(blobs, list) else "a non-list of"
+                raise RedisError("MGET answered %s value(s) for %d id(s)" % (got, len(ids)))
+        finally:
+            handle.close()
+    finally:
+        sock.close()
+
+    records = []
+    for ident, blob in zip(ids, blobs):
+        if blob is None:
+            continue                      # deleted between the two calls
+        if blob.startswith(ENCRYPTION_PREFIX):
+            raise RedisError("%s records are encrypted (%s%s)" % (namespace, prefix, ident))
+        record = json.loads(blob)
+        if not isinstance(record, dict):
+            raise RedisError("%s%s is not an object" % (prefix, ident))
+        record["id"] = ident
+        records.append(record)
+    return records
+
+
+# --------------------------------------------------------------------------------------
 # plugin metadata - an annotation, never a finding
 # --------------------------------------------------------------------------------------
 

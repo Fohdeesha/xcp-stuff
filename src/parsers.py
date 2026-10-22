@@ -10,6 +10,7 @@ generations, the record splitting that merged two SRs' VDIs into one.
 import ipaddress
 import json
 import re
+from urllib.parse import urlsplit
 
 # --------------------------------------------------------------------------------------
 # xe labelled output
@@ -919,3 +920,186 @@ def plugin_block(third_party, autoload, autoload_known):
         if plugin["link"]:
             out.append("    -> %s" % plugin["link"])
     return "\n".join(out)
+
+
+# --------------------------------------------------------------------------------------
+# which of XO's backup jobs move a pool's data, and from where
+# --------------------------------------------------------------------------------------
+# XO picks the machine that moves a pool's backup traffic per job: a job with a `proxy`
+# runs on that XO Proxy, which reaches the hosts itself (xo-server backups-ng/index.mjs
+# hands it the pool's credentials and the master's backup-network URL, and deliberately
+# not the server's HTTP proxy), and every other job runs on the XOA. So whether the XOA
+# needs to reach a pool's backup network is a question about the jobs that touch it.
+
+def xo_pattern_match(pattern, value):
+    """value-matcher's match() (xen-orchestra packages/value-matcher) for one plain value.
+
+    That is all a job ever matches a pool id against: a string, or __and / __or / __not
+    over strings. An array, or any other object, only ever matches an object, so it is
+    False against a plain value - which is how XO evaluates it too. An __and or __or over
+    something that is not a list makes XO's own evaluation throw; that raises ValueError
+    here, for the caller to read as "cannot tell".
+    """
+    if isinstance(pattern, list):
+        return False
+    if isinstance(pattern, dict):
+        if len(pattern) == 1:
+            key = list(pattern)[0]
+            sub = pattern[key]
+            if key in ("__and", "__or"):
+                if not isinstance(sub, list):
+                    raise ValueError("%s is not a list" % key)
+                hits = [xo_pattern_match(p, value) for p in sub]
+                return all(hits) if key == "__and" else any(hits)
+            if key == "__not":
+                return not xo_pattern_match(sub, value)
+        return False
+    return pattern == value
+
+
+def xo_simple_ids(pattern):
+    """The ids of an explicit {id: ...} pattern, or None when it is not one.
+
+    XO's extractIdsFromSimplePattern: {'id': 'x'} or {'id': {'__or': ['x', ...]}}. This is
+    how a job lists VMs picked by hand, target SRs, and the pools of a metadata backup.
+    """
+    if not isinstance(pattern, dict) or list(pattern) != ["id"]:
+        return None
+    ids = pattern["id"]
+    if isinstance(ids, str):
+        return [ids]
+    if (isinstance(ids, dict) and list(ids) == ["__or"] and isinstance(ids["__or"], list)
+            and all(isinstance(i, str) for i in ids["__or"])):
+        return list(ids["__or"])
+    return None
+
+
+def job_field(job, key):
+    """One field of an XO job record, decoded the way XO decodes it.
+
+    Jobs are stored with every non-string value JSON-encoded (JobsDb._serialize), and read
+    back with a JSON.parse that keeps the raw string when it does not parse - which is
+    what a plain string such as a proxy id is.
+    """
+    value = job.get(key)
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except ValueError:
+        return value
+
+
+def _ids_among(ids, known):
+    """True/False against a set of uuids read off the pool; None when that set could not
+    be read - unless there was nothing to look for in the first place."""
+    if not ids:
+        return False
+    if known is None:
+        return None
+    return any(i in known for i in ids)
+
+
+def job_touches_pool(job, pool_uuid, vm_uuids, sr_uuids):
+    """Does this XO job move data to or from this pool? True, False, or None when that
+    cannot be told from here.
+
+    A VM backup picks its VMs by uuid, or in smart mode by a pattern over their pool
+    ($pool) and their tags; a replication writes into target SRs; a health check restores
+    into an SR; a pool metadata backup names pools. Nothing on the XOA says which pool a
+    VM or SR uuid lives in, so those are looked up in the pool's own uuids, read by the
+    collector - and when those could not be read the answer is None, not a guess. A smart
+    job that names no pool covers every pool's VMs: its tags may still leave this pool
+    with nothing to back up, which cannot be told without the VMs, so it counts.
+    """
+    kind = job.get("type")
+    if kind == "metadataBackup":
+        pools = job_field(job, "pools")
+        if pools is None:
+            return False            # XO's own metadata only: no pool is read
+        ids = xo_simple_ids(pools)
+        if ids is None or not pool_uuid:
+            return None
+        return pool_uuid in ids
+    if kind != "backup":
+        return False                # a mirror backup copies between remotes
+
+    answers = []
+    vms = job_field(job, "vms")
+    ids = xo_simple_ids(vms)
+    if ids is not None:
+        answers.append(_ids_among(ids, vm_uuids))
+    elif isinstance(vms, dict) and "$pool" not in vms:
+        answers.append(True)
+    elif isinstance(vms, dict) and pool_uuid:
+        try:
+            answers.append(xo_pattern_match(vms["$pool"], pool_uuid))
+        except ValueError:
+            answers.append(None)
+    else:
+        answers.append(None)
+
+    srs = job_field(job, "srs")
+    if srs is not None:
+        targets = xo_simple_ids(srs)
+        answers.append(None if targets is None else _ids_among(targets, sr_uuids))
+
+    settings = job_field(job, "settings")
+    if isinstance(settings, dict):
+        restore_into = [s.get("healthCheckSr") for s in settings.values()
+                        if isinstance(s, dict) and isinstance(s.get("healthCheckSr"), str)]
+        answers.append(_ids_among(restore_into, sr_uuids))
+
+    if True in answers:
+        return True
+    if None in answers:
+        return None
+    return False
+
+
+def backup_runners(jobs, schedules, pool_uuid, vm_uuids, sr_uuids):
+    """(does the XOA itself move data for this pool, [ids of the XO Proxies that do]).
+
+    A job counts when one of its schedules is enabled - a job whose every schedule is off
+    moves nothing - and every job counts when the schedules could not be read
+    (schedules=None). A job whose reach cannot be told counts as touching the pool, so an
+    unreadable job can keep the XOA in the answer but never take it out. And the XOA is
+    the default: with no job touching the pool, what moves its data is whatever somebody
+    starts from XOA - an export, a restore - so it is the XOA that needs the network.
+    """
+    active = None
+    if schedules is not None:
+        active = set(s.get("jobId") for s in schedules
+                     if s.get("enabled") is True or s.get("enabled") == "true")
+    xoa, touched, proxies = False, False, []
+    for job in jobs:
+        if active is not None and job.get("id") not in active:
+            continue
+        if job_touches_pool(job, pool_uuid, vm_uuids, sr_uuids) is False:
+            continue
+        touched = True
+        proxy = job_field(job, "proxy")
+        if isinstance(proxy, str) and proxy:
+            if proxy not in proxies:
+                proxies.append(proxy)
+        else:
+            xoa = True
+    return (xoa or not touched), proxies
+
+
+def http_proxy_address(url):
+    """host[:port] of a server record's httpProxy URL - never the credentials it may
+    carry - or '' when there is none. A URL that will not parse is shown as set rather
+    than dropped, since it is still what XO routes the pool's traffic through."""
+    if not url or not isinstance(url, str):
+        return ""
+    try:
+        parts = urlsplit(url if "://" in url else "http://" + url)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return "(set, address unreadable)"
+    if not host:
+        return "(set, address unreadable)"
+    if ":" in host:
+        host = "[%s]" % host
+    return "%s:%d" % (host, port) if port else host

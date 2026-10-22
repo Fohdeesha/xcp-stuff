@@ -24,6 +24,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
+from urllib.parse import urlsplit
 import atexit
 import base64
 import getopt
@@ -1414,6 +1415,189 @@ def plugin_block(third_party, autoload, autoload_known):
         if plugin["link"]:
             out.append("    -> %s" % plugin["link"])
     return "\n".join(out)
+
+
+# --------------------------------------------------------------------------------------
+# which of XO's backup jobs move a pool's data, and from where
+# --------------------------------------------------------------------------------------
+# XO picks the machine that moves a pool's backup traffic per job: a job with a `proxy`
+# runs on that XO Proxy, which reaches the hosts itself (xo-server backups-ng/index.mjs
+# hands it the pool's credentials and the master's backup-network URL, and deliberately
+# not the server's HTTP proxy), and every other job runs on the XOA. So whether the XOA
+# needs to reach a pool's backup network is a question about the jobs that touch it.
+
+def xo_pattern_match(pattern, value):
+    """value-matcher's match() (xen-orchestra packages/value-matcher) for one plain value.
+
+    That is all a job ever matches a pool id against: a string, or __and / __or / __not
+    over strings. An array, or any other object, only ever matches an object, so it is
+    False against a plain value - which is how XO evaluates it too. An __and or __or over
+    something that is not a list makes XO's own evaluation throw; that raises ValueError
+    here, for the caller to read as "cannot tell".
+    """
+    if isinstance(pattern, list):
+        return False
+    if isinstance(pattern, dict):
+        if len(pattern) == 1:
+            key = list(pattern)[0]
+            sub = pattern[key]
+            if key in ("__and", "__or"):
+                if not isinstance(sub, list):
+                    raise ValueError("%s is not a list" % key)
+                hits = [xo_pattern_match(p, value) for p in sub]
+                return all(hits) if key == "__and" else any(hits)
+            if key == "__not":
+                return not xo_pattern_match(sub, value)
+        return False
+    return pattern == value
+
+
+def xo_simple_ids(pattern):
+    """The ids of an explicit {id: ...} pattern, or None when it is not one.
+
+    XO's extractIdsFromSimplePattern: {'id': 'x'} or {'id': {'__or': ['x', ...]}}. This is
+    how a job lists VMs picked by hand, target SRs, and the pools of a metadata backup.
+    """
+    if not isinstance(pattern, dict) or list(pattern) != ["id"]:
+        return None
+    ids = pattern["id"]
+    if isinstance(ids, str):
+        return [ids]
+    if (isinstance(ids, dict) and list(ids) == ["__or"] and isinstance(ids["__or"], list)
+            and all(isinstance(i, str) for i in ids["__or"])):
+        return list(ids["__or"])
+    return None
+
+
+def job_field(job, key):
+    """One field of an XO job record, decoded the way XO decodes it.
+
+    Jobs are stored with every non-string value JSON-encoded (JobsDb._serialize), and read
+    back with a JSON.parse that keeps the raw string when it does not parse - which is
+    what a plain string such as a proxy id is.
+    """
+    value = job.get(key)
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except ValueError:
+        return value
+
+
+def _ids_among(ids, known):
+    """True/False against a set of uuids read off the pool; None when that set could not
+    be read - unless there was nothing to look for in the first place."""
+    if not ids:
+        return False
+    if known is None:
+        return None
+    return any(i in known for i in ids)
+
+
+def job_touches_pool(job, pool_uuid, vm_uuids, sr_uuids):
+    """Does this XO job move data to or from this pool? True, False, or None when that
+    cannot be told from here.
+
+    A VM backup picks its VMs by uuid, or in smart mode by a pattern over their pool
+    ($pool) and their tags; a replication writes into target SRs; a health check restores
+    into an SR; a pool metadata backup names pools. Nothing on the XOA says which pool a
+    VM or SR uuid lives in, so those are looked up in the pool's own uuids, read by the
+    collector - and when those could not be read the answer is None, not a guess. A smart
+    job that names no pool covers every pool's VMs: its tags may still leave this pool
+    with nothing to back up, which cannot be told without the VMs, so it counts.
+    """
+    kind = job.get("type")
+    if kind == "metadataBackup":
+        pools = job_field(job, "pools")
+        if pools is None:
+            return False            # XO's own metadata only: no pool is read
+        ids = xo_simple_ids(pools)
+        if ids is None or not pool_uuid:
+            return None
+        return pool_uuid in ids
+    if kind != "backup":
+        return False                # a mirror backup copies between remotes
+
+    answers = []
+    vms = job_field(job, "vms")
+    ids = xo_simple_ids(vms)
+    if ids is not None:
+        answers.append(_ids_among(ids, vm_uuids))
+    elif isinstance(vms, dict) and "$pool" not in vms:
+        answers.append(True)
+    elif isinstance(vms, dict) and pool_uuid:
+        try:
+            answers.append(xo_pattern_match(vms["$pool"], pool_uuid))
+        except ValueError:
+            answers.append(None)
+    else:
+        answers.append(None)
+
+    srs = job_field(job, "srs")
+    if srs is not None:
+        targets = xo_simple_ids(srs)
+        answers.append(None if targets is None else _ids_among(targets, sr_uuids))
+
+    settings = job_field(job, "settings")
+    if isinstance(settings, dict):
+        restore_into = [s.get("healthCheckSr") for s in settings.values()
+                        if isinstance(s, dict) and isinstance(s.get("healthCheckSr"), str)]
+        answers.append(_ids_among(restore_into, sr_uuids))
+
+    if True in answers:
+        return True
+    if None in answers:
+        return None
+    return False
+
+
+def backup_runners(jobs, schedules, pool_uuid, vm_uuids, sr_uuids):
+    """(does the XOA itself move data for this pool, [ids of the XO Proxies that do]).
+
+    A job counts when one of its schedules is enabled - a job whose every schedule is off
+    moves nothing - and every job counts when the schedules could not be read
+    (schedules=None). A job whose reach cannot be told counts as touching the pool, so an
+    unreadable job can keep the XOA in the answer but never take it out. And the XOA is
+    the default: with no job touching the pool, what moves its data is whatever somebody
+    starts from XOA - an export, a restore - so it is the XOA that needs the network.
+    """
+    active = None
+    if schedules is not None:
+        active = set(s.get("jobId") for s in schedules
+                     if s.get("enabled") is True or s.get("enabled") == "true")
+    xoa, touched, proxies = False, False, []
+    for job in jobs:
+        if active is not None and job.get("id") not in active:
+            continue
+        if job_touches_pool(job, pool_uuid, vm_uuids, sr_uuids) is False:
+            continue
+        touched = True
+        proxy = job_field(job, "proxy")
+        if isinstance(proxy, str) and proxy:
+            if proxy not in proxies:
+                proxies.append(proxy)
+        else:
+            xoa = True
+    return (xoa or not touched), proxies
+
+
+def http_proxy_address(url):
+    """host[:port] of a server record's httpProxy URL - never the credentials it may
+    carry - or '' when there is none. A URL that will not parse is shown as set rather
+    than dropped, since it is still what XO routes the pool's traffic through."""
+    if not url or not isinstance(url, str):
+        return ""
+    try:
+        parts = urlsplit(url if "://" in url else "http://" + url)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return "(set, address unreadable)"
+    if not host:
+        return "(set, address unreadable)"
+    if ":" in host:
+        host = "[%s]" % host
+    return "%s:%d" % (host, port) if port else host
 
 
 # ======================================================================================
@@ -2994,6 +3178,19 @@ def _pif_ips(network_uuid):
     return fact(ips)
 
 
+def _backup_scope():
+    """Every VM and SR uuid in the pool. The single-param --minimal form, which is the one
+    that answers correctly across many objects (see the trap ledger on --minimal)."""
+    scope = {}
+    for key, command in (("vms", "vm-list"), ("srs", "sr-list")):
+        r = xe([command, "params=uuid", "--minimal"])
+        if r.ok:
+            scope[key] = fact(sorted(set(u.strip() for u in r.out.split(",") if u.strip())))
+        else:
+            scope[key] = err("xe %s failed (%s)" % (command, r.why()))
+    return scope
+
+
 def _network_info(network_uuid, want_ips):
     """bond-slave-of for every PIF on a network, plus (for backup) their IPs.
 
@@ -3228,6 +3425,12 @@ def collect_pool(spec, self_uuid):
         if uuid:
             resolved[key] = _network_info(uuid, want_ips)
     out["networks"] = resolved
+
+    # asked for by the XOA only, and only worth asking with a backup network to judge:
+    # which of its backup jobs move this pool's data is a question about uuids, since a
+    # job names VMs and SRs by uuid and nothing on the XOA says which pool one lives in
+    if spec.get("backup_scope") and "xo:backupNetwork" in resolved:
+        out["backup_scope"] = _backup_scope()
 
     if sr_uuids:
         controllers = spec.get("controllers") or []
@@ -4147,6 +4350,73 @@ def read_server_records(cli_path, addr=DEFAULT_ADDR, timeout=None):
 
 
 # --------------------------------------------------------------------------------------
+# any other collection: backup jobs, their schedules, XO Proxies
+# --------------------------------------------------------------------------------------
+
+def read_records(cli_path, namespace, addr=DEFAULT_ADDR, timeout=None):
+    """Every record of one more xo collection, as the dicts XO stored, plus its `id`.
+
+    The same two declines as the server records, for the same reasons: an endpoint not
+    established from the config files, and `enc:` (jobs, schedules and proxy
+    registrations are all encrypted along with the servers when encryption is on). Unlike
+    the server ids, an empty set is an answer here - an appliance with no backup job or no
+    proxy is the usual case, not a sign of the wrong redis.
+
+    Values are left as XO wrote them, unlike _flatten: a schedule's `enabled` is a real
+    boolean in redis, and a job's patterns are JSON strings the caller decodes.
+    """
+    if timeout is None:
+        timeout = config.XO_REDIS_TIMEOUT
+    if _mentions_redis(cli_path):
+        raise RedisError("xo-server config mentions redis; not assuming %s:%d" % DEFAULT_ADDR)
+    try:
+        return _fetch_collection(addr, timeout, namespace)
+    except OSError as exc:
+        raise RedisError("%s:%d: %s" % (addr[0], addr[1], exc))
+    except UnicodeDecodeError as exc:
+        raise RedisError("undecodable answer from redis: %s" % exc)
+    except ValueError as exc:
+        raise RedisError("unreadable answer from redis: %s" % exc)
+
+
+def _fetch_collection(addr, timeout, namespace):
+    ids_key = "xo:%s_ids" % namespace
+    prefix = "xo:%s:" % namespace
+    sock = socket.create_connection(addr, timeout=timeout)
+    try:
+        handle = sock.makefile("rb")
+        try:
+            sock.sendall(_encode(["SMEMBERS", ids_key]))
+            ids = _read_reply(handle)
+            if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+                raise RedisError("%s is not a set of ids" % ids_key)
+            if not ids:
+                return []
+            sock.sendall(_encode(["MGET"] + [prefix + i for i in ids]))
+            blobs = _read_reply(handle)
+            if not isinstance(blobs, list) or len(blobs) != len(ids):
+                got = len(blobs) if isinstance(blobs, list) else "a non-list of"
+                raise RedisError("MGET answered %s value(s) for %d id(s)" % (got, len(ids)))
+        finally:
+            handle.close()
+    finally:
+        sock.close()
+
+    records = []
+    for ident, blob in zip(ids, blobs):
+        if blob is None:
+            continue                      # deleted between the two calls
+        if blob.startswith(ENCRYPTION_PREFIX):
+            raise RedisError("%s records are encrypted (%s%s)" % (namespace, prefix, ident))
+        record = json.loads(blob)
+        if not isinstance(record, dict):
+            raise RedisError("%s%s is not an object" % (prefix, ident))
+        record["id"] = ident
+        records.append(record)
+    return records
+
+
+# --------------------------------------------------------------------------------------
 # plugin metadata - an annotation, never a finding
 # --------------------------------------------------------------------------------------
 
@@ -4357,6 +4627,7 @@ def have_xo_server_db():
 _ALL_SERVERS = None     # the one `xo-server-db ls server` scan; None until it is read
 _READ_ERROR = ""        # why that scan failed, when it did; "" while it has not
 _RESOLVED = {}          # db host name -> frozenset of its addresses, looked up once a run
+_COLLECTIONS = {}       # namespace -> (records, why not), for the collections read on demand
 
 
 def _describe_failure(rc, err):
@@ -4456,6 +4727,7 @@ def reset_cache():
     _ALL_SERVERS = None
     _READ_ERROR = ""
     _RESOLVED.clear()
+    _COLLECTIONS.clear()
 
 
 def enabled_servers():
@@ -4640,6 +4912,59 @@ def pool_name_for_host(want, resolve_want=True):
     """
     row, _how = enabled_server_for(want, resolve_want)
     return row.name if row is not None else ""
+
+
+# --------------------------------------------------------------------------------------
+# the other collections, read only when a check needs one
+# --------------------------------------------------------------------------------------
+
+def collection(namespace):
+    """(records, "" or why not) for one more xo collection - job, schedule, proxy.
+
+    Read at most once per run and only when asked: nothing in an ordinary run needs them,
+    and on an appliance whose credential db is encrypted each one costs another 3.3s of
+    xo-server-db. Redis directly when that can be trusted, as for the servers.
+    """
+    if namespace not in _COLLECTIONS:
+        records, why = None, ""
+        cli_path = transport.which("xo-server-db")
+        if cli_path:
+            try:
+                records = xoredis.read_records(cli_path, namespace)
+            except xoredis.RedisError as exc:
+                transport.debug("xo-db %s: redis declined (%s); asking xo-server-db"
+                                % (namespace, exc))
+        if records is None:
+            out, why = _ls([namespace])
+            records = scan_records(out) if out is not None else []
+        _COLLECTIONS[namespace] = (records, why)
+    return _COLLECTIONS[namespace]
+
+
+def backup_routes(server, pool_uuid, vm_uuids, sr_uuids):
+    """Where XO moves this pool's backup traffic from, as XO is configured to.
+
+      xoa         the XOA itself moves some of it (or nothing is configured to, which
+                  leaves whatever somebody starts from XOA)
+      proxies     the names of the XO Proxies that move the rest
+      http_proxy  host[:port] of the HTTP proxy the XOA's own connection to this pool goes
+                  through ('' for none) - xen-api sends every request through it, exports
+                  to the backup network included
+      error       why none of that could be told; the other keys are absent then
+    """
+    jobs, why = collection("job")
+    if why:
+        return {"error": "could not read XO's backup jobs (%s)" % why}
+    schedules, why = collection("schedule")
+    xoa, proxy_ids = parsers.backup_runners(jobs, None if why else schedules,
+                                            pool_uuid, vm_uuids, sr_uuids)
+    names = []
+    if proxy_ids:
+        proxies, why = collection("proxy")
+        known = {} if why else dict((p.get("id"), p.get("name")) for p in proxies)
+        names = [known.get(i) or i for i in proxy_ids]
+    return {"xoa": xoa, "proxies": names, "error": "",
+            "http_proxy": parsers.http_proxy_address((server or {}).get("httpProxy"))}
 
 
 SELECT_OK = 0
@@ -5844,10 +6169,19 @@ def migration_network(pool):
     return ok("Migration Network", "Configured")
 
 
-def backup_network(pool, run_env, pinger):
+def backup_network(pool, run_env, pinger, routes=None):
     """The ping half asks 'can the XOA reach every host on this network', because that is
     what XO needs to move backup traffic. Asking it from a pool host answers a different
-    question, so host mode does not ask it at all rather than mislabelling the answer."""
+    question, so host mode does not ask it at all rather than mislabelling the answer.
+
+    For the same reason a silent ping is only a finding when it is the XOA that moves the
+    traffic. A job pinned to an XO Proxy runs there and reaches the hosts from there, and
+    an HTTP proxy on the pool's server record carries every request the XOA itself makes,
+    exports included - so a pool whose backups all go one of those ways can be unreachable
+    from the XOA by design (issue #71). `routes(pool_uuid, vm_uuids, sr_uuids)` says which
+    it is; it is only asked once a ping has gone unanswered, so a pool the XOA reaches
+    costs nothing more than it did.
+    """
     line, net = _network_line(pool, "backup", "Backup Network", "xo:backupNetwork")
     if line is not None:
         return line
@@ -5865,10 +6199,39 @@ def backup_network(pool, run_env, pinger):
     silent = pinger(ips.value)
     if not silent:
         return ok("Backup Network", "Configured and reachable from XOA")
+    elsewhere = _backup_moved_elsewhere(pool, routes)
+    if elsewhere:
+        # nothing was learned about the path the traffic really takes, and the line says
+        # so: what is green is the configuration, the way host mode's line is
+        return ok("Backup Network", "Configured, %s (not tested from here) - No ping answer "
+                                    "from XOA itself for: %s" % (elsewhere, ", ".join(silent)))
     # ICMP only, so a ping-filtering network reads yellow - the wording claims exactly
     # what was tested and nothing more
     return flag("Backup Network", "Configured but not fully reachable",
                 " - No ping answer from XOA for: " + ", ".join(silent))
+
+
+def _backup_moved_elsewhere(pool, routes):
+    """What carries this pool's backup traffic instead of the XOA's own connection, as a
+    phrase - or '' when the XOA moves it itself, or when XO's configuration could not be
+    read, which leaves the finding exactly as it was."""
+    if routes is None:
+        return ""
+    scope = pool.payload.get("backup_scope") or {}
+    vms, srs = result.wrap(scope, "vms"), result.wrap(scope, "srs")
+    uuid = pool.fact("pool_uuid")
+    info = routes(uuid.value if uuid.ok else "",
+                  set(vms.value) if vms.ok else None,
+                  set(srs.value) if srs.ok else None)
+    if info.get("error") or (info["xoa"] and not info["http_proxy"]):
+        return ""
+    parts = []
+    if info["proxies"]:
+        parts.append("backups run through XO Proxy %s"
+                     % ", ".join("'%s'" % name for name in info["proxies"]))
+    if info["xoa"]:
+        parts.append("XOA connects to this pool through HTTP proxy %s" % info["http_proxy"])
+    return " and ".join(parts)
 
 
 # --------------------------------------------------------------------------------------
@@ -6920,11 +7283,14 @@ def _host_spec(with_smapi):
     }
 
 
-def _pool_spec(controllers):
+def _pool_spec(controllers, backup_scope=False):
     return {
         "want": ["pool", "yumcheck"],
         "controllers": controllers,
         "qcow2_max": config.XOSTOR_QCOW2_MAX_LINES,
+        # the pool's VM and SR uuids, for telling which XO backup jobs touch it - asked
+        # only from XOA, the one place that has the jobs to compare them with
+        "backup_scope": backup_scope,
     }
 
 
@@ -7126,6 +7492,14 @@ def _known_as(server, how):
         return ("an address of pool '%s' (xo-server-db has it as %s, which resolves to it)"
                 % (server.name, xodb.db_address(server.record)))
     return "the address of pool '%s' in xo-server-db" % server.name
+
+
+def _server_record(run):
+    """The pool's xo-db record, looked up the first time something needs it: a run given
+    a host and its password never had to, and most runs never ask."""
+    if run.server is None:
+        run.server = xodb.server_for_host(run.seed)[0] or {}
+    return run.server
 
 
 def resolve_target_xoa(run, args):
@@ -7533,7 +7907,7 @@ def collect_hosts(run):
     document - so gathering them concurrently changes nothing but the wall clock.
     """
     controllers = run.all_addresses if run.host_solo() else [h.address for h in run.hosts]
-    pool_spec = _pool_spec(controllers)
+    pool_spec = _pool_spec(controllers, backup_scope=(run.run_env != "host"))
 
     workers = parallel_workers(len(run.hosts))
     transport.debug("collecting %d host(s), %d at a time" % (len(run.hosts), workers))
@@ -7647,7 +8021,9 @@ def pool_status_section(run, rep):
     rep.check("VLAN 0 Check", checks.vlan0, run.pool)
     rep.check("Migration Network", checks.migration_network, run.pool)
     rep.check("Backup Network", checks.backup_network, run.pool, run.run_env,
-              xoa.ping_silent)
+              xoa.ping_silent,
+              lambda pool_uuid, vm_uuids, sr_uuids: xodb.backup_routes(
+                  _server_record(run), pool_uuid, vm_uuids, sr_uuids))
     # inside the section, so that under -f a pool with nothing to report takes its own
     # separator with it instead of leaving a blank line where the section was
     rep.blank()
@@ -8078,13 +8454,13 @@ def _module(name, exported):
 config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DMESG_MAX_LINES', 'DMESG_ROLLUP_MIN', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MOUNT_PROBE_RESERVE', 'MOUNT_PROBE_TIMEOUT', 'MOUNT_STALL_FILES', 'MOUNT_STALL_PHRASES', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'NETWORK_FS_TYPES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'PROGRESS_INTERVAL', 'REMOTE_CMD_TIMEOUT', 'RUN_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'STUCK_MAX_LINES', 'STUCK_MIN_AGE', 'STUCK_RECHECK_DELAY', 'STUCK_SAMPLES', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOA_STOCK_PLUGINS', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_QCOW2_MAX_LINES', 'XO_DNS_TIMEOUT', 'XO_PLUGIN_LOOKUP_PATHS', 'XO_PLUGIN_PREFIX', 'XO_PLUGIN_SCOPE_DIR', 'XO_PLUGIN_SCOPE_PREFIX', 'XO_REDIS_TIMEOUT'])
 colors = _module('colors', ['CYAN', 'GREEN', 'RESET', 'YELLOW', 'cyan', 'green', 'init', 'strip_ansi', 'yellow'])
 result = _module('result', ['FLAG', 'Fact', 'INFO', 'Line', 'MISSING', 'OK', 'UNKNOWN', 'flag', 'guard', 'info', 'ok', 'pinned', 'raw', 'unknown', 'wrap'])
-parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', '_LINK_RE', '_MANIFEST_PKG_RE', '_MTU_RE', '_PARAM_RE', '_PREMIUM_SUFFIX', '_TS_RE', '_XO_URL_RE', '_cidr_range', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'cap_lines', 'classify_multipath_path', 'classify_xo_plugins', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'format_age', 'has_overlapping_subnets', 'host_records_from_state_db', 'ip_literal', 'manifest_diff', 'manifest_plugin_names', 'manifest_versions', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pool_conf', 'parse_timedatectl', 'parse_xe_records', 'plugin_block', 'pool_member_addresses', 'rollup_repeats', 'round_1dp', 'split_host_port', 'split_timestamp', 'truncate_block', 'xo_server_address'])
+parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', '_LINK_RE', '_MANIFEST_PKG_RE', '_MTU_RE', '_PARAM_RE', '_PREMIUM_SUFFIX', '_TS_RE', '_XO_URL_RE', '_cidr_range', '_ids_among', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'backup_runners', 'cap_lines', 'classify_multipath_path', 'classify_xo_plugins', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'format_age', 'has_overlapping_subnets', 'host_records_from_state_db', 'http_proxy_address', 'ip_literal', 'job_field', 'job_touches_pool', 'manifest_diff', 'manifest_plugin_names', 'manifest_versions', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pool_conf', 'parse_timedatectl', 'parse_xe_records', 'plugin_block', 'pool_member_addresses', 'rollup_repeats', 'round_1dp', 'split_host_port', 'split_timestamp', 'truncate_block', 'xo_pattern_match', 'xo_server_address', 'xo_simple_ids'])
 model = _module('model', ['Host', 'Pool', 'ntp_match', 'ram_match'])
 collectorsrc = _module('collectorsrc', ['EMBEDDED', 'collector_source'])
 transport = _module('transport', ['ASKPASS_ENV', 'ASKPASS_SCRIPT', 'AUTH_ASKPASS', 'AUTH_SSHPASS', 'BEGIN_MARKER', 'CollectError', 'END_MARKER', 'Transport', '_DEBUG_LOCK', '_LIVE', '_LIVE_LOCK', '_REMOTE_LAUNCH', '_REMOTE_LAUNCH_PINNED', '_kill_tree', '_remote_launch', 'cleanup_work_dir', 'debug', 'ensure_sshpass', 'have', 'kill_all_children', 'make_work_dir', 'run_local_cmd', 'which', 'write_askpass'])
-xoredis = _module('xoredis', ['DEFAULT_ADDR', 'ENCRYPTION_PREFIX', 'IDS_KEY', 'PLUGIN_IDS_KEY', 'PLUGIN_RECORD_PREFIX', 'RECORD_PREFIX', 'RedisError', '_config_dirs', '_config_files', '_encode', '_fetch', '_fetch_autoload', '_flatten', '_mentions_redis', '_read_reply', 'read_plugin_autoload', 'read_server_records'])
-xodb = _module('xodb', ['QUOTES', 'SELECT_NONE', 'SELECT_NO_MATCH', 'SELECT_OK', 'SELECT_QUIT', 'SELECT_UNREADABLE', 'Server', '_ALL_SERVERS', '_ESCAPE_RE', '_KEY_RE', '_READ_ERROR', '_RESOLVED', '_SIMPLE_ESCAPES', '_describe_failure', '_ls', '_read_servers', '_resolve', '_same_address', '_sort_key', 'all_servers', 'clean', 'db_address', 'enabled_server_for', 'enabled_servers', 'have_xo_server_db', 'match_record', 'password_for', 'pool_name_for_host', 'read_error', 'record_password', 'reset_cache', 'scan_records', 'select_pool', 'server_for_host', 'unescape'])
-checks = _module('checks', ['_dmesg_phrase_blocks', '_first_line', '_linstor_column', '_linstor_has_rows', '_linstor_line', '_linstor_node_addresses', '_linstor_node_offline', '_linstor_table', '_linstor_unknown', '_maps', '_mount_detail', '_multipath_detail', '_multipath_read', '_network_line', '_pool_conf_target', '_pool_roles_detail', '_render_scan_blocks', '_stuck_detail', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_block', 'dmesg_content', 'dmesg_content_of', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mount_stalls', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'network_mounts', 'ntp', 'oom_events', 'overlapping_subnets', 'pool_host_list', 'pool_roles', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'stuck_processes', 'tap_status', 'task_timeout_override', 'vlan0', 'xapi_status', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_nodes', 'xostor_pref_nic', 'xostor_qcow2', 'xostor_ram', 'yum_patch_level'])
+xoredis = _module('xoredis', ['DEFAULT_ADDR', 'ENCRYPTION_PREFIX', 'IDS_KEY', 'PLUGIN_IDS_KEY', 'PLUGIN_RECORD_PREFIX', 'RECORD_PREFIX', 'RedisError', '_config_dirs', '_config_files', '_encode', '_fetch', '_fetch_autoload', '_fetch_collection', '_flatten', '_mentions_redis', '_read_reply', 'read_plugin_autoload', 'read_records', 'read_server_records'])
+xodb = _module('xodb', ['QUOTES', 'SELECT_NONE', 'SELECT_NO_MATCH', 'SELECT_OK', 'SELECT_QUIT', 'SELECT_UNREADABLE', 'Server', '_ALL_SERVERS', '_COLLECTIONS', '_ESCAPE_RE', '_KEY_RE', '_READ_ERROR', '_RESOLVED', '_SIMPLE_ESCAPES', '_describe_failure', '_ls', '_read_servers', '_resolve', '_same_address', '_sort_key', 'all_servers', 'backup_routes', 'clean', 'collection', 'db_address', 'enabled_server_for', 'enabled_servers', 'have_xo_server_db', 'match_record', 'password_for', 'pool_name_for_host', 'read_error', 'record_password', 'reset_cache', 'scan_records', 'select_pool', 'server_for_host', 'unescape'])
+checks = _module('checks', ['_backup_moved_elsewhere', '_dmesg_phrase_blocks', '_first_line', '_linstor_column', '_linstor_has_rows', '_linstor_line', '_linstor_node_addresses', '_linstor_node_offline', '_linstor_table', '_linstor_unknown', '_maps', '_mount_detail', '_multipath_detail', '_multipath_read', '_network_line', '_pool_conf_target', '_pool_roles_detail', '_render_scan_blocks', '_stuck_detail', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_block', 'dmesg_content', 'dmesg_content_of', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mount_stalls', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'network_mounts', 'ntp', 'oom_events', 'overlapping_subnets', 'pool_host_list', 'pool_roles', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'stuck_processes', 'tap_status', 'task_timeout_override', 'vlan0', 'xapi_status', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_nodes', 'xostor_pref_nic', 'xostor_qcow2', 'xostor_ram', 'yum_patch_level'])
 xoa = _module('xoa', ['_dmesg', '_first_token', '_max_old_space', '_meminfo', '_os_version', '_plugin_autoload', '_plugin_scan_targets', '_plugin_version', '_plugins_line', '_service_state', '_updater', 'collect_xoa', 'debian_version_ok', 'lines', 'ping_silent', 'running_as_root', 'scan_plugins'])
 report = _module('report', ['Report', '_as_entry'])
 runcmd = _module('runcmd', ['TRANSPORT_FAILED', '_run_one', 'execute'])
