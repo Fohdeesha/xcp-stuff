@@ -96,9 +96,43 @@ def dns(monkeypatch):
     ("https://[fd00::1]", ("fd00::1", None)),
     # XO's own pattern takes no bare IPv6; the old reading leaves it whole
     ("fd00::1", ("fd00::1", None)),
+    # what a browser's address bar hands over, and the forms XO's pattern also takes
+    ("https://192.168.1.5/", ("192.168.1.5", None)),
+    ("http://192.168.1.5:80/", ("192.168.1.5", 80)),
+    ("  https://192.168.1.5  ", ("192.168.1.5", None)),
+    ("https:192.168.1.5", ("192.168.1.5", None)),
+    ("https://root@xen.example.com/some/path", ("xen.example.com", None)),
+    # refused by XO's pattern, so read for whatever address is left: XO matches the
+    # scheme in lower case only...
+    ("HTTPS://192.168.1.5", ("192.168.1.5", None)),
+    ("Http://xen.example.com:8443", ("xen.example.com", 8443)),
+    ("HTTPS://root:pw@10.0.0.5/", ("10.0.0.5", None)),
+    # ...and takes no query, fragment or unbracketed IPv6
+    ("https://192.168.1.5/?a=1#top", ("192.168.1.5", None)),
+    ("https://fd00::1", ("fd00::1", None)),
+    ("https://[fd00::1]:8443/?a=1", ("fd00::1", 8443)),
+    ("//192.168.1.5", ("192.168.1.5", None)),
+    # and nothing at all is nothing at all
+    ("https://", ("", None)),
+    ("", ("", None)),
 ])
 def test_a_record_host_is_read_the_way_xo_reads_it(text, want):
     assert parsers.xo_server_address(text) == want
+
+
+@pytest.mark.parametrize("text, want", [
+    ("https://10.0.0.5", True),
+    ("HTTP://10.0.0.5", True),
+    ("  http:10.0.0.5", True),
+    ("10.0.0.5", False),
+    ("10.0.0.5:2222", False),
+    ("httpserver01:2222", False),
+    ("xen.example.com", False),
+    ("", False),
+    (None, False),
+])
+def test_only_a_scheme_makes_an_address_a_url(text, want):
+    assert parsers.has_url_scheme(text) is want
 
 
 def test_ip_literal_is_canonical_and_refuses_names():
@@ -119,6 +153,12 @@ def test_member_addresses_read_only_a_list_of_strings():
     assert parsers.pool_member_addresses('["10.0.0.1", 7, ""]') == ["10.0.0.1"]
 
 
+def test_member_addresses_lose_the_brackets_xo_stores_ipv6_in():
+    """xen-api's formatHostname brackets a bare IPv6 address before it joins the list."""
+    assert parsers.pool_member_addresses('["[fd00::1]", "[fd00::2]", "10.0.0.1", "[]"]') \
+        == ["fd00::1", "fd00::2", "10.0.0.1"]
+
+
 # --------------------------------------------------------------------------------------
 # which record an address belongs to
 # --------------------------------------------------------------------------------------
@@ -134,6 +174,32 @@ def test_the_host_field_answers_first_and_dns_is_never_asked(db, dns):
 def test_a_host_field_with_a_scheme_or_port_still_names_its_address(db, dns):
     db(record("https://10.0.0.5:443"))
     assert xodb.match_record("10.0.0.5", xodb.all_servers())[1] == "host"
+    assert dns.asked == []
+
+
+def test_an_address_written_as_a_url_finds_its_record(db, dns):
+    db(record("10.0.0.5"), record("HTTPS://10.0.0.6/", password="p6"))
+    assert xodb.match_record("https://10.0.0.5:443/", xodb.all_servers())[1] == "host"
+    assert xodb.match_record("http://10.0.0.6", xodb.all_servers())[0]["password"] == "p6"
+    # a record holding exactly that text still answers to it
+    assert xodb.match_record("HTTPS://10.0.0.6/", xodb.all_servers())[0]["password"] == "p6"
+    assert dns.asked == []
+
+
+def test_a_url_that_may_be_a_password_is_never_resolved(db, dns):
+    db(record(NAME))
+    dns.table[NAME] = [MASTER_IP]
+    assert xodb.match_record("https://secret.example", xodb.all_servers(),
+                             resolve_want=False) == (None, "")
+    assert xodb.match_record("https://", xodb.all_servers(), resolve_want=False) == (None, "")
+    assert dns.asked == []
+
+
+def test_an_ipv6_member_is_found_whatever_brackets_xo_stored_it_in(db, dns):
+    db(record("https://[fd00::1]", members=["[fd00::1]", "[fd00::2]"]))
+    assert xodb.match_record("fd00::2", xodb.all_servers())[1] == "member"
+    assert xodb.match_record("FD00:0::2", xodb.all_servers())[1] == "member"
+    assert xodb.match_record("fd00::1", xodb.all_servers())[1] == "host"
     assert dns.asked == []
 
 
@@ -165,7 +231,7 @@ def test_a_value_that_may_be_a_password_is_never_resolved(db, dns):
 
 
 def test_a_host_argument_given_by_name_finds_a_record_stored_by_ip(db, dns):
-    db(record("192.168.4.16", password="p16", name="2028 East"))
+    db(record("192.168.4.16", password="p16", name="1st Avenue"))
     dns.table["east-master.lab"] = ["192.168.4.16"]
     rec, how = xodb.match_record("east-master.lab", xodb.all_servers(), resolve_want=True)
     assert how == "dns" and rec["password"] == "p16"
@@ -239,7 +305,7 @@ def test_the_banner_names_a_pool_stored_by_name(db, dns):
 # resolve_target_xoa, end to end
 # --------------------------------------------------------------------------------------
 
-def resolve(monkeypatch, argv, name_filter="", single=False):
+def resolve(monkeypatch, argv, name_filter="", single=False, ssh_port=22):
     """resolve_target_xoa as main runs it. (exit code or None, stdout, stderr, run)."""
     out, err = io.StringIO(), io.StringIO()
     monkeypatch.setattr(sys, "stdout", out)
@@ -248,7 +314,7 @@ def resolve(monkeypatch, argv, name_filter="", single=False):
     run = main.Run()
     run.name_filter = name_filter
     run.pool_mode = not single
-    run.transport = types.SimpleNamespace(ssh_port=22, password="",
+    run.transport = types.SimpleNamespace(ssh_port=ssh_port, password="",
                                           enable_password_auth=lambda run_env: True)
     code = None
     try:
@@ -343,6 +409,81 @@ def test_a_host_argument_keeps_its_ssh_port(monkeypatch, db, dns):
     assert code is None
     assert run.seed == "10.0.0.5" and run.transport.ssh_port == 2222
     assert run.password == "pwA01"
+
+
+@pytest.mark.parametrize("stored, given", [
+    ("10.0.0.5", "https://10.0.0.5"),
+    ("10.0.0.5", "https://10.0.0.5:443/"),
+    ("https://10.0.0.5", "https://10.0.0.5"),
+    ("http://10.0.0.5", "HTTP://10.0.0.5/"),
+    ("https://10.0.0.5:443", "10.0.0.5"),
+])
+def test_a_host_argument_written_the_way_xo_shows_it(monkeypatch, db, dns, stored, given):
+    """Copied out of XO's list of servers, https:// and all. Its port is xapi's, so ssh
+    stays on 22 - and the banner names the address that is dialled, not the URL."""
+    db(record(stored))
+    code, out, err, run = resolve(monkeypatch, [given], ssh_port=None)
+    assert code is None, err
+    assert run.seed == "10.0.0.5"
+    assert run.transport.ssh_port == 22
+    assert run.password == "pwA01"
+    assert "Checking pool: %s (10.0.0.5)\n" % POOL in out
+
+
+def test_a_host_argument_naming_no_host_is_a_usage_error(monkeypatch, db, dns):
+    db(record("10.0.0.5"))
+    code, out, err, _ = resolve(monkeypatch, ["https://"])
+    assert code == 2
+    assert "ERROR: 'https://' names no host." in err
+    assert out == ""
+
+
+def test_a_url_after_n_is_refused_as_an_address_too(monkeypatch, db, dns):
+    db(record("192.168.1.5", name="XEN-PRIMARY", label="XEN-MAIN-01"))
+    code, _, err, _ = resolve(monkeypatch, ["https://192.168.1.5/"], name_filter="main")
+    assert code == 2
+    assert "'https://192.168.1.5/' is the address of pool 'XEN-PRIMARY'" in err
+
+
+@pytest.mark.parametrize("stored", [
+    "HTTPS://10.0.0.5",
+    "https://10.0.0.5/?tab=general",
+    "//10.0.0.5",
+])
+def test_a_picked_record_xo_itself_cannot_parse_is_still_dialled(monkeypatch, db, dns, stored):
+    db(record(stored, name="Schemed"))
+    code, _, err, run = resolve(monkeypatch, [], name_filter="schemed", ssh_port=None)
+    assert code is None, err
+    assert run.seed == "10.0.0.5" and run.transport.ssh_port == 22
+    assert run.password == "pwA01"
+
+
+def test_a_picked_record_naming_no_host_says_so(monkeypatch, db, dns):
+    db(record("https://", name="Empty"))
+    code, out, err, _ = resolve(monkeypatch, [], name_filter="empty")
+    assert code == 1
+    assert "the address xo-server-db holds for pool 'Empty' names no host" in err
+    assert "Checking pool" not in out
+
+
+class Tty(io.StringIO):
+    def isatty(self):
+        return True
+
+
+def test_the_menu_and_the_no_match_list_show_addresses_never_the_host_field(db, dns):
+    """A host field may carry a password before an '@'; the address it names is what the
+    run will dial, and what the banner prints."""
+    db(record("https://root:hunter2@10.0.0.5:443/", name="Alpha"),
+       record("http://10.0.0.6", name="Beta"))
+    menu = io.StringIO()
+    code, row = xodb.select_pool("", stdin=Tty("2\n"), stderr=menu)
+    assert code == xodb.SELECT_OK and row.name == "Beta"
+    assert "1 - Alpha (10.0.0.5)\n2 - Beta (10.0.0.6)\n" in menu.getvalue()
+    listing = io.StringIO()
+    assert xodb.select_pool("gamma", stderr=listing)[0] == xodb.SELECT_NO_MATCH
+    assert "  Alpha (10.0.0.5)\n  Beta (10.0.0.6)\n" in listing.getvalue()
+    assert "hunter2" not in menu.getvalue() + listing.getvalue()
 
 
 # --------------------------------------------------------------------------------------

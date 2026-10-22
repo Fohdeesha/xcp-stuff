@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Every threshold, list and toggle, in one place. Same names and values as health.sh."""
 
-SCRIPT_VERSION = "3.20"
+SCRIPT_VERSION = "3.21"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
@@ -162,7 +162,7 @@ MOUNT_PROBE_RESERVE = 60         # run-budget seconds kept back for everything t
 # Mounts already prints from /proc/mounts, for a condition Stuck Processes already reports.
 MOUNT_STALL_PHRASES = [
     # verbatim from a live 8.3.0 dom0 whose SMB server had stopped answering:
-    # "CIFS VFS: Server 10.10.10.11 has not responded in 120 seconds. Reconnecting..."
+    # "CIFS VFS: Server 192.0.2.11 has not responded in 120 seconds. Reconnecting..."
     "has not responded in",
     "not responding",            # nfs: "server X not responding, still trying"
     "blocked for more than",     # the kernel's hung-task detector - see the note above on

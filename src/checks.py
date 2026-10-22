@@ -1009,7 +1009,7 @@ def xostor_nodes(pool):
 def _linstor_node_addresses(text):
     """{address: node} out of the Addresses column of 'linstor n l'.
 
-    A cell reads '172.16.210.84:3366 (PLAIN)' - the satellite's address, its port and the
+    A cell reads '192.0.2.84:3366 (PLAIN)' - the satellite's address, its port and the
     connection type. An older table without an Addresses column simply names nobody.
     """
     header, rows = _linstor_table(text)

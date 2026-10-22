@@ -368,6 +368,10 @@ def match_record(want, records, resolve_want=False):
     when the caller says it is a host (resolve_want), never when it may be a password.
     """
     want = (want or "").strip()
+    if parsers.has_url_scheme(want):
+        # written the way XO shows an address ('https://10.0.0.5/'), so read the way XO
+        # reads one - as every record's host field is
+        want = parsers.xo_server_address(want)[0]
     if not want:
         return None, ""
     for rec in records:
@@ -537,7 +541,7 @@ def select_pool(name_filter, stdin=None, stderr=None):
         stderr.write("ERROR: no enabled pool in xo-server-db matches '%s'.\n" % name_filter)
         stderr.write("Enabled pools:\n")
         for row in rows:
-            stderr.write("  %s (%s)\n" % (row.name, row.host))
+            stderr.write("  %s (%s)\n" % (row.name, db_address(row.record)))
         return (SELECT_NO_MATCH, None)
 
     try:
@@ -549,8 +553,10 @@ def select_pool(name_filter, stdin=None, stderr=None):
         return (SELECT_OK, rows[0])
 
     stderr.write("\n%s\n" % colors.cyan("== Multiple pools found in XOA =="))
+    # each pool by the address the run will dial - the banner's - and never by the host
+    # field itself, which may carry a password ('https://root:pw@10.0.0.5')
     for i, row in enumerate(rows, 1):
-        stderr.write("%d - %s (%s)\n" % (i, row.name, row.host))
+        stderr.write("%d - %s (%s)\n" % (i, row.name, db_address(row.record)))
     stderr.write("\n")
 
     while True:

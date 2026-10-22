@@ -41,7 +41,7 @@ def stuck_row(pid, age, cmd, module="cifs", frame="open_shroot+0x43/0x210 [cifs]
     return {"pid": pid, "age": age, "cmd": cmd, "module": module, "frame": frame}
 
 
-def mount_row(target, state, source="//10.10.10.11/XCP_ISO", fstype="cifs", **extra):
+def mount_row(target, state, source="//192.0.2.11/XCP_ISO", fstype="cifs", **extra):
     row = {"source": source, "target": target, "type": fstype, "state": state}
     row.update(extra)
     return row
@@ -70,8 +70,8 @@ def test_proc_stat_on_a_truncated_or_empty_line():
 
 MOUNTS = """\
 /dev/sda1 / ext3 rw,relatime 0 0
-//10.10.10.11/XCP_ISO /run/sr-mount/e512c88e cifs rw,vers=3.0,soft 0 0
-10.10.10.11:/NFS_export /run/sr-mount/8bdf2ce0 nfs rw,vers=3,hard 0 0
+//192.0.2.11/XCP_ISO /run/sr-mount/e512c88e cifs rw,vers=3.0,soft 0 0
+192.0.2.11:/NFS_export /run/sr-mount/8bdf2ce0 nfs rw,vers=3,hard 0 0
 tmpfs /run tmpfs rw 0 0
 //nas/Some\\040Share /mnt/with\\040space cifs rw 0 0
 """
@@ -241,7 +241,7 @@ def test_a_process_on_the_age_floor_is_not_dropped_for_being_caught_early(monkey
 # --------------------------------------------------------------------------------------
 
 PROBE_SPEC = {"types": config.NETWORK_FS_TYPES, "probe_timeout": 10}
-DEAD_MOUNT = "//10.10.10.11/XCP_ISO /run/sr-mount/e512c88e cifs rw,vers=3.0,soft 0 0\n"
+DEAD_MOUNT = "//192.0.2.11/XCP_ISO /run/sr-mount/e512c88e cifs rw,vers=3.0,soft 0 0\n"
 
 
 def probe(monkeypatch, mounts, budget=None, answer=None, spec=None):
@@ -421,7 +421,7 @@ def test_a_mount_that_never_answered_is_a_finding_naming_the_source():
         mount_row("/run/sr-mount/8bdf2ce0", "ok", fstype="nfs", seconds=0.01)])))
     assert line.status == FLAG
     assert "1 of 2 not responding" in line.text
-    assert "//10.10.10.11/XCP_ISO" in line.detail_text
+    assert "//192.0.2.11/XCP_ISO" in line.detail_text
 
 
 def test_not_probed_is_unknown_and_never_green():
@@ -482,9 +482,9 @@ def test_the_kernels_own_hung_task_line_is_caught():
 
 
 def test_a_server_stall_from_either_filesystem_is_caught():
-    for ring in ("[Sun Sep  7 04:02:03 2026] nfs: server 10.10.10.11 not responding, "
+    for ring in ("[Sun Sep  7 04:02:03 2026] nfs: server 192.0.2.11 not responding, "
                  "still trying\n",
-                 "[Sun Sep  7 04:02:03 2026] CIFS VFS: Server 10.10.10.11 has not "
+                 "[Sun Sep  7 04:02:03 2026] CIFS VFS: Server 192.0.2.11 has not "
                  "responded in 120 seconds. Reconnecting...\n"):
         line = checks.mount_stalls(host(mount_stall_scan=fact([]), dmesg=fact(ring)))
         assert line.status == FLAG, ring

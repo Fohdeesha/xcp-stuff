@@ -47,7 +47,7 @@ import unicodedata
 # ======================================================================================
 # --- config ----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "3.20"
+SCRIPT_VERSION = "3.21"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
@@ -208,7 +208,7 @@ MOUNT_PROBE_RESERVE = 60         # run-budget seconds kept back for everything t
 # Mounts already prints from /proc/mounts, for a condition Stuck Processes already reports.
 MOUNT_STALL_PHRASES = [
     # verbatim from a live 8.3.0 dom0 whose SMB server had stopped answering:
-    # "CIFS VFS: Server 10.10.10.11 has not responded in 120 seconds. Reconnecting..."
+    # "CIFS VFS: Server 192.0.2.11 has not responded in 120 seconds. Reconnecting..."
     "has not responded in",
     "not responding",            # nfs: "server X not responding, still trying"
     "blocked for more than",     # the kernel's hung-task detector - see the note above on
@@ -567,6 +567,17 @@ def split_host_port(text):
 # or IPv4 address, an optional :port and an optional /path
 _XO_URL_RE = re.compile(r"^(?:(https?:)/*)?(?:(([^:]*)(?::([^@]*))?)@)?"
                         r"(\[[^\]]+\]|[^:/]+)(?::([0-9]+))?(/[^?#]*)?$")
+# what is left of anything that pattern refuses once a scheme (in any case: XO matches it
+# in lower case only), credentials, and whatever follows the host - a path, a query, a
+# fragment - are taken off
+_LOOSE_URL_RE = re.compile(r"^(?:https?:)?/*(?:[^@/?#]*@)?([^/?#]*)", re.IGNORECASE)
+_SCHEME_RE = re.compile(r"^\s*https?:", re.IGNORECASE)
+
+
+def has_url_scheme(text):
+    """True for an address written as a URL - 'https://10.0.0.5', copied out of XO's own
+    list of servers or a browser - rather than as address[:port]."""
+    return bool(_SCHEME_RE.match(text or ""))
 
 
 def xo_server_address(text):
@@ -574,12 +585,17 @@ def xo_server_address(text):
 
     XO takes more than an address there - 'https://', credentials before an '@', a path -
     and a record written that way used to reach ssh whole, as 'root@http://...', failing
-    the run before it began. What XO's pattern does not accept is read as address[:port],
-    as before. The port is the XAPI port XO connects on, never an ssh port.
+    the run before it began. The port is the XAPI port XO connects on, never an ssh port.
+
+    What XO's pattern refuses ('HTTPS://', a query string, an IPv6 address with a scheme
+    and no brackets) is a record XO cannot connect with either, which may be the very
+    reason the pool is being checked: it is read for whatever address is left once the
+    scheme, credentials and anything after the host are off.
     """
-    m = _XO_URL_RE.match(text.strip())
+    text = (text or "").strip()
+    m = _XO_URL_RE.match(text)
     if not m:
-        return split_host_port(text)
+        return split_host_port(_LOOSE_URL_RE.match(text).group(1))
     host = m.group(5)
     if host.startswith("["):
         host = host[1:-1]
@@ -605,6 +621,9 @@ def pool_member_addresses(value):
     the address it connects to, so it can fail over to a survivor when the master dies. It
     is stored as a JSON string inside the record; older XO has no such field, and anything
     that does not read as a list of strings is no list at all.
+
+    An IPv6 address is stored in brackets (xen-api's formatHostname, so it can go straight
+    into a URL), which no address comparison would ever match; they are taken off.
     """
     if not value or not isinstance(value, str):
         return []
@@ -614,7 +633,15 @@ def pool_member_addresses(value):
         return []
     if not isinstance(parsed, list):
         return []
-    return [a for a in parsed if isinstance(a, str) and a]
+    out = []
+    for address in parsed:
+        if not isinstance(address, str):
+            continue
+        if address.startswith("[") and address.endswith("]"):
+            address = address[1:-1]
+        if address:
+            out.append(address)
+    return out
 
 
 def parse_host_list(text):
@@ -1245,7 +1272,7 @@ def rollup_repeats(lines, threshold=3):
 
     A run of `threshold` or more prints its first line, then a count and the span:
 
-        [Mon Jun  1 17:55:16 2026] nfs: server 172.21.203.251 not responding, timed out
+        [Mon Jun  1 17:55:16 2026] nfs: server 192.0.2.251 not responding, timed out
         ... repeated 24668 times, through [Mon Jun  1 22:41:03 2026]
 
     Shorter runs print verbatim - a summary of two lines is longer than the two lines.
@@ -4828,6 +4855,10 @@ def match_record(want, records, resolve_want=False):
     when the caller says it is a host (resolve_want), never when it may be a password.
     """
     want = (want or "").strip()
+    if parsers.has_url_scheme(want):
+        # written the way XO shows an address ('https://10.0.0.5/'), so read the way XO
+        # reads one - as every record's host field is
+        want = parsers.xo_server_address(want)[0]
     if not want:
         return None, ""
     for rec in records:
@@ -4997,7 +5028,7 @@ def select_pool(name_filter, stdin=None, stderr=None):
         stderr.write("ERROR: no enabled pool in xo-server-db matches '%s'.\n" % name_filter)
         stderr.write("Enabled pools:\n")
         for row in rows:
-            stderr.write("  %s (%s)\n" % (row.name, row.host))
+            stderr.write("  %s (%s)\n" % (row.name, db_address(row.record)))
         return (SELECT_NO_MATCH, None)
 
     try:
@@ -5009,8 +5040,10 @@ def select_pool(name_filter, stdin=None, stderr=None):
         return (SELECT_OK, rows[0])
 
     stderr.write("\n%s\n" % colors.cyan("== Multiple pools found in XOA =="))
+    # each pool by the address the run will dial - the banner's - and never by the host
+    # field itself, which may carry a password ('https://root:pw@10.0.0.5')
     for i, row in enumerate(rows, 1):
-        stderr.write("%d - %s (%s)\n" % (i, row.name, row.host))
+        stderr.write("%d - %s (%s)\n" % (i, row.name, db_address(row.record)))
     stderr.write("\n")
 
     while True:
@@ -6026,7 +6059,7 @@ def xostor_nodes(pool):
 def _linstor_node_addresses(text):
     """{address: node} out of the Addresses column of 'linstor n l'.
 
-    A cell reads '172.16.210.84:3366 (PLAIN)' - the satellite's address, its port and the
+    A cell reads '192.0.2.84:3366 (PLAIN)' - the satellite's address, its port and the
     connection type. An older table without an Addresses column simply names nobody.
     """
     header, rows = _linstor_table(text)
@@ -7152,7 +7185,9 @@ Health-check every host of an XCP-ng pool, from a Xen Orchestra appliance.
 All arguments are optional. With no host, the enabled pools in xo-server-db
 are listed to pick from - a single enabled pool, or a non-interactive run,
 takes the first. With no password, it is looked up in xo-server-db. Every host
-in the pool is checked unless -s says otherwise.
+in the pool is checked unless -s says otherwise. A host may also be given the
+way XO shows it, https:// and all; the port in such an address is the one XO
+reaches xapi on, so ssh still goes to port 22.
 
   -f, --filter          only print checks that flagged; passing and
                         informational lines are hidden, sections included
@@ -7555,6 +7590,22 @@ def resolve_target_xoa(run, args):
         host = parsers.xo_server_address(selected.host)[0]
         run.transport.ssh_port = 22
         run.server = selected.record
+        if not host:
+            # 'https://' with nothing after it: ssh handed an empty host prints its own
+            # usage text, which says nothing about where the address came from
+            sys.stderr.write("ERROR: the address xo-server-db holds for pool '%s' names no "
+                             "host.\n       Fix it in XO, or give the master's IP as an "
+                             "argument instead.\n" % selected.name)
+            sys.exit(1)
+    elif parsers.has_url_scheme(args[0]):
+        # given the way XO shows a pool's address - 'https://10.0.0.5', copied out of its
+        # list of servers - and read the way XO reads one. The port of such an address is
+        # the one xapi answers on, not sshd's, so ssh stays on 22 here too
+        host = parsers.xo_server_address(args[0])[0]
+        run.transport.ssh_port = 22
+        if not host:
+            sys.stderr.write("ERROR: '%s' names no host.\n" % args[0])
+            usage(run.run_env)
     else:
         host, port = parsers.split_host_port(args[0])
         run.transport.ssh_port = port or 22
@@ -8454,7 +8505,7 @@ def _module(name, exported):
 config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DMESG_MAX_LINES', 'DMESG_ROLLUP_MIN', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MOUNT_PROBE_RESERVE', 'MOUNT_PROBE_TIMEOUT', 'MOUNT_STALL_FILES', 'MOUNT_STALL_PHRASES', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'NETWORK_FS_TYPES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'PROGRESS_INTERVAL', 'REMOTE_CMD_TIMEOUT', 'RUN_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'STUCK_MAX_LINES', 'STUCK_MIN_AGE', 'STUCK_RECHECK_DELAY', 'STUCK_SAMPLES', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOA_STOCK_PLUGINS', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_QCOW2_MAX_LINES', 'XO_DNS_TIMEOUT', 'XO_PLUGIN_LOOKUP_PATHS', 'XO_PLUGIN_PREFIX', 'XO_PLUGIN_SCOPE_DIR', 'XO_PLUGIN_SCOPE_PREFIX', 'XO_REDIS_TIMEOUT'])
 colors = _module('colors', ['CYAN', 'GREEN', 'RESET', 'YELLOW', 'cyan', 'green', 'init', 'strip_ansi', 'yellow'])
 result = _module('result', ['FLAG', 'Fact', 'INFO', 'Line', 'MISSING', 'OK', 'UNKNOWN', 'flag', 'guard', 'info', 'ok', 'pinned', 'raw', 'unknown', 'wrap'])
-parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', '_LINK_RE', '_MANIFEST_PKG_RE', '_MTU_RE', '_PARAM_RE', '_PREMIUM_SUFFIX', '_TS_RE', '_XO_URL_RE', '_cidr_range', '_ids_among', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'backup_runners', 'cap_lines', 'classify_multipath_path', 'classify_xo_plugins', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'format_age', 'has_overlapping_subnets', 'host_records_from_state_db', 'http_proxy_address', 'ip_literal', 'job_field', 'job_touches_pool', 'manifest_diff', 'manifest_plugin_names', 'manifest_versions', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pool_conf', 'parse_timedatectl', 'parse_xe_records', 'plugin_block', 'pool_member_addresses', 'rollup_repeats', 'round_1dp', 'split_host_port', 'split_timestamp', 'truncate_block', 'xo_pattern_match', 'xo_server_address', 'xo_simple_ids'])
+parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', '_LINK_RE', '_LOOSE_URL_RE', '_MANIFEST_PKG_RE', '_MTU_RE', '_PARAM_RE', '_PREMIUM_SUFFIX', '_SCHEME_RE', '_TS_RE', '_XO_URL_RE', '_cidr_range', '_ids_among', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'backup_runners', 'cap_lines', 'classify_multipath_path', 'classify_xo_plugins', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'format_age', 'has_overlapping_subnets', 'has_url_scheme', 'host_records_from_state_db', 'http_proxy_address', 'ip_literal', 'job_field', 'job_touches_pool', 'manifest_diff', 'manifest_plugin_names', 'manifest_versions', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pool_conf', 'parse_timedatectl', 'parse_xe_records', 'plugin_block', 'pool_member_addresses', 'rollup_repeats', 'round_1dp', 'split_host_port', 'split_timestamp', 'truncate_block', 'xo_pattern_match', 'xo_server_address', 'xo_simple_ids'])
 model = _module('model', ['Host', 'Pool', 'ntp_match', 'ram_match'])
 collectorsrc = _module('collectorsrc', ['EMBEDDED', 'collector_source'])
 transport = _module('transport', ['ASKPASS_ENV', 'ASKPASS_SCRIPT', 'AUTH_ASKPASS', 'AUTH_SSHPASS', 'BEGIN_MARKER', 'CollectError', 'END_MARKER', 'Transport', '_DEBUG_LOCK', '_LIVE', '_LIVE_LOCK', '_REMOTE_LAUNCH', '_REMOTE_LAUNCH_PINNED', '_kill_tree', '_remote_launch', 'cleanup_work_dir', 'debug', 'ensure_sshpass', 'have', 'kill_all_children', 'make_work_dir', 'run_local_cmd', 'which', 'write_askpass'])

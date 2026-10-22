@@ -341,8 +341,8 @@ def test_xostor_controller_none_is_a_failure():
 LINSTOR_NODES_WITH_ADDRESSES = """+-------------------------------------------------------+
 | Node  | NodeType | Addresses                  | State  |
 |=======================================================|
-| xen12 | COMBINED | 172.16.210.84:3366 (PLAIN) | Online |
-| xen13 | COMBINED | 172.16.210.85:3366 (PLAIN) | Online |
+| node12 | COMBINED | 192.0.2.84:3366 (PLAIN) | Online |
+| node13 | COMBINED | 192.0.2.85:3366 (PLAIN) | Online |
 +-------------------------------------------------------+
 """
 
@@ -353,25 +353,25 @@ def _plain(line):
 
 
 def test_xostor_controller_names_the_host_from_the_pool_host_list():
-    p = pool(linstor_controller=fact("linstor://172.16.210.84\n"))
-    line = checks.xostor_controller(p, {"172.16.210.84": "Xen12", "172.16.210.85": "Xen13"})
+    p = pool(linstor_controller=fact("linstor://192.0.2.84\n"))
+    line = checks.xostor_controller(p, {"192.0.2.84": "Node12", "192.0.2.85": "Node13"})
     assert line.status == OK
-    assert _plain(line) == "172.16.210.84 (Xen12)"
+    assert _plain(line) == "192.0.2.84 (Node12)"
 
 
 def test_xostor_controller_falls_back_to_the_linstor_node_list():
     # a solo host run only knows its own name from xapi; linstor names every node
-    p = pool(linstor_controller=fact("linstor://172.16.210.85\n"),
+    p = pool(linstor_controller=fact("linstor://192.0.2.85\n"),
              linstor_nodes=fact(LINSTOR_NODES_WITH_ADDRESSES))
-    assert _plain(checks.xostor_controller(p, {})) == "172.16.210.85 (xen13)"
-    assert _plain(checks.xostor_controller(p)) == "172.16.210.85 (xen13)"
+    assert _plain(checks.xostor_controller(p, {})) == "192.0.2.85 (node13)"
+    assert _plain(checks.xostor_controller(p)) == "192.0.2.85 (node13)"
 
 
 def test_xostor_controller_prefers_the_name_the_host_blocks_use():
-    p = pool(linstor_controller=fact("linstor://172.16.210.84\n"),
+    p = pool(linstor_controller=fact("linstor://192.0.2.84\n"),
              linstor_nodes=fact(LINSTOR_NODES_WITH_ADDRESSES))
-    line = checks.xostor_controller(p, {"172.16.210.84": "Xen12"})
-    assert _plain(line) == "172.16.210.84 (Xen12)"
+    line = checks.xostor_controller(p, {"192.0.2.84": "Node12"})
+    assert _plain(line) == "192.0.2.84 (Node12)"
 
 
 def test_xostor_controller_with_no_name_to_give_prints_the_address_alone():
@@ -387,14 +387,14 @@ def test_xostor_controller_with_no_name_to_give_prints_the_address_alone():
 
 
 def test_xostor_controller_matches_an_address_that_carries_a_port():
-    p = pool(linstor_controller=fact("linstor://172.16.210.84:3370\n"))
-    line = checks.xostor_controller(p, {"172.16.210.84": "Xen12"})
-    assert _plain(line) == "172.16.210.84:3370 (Xen12)"
+    p = pool(linstor_controller=fact("linstor://192.0.2.84:3370\n"))
+    line = checks.xostor_controller(p, {"192.0.2.84": "Node12"})
+    assert _plain(line) == "192.0.2.84:3370 (Node12)"
 
 
 def test_linstor_node_addresses_reads_the_table():
     assert checks._linstor_node_addresses(LINSTOR_NODES_WITH_ADDRESSES) == {
-        "172.16.210.84": "xen12", "172.16.210.85": "xen13"}
+        "192.0.2.84": "node12", "192.0.2.85": "node13"}
     assert checks._linstor_node_addresses(LINSTOR_NODES) == {}
     assert checks._linstor_node_addresses("") == {}
 
@@ -408,7 +408,7 @@ LINSTOR_FAULTY_EMPTY = """+-----------------------------------------------------
 LINSTOR_FAULTY_ONE = """+------------------------------------------------------------+
 | ResourceName | Node  | Port | Usage  | Conns | State       |
 |============================================================|
-| xcp-volume-1 | xen12 | 7000 | Unused | Ok    | Inconsistent |
+| xcp-volume-1 | node12 | 7000 | Unused | Ok    | Inconsistent |
 +------------------------------------------------------------+
 """
 
@@ -418,7 +418,7 @@ def test_linstor_table_reader_is_one_reader_for_every_linstor_line():
     any of the glyphs is not a row, and ANSI never reaches a cell."""
     header, rows = checks._linstor_table(LINSTOR_NODES_WITH_ADDRESSES)
     assert header == ["Node", "NodeType", "Addresses", "State"]
-    assert [r[0] for r in rows] == ["xen12", "xen13"]
+    assert [r[0] for r in rows] == ["node12", "node13"]
     assert checks._linstor_column(LINSTOR_NODES, "State") == ["Online", "OFFLINE"]
     assert checks._linstor_column(LINSTOR_NODES, "Nope") == []
     coloured = LINSTOR_NODES.replace("OFFLINE", "\x1b[31mOFFLINE\x1b[0m")

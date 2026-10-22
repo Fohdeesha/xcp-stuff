@@ -72,6 +72,17 @@ def split_host_port(text):
 # or IPv4 address, an optional :port and an optional /path
 _XO_URL_RE = re.compile(r"^(?:(https?:)/*)?(?:(([^:]*)(?::([^@]*))?)@)?"
                         r"(\[[^\]]+\]|[^:/]+)(?::([0-9]+))?(/[^?#]*)?$")
+# what is left of anything that pattern refuses once a scheme (in any case: XO matches it
+# in lower case only), credentials, and whatever follows the host - a path, a query, a
+# fragment - are taken off
+_LOOSE_URL_RE = re.compile(r"^(?:https?:)?/*(?:[^@/?#]*@)?([^/?#]*)", re.IGNORECASE)
+_SCHEME_RE = re.compile(r"^\s*https?:", re.IGNORECASE)
+
+
+def has_url_scheme(text):
+    """True for an address written as a URL - 'https://10.0.0.5', copied out of XO's own
+    list of servers or a browser - rather than as address[:port]."""
+    return bool(_SCHEME_RE.match(text or ""))
 
 
 def xo_server_address(text):
@@ -79,12 +90,17 @@ def xo_server_address(text):
 
     XO takes more than an address there - 'https://', credentials before an '@', a path -
     and a record written that way used to reach ssh whole, as 'root@http://...', failing
-    the run before it began. What XO's pattern does not accept is read as address[:port],
-    as before. The port is the XAPI port XO connects on, never an ssh port.
+    the run before it began. The port is the XAPI port XO connects on, never an ssh port.
+
+    What XO's pattern refuses ('HTTPS://', a query string, an IPv6 address with a scheme
+    and no brackets) is a record XO cannot connect with either, which may be the very
+    reason the pool is being checked: it is read for whatever address is left once the
+    scheme, credentials and anything after the host are off.
     """
-    m = _XO_URL_RE.match(text.strip())
+    text = (text or "").strip()
+    m = _XO_URL_RE.match(text)
     if not m:
-        return split_host_port(text)
+        return split_host_port(_LOOSE_URL_RE.match(text).group(1))
     host = m.group(5)
     if host.startswith("["):
         host = host[1:-1]
@@ -110,6 +126,9 @@ def pool_member_addresses(value):
     the address it connects to, so it can fail over to a survivor when the master dies. It
     is stored as a JSON string inside the record; older XO has no such field, and anything
     that does not read as a list of strings is no list at all.
+
+    An IPv6 address is stored in brackets (xen-api's formatHostname, so it can go straight
+    into a URL), which no address comparison would ever match; they are taken off.
     """
     if not value or not isinstance(value, str):
         return []
@@ -119,7 +138,15 @@ def pool_member_addresses(value):
         return []
     if not isinstance(parsed, list):
         return []
-    return [a for a in parsed if isinstance(a, str) and a]
+    out = []
+    for address in parsed:
+        if not isinstance(address, str):
+            continue
+        if address.startswith("[") and address.endswith("]"):
+            address = address[1:-1]
+        if address:
+            out.append(address)
+    return out
 
 
 def parse_host_list(text):
@@ -750,7 +777,7 @@ def rollup_repeats(lines, threshold=3):
 
     A run of `threshold` or more prints its first line, then a count and the span:
 
-        [Mon Jun  1 17:55:16 2026] nfs: server 172.21.203.251 not responding, timed out
+        [Mon Jun  1 17:55:16 2026] nfs: server 192.0.2.251 not responding, timed out
         ... repeated 24668 times, through [Mon Jun  1 22:41:03 2026]
 
     Shorter runs print verbatim - a summary of two lines is longer than the two lines.

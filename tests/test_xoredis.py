@@ -99,7 +99,7 @@ def serve():
 RECORDS = {
     "id-a": {"enabled": "true", "host": "192.168.1.13", "label": "sec-01",
              "poolNameLabel": "XEN-SECONDARY", "password": "p13"},
-    "id-b": {"host": "192.168.4.16", "label": "2028 East", "enabled": "true",
+    "id-b": {"host": "192.168.4.16", "label": "1st Avenue", "enabled": "true",
              "password": "p16"},
 }
 
@@ -121,7 +121,7 @@ def test_the_records_come_back_whole(serve):
     assert got == [
         {"enabled": "true", "host": "192.168.1.13", "label": "sec-01",
          "poolNameLabel": "XEN-SECONDARY", "password": "p13", "id": "id-a"},
-        {"host": "192.168.4.16", "label": "2028 East", "enabled": "true",
+        {"host": "192.168.4.16", "label": "1st Avenue", "enabled": "true",
          "password": "p16", "id": "id-b"},
     ]
 

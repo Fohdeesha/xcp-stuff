@@ -109,7 +109,7 @@ DB = (
     r"{ enabled: 'true', host: '192.168.1.13', label: 'sec-01',"
     r" poolNameLabel: 'XEN-SECONDARY', password: 'p13' }" "\n"
     r"{ enabled: 'true', host: '192.168.4.16', label: 'east-01',"
-    r" poolNameLabel: '2028 East', password: 'p16' }" "\n"
+    r" poolNameLabel: '1st Avenue', password: 'p16' }" "\n"
     r"{ host: 'http://192.168.1.229', label: 'never-connected', password: 'p229' }" "\n"
     r"{ enabled: 'false', host: '192.168.1.99', label: 'switched-off',"
     r" poolNameLabel: 'OFF', password: 'p\\99' }" "\n"
@@ -264,10 +264,10 @@ def test_reset_cache_forgets_the_failure_as_well(monkeypatch):
 
 
 def test_the_picker_order_is_the_sorted_one_the_cache_did_not_reorder(db):
-    """2028 East is entry 1, not entry 3 - digits before letters, ICU root collation.
+    """1st Avenue is entry 1, not entry 3 - digits before letters, ICU root collation.
     This decides which pool a no-args cron run checks."""
-    assert [r.name for r in xodb.enabled_servers()] == ["2028 East", "XEN-SECONDARY"]
-    assert xodb.select_pool("")[1].name == "2028 East"
+    assert [r.name for r in xodb.enabled_servers()] == ["1st Avenue", "XEN-SECONDARY"]
+    assert xodb.select_pool("")[1].name == "1st Avenue"
 
 
 def test_reset_cache_really_forgets(db):
@@ -289,7 +289,7 @@ REDIS_RECORDS = [
     {"enabled": "true", "host": "192.168.1.13", "label": "sec-01",
      "poolNameLabel": "XEN-SECONDARY", "password": "p13", "id": "a"},
     {"enabled": "true", "host": "192.168.4.16", "label": "east-01",
-     "poolNameLabel": "2028 East", "password": "p16", "id": "b"},
+     "poolNameLabel": "1st Avenue", "password": "p16", "id": "b"},
     {"host": "http://192.168.1.229", "label": "never-connected", "password": "p229",
      "id": "c"},
     {"enabled": "false", "host": "192.168.1.99", "label": "switched-off",
@@ -318,7 +318,7 @@ def fast(monkeypatch):
 
 
 def test_the_fast_path_answers_and_the_cli_is_never_started(db, fast):
-    assert [r.name for r in xodb.enabled_servers()] == ["2028 East", "XEN-SECONDARY"]
+    assert [r.name for r in xodb.enabled_servers()] == ["1st Avenue", "XEN-SECONDARY"]
     assert xodb.password_for("192.168.1.13") == ("p13", False)
     assert db.calls == []
     assert fast == ["/usr/local/bin/xo-server-db"]
@@ -343,7 +343,7 @@ def test_both_paths_give_the_callers_the_same_answers(db, fast, monkeypatch):
 
 def test_a_decline_falls_back_to_the_cli(db, monkeypatch, fast):
     monkeypatch.setattr(xoredis, "read_server_records", _decline)
-    assert [r.name for r in xodb.enabled_servers()] == ["2028 East", "XEN-SECONDARY"]
+    assert [r.name for r in xodb.enabled_servers()] == ["1st Avenue", "XEN-SECONDARY"]
     assert db.calls == [["xo-server-db", "ls", "server"]]
 
 

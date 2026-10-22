@@ -46,7 +46,9 @@ Health-check every host of an XCP-ng pool, from a Xen Orchestra appliance.
 All arguments are optional. With no host, the enabled pools in xo-server-db
 are listed to pick from - a single enabled pool, or a non-interactive run,
 takes the first. With no password, it is looked up in xo-server-db. Every host
-in the pool is checked unless -s says otherwise.
+in the pool is checked unless -s says otherwise. A host may also be given the
+way XO shows it, https:// and all; the port in such an address is the one XO
+reaches xapi on, so ssh still goes to port 22.
 
   -f, --filter          only print checks that flagged; passing and
                         informational lines are hidden, sections included
@@ -449,6 +451,22 @@ def resolve_target_xoa(run, args):
         host = parsers.xo_server_address(selected.host)[0]
         run.transport.ssh_port = 22
         run.server = selected.record
+        if not host:
+            # 'https://' with nothing after it: ssh handed an empty host prints its own
+            # usage text, which says nothing about where the address came from
+            sys.stderr.write("ERROR: the address xo-server-db holds for pool '%s' names no "
+                             "host.\n       Fix it in XO, or give the master's IP as an "
+                             "argument instead.\n" % selected.name)
+            sys.exit(1)
+    elif parsers.has_url_scheme(args[0]):
+        # given the way XO shows a pool's address - 'https://10.0.0.5', copied out of its
+        # list of servers - and read the way XO reads one. The port of such an address is
+        # the one xapi answers on, not sshd's, so ssh stays on 22 here too
+        host = parsers.xo_server_address(args[0])[0]
+        run.transport.ssh_port = 22
+        if not host:
+            sys.stderr.write("ERROR: '%s' names no host.\n" % args[0])
+            usage(run.run_env)
     else:
         host, port = parsers.split_host_port(args[0])
         run.transport.ssh_port = port or 22
