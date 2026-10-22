@@ -19,7 +19,10 @@ Values are only ever read as data. Nothing here evaluates anything.
 """
 
 import re
+import socket
 import sys
+import threading
+import time
 import unicodedata
 
 import colors
@@ -148,12 +151,13 @@ def _sort_key(name):
 
 
 class Server(object):
-    __slots__ = ("host", "name", "search")
+    __slots__ = ("host", "name", "search", "record")
 
-    def __init__(self, host, name, search):
+    def __init__(self, host, name, search, record=None):
         self.host = host
         self.name = name
         self.search = search
+        self.record = record if record is not None else {}
 
 
 def have_xo_server_db():
@@ -162,6 +166,7 @@ def have_xo_server_db():
 
 _ALL_SERVERS = None     # the one `xo-server-db ls server` scan; None until it is read
 _READ_ERROR = ""        # why that scan failed, when it did; "" while it has not
+_RESOLVED = {}          # db host name -> frozenset of its addresses, looked up once a run
 
 
 def _describe_failure(rc, err):
@@ -260,6 +265,7 @@ def reset_cache():
     global _ALL_SERVERS, _READ_ERROR
     _ALL_SERVERS = None
     _READ_ERROR = ""
+    _RESOLVED.clear()
 
 
 def enabled_servers():
@@ -275,9 +281,132 @@ def enabled_servers():
         name = pool_name or label or "(unnamed)"
         # -n matches EITHER name: a pool can show as XEN-PRIMARY while the server label a
         # user remembers it by is XEN-MAIN-01
-        rows.append(Server(rec["host"], name, (pool_name + " " + label).lower()))
+        rows.append(Server(rec["host"], name, (pool_name + " " + label).lower(), rec))
     rows.sort(key=lambda r: _sort_key(r.name))
     return rows
+
+
+# --------------------------------------------------------------------------------------
+# which record an address belongs to
+# --------------------------------------------------------------------------------------
+# A record's `host` is whatever was typed into XO - an IP, a name, sometimes with a scheme
+# or a port - and a pool stored by name used to be invisible to every lookup made with
+# one of its addresses: '-n a01 192.0.2.60' took the master's own address for a
+# password and failed as a login error, and 'health.py 192.0.2.60' said the master was
+# not in xo-db. Three kinds of evidence are tried, strongest first, and a weaker one is
+# only consulted when no record at all answers to a stronger one.
+
+def db_address(rec):
+    """The bare address in a record's `host`, as XO itself reads that field."""
+    return parsers.xo_server_address(rec.get("host") or "")[0]
+
+
+def _same_address(a, b):
+    """Two spellings of one address: case-blind for names, canonical for IPs."""
+    if not a or not b:
+        return False
+    if a.lower() == b.lower():
+        return True
+    ip = parsers.ip_literal(a)
+    return ip is not None and ip == parsers.ip_literal(b)
+
+
+def _resolve(names):
+    """{name: frozenset of its addresses}, each name looked up at most once per run.
+
+    Only ever handed xo-db's own host names - never anything a user typed in the password
+    position, which would put a root password into a DNS query. The lookups run at once
+    and the whole set gets config.XO_DNS_TIMEOUT: an XOA whose DNS has gone away must
+    not hang the run, and a name that has not answered by then has no addresses, which
+    makes a match less likely and never more. The threads are daemons, so one wedged in
+    the resolver cannot hold the process at exit.
+    """
+    todo = sorted(set(n for n in names if n and n not in _RESOLVED))
+    if todo:
+        found = {}
+
+        def lookup(name):
+            try:
+                infos = socket.getaddrinfo(name, None)
+            except (OSError, UnicodeError, ValueError):
+                # gaierror is an OSError; an IDNA-invalid name is a UnicodeError and an
+                # embedded NUL a ValueError. Each means this name has no address to give.
+                found[name] = frozenset()
+                return
+            found[name] = frozenset(a for a in (parsers.ip_literal(i[4][0]) for i in infos) if a)
+
+        threads = []
+        for name in todo:
+            t = threading.Thread(target=lookup, args=(name,))
+            t.daemon = True
+            t.start()
+            threads.append(t)
+        deadline = time.time() + config.XO_DNS_TIMEOUT
+        for t in threads:
+            t.join(max(0.0, deadline - time.time()))
+        for name in todo:
+            _RESOLVED[name] = found.get(name, frozenset())
+            if name not in found:
+                transport.debug("xo-db: no DNS answer for %s within %ss"
+                                % (name, config.XO_DNS_TIMEOUT))
+    return dict((n, _RESOLVED.get(n, frozenset())) for n in names)
+
+
+def match_record(want, records, resolve_want=False):
+    """(record, how) for the first record `want` is an address of, or (None, "").
+
+    `how` says what made it a match, for messages that have to explain one:
+      "host"    the record's own host field names it
+      "member"  it is one of the pool members' addresses XO recorded (poolMembersAddresses,
+                xo-server since July 2026), slaves included - which is what lets a slave's
+                address find the pool's password, since every member shares it
+      "dns"     it and the record's host name resolve to a common address
+
+    DNS is the last resort and only ever resolves xo-db's own names - plus `want` itself
+    when the caller says it is a host (resolve_want), never when it may be a password.
+    """
+    want = (want or "").strip()
+    if not want:
+        return None, ""
+    for rec in records:
+        if rec.get("host") == want or _same_address(db_address(rec), want):
+            return rec, "host"
+    for rec in records:
+        if any(_same_address(m, want)
+               for m in parsers.pool_member_addresses(rec.get("poolMembersAddresses"))):
+            return rec, "member"
+
+    want_ip = parsers.ip_literal(want)
+    if want_ip is None and not resolve_want:
+        return None, ""
+    if want_ip is not None:
+        wanted = frozenset([want_ip])
+    else:
+        wanted = _resolve([want])[want]
+        if not wanted:
+            return None, ""
+        # a name that resolves to an address a record holds outright, or to one of its
+        # members' addresses
+        for rec in records:
+            held = [db_address(rec)] + parsers.pool_member_addresses(
+                rec.get("poolMembersAddresses"))
+            if any(parsers.ip_literal(a) in wanted for a in held):
+                return rec, "dns"
+    named = [rec for rec in records if parsers.ip_literal(db_address(rec)) is None]
+    resolved = _resolve([db_address(rec) for rec in named])
+    for rec in named:
+        if resolved.get(db_address(rec), frozenset()) & wanted:
+            return rec, "dns"
+    return None, ""
+
+
+def server_for_host(host):
+    """(record, how) for a host given as an argument, or (None, "").
+
+    Searched across ALL records, not the enabled ones - a host given as an argument may
+    well be a server XO has disabled, and its password must still be found.
+    """
+    return match_record(host, all_servers(), resolve_want=True)
 
 
 def password_for(host):
@@ -286,32 +415,41 @@ def password_for(host):
     Answered out of the one scan rather than with a second `xo-server-db ls server
     host=...`: the indexed query returns the same record field for field and costs another
     3.3s (see all_servers).
-
-    Searched across ALL records, not the enabled ones - a host given as an argument may
-    well be a server XO has disabled, and the indexed lookup found its password before.
     """
-    for rec in all_servers():
-        if rec.get("host") == host:
-            pwd = rec.get("password")
-            if not pwd:
-                return (None, False)
-            return (pwd, "\\" in pwd)
-    return (None, False)
+    rec, _how = server_for_host(host)
+    return record_password(rec)
 
 
-def pool_name_for_host(want):
+def record_password(rec):
+    """(password, has_backslash) or (None, False) for one record."""
+    pwd = (rec or {}).get("password")
+    if not pwd:
+        return (None, False)
+    return (pwd, "\\" in pwd)
+
+
+def enabled_server_for(want, resolve_want=True):
+    """(Server, how) among the enabled pools, or (None, ""). resolve_want=False for a
+    value that may be a password: it is then matched against what xo-db holds, and only
+    xo-db's own names are looked up."""
+    if not have_xo_server_db():
+        return None, ""
+    rows = enabled_servers()
+    rec, how = match_record(want, [row.record for row in rows], resolve_want)
+    for row in rows:
+        if row.record is rec:
+            return row, how
+    return None, ""
+
+
+def pool_name_for_host(want, resolve_want=True):
     """The db's name for a host given as an argument, so every run can name its target.
 
-    Quiet and never an error: a slave via -s, a pool XO does not manage, or no
-    xo-server-db at all are all normal - it just means the banner prints the address.
+    Quiet and never an error: a pool XO does not manage, or no xo-server-db at all, are
+    both normal - it just means the banner prints the address.
     """
-    if not have_xo_server_db():
-        return ""
-    for row in enabled_servers():
-        # a db host may carry the ':port' XO connects to xapi on
-        if row.host == want or parsers.split_host_port(row.host)[0] == want:
-            return row.name
-    return ""
+    row, _how = enabled_server_for(want, resolve_want)
+    return row.name if row is not None else ""
 
 
 SELECT_OK = 0

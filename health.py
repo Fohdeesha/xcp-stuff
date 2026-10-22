@@ -27,6 +27,7 @@ from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 import atexit
 import base64
 import getopt
+import ipaddress
 import json
 import os
 import re
@@ -36,6 +37,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import traceback
 import unicodedata
 
@@ -44,7 +46,7 @@ import unicodedata
 # ======================================================================================
 # --- config ----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "3.18"
+SCRIPT_VERSION = "3.19"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
@@ -53,6 +55,8 @@ PROGRESS_INTERVAL = 15           # seconds between 'still waiting on ...' lines,
 LOCAL_CMD_TIMEOUT = 10           # max seconds a local command may run (hung xoa-updater etc)
 XO_REDIS_TIMEOUT = 2             # reading xo's server records straight from redis: 0.002s
                                  # measured, so this is only here to bound a wedged socket
+XO_DNS_TIMEOUT = 5               # resolving xo-db host names to match an address against a
+                                 # pool stored by name: all at once, this long for the lot
 XOA_CHECK_TIMEOUT = 60           # 'xoa check' does real network probes, so it gets longer
 RUN_CMD_TIMEOUT = 120            # -c: max seconds one arbitrary command may take on a host.
                                  # Separate from REMOTE_CMD_TIMEOUT because the two answer
@@ -555,6 +559,61 @@ def split_host_port(text):
         if host and port.isdigit():
             return host, int(port)
     return text, None
+
+
+# xen-api's own reading of a server record's `host` (packages/xen-api/_parseUrl.mjs): an
+# optional http(s) scheme, optional user[:password]@, a bracketed IPv6 address or a name
+# or IPv4 address, an optional :port and an optional /path
+_XO_URL_RE = re.compile(r"^(?:(https?:)/*)?(?:(([^:]*)(?::([^@]*))?)@)?"
+                        r"(\[[^\]]+\]|[^:/]+)(?::([0-9]+))?(/[^?#]*)?$")
+
+
+def xo_server_address(text):
+    """A server record's `host` -> (address, port), read the way XO reads it.
+
+    XO takes more than an address there - 'https://', credentials before an '@', a path -
+    and a record written that way used to reach ssh whole, as 'root@http://...', failing
+    the run before it began. What XO's pattern does not accept is read as address[:port],
+    as before. The port is the XAPI port XO connects on, never an ssh port.
+    """
+    m = _XO_URL_RE.match(text.strip())
+    if not m:
+        return split_host_port(text)
+    host = m.group(5)
+    if host.startswith("["):
+        host = host[1:-1]
+    return host, (int(m.group(6)) if m.group(6) else None)
+
+
+def ip_literal(text):
+    """The canonical spelling of an IP address, or None for anything that is not one.
+
+    Canonical, so two spellings of one IPv6 address compare equal. A '%scope' suffix is
+    dropped: ipaddress reads one only from 3.9, and the floor here is 3.6.
+    """
+    try:
+        return ipaddress.ip_address(str(text or "").split("%")[0].strip()).compressed
+    except ValueError:
+        return None
+
+
+def pool_member_addresses(value):
+    """A server record's `poolMembersAddresses` -> list of addresses.
+
+    xo-server (July 2026, xen-orchestra #10016) keeps every member's address there, plus
+    the address it connects to, so it can fail over to a survivor when the master dies. It
+    is stored as a JSON string inside the record; older XO has no such field, and anything
+    that does not read as a list of strings is no list at all.
+    """
+    if not value or not isinstance(value, str):
+        return []
+    try:
+        parsed = json.loads(value)
+    except ValueError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [a for a in parsed if isinstance(a, str) and a]
 
 
 def parse_host_list(text):
@@ -4282,12 +4341,13 @@ def _sort_key(name):
 
 
 class Server(object):
-    __slots__ = ("host", "name", "search")
+    __slots__ = ("host", "name", "search", "record")
 
-    def __init__(self, host, name, search):
+    def __init__(self, host, name, search, record=None):
         self.host = host
         self.name = name
         self.search = search
+        self.record = record if record is not None else {}
 
 
 def have_xo_server_db():
@@ -4296,6 +4356,7 @@ def have_xo_server_db():
 
 _ALL_SERVERS = None     # the one `xo-server-db ls server` scan; None until it is read
 _READ_ERROR = ""        # why that scan failed, when it did; "" while it has not
+_RESOLVED = {}          # db host name -> frozenset of its addresses, looked up once a run
 
 
 def _describe_failure(rc, err):
@@ -4394,6 +4455,7 @@ def reset_cache():
     global _ALL_SERVERS, _READ_ERROR
     _ALL_SERVERS = None
     _READ_ERROR = ""
+    _RESOLVED.clear()
 
 
 def enabled_servers():
@@ -4409,9 +4471,132 @@ def enabled_servers():
         name = pool_name or label or "(unnamed)"
         # -n matches EITHER name: a pool can show as XEN-PRIMARY while the server label a
         # user remembers it by is XEN-MAIN-01
-        rows.append(Server(rec["host"], name, (pool_name + " " + label).lower()))
+        rows.append(Server(rec["host"], name, (pool_name + " " + label).lower(), rec))
     rows.sort(key=lambda r: _sort_key(r.name))
     return rows
+
+
+# --------------------------------------------------------------------------------------
+# which record an address belongs to
+# --------------------------------------------------------------------------------------
+# A record's `host` is whatever was typed into XO - an IP, a name, sometimes with a scheme
+# or a port - and a pool stored by name used to be invisible to every lookup made with
+# one of its addresses: '-n a01 192.0.2.60' took the master's own address for a
+# password and failed as a login error, and 'health.py 192.0.2.60' said the master was
+# not in xo-db. Three kinds of evidence are tried, strongest first, and a weaker one is
+# only consulted when no record at all answers to a stronger one.
+
+def db_address(rec):
+    """The bare address in a record's `host`, as XO itself reads that field."""
+    return parsers.xo_server_address(rec.get("host") or "")[0]
+
+
+def _same_address(a, b):
+    """Two spellings of one address: case-blind for names, canonical for IPs."""
+    if not a or not b:
+        return False
+    if a.lower() == b.lower():
+        return True
+    ip = parsers.ip_literal(a)
+    return ip is not None and ip == parsers.ip_literal(b)
+
+
+def _resolve(names):
+    """{name: frozenset of its addresses}, each name looked up at most once per run.
+
+    Only ever handed xo-db's own host names - never anything a user typed in the password
+    position, which would put a root password into a DNS query. The lookups run at once
+    and the whole set gets config.XO_DNS_TIMEOUT: an XOA whose DNS has gone away must
+    not hang the run, and a name that has not answered by then has no addresses, which
+    makes a match less likely and never more. The threads are daemons, so one wedged in
+    the resolver cannot hold the process at exit.
+    """
+    todo = sorted(set(n for n in names if n and n not in _RESOLVED))
+    if todo:
+        found = {}
+
+        def lookup(name):
+            try:
+                infos = socket.getaddrinfo(name, None)
+            except (OSError, UnicodeError, ValueError):
+                # gaierror is an OSError; an IDNA-invalid name is a UnicodeError and an
+                # embedded NUL a ValueError. Each means this name has no address to give.
+                found[name] = frozenset()
+                return
+            found[name] = frozenset(a for a in (parsers.ip_literal(i[4][0]) for i in infos) if a)
+
+        threads = []
+        for name in todo:
+            t = threading.Thread(target=lookup, args=(name,))
+            t.daemon = True
+            t.start()
+            threads.append(t)
+        deadline = time.time() + config.XO_DNS_TIMEOUT
+        for t in threads:
+            t.join(max(0.0, deadline - time.time()))
+        for name in todo:
+            _RESOLVED[name] = found.get(name, frozenset())
+            if name not in found:
+                transport.debug("xo-db: no DNS answer for %s within %ss"
+                                % (name, config.XO_DNS_TIMEOUT))
+    return dict((n, _RESOLVED.get(n, frozenset())) for n in names)
+
+
+def match_record(want, records, resolve_want=False):
+    """(record, how) for the first record `want` is an address of, or (None, "").
+
+    `how` says what made it a match, for messages that have to explain one:
+      "host"    the record's own host field names it
+      "member"  it is one of the pool members' addresses XO recorded (poolMembersAddresses,
+                xo-server since July 2026), slaves included - which is what lets a slave's
+                address find the pool's password, since every member shares it
+      "dns"     it and the record's host name resolve to a common address
+
+    DNS is the last resort and only ever resolves xo-db's own names - plus `want` itself
+    when the caller says it is a host (resolve_want), never when it may be a password.
+    """
+    want = (want or "").strip()
+    if not want:
+        return None, ""
+    for rec in records:
+        if rec.get("host") == want or _same_address(db_address(rec), want):
+            return rec, "host"
+    for rec in records:
+        if any(_same_address(m, want)
+               for m in parsers.pool_member_addresses(rec.get("poolMembersAddresses"))):
+            return rec, "member"
+
+    want_ip = parsers.ip_literal(want)
+    if want_ip is None and not resolve_want:
+        return None, ""
+    if want_ip is not None:
+        wanted = frozenset([want_ip])
+    else:
+        wanted = _resolve([want])[want]
+        if not wanted:
+            return None, ""
+        # a name that resolves to an address a record holds outright, or to one of its
+        # members' addresses
+        for rec in records:
+            held = [db_address(rec)] + parsers.pool_member_addresses(
+                rec.get("poolMembersAddresses"))
+            if any(parsers.ip_literal(a) in wanted for a in held):
+                return rec, "dns"
+    named = [rec for rec in records if parsers.ip_literal(db_address(rec)) is None]
+    resolved = _resolve([db_address(rec) for rec in named])
+    for rec in named:
+        if resolved.get(db_address(rec), frozenset()) & wanted:
+            return rec, "dns"
+    return None, ""
+
+
+def server_for_host(host):
+    """(record, how) for a host given as an argument, or (None, "").
+
+    Searched across ALL records, not the enabled ones - a host given as an argument may
+    well be a server XO has disabled, and its password must still be found.
+    """
+    return match_record(host, all_servers(), resolve_want=True)
 
 
 def password_for(host):
@@ -4420,32 +4605,41 @@ def password_for(host):
     Answered out of the one scan rather than with a second `xo-server-db ls server
     host=...`: the indexed query returns the same record field for field and costs another
     3.3s (see all_servers).
-
-    Searched across ALL records, not the enabled ones - a host given as an argument may
-    well be a server XO has disabled, and the indexed lookup found its password before.
     """
-    for rec in all_servers():
-        if rec.get("host") == host:
-            pwd = rec.get("password")
-            if not pwd:
-                return (None, False)
-            return (pwd, "\\" in pwd)
-    return (None, False)
+    rec, _how = server_for_host(host)
+    return record_password(rec)
 
 
-def pool_name_for_host(want):
+def record_password(rec):
+    """(password, has_backslash) or (None, False) for one record."""
+    pwd = (rec or {}).get("password")
+    if not pwd:
+        return (None, False)
+    return (pwd, "\\" in pwd)
+
+
+def enabled_server_for(want, resolve_want=True):
+    """(Server, how) among the enabled pools, or (None, ""). resolve_want=False for a
+    value that may be a password: it is then matched against what xo-db holds, and only
+    xo-db's own names are looked up."""
+    if not have_xo_server_db():
+        return None, ""
+    rows = enabled_servers()
+    rec, how = match_record(want, [row.record for row in rows], resolve_want)
+    for row in rows:
+        if row.record is rec:
+            return row, how
+    return None, ""
+
+
+def pool_name_for_host(want, resolve_want=True):
     """The db's name for a host given as an argument, so every run can name its target.
 
-    Quiet and never an error: a slave via -s, a pool XO does not manage, or no
-    xo-server-db at all are all normal - it just means the banner prints the address.
+    Quiet and never an error: a pool XO does not manage, or no xo-server-db at all, are
+    both normal - it just means the banner prints the address.
     """
-    if not have_xo_server_db():
-        return ""
-    for row in enabled_servers():
-        # a db host may carry the ':port' XO connects to xapi on
-        if row.host == want or parsers.split_host_port(row.host)[0] == want:
-            return row.name
-    return ""
+    row, _how = enabled_server_for(want, resolve_want)
+    return row.name if row is not None else ""
 
 
 SELECT_OK = 0
@@ -6752,7 +6946,10 @@ class Run(object):
         self.run_cmd = ""         # -c: a command to run on every host INSTEAD of the report
         self.json_output = False
         self.seed = ""
+        self.seed_uuid = ""       # the seed's own INSTALLATION_UUID, from discovery
+        self.server = None        # the pool's xo-db record, when there is one
         self.password = ""
+        self.password_after_name = False   # the password was the argument after -n
         self.pw_has_backslash = False
         self.host_sweep = False
         self.transport = None
@@ -6921,6 +7118,16 @@ def _xodb_unreadable(consequence):
     sys.exit(1)
 
 
+def _known_as(server, how):
+    """How xo-db knows an address, for the message that refuses it as a password."""
+    if how == "member":
+        return "the address of a member of pool '%s' in xo-server-db" % server.name
+    if how == "dns":
+        return ("an address of pool '%s' (xo-server-db has it as %s, which resolves to it)"
+                % (server.name, xodb.db_address(server.record)))
+    return "the address of pool '%s' in xo-server-db" % server.name
+
+
 def resolve_target_xoa(run, args):
     """Pick a pool / take the host argument, then find a password for it.
 
@@ -6936,16 +7143,19 @@ def resolve_target_xoa(run, args):
     # read as a password - so '-n sec 192.168.1.5' used to try to log into the -n-matched
     # pool using an address as the password, surfacing as an authentication failure a long
     # way from the cause. Only xo-db can tell them apart: nobody's root password is one of
-    # their own pool addresses.
+    # their own pool addresses. Those include the addresses of a pool stored by name, and
+    # its slaves': '-n a01 192.0.2.60' against a record holding xcp-a01... was
+    # taken for a password. The argument itself is never looked up in DNS - it may be one.
     if run.name_filter and len(args) == 1:
-        clash = xodb.pool_name_for_host(args[0])
-        if clash:
+        clash, how = xodb.enabled_server_for(args[0], resolve_want=False)
+        if clash is not None:
             sys.stderr.write(
-                "ERROR: '%s' is the address of pool '%s' in xo-server-db, but the value after\n"
+                "ERROR: '%s' is %s, but the value after\n"
                 "       -n/--name is read as a password, not a host - -n already selects the pool.\n"
                 "       Use either '-n %s' or the host '%s', not both.\n"
-                % (args[0], clash, run.name_filter, args[0]))
+                % (args[0], _known_as(clash, how), run.name_filter, args[0]))
             usage(run.run_env)
+        run.password_after_name = True
 
     selected = None
     if run.name_filter or not args:
@@ -6964,11 +7174,17 @@ def resolve_target_xoa(run, args):
             sys.exit(1)
         args = [selected.host] + list(args)
 
-    host, port = parsers.split_host_port(args[0])
+    if selected is not None:
+        # a picker-chosen host is a server record's `host`, read the way XO reads it: it
+        # may carry a scheme, and a ':port' that is the XAPI HTTPS port XO connects on -
+        # not an ssh port, so it is stripped for ssh and we stay on 22
+        host = parsers.xo_server_address(selected.host)[0]
+        run.transport.ssh_port = 22
+        run.server = selected.record
+    else:
+        host, port = parsers.split_host_port(args[0])
+        run.transport.ssh_port = port or 22
     run.seed = host
-    # a picker-chosen host may carry ':port' - that is the XAPI HTTPS port XO connects on,
-    # not an ssh port, so it is stripped for ssh and we stay on 22
-    run.transport.ssh_port = 22 if selected or not port else port
 
     run.pool_name = selected.name if selected else xodb.pool_name_for_host(host)
     print_banner(run, host, run.pool_name)
@@ -6982,10 +7198,12 @@ def resolve_target_xoa(run, args):
     if len(args) == 2:
         run.password = args[1]
     else:
-        # look the password up under the exact string xo-db keys the record by: for a
-        # picker-chosen host that is its host field verbatim, ':port' and all
-        db_host = selected.host if selected else host
-        password, has_backslash = xodb.password_for(db_host)
+        # the picked record's own password, or the record this address belongs to - by
+        # its host field, by XO's list of the pool's members, or by DNS for a pool stored
+        # by name. A member's address finds the pool's password: every member shares it.
+        if run.server is None:
+            run.server = xodb.server_for_host(host)[0]
+        password, has_backslash = xodb.record_password(run.server)
         run.pw_has_backslash = has_backslash
         if not password:
             if xodb.read_error():
@@ -7142,9 +7360,18 @@ def discover(run):
     except transport.CollectError as exc:
         sys.stderr.write("ERROR: Could not retrieve pool host addresses from '%s': %s\n"
                          % (run.seed or "this host", exc))
+        if run.password_after_name and "Permission denied" in str(exc):
+            # the one reading xo-db could not settle: an address it does not know - a
+            # slave of a pool stored by name, on an XO too old to list members - went in
+            # as the password. Said without echoing it, since it may really be one.
+            sys.stderr.write("       With -n/--name the one argument after it is the root "
+                             "password, not a host.\n")
         sys.exit(1)
 
     records = _host_records(run, payload, spec.get("host_list") == "statedb")
+    self_uuid = result.wrap(payload, "self_uuid")
+    if self_uuid.ok and self_uuid.value:
+        run.seed_uuid = self_uuid.value
 
     if run.run_env == "host":
         address, why = _own_address(payload, records)
@@ -7192,10 +7419,9 @@ def discover(run):
         # comparison is against that published address, so resolve the seed to its own
         # host record and prefer what xapi calls it.
         run.master_address = run.seed
-        self_uuid = result.wrap(payload, "self_uuid")
-        if self_uuid.ok and self_uuid.value:
+        if run.seed_uuid:
             for host in hosts:
-                if host.uuid == self_uuid.value:
+                if host.uuid == run.seed_uuid:
                     run.master_address = host.address
                     break
     elif role == "slave":
@@ -7806,8 +8032,14 @@ def _narrow_to_seed(run, hosts):
     for host in hosts:
         if host.address == run.seed:
             return [host]
-    # the seed was given in a form xapi does not use (a hostname, say): keep it, with the
-    # per-host map values left Unknown, exactly as before
+    # dialled in a form xapi does not publish - a pool stored by name in xo-db, or an
+    # address on a second network. The seed's own uuid still says which member it is, so
+    # its xapi values are kept; it is still reached the way it was dialled, the one way
+    # it is known to answer.
+    for host in hosts:
+        if run.seed_uuid and host.uuid == run.seed_uuid:
+            return [model.Host(run.seed, host.uuid, host.hostname, host.enabled,
+                               host.multipathing)]
     return [model.Host(run.seed)]
 
 
@@ -7843,15 +8075,15 @@ def _module(name, exported):
     return module
 
 
-config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DMESG_MAX_LINES', 'DMESG_ROLLUP_MIN', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MOUNT_PROBE_RESERVE', 'MOUNT_PROBE_TIMEOUT', 'MOUNT_STALL_FILES', 'MOUNT_STALL_PHRASES', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'NETWORK_FS_TYPES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'PROGRESS_INTERVAL', 'REMOTE_CMD_TIMEOUT', 'RUN_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'STUCK_MAX_LINES', 'STUCK_MIN_AGE', 'STUCK_RECHECK_DELAY', 'STUCK_SAMPLES', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOA_STOCK_PLUGINS', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_QCOW2_MAX_LINES', 'XO_PLUGIN_LOOKUP_PATHS', 'XO_PLUGIN_PREFIX', 'XO_PLUGIN_SCOPE_DIR', 'XO_PLUGIN_SCOPE_PREFIX', 'XO_REDIS_TIMEOUT'])
+config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DMESG_MAX_LINES', 'DMESG_ROLLUP_MIN', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MOUNT_PROBE_RESERVE', 'MOUNT_PROBE_TIMEOUT', 'MOUNT_STALL_FILES', 'MOUNT_STALL_PHRASES', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'NETWORK_FS_TYPES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'PROGRESS_INTERVAL', 'REMOTE_CMD_TIMEOUT', 'RUN_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'STUCK_MAX_LINES', 'STUCK_MIN_AGE', 'STUCK_RECHECK_DELAY', 'STUCK_SAMPLES', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOA_STOCK_PLUGINS', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_QCOW2_MAX_LINES', 'XO_DNS_TIMEOUT', 'XO_PLUGIN_LOOKUP_PATHS', 'XO_PLUGIN_PREFIX', 'XO_PLUGIN_SCOPE_DIR', 'XO_PLUGIN_SCOPE_PREFIX', 'XO_REDIS_TIMEOUT'])
 colors = _module('colors', ['CYAN', 'GREEN', 'RESET', 'YELLOW', 'cyan', 'green', 'init', 'strip_ansi', 'yellow'])
 result = _module('result', ['FLAG', 'Fact', 'INFO', 'Line', 'MISSING', 'OK', 'UNKNOWN', 'flag', 'guard', 'info', 'ok', 'pinned', 'raw', 'unknown', 'wrap'])
-parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', '_LINK_RE', '_MANIFEST_PKG_RE', '_MTU_RE', '_PARAM_RE', '_PREMIUM_SUFFIX', '_TS_RE', '_cidr_range', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'cap_lines', 'classify_multipath_path', 'classify_xo_plugins', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'format_age', 'has_overlapping_subnets', 'host_records_from_state_db', 'manifest_diff', 'manifest_plugin_names', 'manifest_versions', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pool_conf', 'parse_timedatectl', 'parse_xe_records', 'plugin_block', 'rollup_repeats', 'round_1dp', 'split_host_port', 'split_timestamp', 'truncate_block'])
+parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', '_LINK_RE', '_MANIFEST_PKG_RE', '_MTU_RE', '_PARAM_RE', '_PREMIUM_SUFFIX', '_TS_RE', '_XO_URL_RE', '_cidr_range', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'cap_lines', 'classify_multipath_path', 'classify_xo_plugins', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'format_age', 'has_overlapping_subnets', 'host_records_from_state_db', 'ip_literal', 'manifest_diff', 'manifest_plugin_names', 'manifest_versions', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pool_conf', 'parse_timedatectl', 'parse_xe_records', 'plugin_block', 'pool_member_addresses', 'rollup_repeats', 'round_1dp', 'split_host_port', 'split_timestamp', 'truncate_block', 'xo_server_address'])
 model = _module('model', ['Host', 'Pool', 'ntp_match', 'ram_match'])
 collectorsrc = _module('collectorsrc', ['EMBEDDED', 'collector_source'])
 transport = _module('transport', ['ASKPASS_ENV', 'ASKPASS_SCRIPT', 'AUTH_ASKPASS', 'AUTH_SSHPASS', 'BEGIN_MARKER', 'CollectError', 'END_MARKER', 'Transport', '_DEBUG_LOCK', '_LIVE', '_LIVE_LOCK', '_REMOTE_LAUNCH', '_REMOTE_LAUNCH_PINNED', '_kill_tree', '_remote_launch', 'cleanup_work_dir', 'debug', 'ensure_sshpass', 'have', 'kill_all_children', 'make_work_dir', 'run_local_cmd', 'which', 'write_askpass'])
 xoredis = _module('xoredis', ['DEFAULT_ADDR', 'ENCRYPTION_PREFIX', 'IDS_KEY', 'PLUGIN_IDS_KEY', 'PLUGIN_RECORD_PREFIX', 'RECORD_PREFIX', 'RedisError', '_config_dirs', '_config_files', '_encode', '_fetch', '_fetch_autoload', '_flatten', '_mentions_redis', '_read_reply', 'read_plugin_autoload', 'read_server_records'])
-xodb = _module('xodb', ['QUOTES', 'SELECT_NONE', 'SELECT_NO_MATCH', 'SELECT_OK', 'SELECT_QUIT', 'SELECT_UNREADABLE', 'Server', '_ALL_SERVERS', '_ESCAPE_RE', '_KEY_RE', '_READ_ERROR', '_SIMPLE_ESCAPES', '_describe_failure', '_ls', '_read_servers', '_sort_key', 'all_servers', 'clean', 'enabled_servers', 'have_xo_server_db', 'password_for', 'pool_name_for_host', 'read_error', 'reset_cache', 'scan_records', 'select_pool', 'unescape'])
+xodb = _module('xodb', ['QUOTES', 'SELECT_NONE', 'SELECT_NO_MATCH', 'SELECT_OK', 'SELECT_QUIT', 'SELECT_UNREADABLE', 'Server', '_ALL_SERVERS', '_ESCAPE_RE', '_KEY_RE', '_READ_ERROR', '_RESOLVED', '_SIMPLE_ESCAPES', '_describe_failure', '_ls', '_read_servers', '_resolve', '_same_address', '_sort_key', 'all_servers', 'clean', 'db_address', 'enabled_server_for', 'enabled_servers', 'have_xo_server_db', 'match_record', 'password_for', 'pool_name_for_host', 'read_error', 'record_password', 'reset_cache', 'scan_records', 'select_pool', 'server_for_host', 'unescape'])
 checks = _module('checks', ['_dmesg_phrase_blocks', '_first_line', '_linstor_column', '_linstor_has_rows', '_linstor_line', '_linstor_node_addresses', '_linstor_node_offline', '_linstor_table', '_linstor_unknown', '_maps', '_mount_detail', '_multipath_detail', '_multipath_read', '_network_line', '_pool_conf_target', '_pool_roles_detail', '_render_scan_blocks', '_stuck_detail', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_block', 'dmesg_content', 'dmesg_content_of', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mount_stalls', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'network_mounts', 'ntp', 'oom_events', 'overlapping_subnets', 'pool_host_list', 'pool_roles', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'stuck_processes', 'tap_status', 'task_timeout_override', 'vlan0', 'xapi_status', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_nodes', 'xostor_pref_nic', 'xostor_qcow2', 'xostor_ram', 'yum_patch_level'])
 xoa = _module('xoa', ['_dmesg', '_first_token', '_max_old_space', '_meminfo', '_os_version', '_plugin_autoload', '_plugin_scan_targets', '_plugin_version', '_plugins_line', '_service_state', '_updater', 'collect_xoa', 'debian_version_ok', 'lines', 'ping_silent', 'running_as_root', 'scan_plugins'])
 report = _module('report', ['Report', '_as_entry'])

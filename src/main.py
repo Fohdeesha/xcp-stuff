@@ -203,7 +203,10 @@ class Run(object):
         self.run_cmd = ""         # -c: a command to run on every host INSTEAD of the report
         self.json_output = False
         self.seed = ""
+        self.seed_uuid = ""       # the seed's own INSTALLATION_UUID, from discovery
+        self.server = None        # the pool's xo-db record, when there is one
         self.password = ""
+        self.password_after_name = False   # the password was the argument after -n
         self.pw_has_backslash = False
         self.host_sweep = False
         self.transport = None
@@ -372,6 +375,16 @@ def _xodb_unreadable(consequence):
     sys.exit(1)
 
 
+def _known_as(server, how):
+    """How xo-db knows an address, for the message that refuses it as a password."""
+    if how == "member":
+        return "the address of a member of pool '%s' in xo-server-db" % server.name
+    if how == "dns":
+        return ("an address of pool '%s' (xo-server-db has it as %s, which resolves to it)"
+                % (server.name, xodb.db_address(server.record)))
+    return "the address of pool '%s' in xo-server-db" % server.name
+
+
 def resolve_target_xoa(run, args):
     """Pick a pool / take the host argument, then find a password for it.
 
@@ -387,16 +400,19 @@ def resolve_target_xoa(run, args):
     # read as a password - so '-n sec 192.168.1.5' used to try to log into the -n-matched
     # pool using an address as the password, surfacing as an authentication failure a long
     # way from the cause. Only xo-db can tell them apart: nobody's root password is one of
-    # their own pool addresses.
+    # their own pool addresses. Those include the addresses of a pool stored by name, and
+    # its slaves': '-n a01 192.0.2.60' against a record holding xcp-a01... was
+    # taken for a password. The argument itself is never looked up in DNS - it may be one.
     if run.name_filter and len(args) == 1:
-        clash = xodb.pool_name_for_host(args[0])
-        if clash:
+        clash, how = xodb.enabled_server_for(args[0], resolve_want=False)
+        if clash is not None:
             sys.stderr.write(
-                "ERROR: '%s' is the address of pool '%s' in xo-server-db, but the value after\n"
+                "ERROR: '%s' is %s, but the value after\n"
                 "       -n/--name is read as a password, not a host - -n already selects the pool.\n"
                 "       Use either '-n %s' or the host '%s', not both.\n"
-                % (args[0], clash, run.name_filter, args[0]))
+                % (args[0], _known_as(clash, how), run.name_filter, args[0]))
             usage(run.run_env)
+        run.password_after_name = True
 
     selected = None
     if run.name_filter or not args:
@@ -415,11 +431,17 @@ def resolve_target_xoa(run, args):
             sys.exit(1)
         args = [selected.host] + list(args)
 
-    host, port = parsers.split_host_port(args[0])
+    if selected is not None:
+        # a picker-chosen host is a server record's `host`, read the way XO reads it: it
+        # may carry a scheme, and a ':port' that is the XAPI HTTPS port XO connects on -
+        # not an ssh port, so it is stripped for ssh and we stay on 22
+        host = parsers.xo_server_address(selected.host)[0]
+        run.transport.ssh_port = 22
+        run.server = selected.record
+    else:
+        host, port = parsers.split_host_port(args[0])
+        run.transport.ssh_port = port or 22
     run.seed = host
-    # a picker-chosen host may carry ':port' - that is the XAPI HTTPS port XO connects on,
-    # not an ssh port, so it is stripped for ssh and we stay on 22
-    run.transport.ssh_port = 22 if selected or not port else port
 
     run.pool_name = selected.name if selected else xodb.pool_name_for_host(host)
     print_banner(run, host, run.pool_name)
@@ -433,10 +455,12 @@ def resolve_target_xoa(run, args):
     if len(args) == 2:
         run.password = args[1]
     else:
-        # look the password up under the exact string xo-db keys the record by: for a
-        # picker-chosen host that is its host field verbatim, ':port' and all
-        db_host = selected.host if selected else host
-        password, has_backslash = xodb.password_for(db_host)
+        # the picked record's own password, or the record this address belongs to - by
+        # its host field, by XO's list of the pool's members, or by DNS for a pool stored
+        # by name. A member's address finds the pool's password: every member shares it.
+        if run.server is None:
+            run.server = xodb.server_for_host(host)[0]
+        password, has_backslash = xodb.record_password(run.server)
         run.pw_has_backslash = has_backslash
         if not password:
             if xodb.read_error():
@@ -593,9 +617,18 @@ def discover(run):
     except transport.CollectError as exc:
         sys.stderr.write("ERROR: Could not retrieve pool host addresses from '%s': %s\n"
                          % (run.seed or "this host", exc))
+        if run.password_after_name and "Permission denied" in str(exc):
+            # the one reading xo-db could not settle: an address it does not know - a
+            # slave of a pool stored by name, on an XO too old to list members - went in
+            # as the password. Said without echoing it, since it may really be one.
+            sys.stderr.write("       With -n/--name the one argument after it is the root "
+                             "password, not a host.\n")
         sys.exit(1)
 
     records = _host_records(run, payload, spec.get("host_list") == "statedb")
+    self_uuid = result.wrap(payload, "self_uuid")
+    if self_uuid.ok and self_uuid.value:
+        run.seed_uuid = self_uuid.value
 
     if run.run_env == "host":
         address, why = _own_address(payload, records)
@@ -643,10 +676,9 @@ def discover(run):
         # comparison is against that published address, so resolve the seed to its own
         # host record and prefer what xapi calls it.
         run.master_address = run.seed
-        self_uuid = result.wrap(payload, "self_uuid")
-        if self_uuid.ok and self_uuid.value:
+        if run.seed_uuid:
             for host in hosts:
-                if host.uuid == self_uuid.value:
+                if host.uuid == run.seed_uuid:
                     run.master_address = host.address
                     break
     elif role == "slave":
@@ -1257,8 +1289,14 @@ def _narrow_to_seed(run, hosts):
     for host in hosts:
         if host.address == run.seed:
             return [host]
-    # the seed was given in a form xapi does not use (a hostname, say): keep it, with the
-    # per-host map values left Unknown, exactly as before
+    # dialled in a form xapi does not publish - a pool stored by name in xo-db, or an
+    # address on a second network. The seed's own uuid still says which member it is, so
+    # its xapi values are kept; it is still reached the way it was dialled, the one way
+    # it is known to answer.
+    for host in hosts:
+        if run.seed_uuid and host.uuid == run.seed_uuid:
+            return [model.Host(run.seed, host.uuid, host.hostname, host.enabled,
+                               host.multipathing)]
     return [model.Host(run.seed)]
 
 

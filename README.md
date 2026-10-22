@@ -82,7 +82,7 @@ Args go on the end of the one-liner:
 | | |
 |---|---|
 | `-n NAME` | pick the pool by name instead of from the menu. Partial match, any case, so `-n sec` finds XEN-SECONDARY |
-| `IP [password]` | check a pool by its master's IP (`IP:port` for a different ssh port). Password's only needed if XOA doesn't have it, e.g. `-s` on a slave |
+| `IP [password]` | check a pool by its master's IP or name (`IP:port` for a different ssh port). Password's only needed if XOA doesn't have it, e.g. `-s` on a slave with XO older than 6.7 |
 | `-s` | only check the host you gave it, not the rest of the pool |
 | `-f` | findings only. Everything that passed is hidden, so a healthy pool prints almost nothing |
 | `-c CMD` | run a command on every host in the pool instead of the health check (see below) |

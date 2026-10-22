@@ -7,6 +7,8 @@ diff that dropped duplicate package names, the util.inspect scan, the timedatect
 generations, the record splitting that merged two SRs' VDIs into one.
 """
 
+import ipaddress
+import json
 import re
 
 # --------------------------------------------------------------------------------------
@@ -62,6 +64,61 @@ def split_host_port(text):
         if host and port.isdigit():
             return host, int(port)
     return text, None
+
+
+# xen-api's own reading of a server record's `host` (packages/xen-api/_parseUrl.mjs): an
+# optional http(s) scheme, optional user[:password]@, a bracketed IPv6 address or a name
+# or IPv4 address, an optional :port and an optional /path
+_XO_URL_RE = re.compile(r"^(?:(https?:)/*)?(?:(([^:]*)(?::([^@]*))?)@)?"
+                        r"(\[[^\]]+\]|[^:/]+)(?::([0-9]+))?(/[^?#]*)?$")
+
+
+def xo_server_address(text):
+    """A server record's `host` -> (address, port), read the way XO reads it.
+
+    XO takes more than an address there - 'https://', credentials before an '@', a path -
+    and a record written that way used to reach ssh whole, as 'root@http://...', failing
+    the run before it began. What XO's pattern does not accept is read as address[:port],
+    as before. The port is the XAPI port XO connects on, never an ssh port.
+    """
+    m = _XO_URL_RE.match(text.strip())
+    if not m:
+        return split_host_port(text)
+    host = m.group(5)
+    if host.startswith("["):
+        host = host[1:-1]
+    return host, (int(m.group(6)) if m.group(6) else None)
+
+
+def ip_literal(text):
+    """The canonical spelling of an IP address, or None for anything that is not one.
+
+    Canonical, so two spellings of one IPv6 address compare equal. A '%scope' suffix is
+    dropped: ipaddress reads one only from 3.9, and the floor here is 3.6.
+    """
+    try:
+        return ipaddress.ip_address(str(text or "").split("%")[0].strip()).compressed
+    except ValueError:
+        return None
+
+
+def pool_member_addresses(value):
+    """A server record's `poolMembersAddresses` -> list of addresses.
+
+    xo-server (July 2026, xen-orchestra #10016) keeps every member's address there, plus
+    the address it connects to, so it can fail over to a survivor when the master dies. It
+    is stored as a JSON string inside the record; older XO has no such field, and anything
+    that does not read as a list of strings is no list at all.
+    """
+    if not value or not isinstance(value, str):
+        return []
+    try:
+        parsed = json.loads(value)
+    except ValueError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [a for a in parsed if isinstance(a, str) and a]
 
 
 def parse_host_list(text):
