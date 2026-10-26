@@ -28,11 +28,12 @@ import time
 import xml.parsers.expat
 import zlib
 
-VERSION = '2.7'
+VERSION = '2.8'
 PYTHON = sys.version.split()[0]
 PROG = 'storage-state-fixer'
 STORAGE_DB = '/var/run/nonpersistent/xapi/storage.db'
 STORAGE_DPS = '/var/run/nonpersistent/xapi/storage-dps'
+SXM_DIR = '/var/run/nonpersistent'
 SM_BACKEND = '/dev/sm/backend'
 SM_PHY = '/dev/sm/phy'
 BLKTAP_DIR = '/dev/xen/blktap-2'
@@ -1027,6 +1028,11 @@ def teardown_refusal(dps, dp):
 
 DOM0_DP_RE = re.compile(r'^vbd/0/(xvd[a-z]{1,2})$')
 GUEST_DP_RE = re.compile(r'^vbd/([0-9]+)/([A-Za-z0-9]+)$')
+SXM_DP_RE = re.compile(r'^(?:' + UUID_PAT + r'|(?:mirror|copy)_\S{1,200})$')
+SXM_VM_RE = re.compile(r'^(?:0|(?:CP|MIR)[0-9a-f]{6})$')
+SXM_TABLES = ('send', 'recv', 'copy')
+SXM_TASKS = ('VM.migrate_send', 'VM.pool_migrate', 'VM.migrate', 'VDI.pool_migrate', 'VDI.copy', 'VM.copy')
+SXM_COMMS = ('sparse_dd', 'vhd-tool')
 
 
 class TapctlError(Exception):
@@ -1449,7 +1455,7 @@ WATCH_COMMS = ('vhd-tool', 'sparse_dd', 'xapi-nbd', 'qemu-img', 'qemu-nbd', 'xha
 SM_PREFIXES = (SM_DIR + '/', PLUGIN_DIR + '/')
 TERMINAL = ('done', 'refused', 'rolled-back', 'failed', 'superseded')
 ACT_ENDS = TERMINAL + ('unverified',)
-PATH_KEYS = ('STORAGE_DB', 'STORAGE_DPS', 'SM_BACKEND', 'SM_PHY', 'BLKTAP_DIR', 'SYS_BLKTAP', 'SYS_DEV_BLOCK',
+PATH_KEYS = ('STORAGE_DB', 'STORAGE_DPS', 'SXM_DIR', 'SM_BACKEND', 'SM_PHY', 'BLKTAP_DIR', 'SYS_BLKTAP', 'SYS_DEV_BLOCK',
              'SYS_BLOCK', 'XENSOURCE_LOG', 'VHD_UTIL', 'IPC_DIR', 'SM_REFCOUNT', 'SR_MOUNT', 'DRBD_BY_RES', 'NBD_VBDS',
              'XENSTORE_LIST', 'XENSTORE_READ', 'VGS', 'LIO_CORE', 'CG_SYSTEMD', 'SS', 'SM_LOCK_DIR', 'SMLOG', 'NO_SM_LOG', 'LOCAL_DB',
              'INVENTORY',
@@ -2722,6 +2728,71 @@ def f_ctlfiles():
         except OSError:
             mtime = None
         out[pid] = {'ctl': sorted(rec['ctl']), 'shm': sorted(rec['shm']), 'comm': comm, 'mtime': mtime}
+        files = {}
+        for name in rec['ctl']:
+            try:
+                st = os.lstat(os.path.join(BLKTAP_CTL, name))
+            except OSError as exc:
+                if gone(exc):
+                    continue
+                raise
+            files[name] = [st.st_ino, st.st_mtime]
+        out[pid]['files'] = files
+    return out
+
+
+def f_nbdlinks():
+    out = []
+    base = os.path.join(BLKTAP_CTL, 'nbd')
+    for sr in _listdir(base):
+        d = os.path.join(base, sr)
+        if not UUID_RE.match(sr) or os.path.islink(d) or not os.path.isdir(d):
+            continue
+        for name in _listdir(d):
+            p = os.path.join(d, name)
+            try:
+                st = os.lstat(p)
+                rec = {'sr': sr, 'vdi': name, 'ino': st.st_ino, 'mtime': st.st_mtime,
+                       'kind': 'link' if stat.S_ISLNK(st.st_mode) else 'other'}
+                if rec['kind'] == 'link':
+                    rec['target'] = os.readlink(p)
+            except OSError as exc:
+                if gone(exc):
+                    continue
+                raise
+            out.append(rec)
+    return out
+
+
+def f_sxm():
+    out = {'tables': {}, 'missing': []}
+    for t in SXM_TABLES:
+        p = os.path.join(SXM_DIR, 'storage_mirrors_%s.json' % t)
+        try:
+            data = read_file(p)
+        except EnvironmentError as exc:
+            if exc.errno == errno.ENOENT:
+                out['tables'][t] = {}
+                out['missing'].append(t)
+                continue
+            raise
+        try:
+            obj = json.loads(data.decode('utf-8'))
+        except ValueError as exc:
+            raise Failed('%s cannot be read as JSON: %s' % (p, _text(exc)))
+        if not isinstance(obj, dict):
+            raise Failed('%s holds %s, not a table' % (p, type(obj).__name__))
+        out['tables'][t] = obj
+    return out
+
+
+def f_domvms():
+    out = {}
+    for domid in f_domains():
+        if domid == '0':
+            continue
+        vu, why = domain_vm(domid)
+        out[domid] = vu
     return out
 
 
@@ -4604,6 +4675,9 @@ def facts_doc(args):
         doc['xl'] = fact(f_xl)
         doc['tapinfo'] = fact(bounded, f_tapinfo, 20)
         doc['ctlfiles'] = fact(bounded, f_ctlfiles, 10)
+        doc['nbdlinks'] = fact(f_nbdlinks)
+        doc['sxm'] = fact(f_sxm)
+        doc['domvms'] = fact(bounded, f_domvms, 30)
         doc['room'] = fact(f_room)
         doc['blockmap'] = fact(f_blockmap)
         parts = [doc['backend'], doc['phy'], doc['blktap'], doc['blockmap']]
@@ -5614,6 +5688,7 @@ def restore_units(d, units_before, res):
                      % ('again after the start' if now is None else 'before xapi was stopped',
                         ('; started again in any case: %s' % ', '.join(started)) if started else ''))
         return
+    missing = []
     for u in units_before:
         if u in now or u == XAPI_UNIT:
             continue
@@ -5621,7 +5696,67 @@ def restore_units(d, units_before, res):
             r = systemctl('start', '--no-block', u)
             res['restored'].append('%s (%s)' % (u, 'started' if r.ok else r.why()))
         else:
-            res['missing_units'].append(u)
+            missing.append(u)
+    if not missing:
+        return
+    deadline = _now() + UNIT_SETTLE
+    while True:
+        st = unit_states(missing)
+        busy = [u for u in missing if (st.get(u) or {}).get('ActiveState') in UNIT_BUSY]
+        if not busy or _now() >= deadline:
+            break
+        time.sleep(2)
+    for u in missing:
+        s = st.get(u) or {}
+        state, sub = s.get('ActiveState'), s.get('SubState')
+        deps = set()
+        for p in ('Requires', 'BindsTo', 'PartOf', 'Requisite'):
+            deps |= set((s.get(p) or '').split())
+        if state == 'active':
+            res.setdefault('settled', []).append(
+                '%s was still starting right after xapi came up (it %s), and is active again' % (
+                    u, 'depends on %s' % ', '.join(sorted(deps - set(['basic.target', 'sysinit.target', '-.mount'])))
+                    if deps - set(['basic.target', 'sysinit.target', '-.mount']) else 'has no dependency on xapi'))
+            continue
+        if state == 'inactive' and XAPI_UNIT in deps:
+            r = systemctl('start', '--no-block', u)
+            res['restored'].append('%s (%s: it depends on %s, so stopping xapi stopped it too)' % (
+                u, 'started' if r.ok else r.why(), XAPI_UNIT))
+            continue
+        res['missing_units'].append('%s (%s%s%s%s)' % (
+            u, state or 'its state was not read', ('/' + sub) if sub else '',
+            ('; result %s' % s['Result']) if s.get('Result') not in (None, '', 'success') else '',
+            ('; inactive since %s' % s['InactiveEnterTimestamp']) if state in ('inactive', 'failed') and
+            s.get('InactiveEnterTimestamp') else ''))
+
+
+UNIT_SETTLE = 150
+UNIT_BUSY = ('activating', 'reloading', 'deactivating')
+UNIT_PROPS = ('Id', 'ActiveState', 'SubState', 'Result', 'Requires', 'BindsTo', 'PartOf', 'Requisite',
+              'InactiveEnterTimestamp')
+
+
+def unit_states(units):
+    out = {}
+    if not units:
+        return out
+    args = ['show']
+    for p in UNIT_PROPS:
+        args.extend(['-p', p])
+    r = systemctl(*(args + list(units)))
+    if not r.ok:
+        return out
+    cur = {}
+    for line in (r.out + '\n').splitlines():
+        if not line.strip():
+            if cur.get('Id'):
+                out[cur['Id']] = cur
+            cur = {}
+            continue
+        k, eq, v = line.partition('=')
+        if eq:
+            cur[k] = v
+    return out
 
 
 EDIT_STATES = (['Attached', 'RO'], ['Attached', 'RW'], ['Activated', 'RO'], ['Activated', 'RW'])
@@ -7385,6 +7520,314 @@ def agent_tap_free(args, source):
                                                            'still lists it' if after else 'no longer lists it')]}
 
 
+def agent_ctl_clean(args, source):
+    pid = int(args['pid'])
+    if pid <= 1:
+        raise Failed('bad pid')
+    files = args.get('files') or {}
+    shm = list(args.get('shm') or [])
+    for name in files:
+        m = CTL_FILE.match(name)
+        if not m or int(m.group(1) or m.group(2)) != pid or '/' in name:
+            raise Failed('%s is not a control file of pid %d' % (canon(name), pid))
+    for p in shm:
+        base, d = os.path.basename(p), os.path.dirname(p)
+        mm = SHM_TAP.match(base)
+        if not ((d == DEV_SHM and base == 'td3-%d' % pid) or
+                (d == os.path.join(DEV_SHM, 'metrics') and mm and int(mm.group(1)) == pid)):
+            raise Failed('%s is not a file tapdisk pid %d leaves' % (canon(p), pid))
+    cleaned, left = [], []
+    for name, rec in sorted(files.items()):
+        p = os.path.join(BLKTAP_CTL, name)
+        if comm_strict(pid) == 'tapdisk':
+            return {'done': False, 'cleaned': cleaned, 'problems': ['pid %d is a tapdisk now' % pid]}
+        try:
+            st = os.lstat(p)
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                continue
+            raise
+        if st.st_ino != rec[0] or abs(st.st_mtime - rec[1]) > 1:
+            left.append('%s is another file now, so it was left alone' % p)
+            continue
+        _unlink_quietly(p)
+        (left if os.path.lexists(p) else cleaned).append(p)
+    for p in shm:
+        if comm_strict(pid) == 'tapdisk':
+            return {'done': False, 'cleaned': cleaned, 'problems': ['pid %d is a tapdisk now' % pid]}
+        if not os.path.lexists(p):
+            continue
+        if os.path.isdir(p) and not os.path.islink(p):
+            shutil.rmtree(p, True)
+        else:
+            _unlink_quietly(p)
+        (left if os.path.lexists(p) else cleaned).append(p)
+    return {'done': True, 'cleaned': cleaned, 'left': left, 'problems': []}
+
+
+def agent_attach_clean(args, source):
+    sr, vdi = args.get('sr'), args.get('vdi')
+    if not (UUID_RE.match(sr or '') and UUID_RE.match(vdi or '')):
+        raise Failed('bad SR or VDI')
+    lockfd = sm_vdi_lock(vdi)
+    if lockfd is None:
+        return {'done': False, 'problems': ['SM holds the lock of VDI %s: an SM operation on it is running' % vdi]}
+    try:
+        node = os.path.join(SM_BACKEND, sr, vdi)
+        p = node + '.attach_info'
+        if os.path.lexists(node):
+            return {'done': False, 'problems': ['the VDI has a backend node there now (%s)' % node]}
+        try:
+            st = os.lstat(p)
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                return {'done': False, 'already': True, 'problems': []}
+            raise
+        if not stat.S_ISREG(st.st_mode) or st.st_ino != args.get('ino'):
+            return {'done': False, 'problems': ['%s is not the file that was read' % p]}
+        os.unlink(p)
+        return {'done': True, 'path': p, 'problems': []}
+    finally:
+        os.close(lockfd)
+
+
+TEARDOWN_BUDGET = 240
+TEARDOWN_CALL = TEARDOWN_BUDGET + 180
+CLOSE_TIMEOUT = 150
+DETACH_TIMEOUT = 60
+EXIT_WAIT = 20
+
+
+def agent_sm_teardown(args, source):
+    sr, vdi = args.get('sr'), args.get('vdi')
+    if not (UUID_RE.match(sr or '') and UUID_RE.match(vdi or '')) or not RUN_ID_RE.match(args.get('run_id') or ''):
+        raise Failed('bad SR, VDI or run id')
+    tap = args.get('tap')
+    if tap is not None and (int(tap['pid']) <= 1 or int(tap['minor']) < 0):
+        raise Failed('bad pid or minor')
+    lockfd = sm_vdi_lock(vdi)
+    if lockfd is None:
+        return {'done': False, 'did': [], 'problems': ['SM holds the lock of VDI %s: an SM operation on it is running'
+                                                       % vdi]}
+    outer = _DEADLINE[0]
+    _DEADLINE[0] = _now() + TEARDOWN_BUDGET if outer is None else min(outer, _now() + TEARDOWN_BUDGET)
+    try:
+        return teardown_locked(args, sr, vdi)
+    finally:
+        _DEADLINE[0] = outer
+        os.close(lockfd)
+
+
+def inert_was(path):
+    try:
+        data = read_file(path)
+    except EnvironmentError:
+        return None
+    if not data.startswith(INERT_MARK):
+        return None
+    try:
+        return json.loads(data[len(INERT_MARK):].decode('utf-8')).get('was') or {}
+    except (ValueError, AttributeError):
+        return None
+
+
+def node_problem(path, exp, ended):
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            return None if exp is None else '%s is gone since it was read' % path
+        raise
+    if exp is None:
+        return '%s exists now, and it was not there when it was read: something activated the VDI here since' % path
+    if stat.S_ISBLK(st.st_mode):
+        if exp.get('kind') != 'block':
+            return '%s is a block node now, not the %s file that was read' % (path, exp.get('kind'))
+        if [os.major(st.st_rdev), os.minor(st.st_rdev)] != list(exp['rdev']) or \
+                (exp.get('ino') is not None and st.st_ino != exp['ino']):
+            return '%s is %d:%d inode %d now, not the %d:%d inode %s read' % (
+                path, os.major(st.st_rdev), os.minor(st.st_rdev), st.st_ino, exp['rdev'][0], exp['rdev'][1],
+                exp.get('ino'))
+        return None
+    was = inert_was(path) if stat.S_ISREG(st.st_mode) else None
+    if was is None:
+        return '%s is neither a block node nor this tool\'s inert file' % path
+    if exp.get('kind') == 'inert':
+        return None if exp.get('ino') is None or st.st_ino == exp['ino'] else '%s is another inert file now' % path
+    if ended and exp.get('kind') == 'block' and list(was.get('rdev') or []) == list(exp['rdev']) and \
+            (exp.get('ino') is None or was.get('ino') == exp['ino']):
+        return None
+    return '%s is an inert file now, made from a node other than the one read' % path
+
+
+def link_problem(path, exp, what):
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            return None if exp is None else 'its %s %s is gone since it was read' % (what, path)
+        raise
+    if exp is None:
+        return 'its %s %s exists now, and it was not there when it was read' % (what, path)
+    if what == 'attach_info file':
+        if not stat.S_ISREG(st.st_mode) or (exp.get('ino') is not None and st.st_ino != exp['ino']):
+            return 'its attach_info file %s is not the one read' % path
+        return None
+    if not stat.S_ISLNK(st.st_mode) or os.readlink(path) != exp.get('target') or \
+            (exp.get('ino') is not None and st.st_ino != exp['ino']):
+        return 'its %s %s is not the link read (to %s)' % (what, path, exp.get('target'))
+    return None
+
+
+def teardown_locked(args, sr, vdi):
+    did, problems, left = [], [], []
+    tap = args.get('tap')
+    path = os.path.join(SM_BACKEND, sr, vdi)
+    places = [(path + '.attach_info', args.get('attach_info'), 'attach_info file'),
+              (os.path.join(BLKTAP_CTL, 'nbd', sr, vdi), args.get('nbd'), 'NBD link'),
+              (os.path.join(SM_PHY, sr, vdi), args.get('phy'), 'phy link')]
+    why = node_problem(path, args.get('node'), args.get('ended'))
+    if why:
+        problems.append(why)
+    for p, exp, what in places:
+        why = link_problem(p, exp, what)
+        if why:
+            problems.append(why)
+    tapmaj = proc_devices().get(('b', 'tapdev'))
+    if tapmaj is None:
+        problems.append('the tapdev major is not known')
+    roots = set()
+    for v in path_variants(SR_MOUNT):
+        roots.add('%s/%s' % (v, sr))
+    for extra in args.get('roots') or []:
+        roots |= path_variants(extra)
+    try:
+        rows = f_tapdisks()
+    except Exception as exc:
+        return {'done': False, 'did': [], 'problems': ['tap-ctl list: %s' % _text(exc)]}
+    target = (args.get('phy') or {}).get('target')
+    for row in image_rows(rows, vdi, target):
+        if tap is None or row['pid'] != int(tap['pid']):
+            problems.append('tapdisk pid %s minor %s serves this VDI' % (row['pid'], row['minor']))
+    pid = minor = start = btime = None
+    if tap is not None:
+        pid, minor = int(tap['pid']), int(tap['minor'])
+        btime = boot_time()
+        try:
+            st0 = proc_stat(pid)
+        except EnvironmentError as exc:
+            if gone(exc):
+                return {'done': False, 'did': [], 'problems': ['tapdisk pid %d is gone' % pid], 'gone': True}
+            raise
+        start = btime + st0['start_ticks'] / float(clk_tck())
+        if comm_strict(pid) != 'tapdisk':
+            problems.append('pid %d is not a tapdisk any more' % pid)
+        elif tap.get('start_ticks') is not None and st0['start_ticks'] != tap['start_ticks']:
+            problems.append('pid %d is a tapdisk that started at boot tick %s, not the one read (%s)'
+                            % (pid, st0['start_ticks'], tap['start_ticks']))
+        elif tap.get('start_ticks') is None and (tap.get('start') is None or abs(start - float(tap['start'])) >= 2):
+            problems.append('pid %d is a tapdisk that started at %s, not the one read' % (pid, start))
+        mine = [r for r in rows if r['pid'] == pid]
+        if [r['minor'] for r in mine] != [minor]:
+            problems.append('tap-ctl lists tapdisk pid %d on minor(s) %s, not just %d' % (
+                pid, ', '.join(str(r['minor']) for r in mine) or 'none', minor))
+        elif mine[0]['state'] is None or mine[0]['state'] & ~(LOG_DROPPED | PAUSED):
+            problems.append('tapdisk pid %d is in state %s' % (pid, tap_state_text(mine[0]['state'])))
+        fds = tap_fds(pid)
+        if fds.get('unread') or fds.get('gone'):
+            problems.append('its open files cannot be read: %s' % (fds.get('unread') or 'it is gone'))
+        else:
+            if fds['minors'] != [minor]:
+                problems.append('it holds tap minor(s) %s, not just %d' % (fds['minors'], minor))
+            if fds.get('rings') or fds.get('gntdev') or fds.get('evtchn'):
+                problems.append('it holds a guest ring (%s)' % canon([fds.get('rings'), fds.get('gntdev'),
+                                                                      fds.get('evtchn')]))
+            imgs = [bare_path(i.get('path')) for i in fds.get('images') or []]
+            outside = [p for p in imgs if os.path.dirname(p) not in roots]
+            if outside:
+                problems.append('it has %s open, which is not on SR %s' % (', '.join(outside[:2]), sr))
+            elif imgs and not any(own_file(p, roots, vdi) for p in imgs):
+                problems.append('it does not have the image of VDI %s open (it has %s)' % (vdi, ', '.join(imgs[:2])))
+        kind, val = tap_verdict(pid, minor)
+        if kind != 'ok' or not isinstance(val, dict):
+            problems.append('its tap-ctl stats answer %s (%s)' % (kind, canon(val)[:120]))
+        elif val.get('reqs_outstanding') != 0 or 'xenbus' in val:
+            problems.append('its tap-ctl stats show %s' % ('a connected guest ring' if 'xenbus' in val else
+                                                           '%s request(s) outstanding' % val.get('reqs_outstanding')))
+        stuck = d_threads(pid)
+        if stuck:
+            problems.append('thread(s) %s of it are in D state, waiting on its storage' % ', '.join(stuck[:6]))
+        if not fds.get('unread') and not fds.get('gone'):
+            problems.extend(tap_end_proofs(pid, minor, path, tapmaj, None, fds))
+    else:
+        exp = args.get('node') or {}
+        mn = (exp.get('rdev') or exp.get('was_rdev') or [None, None])[1] if exp else None
+        try:
+            xs = xs_backend()
+        except Failed as exc:
+            xs = None
+            problems.append(_text(exc))
+        names = path_variants(path) | path_variants(os.path.join(SM_PHY, sr, vdi))
+        if target:
+            names |= path_variants(bare_path(target))
+        for k, v in sorted((xs or {}).items()):
+            if (k.endswith('/physical-device') and mn is not None and tapmaj is not None and v == '%x:%x' % (tapmaj, mn)) \
+                    or (k.endswith('/params') and v in names):
+                problems.append('xenstore %s names it' % k)
+        if mn is not None:
+            try:
+                users, nodes, blk = minor_users(mn, (), [path])
+                problems.extend(users)
+            except Exception as exc:
+                problems.append('who holds tap minor %d is not established: %s' % (mn, _text(exc)))
+            for p in tapdisk_pids():
+                f2 = tap_fds(p)
+                if f2.get('unread'):
+                    problems.append('the open files of tapdisk pid %d were not read (%s)' % (p, f2['unread']))
+                elif mn in (f2.get('minors') or []):
+                    problems.append('tapdisk pid %d has tap minor %d open' % (p, mn))
+    if problems:
+        return {'done': False, 'did': [], 'problems': problems}
+    if tap is not None:
+        r = run([TAPCTL, 'close', '-p', str(pid), '-m', str(minor), '-t', '120'], CLOSE_TIMEOUT)
+        if not r.ok:
+            return {'done': False, 'did': did, 'problems': ['tap-ctl close -p %d -m %d %s' % (pid, minor, r.why())],
+                    'stage': 'close'}
+        did.append('closed tapdisk pid %d (minor %d)' % (pid, minor))
+        r = run([TAPCTL, 'detach', '-p', str(pid), '-m', str(minor)], DETACH_TIMEOUT)
+        if not r.ok:
+            return {'done': False, 'did': did, 'problems': ['tap-ctl detach -p %d -m %d %s' % (pid, minor, r.why())],
+                    'stage': 'detach'}
+        did.append('detached it')
+        end = _now() + EXIT_WAIT
+        while tap_alive(pid, start, btime) and _now() < end:
+            time.sleep(0.2)
+        if tap_alive(pid, start, btime):
+            fds = tap_fds(pid)
+            if minor in (fds.get('minors') or []) or fds.get('unread'):
+                return {'done': False, 'did': did, 'stage': 'exit',
+                        'problems': ['tapdisk pid %d is still there %ds after its detach, and still holds tap minor %d'
+                                     % (pid, EXIT_WAIT, minor)]}
+            left.append('tapdisk pid %d is still there %ds after its detach, with tap minor %d let go'
+                        % (pid, EXIT_WAIT, minor))
+        else:
+            did.append('tapdisk pid %d exited' % pid)
+    for p, exp, what in [(path + '.attach_info', args.get('attach_info'), 'attach_info file'),
+                         (path, args.get('node'), 'backend node')] + places[1:]:
+        if exp is None:
+            continue
+        why = node_problem(p, exp, args.get('ended')) if what == 'backend node' else link_problem(p, exp, what)
+        if why:
+            return {'done': False, 'did': did, 'problems': [why], 'stage': what}
+        try:
+            os.unlink(p)
+        except OSError as exc:
+            if exc.errno != errno.ENOENT:
+                return {'done': False, 'did': did, 'problems': ['%s: %s' % (p, _text(exc))], 'stage': what}
+        did.append('removed its %s %s' % (what, p))
+    return {'done': True, 'did': did, 'problems': [], 'left': left}
+
+
 FENCE_TAG_RE = re.compile(r'^[a-z0-9-]{1,40}$')
 FENCE_ENDS = ('released', 'refused', 'acted', 'failed', 'lost')
 
@@ -8224,12 +8667,12 @@ def agent_reset_marker(args, source):
 
 def agent_dps_write(args, source):
     dp = args.get('dp') or ''
-    if not (DOM0_DP_RE.match(dp) or GUEST_DP_RE.match(dp)):
+    if not (DOM0_DP_RE.match(dp) or GUEST_DP_RE.match(dp) or SXM_DP_RE.match(dp)):
         raise Failed('%s is not a datapath name this tool writes a record for' % canon(dp))
     sr, vdi, key, vm = args.get('sr'), args.get('vdi'), args.get('vdi_key') or '', _text(args.get('vm'))
     if not UUID_RE.match(sr or '') or not UUID_RE.match(vdi or '') or not key or '/' in key or len(key) > 200:
         raise Failed('bad SR or VDI')
-    if vm != dp.split('/')[1]:
+    if (GUEST_DP_RE.match(dp) and vm != dp.split('/')[1]) or (not GUEST_DP_RE.match(dp) and vm != '0'):
         raise Failed('domain %s is not the one %s names' % (vm, dp))
     if not os.path.isdir(STORAGE_DPS):
         return {'done': False, 'problems': ['%s does not exist' % STORAGE_DPS]}
@@ -8556,6 +8999,7 @@ VERBS = {'facts': lambda a, s: agent_facts(a), 'act-start': agent_act_start, 'ac
          'reset-marker': agent_reset_marker, 'dps-write': agent_dps_write,
          'smlog-tail': agent_smlog_tail, 'xlog-grep': agent_xlog_grep, 'tap-stats': agent_tap_stats,
          'tap-end': agent_tap_end, 'tap-free': agent_tap_free, 'nbd-end': agent_nbd_end,
+         'sm-teardown': agent_sm_teardown, 'ctl-clean': agent_ctl_clean, 'attach-clean': agent_attach_clean,
          'fence-start': agent_fence_start, 'fence-status': agent_fence_status, 'fence-release': agent_fence_release,
          'domains': agent_domains}
 
@@ -9284,6 +9728,10 @@ class HostView(object):
         self.xl = f('xl')
         self.tapinfo = f('tapinfo')
         self.ctlfiles = f('ctlfiles')
+        self.nbdlinks = f('nbdlinks')
+        self.nbd_link = dict(((r['sr'], r['vdi']), r) for r in self.nbdlinks or [])
+        self.sxm = f('sxm')
+        self.domvms = f('domvms')
         self.taplog = audit.taplog.get(self.uuid) if self.doc is not None else None
         self.phantoms, self.unlisted, self.minor_owner = [], [], {}
         self.phantoms_explained = False
@@ -9405,7 +9853,7 @@ class HostView(object):
                 return '%s: %s' % (k, e)
         return None
 
-    def serving(self, sr_type, vdi_uuid):
+    def serving(self, sr_type, vdi_uuid, sr_uuid=None):
         if self.taps is None:
             return None, 'tap-ctl list did not answer'
         if self.tapinfo is None:
@@ -9426,7 +9874,7 @@ class HostView(object):
                              ' (and %d more)' % (len(self.unmapped) - 1) if len(self.unmapped) > 1 else ''))
         m = self.audit.model
         vref = m.vdi_by_uuid.get(vdi_uuid)
-        sr = m.srs.get(m.vdis[vref]['SR']) if vref else None
+        sr = m.srs.get(m.vdis[vref]['SR']) if vref else m.srs.get(m.sr_by_uuid.get(sr_uuid)) if sr_uuid else None
         if sr_type in PATH_SR_TYPES:
             odd = [r for r in self.unnamed if sr is None or sr['uuid'] in (r.get('path') or '')]
         else:
@@ -11202,15 +11650,15 @@ def eval_dps(a, opts):
         guest = []
         for dp, cl in sorted(hv.claim.items()):
             g = GUEST_DP_RE.match(dp)
-            if not g:
+            if not g and not SXM_DP_RE.match(dp):
                 for sr, vdi, st, key in cl:
-                    out.append(not_judged(a, hv, dp, sr, key, vdi, st, 'its name is not vbd/<domid>/<device>, the only '
-                                          'kind this tool handles (xapi names storage-migration datapaths mirror_*, '
-                                          'copy_* or vbd/<vm>/<vdi>)'))
+                    out.append(not_judged(a, hv, dp, sr, key, vdi, st, 'its name is of no kind this tool knows: xapi '
+                                          'names a VM\'s datapaths vbd/<domid>/<device> and a storage migration\'s '
+                                          'with a uuid, mirror_* or copy_*'))
                 continue
             for sr, vdi, st, key in cl:
                 judged, why = hv.keys[(sr, key)][1:]
-                if g.group(1) == '0':
+                if g and g.group(1) == '0':
                     if (vdi, dp) in backed:
                         continue
                     if not judged:
@@ -11262,11 +11710,13 @@ def eval_dps(a, opts):
 def not_judged(a, hv, dp, sr, key, vdi, st, why):
     m = a.model
     vref = m.vdi_by_uuid.get(vdi) if vdi else None
+    left, unknown = footprint_of(hv, sr, vdi or key, strict=True)
+    held = ('; what SM left of the VDI on %s: %s' % (hv.name, '; '.join(left[:5]))) if left else ''
     return ev(('DPX', hv.uuid, sr, key, dp), 'C16', REPORT, hv.uuid,
               'C16 %s on %s, %s' % (dp, hv.name, ('VDI ' + m.name_vdi(vref)) if vref else 'storage.db key %s' % key),
-              'not judged: %s. Only datapaths on %s SRs keyed by the VDI\'s uuid are ever changed'
-              % (why, '/'.join(JUDGED_SR_TYPES)),
-              ['state %s' % canon(st)])
+              'not judged: %s. Only datapaths on %s SRs keyed by the VDI\'s uuid are ever changed%s'
+              % (why, '/'.join(JUDGED_SR_TYPES), held),
+              ['state %s' % canon(st)] + unknown[:2])
 
 
 def dom0_dp_proofs(a, hv, dp, sr, vdi, sr_type, vref, naming, selfcheck, evidence, edit=True, leaked_ok=False):
@@ -11563,6 +12013,28 @@ def restart_gates(a, opts, hv, gate, problems, unknowns, waits, evidence):
     unknowns.extend(gate.unknown)
     problems.extend(gate.stuck)
     evidence.extend(gate.notes)
+    for rec in (getattr(a, '_diverged', None) or ({}, {}))[1].values():
+        if rec['host'] != hv.uuid or 'runs_on' not in rec:
+            continue
+        if rec['runs_on']:
+            problems.append('VM "%s" is recorded %s here in domain %s, which is gone, while domain %s on %s runs it '
+                            '(C26): a xapi restart on %s would record it halted, and it could then be started a second '
+                            'time over the same disks' % (rec['name'], rec['power_state'].lower(), rec['domid'],
+                                                           rec['runs_on'][1], rec['runs_on'][0], hv.name))
+        else:
+            unknowns.append('VM "%s" is recorded %s here in domain %s, which is gone, and whether it runs on another '
+                            'host is not established (C26): a xapi restart on %s would record it halted'
+                            % (rec['name'], rec['power_state'].lower(), rec['domid'], hv.name))
+    m = a.model
+    by_uuid = dict((v.get('uuid'), v) for v in m.vms.values())
+    for d, vu in sorted((hv.domvms or {}).items(), key=lambda kv: domain_order(kv[0])):
+        vm = by_uuid.get(vu) if vu else None
+        if vm is None or vm.get('power_state') not in ('Running', 'Paused') or vm.get('resident_on') == hv.href or \
+                vm.get('resident_on') not in m.hosts:
+            continue
+        problems.append('domain %s on %s runs VM "%s", which xapi records %s on %s: a xapi restart on %s would shut it '
+                        'down as running elsewhere' % (d, hv.name, vm.get('name_label'), vm['power_state'].lower(),
+                                                       m.hosts[vm['resident_on']]['name_label'], hv.name))
     return soft, stale, taps
 
 
@@ -11767,8 +12239,9 @@ def eval_dom0_attached(a, hv, dp, cl, sr, vdi, st, naming, selfcheck, gate, cls,
 INERT_EFFECT = ('until then, a VM start there launches a tapdisk and then fails SM\'s backend-link check, leaving that '
                 'tapdisk running with no node (the next run reports it as C14), and SM\'s pause of the VDI (a snapshot, '
                 'a coalesce) answers False there; SM\'s deactivate of the datapath unlinks the file')
-C03_STEPS = ('end', 'refresh', 'unkey', 'destroy', 'deactivate', 'free')
-STEP_TEXT = {'end': 'end its wedged tapdisk', 'refresh': 'refresh its LV through SM',
+C03_STEPS = ('end', 'teardown', 'refresh', 'unkey', 'destroy', 'deactivate', 'free')
+STEP_TEXT = {'end': 'end its wedged tapdisk', 'teardown': 'remove what SM left of the VDI in dom0',
+             'refresh': 'refresh its LV through SM',
              'unkey': 'remove its stale sm-config paused', 'destroy': 'xe host-sm-dp-destroy',
              'deactivate': 'put back the stale LV activation count through SM', 'free': 'release its tap minor'}
 
@@ -11848,7 +12321,7 @@ def tap_clients(hv, pid):
     return out
 
 
-def c03_tap(a, opts, hv, domid, sr, vdi, sr_type, vref, rows, state, at):
+def c03_tap(a, opts, hv, domid, sr, vdi, sr_type, vref, rows, state, at, gone_vdi=False):
     m = a.model
     problems, unknowns, waits, evidence = [], [], [], []
     if len(rows) > 1:
@@ -11906,9 +12379,11 @@ def c03_tap(a, opts, hv, domid, sr, vdi, sr_type, vref, rows, state, at):
                             % (domid, ', '.join(be[:3])))
     if h['kind'] == 'clean':
         evidence.append('%s is this datapath\'s own tapdisk, %s, with no guest ring, no request outstanding and '
-                        'nothing else holding its device: SM\'s own teardown closes it'
+                        'nothing else holding its device: %s'
                         % (label, 'not listed by tap-ctl (state not known)' if row['state'] is None else
-                           'paused (%s)' % tap_state_text(row['state']) if row['state'] & PAUSED else 'running'))
+                           'paused (%s)' % tap_state_text(row['state']) if row['state'] & PAUSED else 'running',
+                           'this tool closes it the way SM\'s teardown does (tap-ctl close, then detach)' if gone_vdi
+                           else 'SM\'s own teardown closes it'))
         note = resume_note(row['state'])
         if note:
             evidence.append(note)
@@ -12123,11 +12598,341 @@ def same_names(m, vref):
     return out
 
 
+GONE_VDI_TEXT = ('the VDI is not in xapi any more (neither by uuid nor by location on its SR), so xapi\'s teardown '
+                 'never reaches SM for it: xapi raises No_VDI before the backend is called')
+TEARDOWN_TEXT = ('under SM\'s lock of the VDI: its tapdisk closed and detached with tap-ctl, then its attach_info file, '
+                 'backend node, NBD link and phy link removed, each only as it was read; its tap minor is released '
+                 'once nothing names it')
+IMAGE_EXTS = ('vhd', 'qcow2', 'raw')
+
+
+def uniq(items):
+    seen = set()
+    out = []
+    for x in items:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def vdi_gone(m, sr, vdi):
+    return m.vdi_by_uuid.get(vdi) is None and not m.vdi_by_loc.get((sr, vdi))
+
+
+def sr_image_roots(m, href, sr):
+    out = set(path_variants('%s/%s' % (SR_MOUNT, sr)))
+    sref = m.sr_by_uuid.get(sr)
+    if (m.srs.get(sref) or {}).get('type') in ('file', 'zfs'):
+        for pb in m.pbds.values():
+            loc = ((pb.get('device_config') or {}).get('location') or '').rstrip('/')
+            if pb.get('host') == href and pb.get('SR') == sref and loc.startswith('/'):
+                out |= path_variants(loc)
+    return out
+
+
+def bare_path(path):
+    p = _text(path or '')
+    return p[:-len(' (deleted)')] if p.endswith(' (deleted)') else p
+
+
+def own_file(path, roots, vdi):
+    p = bare_path(path)
+    return os.path.dirname(p) in roots and os.path.basename(p) in ['%s.%s' % (vdi, e) for e in IMAGE_EXTS]
+
+
+def nbd_socket_of(target):
+    alts = '|'.join(re.escape(v) for v in sorted(path_variants(BLKTAP_CTL)))
+    mm = re.match(r'^(?:%s)/nbd(\d+)\.(\d+)$' % alts, _text(target or ''))
+    return (int(mm.group(1)), int(mm.group(2))) if mm else None
+
+
+def dp_kind(dp):
+    if DOM0_DP_RE.match(dp):
+        return 'dom0'
+    g = GUEST_DP_RE.match(dp)
+    if g:
+        return 'dom0-other' if g.group(1) == '0' else 'guest'
+    if SXM_DP_RE.match(dp):
+        return 'sxm'
+    return None
+
+
+def sxm_busy(a, hv, dp, vdi):
+    m = a.model
+    waits, unknowns, evidence = [], [], []
+    for href in sorted(m.hosts):
+        h2 = a.view(href)
+        if not h2.live:
+            continue
+        if h2.doc is None:
+            unknowns.append('%s was not audited, so whether a storage migration there uses %s is not established'
+                            % (h2.name, dp))
+            continue
+        if h2.sxm is None:
+            unknowns.append('xapi\'s storage-migration state on %s was not read (%s), so whether a storage migration '
+                            'uses %s is not established' % (h2.name, h2.why('sxm'), dp))
+            continue
+        for t in SXM_TABLES:
+            text = canon((h2.sxm.get('tables') or {}).get(t) or {})
+            if (dp and dp in text) or (vdi and vdi in text):
+                waits.append('xapi\'s storage-migration %s table on %s names %s: a storage migration that uses it is '
+                             'in progress there' % (t, h2.name, dp if dp in text else 'VDI ' + vdi))
+    for t in m.pending_tasks(work=True):
+        name = _text(t.get('name_label'))
+        if any(name in (x, 'Async.' + x) for x in SXM_TASKS):
+            waits.append('task "%s" (%s) is pending in the pool, and a storage migration or copy may hold %s'
+                         % (name, t.get('uuid'), dp))
+    if hv.procs is None:
+        unknowns.append('the processes on %s were not read, so whether a storage-migration copy runs there is not '
+                        'established' % hv.name)
+    else:
+        for p in hv.procs:
+            if p.get('comm') in SXM_COMMS:
+                waits.append('%s pid %s runs on %s: a storage-migration copy may use %s' % (p['comm'], p['pid'],
+                                                                                         hv.name, dp))
+    if not waits and not unknowns:
+        evidence.append('no storage migration holds %s: xapi\'s storage-migration state on every host names neither it '
+                        'nor its VDI, no migrate or copy task is pending in the pool, and no sparse_dd or vhd-tool runs '
+                        'on %s' % (dp, hv.name))
+    return waits, unknowns, evidence
+
+
+def dp_dead(a, hv, dp, sr, vdi, ends=None):
+    m = a.model
+    problems, unknowns, waits, evidence = [], [], [], []
+    k = dp_kind(dp)
+    if k == 'guest':
+        domid = GUEST_DP_RE.match(dp).group(1)
+        ds, xrec = hv.domain_state(domid)
+        if ds == 'gone':
+            evidence.append('domain %s of %s is gone from %s' % (domid, dp, hv.name))
+        elif ds == 'dying' and ends is not None and ends in [r['pid'] for r in hv.pinners(domid)]:
+            evidence.append('domain %s of %s is dying on %s and cannot finish while tapdisk pid %d maps its ring: that '
+                            'tapdisk is ended first, and the domain is then expected to finish, which is checked'
+                            % (domid, dp, hv.name, ends))
+        elif ds in ('present', 'dying'):
+            problems.append('domain %s of %s is %s on %s' % (domid, dp, 'still there' if ds == 'present' else 'dying',
+                                                           hv.name))
+        else:
+            unknowns.append('whether domain %s of %s still exists on %s is not established (%s)'
+                            % (domid, dp, hv.name, hv.why('xl', 'domains') or 'xenstore still lists it'))
+    elif k == 'dom0':
+        cl = (hv.claim or {}).get(dp) or []
+        if len(cl) > 1:
+            problems.append('%d VDIs on %s claim %s, and xapi\'s teardown acts on the name (see C01)'
+                            % (len(cl), hv.name, dp))
+        ud = userdevice_number(dp.split('/')[-1])
+        dom0 = m.dom0_of(hv.href)
+        names = set()
+        for vbds in (m.vbds, a.vbd2 or {}):
+            for r, vbd in vbds.items():
+                if dom0 is not None and vbd['VM'] == dom0 and ud is not None and \
+                        userdevice_number(vbd['userdevice']) == ud:
+                    names.add(vbd['uuid'])
+        if dom0 is None:
+            unknowns.append('the control domain of %s is not established' % hv.name)
+        elif ud is None:
+            unknowns.append('the device name of %s does not map to a userdevice' % dp)
+        elif names:
+            problems.append('dom0 VBD(s) %s on %s hold the device name of %s' % (', '.join(sorted(names)[:3]), hv.name,
+                                                                                dp))
+        else:
+            evidence.append('no dom0 VBD on %s holds the device name of %s' % (hv.name, dp))
+    elif k == 'sxm':
+        w, u, e = sxm_busy(a, hv, dp, vdi)
+        waits.extend(w)
+        unknowns.extend(u)
+        evidence.extend(e)
+    else:
+        problems.append('its datapath %s is of a kind this tool does not judge (xapi names a VM\'s datapaths '
+                        'vbd/<domid>/<device>, and storage-migration ones with a uuid, mirror_* or copy_*)' % dp)
+    return problems, unknowns, waits, evidence
+
+
+def forgotten(a, hv, sr, vdi):
+    cache = getattr(a, '_forgotten', None)
+    if cache is None:
+        cache = a._forgotten = {}
+    key = (hv.uuid, sr, vdi)
+    if key in cache:
+        return cache[key]
+    m = a.model
+    problems, unknowns, waits, evidence = [], [], [], []
+    plan = {'tap': None, 'node': None, 'attach_info': None, 'phy': None, 'nbd': None}
+    sref = m.sr_by_uuid.get(sr)
+    sr_type = m.srs[sref]['type'] if sref else None
+    roots = sr_image_roots(m, hv.href, sr)
+    entry = sdb_entry(hv, sr, vdi) or {}
+    dps = sorted(entry.get('dps') or {})
+    left, fu = footprint_of(hv, sr, vdi, strict=True)
+    left = list(left)
+    minor, end = None, False
+    if hv.taps is None or hv.tapinfo is None or hv.backend is None or hv.phy_list is None or hv.nbdlinks is None:
+        unknowns.append('what SM left of it on %s is not established (%s)'
+                        % (hv.name, hv.why('tapdisks', 'tapinfo', 'backend', 'phy', 'nbdlinks')))
+    rows, why = hv.serving(sr_type, vdi, sr) if hv.taps is not None else (None, 'tap-ctl list did not answer')
+    if rows is None:
+        tap_why(why, unknowns, waits)
+        rows = []
+    state, node, at = hv.node_state(sr, vdi)
+    if rows:
+        tp, tu, tw, te, tap = c03_tap(a, None, hv, None, sr, vdi, sr_type, None, rows, state, at, gone_vdi=True)
+        problems.extend(tp)
+        unknowns.extend(tu)
+        waits.extend(tw)
+        evidence.extend(te)
+        if tap is not None:
+            plan['tap'] = dict(tap)
+            minor = tap['minor']
+            end = tap['kind'] in ('deadring', 'wedged')
+            row = rows[0]
+            imgs = [bare_path(i.get('path')) for i in ((hv.tapinfo or {}).get(str(tap['pid'])) or {}).get('images') or []]
+            paused = row['state'] is not None and bool(row['state'] & PAUSED)
+            if not end and not row.get('unlisted') and row.get('type') not in ('vhd', 'aio', 'qcow2'):
+                problems.append('tapdisk pid %s serves it as %s, a kind this tool does not close' % (tap['pid'],
+                                                                                               row.get('type')))
+            outside = [p for p in imgs if os.path.dirname(p) not in roots]
+            if sr_type not in FILE_SR_TYPES:
+                pass
+            elif outside:
+                problems.append('tapdisk pid %s has %s open, which is not on SR %s' % (tap['pid'],
+                                                                                     ', '.join(outside[:2]), sr))
+            elif imgs and not any(own_file(p, roots, vdi) for p in imgs):
+                problems.append('tapdisk pid %s does not have the image of VDI %s open (it has %s)'
+                                % (tap['pid'], vdi, ', '.join(imgs[:2])))
+            elif not imgs and not paused and not end:
+                problems.append('tapdisk pid %s has no image open, and is not paused, so whose disk it serves is not '
+                                'established from its open files' % tap['pid'])
+            elif imgs:
+                evidence.append('tapdisk pid %s has its image open: %s' % (tap['pid'], ', '.join(
+                    i.get('path') for i in ((hv.tapinfo or {}).get(str(tap['pid'])) or {}).get('images') or [])))
+    if node is not None:
+        if state in ('own', 'free'):
+            plan['node'] = {'kind': 'block', 'rdev': list(node['rdev']), 'ino': node.get('ino')}
+            if state == 'free':
+                mn = node['rdev'][1]
+                if any(r['minor'] == mn for r in hv.empty_minors):
+                    minor = mn
+                evidence.append('its backend node points at tap minor %d, on which no tapdisk runs%s'
+                                % (mn, ' (it is still allocated)' if minor == mn else ''))
+        elif state == 'inert':
+            plan['node'] = {'kind': 'inert', 'ino': node.get('ino'), 'was_rdev': node.get('was_rdev')}
+            mn = (node.get('was_rdev') or [None, None])[1]
+            if mn is not None and any(r['minor'] == mn for r in hv.empty_minors):
+                minor = mn
+        elif state == 'other':
+            problems.append('its backend node points at tap minor %d, which now belongs to %s (C20)'
+                            % (node['rdev'][1], hv.row_label(at)))
+        elif state == 'unknown':
+            unknowns.append(at)
+        else:
+            problems.append('its backend node is %s, which SM does not leave' % (
+                'block %d:%d, not a tap device' % tuple(node['rdev']) if state == 'nontap' else 'a ' + state))
+    elif state == 'unknown':
+        unknowns.append(at)
+    ai = hv.attach_info.get((sr, vdi))
+    if ai is not None:
+        plan['attach_info'] = {'ino': ai.get('ino')}
+    phy = hv.phy.get((sr, vdi))
+    if phy is not None and sr_type in FILE_SR_TYPES:
+        if phy.get('kind') != 'file' or not own_file(phy.get('target'), roots, vdi):
+            problems.append('its phy link points at %s, not at its image on SR %s' % (canon(phy.get('target')), sr))
+        else:
+            plan['phy'] = {'target': phy['target']}
+    nl = hv.nbd_link.get((sr, vdi))
+    if nl is not None:
+        sock = nbd_socket_of(nl.get('target')) if nl.get('kind') == 'link' else None
+        tp_ = plan['tap'] or ({'pid': rows[0]['pid'], 'minor': rows[0]['minor']} if rows else None)
+        if sock is None:
+            problems.append('its NBD link is %s, not a link to a tapdisk\'s NBD socket' % canon(nl.get('target') or
+                                                                                              nl.get('kind')))
+        elif tp_ is not None and list(sock) != [tp_['pid'], tp_['minor']]:
+            problems.append('its NBD link points at the socket of tapdisk pid %d minor %d, not at its own tapdisk (pid '
+                            '%s minor %s)' % (sock[0], sock[1], tp_['pid'], tp_['minor']))
+        elif tp_ is None and (hv.tapinfo is None or str(sock[0]) in hv.tapinfo):
+            problems.append('its NBD link points at the socket of tapdisk pid %d, which %s' % (
+                sock[0], 'runs' if hv.tapinfo is not None else 'may run (the tapdisks were not read)'))
+        else:
+            plan['nbd'] = {'target': nl['target'], 'ino': nl.get('ino')}
+    if not rows:
+        hold = hv.holders(sr, vdi)
+        if hold is None:
+            unknowns.append('the openers of its devices on %s were not established' % hv.name)
+        else:
+            for hh, hits in hold:
+                problems.append('%s pid %d holds %s' % (hh['comm'], hh['pid'], ', '.join(x['target'] for x in hits)))
+    ku = hv.kernel_users(sr, vdi)
+    if ku is None:
+        unknowns.append('the kernel users of its devices on %s were not established' % hv.name)
+    elif ku:
+        problems.append('the kernel uses it: %s' % '; '.join(ku[:4]))
+    if hv.xenstore is None:
+        unknowns.append('the xenstore backends on %s were not read' % hv.name)
+    else:
+        devs = set()
+        for mn in set([minor] + ([node['rdev'][1]] if node is not None and node['kind'] == 'block' else [])):
+            if mn is not None and hv.tap_major is not None:
+                devs.add('%x:%x' % (hv.tap_major, mn))
+        names = path_variants('%s/%s/%s' % (SM_BACKEND, sr, vdi)) | path_variants('%s/%s/%s' % (SM_PHY, sr, vdi))
+        if phy and phy.get('target'):
+            names |= path_variants(bare_path(phy['target']))
+        for k2, v2 in sorted(hv.xenstore.items()):
+            if (k2.endswith('/physical-device') and v2 in devs) or (k2.endswith('/params') and v2 in names):
+                problems.append('xenstore %s names it' % k2)
+    if hv.claim is None:
+        unknowns.append('storage.db on %s was not read' % hv.name)
+    ends = plan['tap']['pid'] if plan['tap'] and end else None
+    for dp in dps:
+        p, u, w, e = dp_dead(a, hv, dp, sr, vdi, ends=ends)
+        problems.extend(p)
+        unknowns.extend(u)
+        waits.extend(w)
+        evidence.extend(e)
+    sw, su, sn = sm_busy_on(a, [hv.href], [vdi], sr, 'the teardown')
+    waits.extend(sw)
+    unknowns.extend(su)
+    evidence.extend(sn)
+    named = [t for t in m.pending_tasks(work=True)
+             if vdi in u'%s %s' % (_text(t.get('name_label')), _text(t.get('name_description')))]
+    if named:
+        waits.append('task "%s" (%s), which names the VDI, is pending' % (named[0]['name_label'], named[0]['uuid']))
+    if sr_type is None:
+        problems.append('SR %s is not known to xapi, so how the VDI was attached is not established' % sr)
+    elif left and sr_type not in FILE_SR_TYPES:
+        problems.append('it is on a %s SR, and what SM left there (%s) includes %s, which this tool does not put back '
+                        'for a VDI xapi no longer has (it does so only on %s SRs, where SM\'s detach leaves nothing but '
+                        'the tapdisk, its nodes and links)%s'
+                        % (sr_type, '; '.join(left[:4]), 'the activation of its LV' if sr_type in LVM_SR_TYPES
+                           else 'what that SR\'s driver attached', '/'.join(FILE_SR_TYPES),
+                           ('. If its LV is still in VG_XenStorage-%s, xe sr-scan uuid=%s brings the VDI back into xapi, '
+                            'and the next run of this tool then has SM tear it down' % (sr, sr))
+                           if sr_type in LVM_SR_TYPES else ''))
+    steps = (['end'] if end and left else []) + (['teardown'] if left else [])
+    tsig = [plan['tap'][k] for k in ('pid', 'minor', 'start_ticks', 'kind')] if plan['tap'] else None
+    unknowns.extend(fu)
+    res = {'left': left, 'fu': list(fu), 'problems': problems, 'unknowns': unknowns, 'waits': waits, 'evidence': evidence,
+           'plan': plan, 'steps': steps, 'minor': minor, 'dps': dps, 'carrier': dps[0] if dps else None,
+           'sig': [tsig, plan['node'], plan['attach_info'], plan['phy'], plan['nbd'], minor]}
+    cache[key] = res
+    return res
+
+
+def teardown_args(fg):
+    p = fg['plan']
+    tap = p['tap'] if p['tap'] and 'end' not in fg['steps'] else None
+    return {'tap': dict((k, tap[k]) for k in ('pid', 'minor', 'start', 'start_ticks', 'kind')) if tap else None,
+            'node': p['node'], 'attach_info': p['attach_info'], 'phy': p['phy'], 'nbd': p['nbd'],
+            'ended': dict((k, p['tap'][k]) for k in ('pid', 'minor')) if p['tap'] and 'end' in fg['steps'] else None}
+
+
 def eval_guest_dp(a, opts, hv, dp, cl, sr, vdi, st):
     m = a.model
-    domid = GUEST_DP_RE.match(dp).group(1)
+    gm = GUEST_DP_RE.match(dp)
+    domid = gm.group(1) if gm else None
+    sxm = domid is None
     vref = m.vdi_by_uuid.get(vdi)
-    running = m.domids.get((hv.href, domid)) or []
+    running = (m.domids.get((hv.href, domid)) or []) if not sxm else []
     for vmref in running:
         for vb in m.vms[vmref]['VBDs']:
             vbd = m.vbds.get(vb)
@@ -12138,6 +12943,9 @@ def eval_guest_dp(a, opts, hv, dp, cl, sr, vdi, st):
     problems, unknowns, waits = [], [], []
     evidence = ['state %s%s' % (canon(st), ', listed in leaked' if any(
         dp in (e.get('leaked') or []) for s2, v2, e in hv.entries if (s2, v2) == (sr, vdi)) else '')]
+    if sxm:
+        evidence.append('%s is a storage-migration datapath: xapi names the datapaths of a migration\'s copy and of '
+                        'its mirror receiver with a fresh uuid, and the source\'s mirror_*/copy_*' % dp)
     if running:
         problems.append('domid %s now belongs to running VM "%s", which does not have this disk attached' % (
             domid, m.vms[running[0]]['name_label']))
@@ -12149,7 +12957,7 @@ def eval_guest_dp(a, opts, hv, dp, cl, sr, vdi, st):
     if hv.dps_files is None:
         unknowns.append('xapi\'s storage-dps records on this host were not read: %s' % hv.why('storage_dps'))
     elif side not in hv.dps_files:
-        route, why = dps_route(m, hv, cl, sr, vdi, domid, st)
+        route, why = dps_route(m, hv, cl, sr, vdi, domid if not sxm else '0', st)
         if why:
             unknowns.append(why)
         else:
@@ -12161,16 +12969,35 @@ def eval_guest_dp(a, opts, hv, dp, cl, sr, vdi, st):
         if why:
             unknowns.append('xapi routes host-sm-dp-destroy %s by its storage-dps/%s record, and %s, so what the '
                             'destroy would reach is not established' % (dp, side, why))
+    fg = None
+    carrier = False
+    if sxm:
+        w, u, e2 = sxm_busy(a, hv, dp, vdi)
+        waits.extend(w)
+        unknowns.extend(u)
+        evidence.extend(e2)
+    entry_dps = dict((sdb_entry(hv, sr, vdi) or {}).get('dps') or {})
+    no_sm = sxm and vref is not None and len(entry_dps) > 1 and teardown_ops(entry_dps, dp) == ([], None)
     if vref is None:
-        evidence.append('the VDI is not in xapi any more: xapi\'s teardown never reaches SM for it (xapi raises No_VDI '
-                        'before the backend is called), so it fails once and the datapath is then forgotten by the '
-                        'allow-leak retry')
-        nl, nu = footprint_of(hv, sr, vdi, strict=True)
-        unknowns.extend(nu)
-        if nl:
-            problems.append('the VDI is not in xapi any more, so xapi\'s teardown never reaches SM (it raises No_VDI '
-                            'before the backend is called), and what SM would tear down stays: %s. Clean that up by '
-                            'hand (tap-ctl close, the LV\'s deactivate) and run this again' % '; '.join(nl[:4]))
+        fg = forgotten(a, hv, sr, vdi)
+        if not fg['left']:
+            unknowns.extend(fg['fu'])
+            evidence.append('%s; nothing of it is left on %s, so xapi is told to forget the datapath straight away '
+                            '(allow-leak=true)' % (GONE_VDI_TEXT, hv.name))
+        elif fg['carrier'] == dp:
+            carrier = True
+            evidence.append('%s, and what SM\'s teardown would remove is still on %s: %s. When the checks of this '
+                            'datapath hold, this tool removes that itself, the way SM\'s own teardown does (%s), and then '
+                            'has xapi forget the datapath (allow-leak=true)'
+                            % (GONE_VDI_TEXT, hv.name, '; '.join(fg['left'][:5]), TEARDOWN_TEXT))
+            problems.extend(fg['problems'])
+            unknowns.extend(fg['unknowns'])
+            waits.extend(fg['waits'])
+            evidence.extend(fg['evidence'])
+        else:
+            evidence.append('%s; what SM left of it on %s is removed by the fix of %s (the first of its datapaths '
+                            'there), and this one is then only forgotten (allow-leak=true)'
+                            % (GONE_VDI_TEXT, hv.name, fg['carrier']))
     elif m.vdis[vref]['type'] in SPECIAL_VDI_TYPES:
         problems.append('it is an %s VDI' % m.vdis[vref]['type'])
     deflate_why = None
@@ -12197,7 +13024,11 @@ def eval_guest_dp(a, opts, hv, dp, cl, sr, vdi, st):
             if vm is None or vm['is_control_domain']:
                 continue
             owned = True
-            if vm['power_state'] in ('Running', 'Paused') and vm['resident_on'] == hv.href:
+            if vm['power_state'] in ('Running', 'Paused') and vm['resident_on'] == hv.href and no_sm:
+                evidence.append('its VM "%s" runs on this host, and keeps the VDI attached through datapath(s) %s, so '
+                                'xapi drops this one without calling SM' % (vm['name_label'], ', '.join(
+                                    sorted(k for k in entry_dps if k != dp))))
+            elif vm['power_state'] in ('Running', 'Paused') and vm['resident_on'] == hv.href:
                 problems.append('its VM "%s" runs on this host' % vm['name_label'])
             evidence.append(diverged_note(a, vm['uuid']) or
                             'VM "%s" is %s%s' % (vm['name_label'], vm['power_state'],
@@ -12248,11 +13079,17 @@ def eval_guest_dp(a, opts, hv, dp, cl, sr, vdi, st):
         unknowns.append('the kernel users of its devices were not established')
     elif ku:
         problems.append('the kernel uses it: %s' % '; '.join(ku[:4]))
-    rows, why = hv.serving(sr_type, vdi)
+    rows, why = hv.serving(sr_type, vdi, sr)
     if rows is not None and state == 'other':
         rows = [r for r in rows if r is not at]
     tap = None
-    if rows is None:
+    if no_sm:
+        evidence.append('xapi works out the SM calls for the VDI from all its datapaths on the host, and with %s still '
+                        'there removing this one changes nothing SM is asked for: its tapdisk is not touched'
+                        % ', '.join(sorted(k for k in entry_dps if k != dp)))
+    elif vref is None:
+        tap = fg['plan']['tap'] if carrier else None
+    elif rows is None:
         tap_why(why, unknowns, waits)
     elif rows and vref is not None:
         dom0 = m.dom0_of(hv.href)
@@ -12274,9 +13111,20 @@ def eval_guest_dp(a, opts, hv, dp, cl, sr, vdi, st):
             unknowns.extend(tu)
             waits.extend(tw)
             evidence.extend(te)
-    ds, xrec = hv.domain_state(domid)
+    ds, xrec = hv.domain_state(domid) if not sxm else ('gone', None)
     pin_pids = []
-    if hv.domains is None:
+    if sxm and tap is not None and hv.xenstore is None:
+        unknowns.append('the xenstore backends on %s were not read' % hv.name)
+    elif sxm and tap is not None:
+        dev = '%x:%x' % (hv.tap_major, tap['minor']) if hv.tap_major is not None else None
+        names = path_variants('%s/%s/%s' % (SM_BACKEND, sr, vdi))
+        for k2, v2 in sorted(hv.xenstore.items()):
+            if (k2.endswith('/physical-device') and dev is not None and v2 == dev) or \
+                    (k2.endswith('/params') and v2 in names):
+                problems.append('xenstore %s names its tapdisk\'s device, so a guest may use it' % k2)
+    if sxm:
+        pass
+    elif hv.domains is None:
         unknowns.append('the domains running on this host were not listed: %s' % hv.why('domains'))
     elif ds == 'dying':
         pins = hv.pinners(domid)
@@ -12338,6 +13186,11 @@ def eval_guest_dp(a, opts, hv, dp, cl, sr, vdi, st):
         problems.append(refusal)
     elif refusal:
         evidence.append('%s; so it is removed only after %s, in this run' % (refusal, ', '.join(after)))
+    after_text = refusal
+    if fg is not None and fg['left'] and not carrier:
+        after = sorted(set(after) | set([fg['carrier']]))
+        after_text = ('%s%swhat SM left of the VDI in dom0 is removed first, by the fix of %s'
+                      % (refusal or '', '; ' if refusal else '', fg['carrier']))
     steps = ['destroy']
     minor = None
     if tap is not None and tap['kind'] in ('deadring', 'wedged'):
@@ -12345,6 +13198,14 @@ def eval_guest_dp(a, opts, hv, dp, cl, sr, vdi, st):
         if tap['minor'] is not None:
             steps.append('free')
             minor = tap['minor']
+    if carrier:
+        steps.extend(fg['steps'])
+        tap = fg['plan']['tap']
+        if fg['minor'] is not None:
+            steps.append('free')
+            minor = fg['minor']
+            evidence.append('tap minor %d is released last, once nothing names it; the open files of every tapdisk are '
+                            'scanned for it again right before' % minor)
     if vref is not None and 'paused' in m.vdis[vref]['sm_config']:
         pp, pu, pw, pe = paused_stale(a, opts, hv, vref, tap)
         if pp:
@@ -12442,13 +13303,24 @@ def eval_guest_dp(a, opts, hv, dp, cl, sr, vdi, st):
     if deflate_why is not None and problems == [deflate_why]:
         return guest_db_route(a, opts, hv, dp, cl, sr, vdi, st, vref, sr_type, domid, key, title, evidence,
                               deflate_why)
+    evidence, waits, unknowns, problems = [uniq(x) for x in (evidence, waits, unknowns, problems)]
     verdict, reason = verdict_of(problems, unknowns, waits)
     if verdict == FIX:
-        reason = 'no running VM on %s with domid %s has it attached' % (hv.name, domid)
-        if vref is None:
-            reason += (', and nothing of it is left in dom0; its VDI is not in xapi any more, so xapi\'s teardown '
-                       'fails once (No_VDI, before SM is called) and the datapath is then forgotten by the allow-leak '
-                       'retry')
+        reason = ('it is a storage-migration datapath, and no storage migration holds it' if sxm else
+                  'no running VM on %s with domid %s has it attached' % (hv.name, domid))
+        if fg is not None and not fg['left']:
+            reason += (', and nothing of it is left in dom0; its VDI is not in xapi any more, so SM is never called for '
+                       'it, and xapi is told to forget the datapath (allow-leak=true)')
+        elif carrier:
+            reason += ('; its VDI is not in xapi any more, so SM is never called for it: this tool removes what SM left '
+                       'of it on %s the way SM\'s own teardown does, then has xapi forget the datapath (allow-leak=true)'
+                       % hv.name)
+        elif fg is not None:
+            reason += ('; its VDI is not in xapi any more: once the fix of %s has removed what SM left of it on %s, '
+                       'xapi is told to forget this one (allow-leak=true)' % (fg['carrier'], hv.name))
+        elif no_sm:
+            reason += '; xapi drops it without calling SM, since %s keep the VDI attached as it is' % ', '.join(
+                sorted(k for k in entry_dps if k != dp))
         if len(run_steps) > 1:
             reason += '; in order: %s' % ', then '.join(STEP_TEXT[s] for s in run_steps)
     tsig = [tap['pid'], tap['minor'], tap['start_ticks'] if tap.get('start_ticks') is not None else int(tap['start'] or 0),
@@ -12458,17 +13330,26 @@ def eval_guest_dp(a, opts, hv, dp, cl, sr, vdi, st):
             'pins': pin_pids, 'dps_write': bool(hv.dps_files is not None and side not in hv.dps_files),
             'vbds': sorted([vbd['uuid'], (m.vms.get(vbd['VM']) or {}).get('uuid'), vbd['userdevice']]
                            for r, vbd in vdi_vbds(m, vref)) if vref else []}
+    if fg is not None:
+        item['forgotten'] = True
+    if carrier:
+        item['teardown'] = teardown_args(fg)
+    if sxm:
+        item['sxm'] = True
+    if no_sm:
+        item['no_sm'] = True
     if seen_tap is not None:
         item['seen_tap'] = seen_tap
     if after:
         item['after'] = after
         if verdict == FIX:
             reason += '; once %s %s gone' % (', '.join(after), 'is' if len(after) == 1 else 'are')
-    e = ev(key, 'C03', verdict, hv.uuid, title, reason, evidence,
-           sig=[dp, st, len(cl), needs, inert, route, steps, tsig, minor],
-           item=item if verdict == FIX else None)
+    sig = [dp, st, len(cl), needs, inert, route, steps, tsig, minor]
+    if carrier:
+        sig.append(fg['sig'])
+    e = ev(key, 'C03', verdict, hv.uuid, title, reason, evidence, sig=sig, item=item if verdict == FIX else None)
     if after and verdict == FIX:
-        e['after_text'] = refusal
+        e['after_text'] = after_text
     return e
 
 
@@ -12557,7 +13438,7 @@ def footprint_of(cv, sr, vdi, strict=False, allow=None):
         if rows:
             left.append('tapdisk pid %s still serves it' % rows[0]['pid'])
         elif strict:
-            rows, why = cv.serving(cv.sr_type(sr), vdi)
+            rows, why = cv.serving(cv.sr_type(sr), vdi, sr)
             if rows is None:
                 unknown.append(why)
             elif rows:
@@ -12566,6 +13447,13 @@ def footprint_of(cv, sr, vdi, strict=False, allow=None):
             left.append('its backend node is still there')
         if (sr, vdi) in cv.phy:
             left.append('its phy link is still there')
+        gone_vdi = strict and cv.audit.model.vdi_by_uuid.get(vdi) is None
+        if gone_vdi and (sr, vdi) in cv.attach_info:
+            left.append('its attach_info file is still there')
+        if gone_vdi and cv.nbdlinks is None:
+            unknown.append('whether its NBD link is still there is not established (%s)' % cv.why('nbdlinks'))
+        elif gone_vdi and (sr, vdi) in cv.nbd_link:
+            left.append('its NBD link is still there')
     if cv.sr_type(sr) in LVM_SR_TYPES:
         if cv.smrefs is None or cv.blockmap is None:
             unknown.append('whether its LV is still active is not established')
@@ -12621,7 +13509,10 @@ def route_of(rec, sr, keys, domid, st, plugged=True):
     if c['vdi'] not in keys:
         notes.append('its storage-dps record names VDI %s, not %s: %s' % (canon(c['vdi']), ' or '.join(keys),
                                                                           ROUTE_ONLY_SR))
-    if c['vm'] != domid:
+    if domid is None and not SXM_VM_RE.match(_text(c['vm'])):
+        notes.append('its storage-dps record names domain %s, where a storage migration records 0, CP<hash> or '
+                     'MIR<hash>: %s' % (canon(c['vm']), ROUTE_ONLY_SR))
+    elif domid is not None and c['vm'] != domid:
         notes.append('its storage-dps record names domain %s, not %s: %s' % (canon(c['vm']), domid, ROUTE_ONLY_SR))
     if rw is not (st[1] == 'RW'):
         notes.append('its storage-dps record says read_write=%s for a datapath that is %s: %s'
@@ -14330,25 +15221,17 @@ def eval_taps(a, opts):
             out.append(eval_minor(a, opts, hv, row))
         out.extend(eval_wedged(a, opts, hv))
         for pid, rec in sorted((hv.ctlfiles or {}).items(), key=lambda kv: int(kv[0])):
-            out.append(ev(('C16', 'ctl', hv.uuid, pid), 'C16', INFO, hv.uuid,
-                          'C16 control files of tapdisk pid %s on %s' % (pid, hv.name),
-                          'pid %s is %s, but %s still has %s%s: what a tapdisk that died without cleaning up leaves. '
-                          'tap-ctl list skips them; harmless, and left alone (remove them only after checking again '
-                          'that pid %s is not a tapdisk)' % (
-                              pid, 'gone' if not rec.get('comm') else 'now %s' % rec['comm'], BLKTAP_CTL,
-                              ', '.join(rec.get('ctl') or []) or 'no control socket',
-                              (' and %s' % ', '.join(rec['shm'][:3])) if rec.get('shm') else '', pid),
-                          ['ctl%s dates from %s ago' % (pid, format_age(host_time(hv, a) - rec['mtime']))]
-                          if rec.get('mtime') else [],
-                          roll=('files left in %s by tapdisks that died (harmless, left alone)' % BLKTAP_CTL,
-                                'pid %s' % pid, hv.name)))
+            out.append(eval_ctlfiles(a, hv, pid, rec))
         if hv.backend is not None:
-            for (sr, vdi), node in hv.back_node.items():
+            for (sr, vdi), node in sorted(hv.back_node.items()):
+                if any(c[1] == vdi for cl in (hv.claim or {}).values() for c in cl):
+                    continue
+                if vdi_gone(a.model, sr, vdi) and hv.claim is not None:
+                    out.append(eval_lone_leftovers(a, hv, sr, vdi))
+                    continue
                 if node['kind'] != 'block' or node['rdev'][0] != hv.tap_major:
                     continue
                 if any(r['minor'] == node['rdev'][1] for r in hv.live_taps()):
-                    continue
-                if any(c[1] == vdi for cl in (hv.claim or {}).values() for c in cl):
                     continue
                 out.append(ev(('C16', 'node', hv.uuid, sr, vdi), 'C16', INFO, hv.uuid,
                               'C16 backend node %s/%s on %s' % (sr, vdi, hv.name),
@@ -14362,23 +15245,13 @@ def eval_taps(a, opts):
                 age = host_time(hv, a) - rec['mtime']
                 if age < ATTACH_INFO_AGE:
                     continue
-                out.append(ev(('C16', 'attachinfo', hv.uuid, sr, vdi), 'C16', INFO, hv.uuid,
-                              'C16 %s/%s/%s.attach_info on %s' % (SM_BACKEND, sr, vdi, hv.name),
-                              'SM wrote it %s ago when it attached VDI %s; no backend node and no datapath account for '
-                              'it, and SM removes it only when it deactivates a VDI whose backend node is there. '
-                              'Nothing reads it; left alone' % (format_age(age), vdi),
-                              roll=('SM .attach_info files no backend node or datapath accounts for (nothing reads '
-                                    'them; left alone)', 'VDI %s' % vdi, hv.name)))
+                out.append(eval_attach_info(a, hv, sr, vdi, rec, age))
         for name, f in sorted((hv.dps_files or {}).items() if hv.claim is not None else ()):
             c = f.get('content') or {}
-            vdi = c.get('vdi')
-            dp = name.replace('-', '/', 2) if name.startswith('vbd-') else None
+            vdi = c.get('vdi') if isinstance(c, dict) else None
+            dp = name.replace('-', '/', 2) if name.startswith('vbd-') else name if UUID_RE.match(name) else None
             if vdi and dp and not any(vdi in (cl[1], cl[3]) for cl in hv.claim.get(dp, [])):
-                out.append(ev(('C16', 'dpsfile', hv.uuid, name), 'C16', INFO, hv.uuid,
-                              'C16 storage-dps/%s on %s' % (name, hv.name),
-                              'it names VDI %s, which no longer holds %s; left alone' % (vdi, dp),
-                              roll=('storage-dps files naming a VDI that no longer holds that datapath (left alone)',
-                                    name, hv.name)))
+                out.append(eval_dps_record(a, hv, name, dp, f))
         errs = len(((hv.sdb or {}).get('obj') or {}).get('errors') or [])
         if errs:
             out.append(ev(('C16', 'errors', hv.uuid), 'C16', INFO, hv.uuid, 'C16 storage.db errors on %s' % hv.name,
@@ -14386,6 +15259,120 @@ def eval_taps(a, opts):
                           roll=('past storage errors recorded in storage.db (never edited)', '%s %d' % (hv.name, errs),
                                 None)))
     return out
+
+
+CTL_MIN_AGE = 600
+
+
+def eval_ctlfiles(a, hv, pid, rec):
+    k = ('C16', 'ctl', hv.uuid, pid)
+    title = 'C16 control files of tapdisk pid %s on %s' % (pid, hv.name)
+    what = '%s%s' % (', '.join(rec.get('ctl') or []) or 'no control socket',
+                     (' and %s' % ', '.join(rec['shm'][:3])) if rec.get('shm') else '')
+    base = ('pid %s is %s, but %s still has %s: what a tapdisk that died without cleaning up leaves'
+            % (pid, 'gone' if not rec.get('comm') else 'now %s' % rec['comm'], BLKTAP_CTL, what))
+    evidence = (['ctl%s dates from %s ago' % (pid, format_age(host_time(hv, a) - rec['mtime']))]
+                if rec.get('mtime') else [])
+    files = rec.get('files')
+    if not isinstance(files, dict) or sorted(files) != sorted(rec.get('ctl') or []):
+        return ev(k, 'C16', INFO, hv.uuid, title, '%s. Their inodes were not read, so they are left alone' % base,
+                  evidence)
+    young = [n for n, (ino, mt) in sorted(files.items()) if host_time(hv, a) - mt < CTL_MIN_AGE]
+    if young:
+        return ev(k, 'C16', WAIT, hv.uuid, title, '%s; %s %s younger than %s, so they are removed by a later run'
+                  % (base, ', '.join(young), 'is' if len(young) == 1 else 'are', format_age(CTL_MIN_AGE)), evidence)
+    item = {'cls': 'C16', 'phase': 'L', 'action': 'ctl-clean', 'host': hv.uuid, 'pid': pid,
+            'files': dict((n, list(v)) for n, v in files.items()), 'shm': sorted(rec.get('shm') or [])}
+    return ev(k, 'C16', FIX, hv.uuid, title, '%s. tap-ctl list skips them and nothing reads them: they are removed, '
+              'each only if it is still the file that was read and pid %s is still not a tapdisk' % (base, pid),
+              evidence, sig=[pid, item['files'], item['shm']], item=item)
+
+
+def eval_attach_info(a, hv, sr, vdi, rec, age):
+    k = ('C16', 'attachinfo', hv.uuid, sr, vdi)
+    title = 'C16 %s/%s/%s.attach_info on %s' % (SM_BACKEND, sr, vdi, hv.name)
+    base = ('SM wrote it %s ago when it attached VDI %s; no backend node and no datapath account for it, and SM '
+            'removes it only when it deactivates a VDI whose backend node is there. Nothing reads it' % (format_age(age),
+                                                                                                       vdi))
+    if rec.get('ino') is None:
+        return ev(k, 'C16', INFO, hv.uuid, title, '%s; its inode was not read, so it is left alone' % base)
+    item = {'cls': 'C16', 'phase': 'L', 'action': 'attach-clean', 'host': hv.uuid, 'sr': sr, 'vdi': vdi,
+            'ino': rec['ino']}
+    return ev(k, 'C16', FIX, hv.uuid, title, '%s: it is removed under SM\'s lock of the VDI, if it is still the file that '
+              'was read and the VDI still has no backend node there' % base, sig=[rec['ino']], item=item)
+
+
+def eval_dps_record(a, hv, name, dp, f):
+    m = a.model
+    k = ('C16', 'dpsfile', hv.uuid, name)
+    title = 'C16 storage-dps/%s on %s' % (name, hv.name)
+    c = f.get('content') or {}
+    base = 'it names VDI %s, which no longer holds %s' % (c.get('vdi'), dp)
+    problems, unknowns, evidence = [], [], []
+    if hv.claim.get(dp):
+        problems.append('VDI(s) %s hold %s now' % (', '.join(sorted(x[1] for x in hv.claim[dp])), dp))
+    kind = dp_kind(dp)
+    if kind == 'guest':
+        domid = GUEST_DP_RE.match(dp).group(1)
+        ds, xrec = hv.domain_state(domid)
+        if ds in ('present', 'dying'):
+            problems.append('domain %s is %s on %s' % (domid, 'there' if ds == 'present' else 'dying', hv.name))
+        elif ds != 'gone':
+            unknowns.append('whether domain %s still exists on %s is not established' % (domid, hv.name))
+    elif kind == 'dom0':
+        p, u, w, e = dp_dead(a, hv, dp, c.get('sr'), c.get('vdi'))
+        problems.extend(p)
+        unknowns.extend(u + w)
+    elif kind == 'sxm':
+        w, u, e = sxm_busy(a, hv, dp, c.get('vdi') or '')
+        unknowns.extend(u + w)
+    else:
+        problems.append('%s is a datapath name of no kind this tool knows' % dp)
+    if not (isinstance(c, dict) and set(['sr', 'vdi', 'vm']) <= set(c) and UUID_RE.match(_text(c.get('sr')))):
+        problems.append('it cannot be read as the record xapi writes (%s)' % canon((f.get('raw') or '')[:120]))
+    elif sr_plugged_here(m, hv, c['sr']) is not True:
+        problems.append('it names SR %s, which is not plugged on %s, so xapi cannot route the call that removes it'
+                        % (c['sr'], hv.name))
+    verdict, reason = verdict_of(problems, unknowns, [])
+    if verdict != FIX:
+        return ev(k, 'C16', INFO, hv.uuid, title, '%s; left alone: %s' % (base, reason),
+                  roll=('storage-dps files naming a VDI that no longer holds that datapath (left alone)', name, hv.name))
+    item = {'cls': 'C16', 'phase': 'L', 'action': 'dps-forget', 'host': hv.uuid, 'name': name, 'dp': dp,
+            'sr': c['sr'], 'vdi': c['vdi']}
+    return ev(k, 'C16', FIX, hv.uuid, title, '%s, and no VDI does: xe host-sm-dp-destroy of it (no leak allowed) finds '
+              'no datapath and only removes the record, as xapi does when a teardown ends' % base,
+              evidence, sig=[name, dp, canon(c)], item=item)
+
+
+def eval_lone_leftovers(a, hv, sr, vdi):
+    k = ('C16', 'node', hv.uuid, sr, vdi)
+    title = 'C16 what SM left of VDI %s on %s' % (vdi, hv.name)
+    fg = forgotten(a, hv, sr, vdi)
+    problems, unknowns, waits = list(fg['problems']), list(fg['unknowns']), list(fg['waits'])
+    evidence = ['%s, and no datapath in storage.db names it any more; what is left: %s'
+                % (GONE_VDI_TEXT, '; '.join(fg['left'][:5]) or 'nothing')] + fg['evidence']
+    if not fg['left']:
+        return ev(k, 'C16', INFO, hv.uuid, title, 'nothing of it is left', evidence)
+    steps = list(fg['steps'])
+    minor = fg['minor']
+    if 'end' in steps:
+        problems.append('its tapdisk does not close normally, and no datapath names the VDI: this tool ends such a '
+                        'tapdisk only for a datapath it removes')
+    if minor is not None:
+        age, why = minor_age(a, hv, minor)
+        if why or age < MINOR_MIN_AGE:
+            evidence.append('tap minor %d is not released in this run: %s' % (
+                minor, why or 'it was allocated only %s ago, and a later run releases it' % format_age(age)))
+        else:
+            steps.append('free')
+    verdict, reason = verdict_of(uniq(problems), uniq(unknowns), uniq(waits))
+    if verdict == FIX:
+        reason = ('%s, and no datapath names it: this tool removes what SM left of it the way SM\'s own teardown does '
+                  '(%s)' % (GONE_VDI_TEXT, TEARDOWN_TEXT))
+    item = {'cls': 'C16', 'phase': 'L', 'action': 'sm-teardown', 'host': hv.uuid, 'sr': sr, 'vdi': vdi,
+            'teardown': teardown_args(fg), 'minor': minor, 'steps': steps, 'forgotten': True}
+    return ev(k, 'C16', verdict, hv.uuid, title, reason, uniq(evidence), sig=[fg['sig'], steps],
+              item=item if verdict == FIX else None)
 
 
 def minor_named(hv, minor):
@@ -14438,7 +15425,8 @@ def eval_minor(a, opts, hv, row):
         unknown.append('the tapdev major is not known')
     if named:
         return ev(k, 'C16', INFO, hv.uuid, title, 'tap-ctl lists it as allocated with no tapdisk behind it (what a '
-                  'killed tapdisk leaves), and it is still named (%s): left alone' % '; '.join(named[:3]))
+                  'killed tapdisk leaves), and it is still named (%s), so it is not released on its own'
+                  % '; '.join(named[:3]))
     age, why = minor_age(a, hv, row['minor'])
     if why:
         unknown.append(why)
@@ -15460,6 +16448,32 @@ def eval_held_vms(a, opts):
     return out
 
 
+def elsewhere(a, href, vm):
+    m = a.model
+    where, unread = [], []
+    for h2ref, h2 in sorted(m.hosts.items()):
+        if h2ref == href or not m.host_live(h2ref):
+            continue
+        if a.facts.get(h2['uuid']) is None:
+            unread.append('%s was not audited' % h2['name_label'])
+            continue
+        dv = a.fact(h2['uuid'], 'domvms')
+        if dv is None:
+            unread.append('which VMs the domains on %s run was not read (%s)' % (h2['name_label'],
+                                                                                 a.fact_error(h2['uuid'], 'domvms')))
+            continue
+        xl2 = a.fact(h2['uuid'], 'xl')
+        for d, vu in sorted(dv.items(), key=lambda kv: domain_order(kv[0])):
+            if vu == vm['uuid']:
+                where.append((h2['name_label'], d))
+            elif vu is None:
+                x = (xl2 or {}).get(d)
+                if xl2 is None or (x is not None and not x.get('dying') and x.get('name') in
+                                   (vm.get('name_label'), '(null)')):
+                    unread.append('which VM domain %s on %s runs was not read' % (d, h2['name_label']))
+    return where, unread
+
+
 def divergence(a):
     got = getattr(a, '_diverged', None)
     if got is not None:
@@ -15512,6 +16526,23 @@ def divergence(a):
         if named:
             rec['why'] = ('its domain %s is not on %s, but task "%s" (%s), which names the VM, is pending'
                           % (domid, h['name_label'], named[0]['name_label'], named[0]['uuid']))
+            unsure[ref] = rec
+            continue
+        where, unread = elsewhere(a, href, vm)
+        if where:
+            rec['why'] = ('its domain %s is gone from %s, but domain %s on %s runs it: xapi records it on the wrong host. '
+                          'A xapi restart on %s would record it halted while it runs, and a xapi restart on %s while '
+                          'xapi records it on %s shuts the running VM down (xapi\'s start-up terminates a domain whose VM '
+                          'it records on another host), so xapi is not restarted for it'
+                          % (domid, h['name_label'], where[0][1], where[0][0], h['name_label'], where[0][0],
+                             h['name_label']))
+            rec['runs_on'] = list(where[0])
+            unsure[ref] = rec
+            continue
+        if unread:
+            rec['why'] = ('its domain %s is gone from %s, but whether it runs on another host is not established: %s'
+                          % (domid, h['name_label'], '; '.join(unread[:3])))
+            rec['runs_on'] = None
             unsure[ref] = rec
             continue
         found[ref] = rec
@@ -16609,7 +17640,7 @@ def dependencies(final, audits):
                 e['reason'] = 'handled by the planned release of dom0 VBD %s: its node is made inert first. ' % \
                     it['vbd'] + base[1]
     chains = [x for x in final if x['verdict'] == FIX and x.get('item') and
-              (x['item']['action'] == 'tap-end' or x['item']['action'] == 'dp-destroy' and
+              (x['item']['action'] in ('tap-end', 'sm-teardown') or x['item']['action'] == 'dp-destroy' and
                (len(x['item'].get('steps') or []) > 1 or x['item'].get('tap')) or
                x['item']['action'] == 'release-vbd' and 'unkey' in (x['item'].get('steps') or []))]
     for e in final:
@@ -16626,13 +17657,20 @@ def dependencies(final, audits):
             tp = it.get('tap') or {}
             what = ('C03 of %s of VDI %s on its host' % (it['dp'], it['vdi']) if it['action'] == 'dp-destroy' else
                     'release of dom0 VBD %s' % it['vbd'] if it['action'] == 'release-vbd' else
+                    'removal of what SM left of VDI %s on its host' % it['vdi'] if it['action'] == 'sm-teardown' else
                     'C15 fix of the orphaned tapdisk pid %s' % tp.get('pid'))
+            if it['action'] == 'sm-teardown':
+                tp = (it.get('teardown') or {}).get('tap') or {}
             note = None
             if e['cls'] == 'C11' and 'unkey' in steps and k == ['C11', it['vdi']]:
                 note = 'removed by the planned %s, before its teardown' % what
             elif e['cls'] == 'C12' and tp and k == ['C12', it['host'], tp['pid'], tp['minor']]:
-                note = ('ended by the planned %s' if 'end' in steps else
-                        'closed by SM\'s own teardown in the planned %s') % what
+                if 'end' in steps:
+                    note = 'ended by the planned %s' % what
+                elif 'teardown' in steps:
+                    note = 'closed by the planned %s, the way SM\'s teardown does' % what
+                else:
+                    note = 'closed by SM\'s own teardown in the planned %s' % what
             elif e['cls'] == 'C14' and 'end' in steps and k == ['C14', it['host'], tp.get('pid'), tp.get('minor')]:
                 note = 'ended by the planned %s' % what
             elif e['cls'] == 'C15' and 'end' in steps and k == ['C15', it['host'], 'wedged', tp.get('pid'),
@@ -17654,6 +18692,12 @@ def describe_item(model, it):
                 % (it['dp'], ' '.join(it.get('state') or []) or 'Attached', vdi_text(model, it['vdi']), hn, dps, after,
                    forget))
     if a == 'dp-destroy':
+        if it.get('forgotten'):
+            forget = (u' (allow-leak=true: its VDI is not in xapi, so SM is not called and xapi only forgets the '
+                      u'datapath)')
+        elif it.get('no_sm'):
+            forget = (u'; xapi asks SM for nothing, since the VDI\'s other datapath(s) on %s keep it attached as it is'
+                      % hn)
         txt = u'xe host-sm-dp-destroy %s of VDI %s on %s%s%s%s%s%s' % (
             it['dp'], vdi_text(model, it['vdi']), hn, dps, (u' (once dom0 VBD(s) %s are released)'
                                                             % ', '.join(it['needs'])) if it.get('needs') else u'',
@@ -17667,6 +18711,16 @@ def describe_item(model, it):
                 parts.append(u'end tapdisk pid %s (%s) with SIGKILL, after saving its forensics and making its backend '
                              u'node inert' % (tp.get('pid'), 'its close never returns: a dead ring' if tp.get('kind') ==
                                               'deadring' else 'it answers control requests with errors'))
+            elif s == 'teardown':
+                td = it.get('teardown') or {}
+                what = [n for n, k in ((u'attach_info file', 'attach_info'), (u'backend node', 'node'),
+                                       (u'NBD link', 'nbd'), (u'phy link', 'phy')) if td.get(k)]
+                parts.append(u'remove what SM left of VDI %s on %s, the way SM\'s own teardown does, under the VDI\'s '
+                             u'SM lock: %s%s' % (
+                                 it['vdi'], hn, (u'close and detach its tapdisk pid %s (minor %s) with tap-ctl, then '
+                                                 % (td['tap']['pid'], td['tap']['minor'])) if td.get('tap') else u'',
+                                 u'remove its %s, each only as it was read' % u', '.join(what) if what else
+                                 u'nothing else'))
             elif s == 'refresh':
                 names = lv.get('refresh') or [lv.get('lv')]
                 parts.append(u'activate %s %s on %s through SM (on-slave refresh) and check %s device-mapper table'
@@ -17677,7 +18731,8 @@ def describe_item(model, it):
             elif s == 'destroy':
                 parts.append(txt + (u' (SM\'s teardown closes %s tapdisk pid %s)' % (
                     u'its' if tp.get('state') is None else u'paused' if tp['state'] & PAUSED else u'its idle',
-                    tp.get('pid')) if tp and 'end' not in steps else u''))
+                    tp.get('pid')) if tp and 'end' not in steps and 'teardown' not in steps and not it.get('forgotten')
+                    else u''))
             elif s == 'deactivate':
                 parts.append(u'put back %d stale activation count(s) of its LV on %s through SM (on-slave deactivate)'
                              % ((lv.get('refcount') or [0])[0], hn))
@@ -17686,6 +18741,27 @@ def describe_item(model, it):
         return u'; then '.join(parts)
     if a == 'tap-free':
         return u'release tap minor %s on %s (tap-ctl free), which nothing names any more' % (it['minor'], hn)
+    if a == 'sm-teardown':
+        td = it.get('teardown') or {}
+        what = [n for n, k in ((u'attach_info file', 'attach_info'), (u'backend node', 'node'), (u'NBD link', 'nbd'),
+                               (u'phy link', 'phy')) if td.get(k)]
+        return (u'remove what SM left of VDI %s on %s (no datapath names it, and it is not in xapi), the way SM\'s own '
+                u'teardown does, under the VDI\'s SM lock: %s%s%s' % (
+                    it['vdi'], hn, (u'close and detach its tapdisk pid %s (minor %s) with tap-ctl, then '
+                                    % (td['tap']['pid'], td['tap']['minor'])) if td.get('tap') else u'',
+                    u'remove its %s, each only as it was read' % u', '.join(what) if what else u'nothing else',
+                    (u'; then release tap minor %s (tap-ctl free)' % it['minor']) if 'free' in (it.get('steps') or [])
+                    else u''))
+    if a == 'ctl-clean':
+        return (u'remove the files dead tapdisk pid %s left on %s (%s), each only if it is still the file that was read '
+                u'and pid %s is still not a tapdisk' % (it['pid'], hn, u', '.join(sorted(it['files']) + it['shm']),
+                                                        it['pid']))
+    if a == 'attach-clean':
+        return (u'remove %s/%s/%s.attach_info on %s, which no backend node or datapath accounts for, under SM\'s lock of '
+                u'the VDI' % (SM_BACKEND, it['sr'], it['vdi'], hn))
+    if a == 'dps-forget':
+        return (u'xe host-sm-dp-destroy %s on %s (no leak allowed): no VDI holds that datapath, so xapi only removes its '
+                u'storage-dps/%s record' % (it['dp'], hn, it['name']))
     if a == 'tap-end':
         return (u'end tapdisk pid %s on %s (it answers control requests with errors, stuck closing a dead ring of '
                 u'domain %s, and SM no '
@@ -18144,6 +19220,10 @@ class Engine(object):
         self.journal_broken = False
         self.token = None
         self.n = 10
+        self.siblings = collections.defaultdict(set)
+        for it in plan or []:
+            if it.get('forgotten') and it['action'] == 'dp-destroy':
+                self.siblings[(it['host'], it['sr'], it['vdi'])].add(it['dp'])
         if audits:
             ctx.host_objs(audits[-1].model)
 
@@ -18749,6 +19829,14 @@ class Engine(object):
             return k == ['C25', it['host']]
         if it['action'] == 'ha-release':
             return k == ['C27', it['vm']]
+        if it['action'] == 'sm-teardown':
+            return k == ['C16', 'node', it['host'], it['sr'], it['vdi']]
+        if it['action'] == 'ctl-clean':
+            return k == ['C16', 'ctl', it['host'], it['pid']]
+        if it['action'] == 'attach-clean':
+            return k == ['C16', 'attachinfo', it['host'], it['sr'], it['vdi']]
+        if it['action'] == 'dps-forget':
+            return k == ['C16', 'dpsfile', it['host'], it['name']]
         return False
 
     def all_hosts_ha(self, with_ready=False, only=None):
@@ -19471,6 +20559,11 @@ class Engine(object):
             self.init_late.append(h.name)
             self.init_texts[h.name] = 'xapi on %s is answering but did not finish initialising in time' % h.name
             self.fail(self.init_texts[h.name])
+        for note in start.get('settled') or []:
+            step('  %s: %s' % (h.name, note))
+        for u in start.get('restored') or []:
+            if not u.startswith(RESTORE_UNITS):
+                step('  %s: started again: %s' % (h.name, u))
         for u in start.get('missing_units') or []:
             warn('%s was active on %s before xapi was stopped and is not now; it was not started again: check it'
                  % (u, h.name))
@@ -20789,8 +21882,113 @@ class Engine(object):
                 self.free_minor(it)
             elif it['action'] == 'lv-deactivate':
                 self.lv_put_item(it)
+            elif it['action'] == 'sm-teardown':
+                self.lone_teardown(it)
+            elif it['action'] == 'ctl-clean':
+                self.ctl_clean(it)
+            elif it['action'] == 'attach-clean':
+                self.attach_clean(it)
+            elif it['action'] == 'dps-forget':
+                self.dps_forget(it)
             else:
                 self.c03(it)
+
+    def lone_teardown(self, it):
+        h = self.host(it['host'])
+        fresh, e, why = self.fresh_check(h, it)
+        if e is None:
+            hv = fresh.view(fresh.model.host_by_uuid[h.uuid])
+            left, unknown = footprint_of(hv, it['sr'], it['vdi'], strict=True)
+            if not left and not unknown:
+                return self.result(it, 'already-fixed', 'nothing of the VDI is left on %s' % h.name)
+            return self.result(it, 'skipped', why)
+        done = []
+        text = self.step_teardown(it, h, fresh, done)
+        if text is None:
+            return
+        done.append('teardown')
+        notes = [text]
+        if 'free' in (it.get('steps') or []):
+            freed = self.minor_free(it, h, it['minor'], done)
+            if freed is None:
+                return
+            notes.append(freed)
+        a = self.audit(hosts=[h.uuid], smlog=False)
+        hv = a.view(a.model.host_by_uuid[h.uuid])
+        left, unknown = footprint_of(hv, it['sr'], it['vdi'], strict=True)
+        if 'free' in (it.get('steps') or []) and hv.taps is not None:
+            stay, reused = minor_left(hv, it['minor'], None)
+            left = left + stay
+        if left or unknown:
+            self.fail_item(it, 'every step ran, but on %s: %s' % (h.name, '; '.join((left + unknown)[:6])))
+        self.result(it, 'fixed', '; '.join(notes))
+
+    def ctl_clean(self, it):
+        h = self.host(it['host'])
+        fresh, e, why = self.fresh_check(h, it)
+        if e is None:
+            hv = fresh.view(fresh.model.host_by_uuid[h.uuid])
+            if hv.ctlfiles is not None and it['pid'] not in hv.ctlfiles:
+                return self.result(it, 'already-fixed', 'its files are gone')
+            return self.result(it, 'skipped', why)
+        self.act_on(it)
+        try:
+            res = self.ctx.transport.call(h, 'ctl-clean', {'pid': it['pid'], 'files': it['files'], 'shm': it['shm']},
+                                          timeout=120)
+        except CallError as exc:
+            self.fail_item(it, call_outcome(exc, 'removes the files of dead tapdisk pid %s on %s' % (it['pid'], h.name)))
+        self.j.rec('ctl_clean', seq=it['seq'], host=h.uuid, result=res)
+        if not res.get('done'):
+            return self.result(it, 'skipped', 'not removed: %s' % '; '.join(res.get('problems') or ['no detail']))
+        text = 'removed %s' % (', '.join(res.get('cleaned') or []) or 'nothing (it was gone already)')
+        if res.get('left'):
+            text += '; left: %s' % '; '.join(res['left'])
+        self.result(it, 'fixed', text)
+
+    def attach_clean(self, it):
+        h = self.host(it['host'])
+        fresh, e, why = self.fresh_check(h, it)
+        if e is None:
+            hv = fresh.view(fresh.model.host_by_uuid[h.uuid])
+            if hv.backend is not None and (it['sr'], it['vdi']) not in hv.attach_info:
+                return self.result(it, 'already-fixed', 'the file is gone')
+            return self.result(it, 'skipped', why)
+        self.act_on(it)
+        try:
+            res = self.ctx.transport.call(h, 'attach-clean', {'sr': it['sr'], 'vdi': it['vdi'], 'ino': it['ino']},
+                                          timeout=60)
+        except CallError as exc:
+            self.fail_item(it, call_outcome(exc, 'removes %s/%s/%s.attach_info on %s' % (SM_BACKEND, it['sr'], it['vdi'],
+                                                                                        h.name)))
+        self.j.rec('attach_clean', seq=it['seq'], host=h.uuid, result=res)
+        if res.get('already'):
+            return self.result(it, 'already-fixed', 'the file is gone')
+        if not res.get('done'):
+            return self.result(it, 'skipped', 'not removed: %s' % '; '.join(res.get('problems') or ['no detail']))
+        self.result(it, 'fixed', 'removed %s' % res.get('path'))
+
+    def dps_forget(self, it):
+        h = self.host(it['host'])
+        fresh, e, why = self.fresh_check(h, it)
+        if e is None:
+            hv = fresh.view(fresh.model.host_by_uuid[h.uuid])
+            if hv.dps_files is not None and it['name'] not in hv.dps_files:
+                return self.result(it, 'already-fixed', 'the record is gone')
+            return self.result(it, 'skipped', why)
+        self.act_on(it)
+        r = xe('host-sm-dp-destroy', 'uuid=' + h.uuid, 'dp=' + it['dp'], 'allow-leak=false', timeout=DP_DESTROY_TIMEOUT)
+        if not r.ok:
+            self.fail_item(it, 'xe host-sm-dp-destroy %s' % r.why())
+        a = self.audit(hosts=[h.uuid], smlog=False)
+        hv = a.view(a.model.host_by_uuid[h.uuid])
+        if hv.dps_files is None or hv.claim is None:
+            self.fail_item(it, 'xapi answered, but its storage-dps records and storage.db on %s cannot be read back: %s'
+                           % (h.name, hv.why('storage_dps', 'storage_db')))
+        if it['name'] in hv.dps_files:
+            self.fail_item(it, 'xapi answered, but storage-dps/%s is still there' % it['name'])
+        if hv.claim.get(it['dp']):
+            self.fail_item(it, 'storage.db on %s holds %s now' % (h.name, it['dp']))
+        self.result(it, 'fixed', 'xapi found no datapath %s and removed its record' % it['dp'])
 
     def c03(self, it, until=None):
         h = self.host(it['host'])
@@ -20860,6 +22058,10 @@ class Engine(object):
             return None, '%s: %s' % (WAIT, '; '.join(e['item']['later']))
         rest = [s for s in it['steps'] if s not in done]
         now = [s for s in e['item']['steps'] if s != 'free' or 'free' in it['steps']]
+        if 'teardown' in done and 'free' in rest and 'free' not in now and it.get('minor') is not None:
+            hvf = fresh.view(fresh.model.host_by_uuid[it['host']])
+            if any(r['minor'] == it['minor'] for r in hvf.empty_minors):
+                now = now + ['free']
         if now != rest:
             return None, 'what is left to do is now %s, where %s was planned' % (', '.join(now), ', '.join(rest))
         pick = lambda s: [s[0], s[1], s[2], s[5]]
@@ -20871,7 +22073,7 @@ class Engine(object):
         tp, tp2 = it.get('tap'), e['item'].get('tap')
         ident = lambda t: [t['pid'], t['minor'], t['start_ticks'] if t.get('start_ticks') is not None else
                            int(t.get('start') or 0)] if t else None
-        if 'end' in done:
+        if 'end' in done or 'teardown' in done:
             if tp2:
                 return None, 'a tapdisk serves it again (pid %s)' % tp2['pid']
         elif canon(ident(tp)) != canon(ident(tp2)):
@@ -20992,6 +22194,55 @@ class Engine(object):
                 'no backend node pointed at it')
         return ('ended tapdisk pid %s (%s; its forensics are in %s on %s; %s%s%s)'
                 % (tp['pid'], how, res.get('forensics'), h.name, node, dom, left))
+
+    def still_gone(self, it):
+        x = self.ctx.api.x
+        try:
+            back = x.VDI.get_all_records_where('field "uuid" = "%s"' % it['vdi'])
+        except Exception as exc:
+            return 'whether VDI %s is in xapi again could not be read (%s)' % (it['vdi'], _text(exc)[:200])
+        if back:
+            return 'VDI %s is in xapi again, so what is left of it is SM\'s to tear down: run the tool again' % it['vdi']
+        try:
+            sref = x.SR.get_by_uuid(it['sr'])
+            hits = x.VDI.get_all_records_where('field "location" = "%s"' % it['vdi'])
+        except Exception as exc:
+            return 'whether a VDI of SR %s has the location %s could not be read (%s)' % (it['sr'], it['vdi'],
+                                                                                        _text(exc)[:200])
+        for r, rec in sorted((hits or {}).items()):
+            if rec.get('SR') == sref:
+                return ('VDI %s of SR %s has the location %s now, so what is left of it is SM\'s to tear down: run '
+                        'the tool again' % (rec.get('uuid'), it['sr'], it['vdi']))
+        return None
+
+    def step_teardown(self, it, h, fresh, done):
+        moved = self.changed(fresh, h, vdis=[it['vdi']], srs=[it['sr']])
+        if moved:
+            return self.chain_stop(it, h, done, 'something changed since it was re-checked (%s); run the tool again'
+                                   % moved)
+        why = self.still_gone(it)
+        if why:
+            return self.chain_stop(it, h, done, why)
+        m = fresh.model
+        args = dict(it['teardown'], sr=it['sr'], vdi=it['vdi'], run_id=self.run_id,
+                    roots=sorted(sr_image_roots(m, m.host_by_uuid.get(h.uuid), it['sr'])))
+        self.act_on(it)
+        try:
+            res = self.ctx.transport.call(h, 'sm-teardown', args, timeout=TEARDOWN_CALL)
+        except CallError as exc:
+            self.fail_item(it, call_outcome(exc, 'removes what SM left of VDI %s on %s' % (it['vdi'], h.name)))
+        self.j.rec('sm_teardown', seq=it['seq'], host=h.uuid, args=args, result=res)
+        if not res.get('done'):
+            why = '; '.join((res.get('problems') or ['no detail'])[:6])
+            if res.get('did'):
+                self.fail_item(it, 'part of what SM left of VDI %s on %s was removed (%s), and then it stopped: %s. The '
+                               'VDI is not in xapi, so nothing will use what is left; the next run of this tool '
+                               'picks it up from there' % (it['vdi'], h.name, '; '.join(res['did']), why))
+            return self.chain_stop(it, h, done, 'nothing of it was changed on %s: %s' % (h.name, why))
+        text = 'removed what SM left of VDI %s on %s: %s' % (it['vdi'], h.name, '; '.join(res.get('did') or []))
+        if res.get('left'):
+            text += ' (%s)' % '; '.join(res['left'])
+        return text
 
     def refresh_lvs(self, it):
         lv = it['lv']
@@ -21325,6 +22576,8 @@ class Engine(object):
             if any(c[1] == it['vdi'] for c in hv.claim.get(it['dp'], [])):
                 left.append('storage.db still has %s for it' % it['dp'])
             live = [e for s2, v2, e in hv.entries if (s2, v2) == (it['sr'], it['vdi']) and e.get('dps')]
+            if live and it.get('forgotten'):
+                live = [e for e in live if set(e['dps']) - set(self.siblings.get((it['host'], it['sr'], it['vdi']), ()))]
             if live:
                 left.append('storage.db on %s still holds datapath(s) %s for it' % (
                     h.name, ', '.join(sorted(live[0]['dps']))))
@@ -21355,13 +22608,15 @@ class Engine(object):
         if moved:
             return self.chain_stop(it, h, done, 'something changed since it was re-checked (%s); run the tool again'
                                    % moved)
-        why = self.before_sm(h, it)
+        why = self.still_gone(it) if it.get('forgotten') else self.before_sm(h, it)
         if why:
             return self.chain_stop(it, h, done, why)
         moved = self.changed(fresh, h, vdis=[it['vdi']], srs=[it['sr']])
         if moved:
             return self.chain_stop(it, h, done, 'something changed since it was re-checked (%s); run the tool again%s'
                                    % (moved, self.inert_note(h, it)))
+        if it.get('forgotten'):
+            return self.forget_dp(it, h, fresh, done)
         allow = [it['lv']['refcount'][0], 0] if 'deactivate' in (it.get('steps') or []) else None
         hvf = fresh.view(fresh.model.host_by_uuid[h.uuid])
         ops = teardown_ops((sdb_entry(hvf, it['sr'], it['vdi']) or {}).get('dps'), it['dp'])[0]
@@ -21557,6 +22812,38 @@ class Engine(object):
             if not keep:
                 self.free_name(h, it, hold)
 
+    def forget_dp(self, it, h, fresh, done):
+        wrote, why = self.write_dps(h, it, fresh)
+        if why:
+            return self.chain_stop(it, h, done, 'not removed: %s' % why)
+        if wrote:
+            step('  %d. %s: %s' % (it['seq'], it['cls'], wrote))
+        self.act_on(it)
+        r = xe('host-sm-dp-destroy', 'uuid=' + h.uuid, 'dp=' + it['dp'], 'allow-leak=true', timeout=DP_DESTROY_TIMEOUT)
+        if not r.ok:
+            self.fail_item(it, 'xe host-sm-dp-destroy allow-leak=true %s%s' % (
+                r.why(), ', so whether xapi forgot the datapath is not established' if r.timed_out else ''))
+        check = self.audit(hosts=[h.uuid], smlog=False)
+        cv = check.view(check.model.host_by_uuid[h.uuid])
+        if cv.claim is None:
+            self.fail_item(it, 'storage.db on %s cannot be read back: %s' % (h.name, cv.sdb_error))
+        if any(c[1] == it['vdi'] for c in cv.claim.get(it['dp'], [])):
+            self.fail_item(it, 'xe host-sm-dp-destroy allow-leak=true answered, but storage.db on %s still has %s for '
+                               'VDI %s%s' % (h.name, it['dp'], it['vdi'], ': xapi found no storage-dps record to route it '
+                                             'by' if cv.dps_files is not None and it['dp'].replace('/', '-')
+                                             not in cv.dps_files else ''))
+        held = sorted(dp for dp, cl in cv.claim.items() if dp != it['dp'] and any(c[1] == it['vdi'] for c in cl))
+        if not held:
+            l2, u2 = self.footprint(cv, it['sr'], it['vdi'], strict=True)
+            if l2 or u2:
+                self.fail_item(it, 'xapi forgot the datapath, but on %s: %s' % (h.name, '; '.join((l2 + u2)[:6])))
+        note = ''
+        if cv.dps_files is not None and it['dp'].replace('/', '-') in cv.dps_files:
+            note = '; xapi\'s storage-dps record of it is still there'
+        return ('xapi forgot it (allow-leak=true; its VDI is not in xapi, so SM was not called)%s%s'
+                % ('; datapath(s) %s still hold the VDI on %s, and their own fixes forget them' % (', '.join(held), h.name)
+                   if held else ', and nothing of the VDI is left on %s' % h.name, note))
+
     def holder_busy(self, vbd_uuid):
         x = self.ctx.api.x
         try:
@@ -21584,7 +22871,8 @@ class Engine(object):
         if len(mine) != 1:
             return None, 'storage.db on %s does not hold %s once for VDI %s' % (h.name, it['dp'], it['vdi'])
         sr, vdi, st, key = mine[0]
-        args = {'dp': it['dp'], 'sr': sr, 'vdi': vdi, 'vdi_key': key, 'vm': it['dp'].split('/')[1],
+        args = {'dp': it['dp'], 'sr': sr, 'vdi': vdi, 'vdi_key': key,
+                'vm': it['dp'].split('/')[1] if GUEST_DP_RE.match(it['dp']) else '0',
                 'rw': st[1] == 'RW', 'state': list(st)}
         self.act_on(it)
         try:
@@ -21689,15 +22977,16 @@ class Engine(object):
         except CallError as exc:
             self.j.rec('xlog_grep', host=h.uuid, seq=it['seq'], error=_text(exc))
             res = None
+        who = ('xapi\'s teardown failed before SM was called (No_VDI: the VDI is not in xapi)' if 'No_VDI' in first else
+               'SM\'s teardown failed')
         if res is not None and res.get('lines'):
-            return ('SM\'s teardown failed (%s) and failed again when xapi retried it with allow-leak=true, so xapi '
-                    'forgot the datapath; nothing of it is left on %s' % (first, h.name))
+            return ('%s (%s), and failed again when xapi retried it with allow-leak=true, so xapi forgot the datapath'
+                    % (who, first))
         if res is not None and res.get('covered', True):
-            return ('SM\'s teardown failed at first (%s) and went through when xapi ran it again with allow-leak=true'
-                    % first)
-        return ('SM\'s teardown failed at first (%s); xapi ran it again with allow-leak=true and the datapath is gone, '
-                'but whether SM tore it down that time or xapi forgot it is not established (xensource.log %s)'
-                % (first, 'could not be read' if res is None else 'no longer covers the call'))
+            return ('%s at first (%s), and went through when xapi ran it again with allow-leak=true' % (who, first))
+        return ('%s at first (%s); xapi ran it again with allow-leak=true and the datapath is gone, but whether SM tore '
+                'it down that time or xapi forgot it is not established (xensource.log %s)'
+                % (who, first, 'could not be read' if res is None else 'no longer covers the call'))
 
     def teardown_left(self, h, cv, it, since, grep=True, allow=None, ops=()):
         left, unknown, notes = [], [], []

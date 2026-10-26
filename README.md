@@ -6,8 +6,9 @@ Both run as root on the pool master, look before they touch anything, and
 ask first. Download the file and run it, don't pipe it in from curl.
 
 **storage-state-fixer.py** (8.3 only) - for when exports, backups or VBD unplugs start failing
-because of storage junk left behind (dead dom0 datapaths, stale dom0 VBDs, leaked datapaths and
-the paused or wedged tapdisks behind them, stale sm-config keys, stuck GC flags, dead NBD exports, VMs
+because of storage junk left behind (dead dom0 datapaths, stale dom0 VBDs, leaked datapaths, also of
+failed storage migrations and of disks xapi forgot, and the paused or wedged tapdisks behind them,
+stale sm-config keys, stuck GC flags, dead NBD exports, VMs
 xapi still shows running after a failed reboot), and names the backup client behind refused disk activations.
 Run it with no arguments: it checks, lists what it found and what it would change, and only
 changes anything once you type `yes`; with `--yes` it makes them without asking. Editing storage.db, or fixing
