@@ -21,6 +21,7 @@ USAGE
     rbac-dump.py URL --templates                      also list the built-in roles' privileges
     rbac-dump.py URL --server-effective               ask XO for each user's privileges too
     rbac-dump.py URL --for-user alice                 one user: their roles, groups, privileges
+    rbac-dump.py URL --for-role "QA operators"        one role: its privileges and who holds it
     rbac-dump.py URL -k                               accept a self-signed certificate
 
 WHAT IT NEEDS
@@ -89,26 +90,25 @@ class Client:
 # fetch and join
 # --------------------------------------------------------------------------------------
 
-def fetch(client, server_effective=False, for_user=None):
-    data = {
+def fetch(client):
+    return {
         "roles": client.collection("/acl-roles"),
         "privileges": client.collection("/acl-privileges"),
         "users": client.collection("/users", USER_FIELDS),
         "groups": client.collection("/groups", GROUP_FIELDS),
     }
-    if for_user is not None:
-        data["for_user"] = find_user(data["users"], for_user)["id"]
-    if server_effective:
-        data["server_effective"] = {}
-        for u in data["users"]:
-            if for_user is not None and u["id"] != data["for_user"]:
-                continue
-            try:
-                data["server_effective"][u["id"]] = client.collection(
-                    "/users/%s/acl-privileges" % quote(u["id"]))
-            except ApiError as e:
-                data["server_effective"][u["id"]] = {"error": str(e)}
-    return data
+
+
+def fetch_effective(client, uids):
+    """XO's own answer to "what may this user do", per user id. One request each, so it is
+    asked only for the users the report shows. A refusal is kept as the answer."""
+    out = {}
+    for uid in uids:
+        try:
+            out[uid] = client.collection("/users/%s/acl-privileges" % quote(uid))
+        except ApiError as e:
+            out[uid] = {"error": str(e)}
+    return out
 
 
 def _clean(obj):
@@ -139,7 +139,41 @@ def find_user(users, query):
         query, len(users), ", ".join(sorted(user_label(u) for u in users)) or "-"))
 
 
-def focus(model, uid):
+def find_role(roles, query):
+    """The one role `query` names: an exact id, else a case-insensitive name. Template
+    roles count too. Anything else is an ApiError naming the candidates."""
+    for r in roles:
+        if r["id"] == query:
+            return r
+    hits = [r for r in roles if (r.get("name") or "").lower() == query.lower()]
+    if len(hits) == 1:
+        return hits[0]
+    if hits:
+        raise ApiError("%r matches %d roles: %s" % (
+            query, len(hits), ", ".join("%s [%s]" % (r.get("name"), r["id"]) for r in hits)))
+    raise ApiError("no role %r among the %d this login can see: %s" % (
+        query, len(roles), ", ".join(sorted(r.get("name") or r["id"] for r in roles)) or "-"))
+
+
+def focus_role(model, rid):
+    """Cut the model down to one role: the role, the groups that hold it, every user who
+    holds it directly or through one of those groups, and the warnings naming any of them."""
+    role = next(r for r in model["roles"] + model["templates"] if r["id"] == rid)
+    template = role in model["templates"]
+    users = [u for u in model["users"] if any(r["id"] == rid for r in u["roles"])]
+    groups = [g for g in model["groups"] if any(r["id"] == rid for r in g["roles"])]
+    subjects = [repr(role["name"])] + [repr(x["name"]) for x in users + groups]
+    return {
+        "role": role,
+        "roles": [] if template else [role],
+        "templates": [role] if template else [],
+        "users": users,
+        "groups": groups,
+        "warnings": [w for w in model["warnings"] if any(s in w for s in subjects)],
+    }
+
+
+def focus_user(model, uid):
     """Cut the model down to one user: the roles they hold, the groups they are in, and
     the warnings that name the user, one of those roles or one of those groups."""
     user = next(u for u in model["users"] if u["id"] == uid)
@@ -264,8 +298,6 @@ def build(data):
         if not admin and not entry["effective"]:
             warnings.append("user %r is not an admin and has no RBAC privileges (no REST/XO 6 access)"
                             % entry["name"])
-        if "server_effective" in data:
-            entry["serverEffective"] = data["server_effective"].get(uid)
         out_users.append(entry)
 
     out_groups = []
@@ -308,6 +340,12 @@ def render(model, source, show_templates):
         lines += render_users(model)
         lines += render_roles(model)
         lines += render_groups(model)
+    elif "role" in model:
+        lines = ["RBAC of role %s [%s] on %s  (%s %s)" % (model["role"]["name"], model["role"]["id"], source,
+                                                         NAME, VERSION)]
+        lines += render_roles(model) if model["roles"] else render_templates(model, True)
+        lines += render_groups(model)
+        lines += render_users(model)
     else:
         lines = ["RBAC configuration of %s  (%s %s)" % (source, NAME, VERSION)]
         lines += render_roles(model)
@@ -405,8 +443,11 @@ def main(argv=None):
     ap.add_argument("--templates", action="store_true", help="list the template roles' privileges too")
     ap.add_argument("--server-effective", action="store_true",
                     help="also fetch /users/<id>/acl-privileges and compare with the computed set")
-    ap.add_argument("--for-user", metavar="USER",
-                    help="only this user (id, username, email or name): their roles, groups and privileges")
+    only = ap.add_mutually_exclusive_group()
+    only.add_argument("--for-user", metavar="USER",
+                      help="only this user (id, username, email or name): their roles, groups and privileges")
+    only.add_argument("--for-role", metavar="ROLE",
+                      help="only this role (id or name): its privileges and the users and groups holding it")
     ap.add_argument("-o", "--output", default="-", help="output file (default: stdout)")
     args = ap.parse_args(argv)
 
@@ -421,7 +462,17 @@ def main(argv=None):
 
     client = Client(args.url, token=token, user=args.user, password=password, insecure=args.insecure)
     try:
-        data = fetch(client, server_effective=args.server_effective, for_user=args.for_user)
+        data = fetch(client)
+        model = build(data)
+        admin_visible = any(u["admin"] for u in model["users"])
+        if args.for_user is not None:
+            model = focus_user(model, find_user(data["users"], args.for_user)["id"])
+        elif args.for_role is not None:
+            model = focus_role(model, find_role(data["roles"], args.for_role)["id"])
+        if args.server_effective:
+            data["server_effective"] = fetch_effective(client, [u["id"] for u in model["users"]])
+            for u in model["users"]:
+                u["serverEffective"] = data["server_effective"][u["id"]]
     except ApiError as e:
         print("rbac-dump: %s" % e, file=sys.stderr)
         return 1
@@ -429,10 +480,6 @@ def main(argv=None):
     if args.json and args.raw:
         text = json.dumps(dict(data, tool=NAME, version=VERSION), indent=2, sort_keys=True) + "\n"
     else:
-        model = build(data)
-        admin_visible = any(u["admin"] for u in model["users"])
-        if "for_user" in data:
-            model = focus(model, data["for_user"])
         if not admin_visible:
             model["warnings"].insert(0, "no admin user is visible: this login is probably not an admin, "
                                         "so the dump only shows what it may read")
