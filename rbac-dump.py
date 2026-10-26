@@ -221,6 +221,11 @@ def build(data):
             warnings.append("privilege %s (%s %s on %s) belongs to missing role %s"
                             % (pid, p.get("effect"), p.get("action"), p.get("resource"), p.get("roleId")))
 
+    for rid, r in roles.items():
+        for p, other, why in pointless(by_role[rid]):
+            warnings.append("role %r: privilege %s (%s) %s %s (%s)"
+                            % (r.get("name"), p["id"], describe(p), why, other["id"], describe(other)))
+
     # Who holds each role, from both directions (role.userIds/groupIds and group.aclRoleIds).
     role_users = {rid: set(r.get("userIds", [])) for rid, r in roles.items()}
     role_groups = {rid: set(r.get("groupIds", [])) for rid, r in roles.items()}
@@ -313,6 +318,49 @@ def build(data):
 
     return {"roles": out_roles, "templates": out_templates, "users": out_users,
             "groups": out_groups, "warnings": warnings}
+
+
+def covers(broad, narrow):
+    """True when `broad` applies to every (action, object) `narrow` does: same resource, an
+    action that is `*`, the same, or a parent (`shutdown` over `shutdown:clean`), and no
+    selector or the same one. Two different selectors are never compared - whether they
+    overlap depends on the objects, so that is left alone rather than guessed."""
+    if broad.get("resource") != narrow.get("resource"):
+        return False
+    ba, na = broad.get("action") or "", narrow.get("action") or ""
+    if not (ba == "*" or ba == na or na.startswith(ba + ":")):
+        return False
+    bs, ns = (broad.get("selector") or "").strip(), (narrow.get("selector") or "").strip()
+    return not bs or bs == ns
+
+
+def pointless(privs):
+    """The privileges of one role that change nothing, as (privilege, other, reason):
+    an exact duplicate, one a broader privilege of the same effect covers, or an allow a
+    deny cancels (deny wins). Of two identical privileges the later id is reported."""
+    out = []
+    privs = sorted(privs, key=lambda p: p["id"])
+    for i, p in enumerate(privs):
+        for j, other in enumerate(privs):
+            if i == j or not covers(other, p):
+                continue
+            if other.get("effect") == p.get("effect"):
+                if covers(p, other):          # identical in effect: report only the later one
+                    if j < i:
+                        out.append((p, other, "duplicates"))
+                        break
+                else:
+                    out.append((p, other, "is already covered by"))
+                    break
+            elif p.get("effect") == "allow":
+                out.append((p, other, "is cancelled by the deny"))
+                break
+    return out
+
+
+def describe(p):
+    return "%s %s %s%s" % (p.get("effect"), p.get("action"), p.get("resource"),
+                           " where " + p["selector"] if p.get("selector") else "")
 
 
 def priv_key(p):
