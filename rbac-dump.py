@@ -47,7 +47,7 @@ from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
 NAME = "rbac-dump"
-VERSION = "0.1"
+VERSION = "0.2"
 
 API = "/rest/v0"
 USER_FIELDS = "id,email,username,name,firstname,lastname,permission,groups,authProviders"
