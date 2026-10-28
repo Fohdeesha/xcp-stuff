@@ -43,11 +43,11 @@ import os
 import ssl
 import sys
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 NAME = "rbac-dump"
-VERSION = "0.2"
+VERSION = "0.3"
 
 API = "/rest/v0"
 USER_FIELDS = "id,email,username,name,firstname,lastname,permission,groups,authProviders"
@@ -81,6 +81,10 @@ class Client:
             raise ApiError("%d on %s: %s" % (e.code, path, body[:300]))
         except URLError as e:
             raise ApiError("cannot reach %s: %s" % (self.base, e.reason))
+        except OSError as e:          # a timeout (not a URLError before 3.10), a reset connection
+            raise ApiError("cannot reach %s: %s" % (self.base, e))
+        except ValueError:            # 200 but not JSON: a wrong URL, a proxy or login page
+            raise ApiError("%s did not answer with JSON: is this an XO REST API URL?" % (self.base + path))
 
     def collection(self, path, fields="*"):
         return self.get("%s?fields=%s" % (path, quote(fields, safe=",*")))
@@ -303,6 +307,9 @@ def build(data):
         if not admin and not entry["effective"]:
             warnings.append("user %r is not an admin and has no RBAC privileges (no REST/XO 6 access)"
                             % entry["name"])
+        elif not admin and not any(p.get("effect") == "allow" for p in entry["effective"]):
+            warnings.append("user %r is not an admin and has only deny privileges (no REST/XO 6 access)"
+                            % entry["name"])
         out_users.append(entry)
 
     out_groups = []
@@ -483,8 +490,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Dump Xen Orchestra RBAC roles, privileges and assignments.")
     ap.add_argument("--version", action="version", version="%s %s" % (NAME, VERSION))
     ap.add_argument("url", help="XO base URL, e.g. https://xoa.example (without /rest/v0)")
-    ap.add_argument("--token", help="authentication token (default: $XO_TOKEN)")
-    ap.add_argument("--user", help="log in with HTTP basic auth as this user instead of a token")
+    auth = ap.add_mutually_exclusive_group()
+    auth.add_argument("--token", help="authentication token (default: $XO_TOKEN)")
+    auth.add_argument("--user", help="log in with HTTP basic auth as this user instead of a token")
     ap.add_argument("-k", "--insecure", action="store_true", help="do not verify the TLS certificate")
     ap.add_argument("--json", action="store_true", help="write JSON instead of the text report")
     ap.add_argument("--raw", action="store_true", help="with --json: the four collections as fetched, unjoined")
@@ -499,7 +507,7 @@ def main(argv=None):
     ap.add_argument("-o", "--output", default="-", help="output file (default: stdout)")
     args = ap.parse_args(argv)
 
-    if not urlsplit(args.url).scheme:
+    if "://" not in args.url:         # not urlsplit().scheme: that reads host:port as a scheme
         args.url = "https://" + args.url
     token = args.token or (None if args.user else os.environ.get("XO_TOKEN"))
     password = None
