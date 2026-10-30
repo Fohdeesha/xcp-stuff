@@ -214,10 +214,13 @@ def oom_events(host):
 
 
 def crash_logs(host):
-    f = host.fact("crash_count")
+    f = host.fact("crash_dumps")
     if not f.ok:
         return unknown("Crash Logs Present", "Unknown (%s)" % f.error)
-    if f.value:
+    if f.value["count"]:
+        if f.value["latest"]:
+            return flag("Crash Logs Present",
+                        "Yes (newest %s) - check /var/crash" % f.value["latest"])
         return flag("Crash Logs Present", "Yes - check /var/crash")
     return ok("Crash Logs Present", "No")
 
