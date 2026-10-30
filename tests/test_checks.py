@@ -102,7 +102,7 @@ def test_the_check_table_and_the_slave_toggles_stay_in_step():
 
 
 def test_every_host_check_says_unknown_when_the_fact_is_an_error():
-    broken = host(df=err(), dmesg=err(), crash_count=err(), coredumps=err(), lacp=err(),
+    broken = host(df=err(), dmesg=err(), crash_dumps=err(), coredumps=err(), lacp=err(),
                   iplink=err(), pifs_dns_gw=err(), ipaddr=err(), log_scan=err(),
                   lun_scan=err(), smapi=err(), boot_epoch=err(), task_timeout=err(),
                   multipath=err(), multipath_scan=err(), tap_status=err())
@@ -665,6 +665,13 @@ def test_coredumps_cap_and_wording():
     line = checks.coredumps(host(coredumps=fact(rows)))
     assert line.status == FLAG and "60 file(s)" in line.text
     assert "(plus 10 older coredump(s) not listed)" in line.detail_text
+
+
+def test_crash_logs_names_the_newest_dump():
+    line = checks.crash_logs(host(crash_dumps=fact({"count": 3, "latest": "2026-10-12 03:14:07"})))
+    assert line.status == FLAG and line.text.endswith("Yes (newest 2026-10-12 03:14:07) - check /var/crash")
+    line = checks.crash_logs(host(crash_dumps=fact({"count": 0, "latest": None})))
+    assert line.status == OK
 
 
 def test_silly_mtus_names_the_offenders():

@@ -967,31 +967,51 @@ def collect_tap_status():
     return fact(r.out)
 
 
-def collect_crash_count(ignore_name):
-    """Files under /var/crash, two levels deep - crash dumps live in subdirectories."""
-    root = "/var/crash"
-    if not os.path.isdir(root):
-        return fact(0)
+def collect_crash_dumps(ignore_name, root="/var/crash"):
+    """Files under /var/crash, two levels deep - crash dumps live in subdirectories.
+
+    The newest mtime comes back with the count, so the report can say whether the dumps
+    are from last night or from a crash someone already dealt with a year ago."""
     count = 0
+    latest = None
+    if not os.path.isdir(root):
+        return fact({"count": 0, "latest": None})
+
+    def counted(path):
+        try:
+            st = os.stat(path)
+        except OSError:
+            return 0, None
+        if not os.path.isfile(path):
+            return 0, None
+        return 1, st.st_mtime
+
     try:
         for name in os.listdir(root):
             path = os.path.join(root, name)
             if os.path.isfile(path):
                 if name != ignore_name:
-                    count += 1
+                    n, mtime = counted(path)
+                    count += n
+                    if mtime is not None and (latest is None or mtime > latest):
+                        latest = mtime
                 continue
             if os.path.isdir(path):
                 try:
                     for sub in os.listdir(path):
                         if sub == ignore_name:
                             continue
-                        if os.path.isfile(os.path.join(path, sub)):
-                            count += 1
+                        n, mtime = counted(os.path.join(path, sub))
+                        count += n
+                        if mtime is not None and (latest is None or mtime > latest):
+                            latest = mtime
                 except OSError:
                     return err("could not list %s" % path)
     except OSError as exc:
-        return err("could not list /var/crash (%s)" % exc)
-    return fact(count)
+        return err("could not list %s (%s)" % (root, exc))
+    if latest is not None:
+        latest = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(latest))
+    return fact({"count": count, "latest": latest})
 
 
 def collect_coredumps(coredump_dir):
@@ -1752,7 +1772,7 @@ def collect(spec):
         out["lacp"] = collect_lacp()
         out["multipath"] = collect_multipath(spec.get("multipath"))
         out["tap_status"] = collect_tap_status()
-        out["crash_count"] = collect_crash_count(spec.get("crash_ignore_file") or "")
+        out["crash_dumps"] = collect_crash_dumps(spec.get("crash_ignore_file") or "")
         out["coredumps"] = collect_coredumps(spec.get("coredump_dir") or "")
         out["task_timeout"] = collect_task_timeout_override()
         out["rpm_manifest"] = collect_rpm_manifest()

@@ -7,6 +7,7 @@ is exercised for real by every run against an 8.2.1 pool, which has no python3.
 """
 
 import json
+import os
 import sys
 import threading
 import time
@@ -505,3 +506,23 @@ def test_a_command_that_hangs_is_named_while_it_hangs():
     assert seen and "time.sleep(1.2)" in seen[0]
     # ...and cleared once it is no longer running, so a later stall is not blamed on it
     assert collector.CURRENT[0] == ""
+
+
+def test_crash_dumps_counts_two_levels_and_dates_the_newest(tmp_path):
+    root = tmp_path / "crash"
+    assert collector.collect_crash_dumps("", str(root)) == {
+        "ok": True, "value": {"count": 0, "latest": None}}
+    dump = root / "20261012-031407-abc"
+    dump.mkdir(parents=True)
+    old, new = dump / "xen.log", dump / "dom0.log"
+    old.write_text(u"x")
+    new.write_text(u"x")
+    ignored = root / ".sacrificial-space-for-logs"
+    ignored.write_text(u"x")
+    stamp = time.mktime((2026, 10, 12, 3, 14, 7, 0, 0, -1))
+    os.utime(str(old), (stamp - 86400, stamp - 86400))
+    os.utime(str(new), (stamp, stamp))
+    # the ignore file is the newest thing there, and must neither count nor date the dumps
+    os.utime(str(ignored), (stamp + 86400, stamp + 86400))
+    got = collector.collect_crash_dumps(".sacrificial-space-for-logs", str(root))
+    assert got == {"ok": True, "value": {"count": 2, "latest": "2026-10-12 03:14:07"}}
