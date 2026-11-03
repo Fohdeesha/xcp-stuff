@@ -21,6 +21,7 @@ import shutil
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import tempfile
 import threading
@@ -28,7 +29,7 @@ import time
 import xml.parsers.expat
 import zlib
 
-VERSION = '2.8'
+VERSION = '2.9'
 PYTHON = sys.version.split()[0]
 PROG = 'storage-state-fixer'
 STORAGE_DB = '/var/run/nonpersistent/xapi/storage.db'
@@ -46,6 +47,8 @@ SYS_DEV_BLOCK = '/sys/dev/block'
 SYS_BLOCK = '/sys/block'
 XENSOURCE_LOG = '/var/log/xensource.log'
 VHD_UTIL = '/usr/bin/vhd-util'
+QEMU_IMG = '/usr/bin/qemu-img'
+DD = '/usr/bin/dd'
 IPC_DIR = '/var/run/sm/ipc'
 SM_REFCOUNT = '/var/run/sm/refcount'
 SR_MOUNT = '/var/run/sr-mount'
@@ -1456,7 +1459,7 @@ SM_PREFIXES = (SM_DIR + '/', PLUGIN_DIR + '/')
 TERMINAL = ('done', 'refused', 'rolled-back', 'failed', 'superseded')
 ACT_ENDS = TERMINAL + ('unverified',)
 PATH_KEYS = ('STORAGE_DB', 'STORAGE_DPS', 'SXM_DIR', 'SM_BACKEND', 'SM_PHY', 'BLKTAP_DIR', 'SYS_BLKTAP', 'SYS_DEV_BLOCK',
-             'SYS_BLOCK', 'XENSOURCE_LOG', 'VHD_UTIL', 'IPC_DIR', 'SM_REFCOUNT', 'SR_MOUNT', 'DRBD_BY_RES', 'NBD_VBDS',
+             'SYS_BLOCK', 'XENSOURCE_LOG', 'VHD_UTIL', 'QEMU_IMG', 'DD', 'IPC_DIR', 'SM_REFCOUNT', 'SR_MOUNT', 'DRBD_BY_RES', 'NBD_VBDS',
              'XENSTORE_LIST', 'XENSTORE_READ', 'VGS', 'LIO_CORE', 'CG_SYSTEMD', 'SS', 'SM_LOCK_DIR', 'SMLOG', 'NO_SM_LOG', 'LOCAL_DB',
              'INVENTORY',
              'POOL_CONF', 'STATIC_VDIS',
@@ -1968,7 +1971,7 @@ def pid_info(pid):
             'argv': keep_argv(argv, 8, 200), 'sm': is_sm_argv(argv) or any('cleanup.py' in a for a in argv)}
 
 
-PROBE_COMMS = ('stat', 'ls', 'vhd-util')
+PROBE_COMMS = ('stat', 'ls', 'vhd-util', 'dd', 'qemu-img')
 SR_MOUNT_PATH = re.compile(r'^/(?:var/)?run/sr-mount/(' + UUID_PAT + r')(?:/|$)')
 _STUCK = [None]
 
@@ -1983,7 +1986,7 @@ def stuck_probes():
         except (EnvironmentError, ValueError, IndexError):
             continue
         for x in argv:
-            mm = SR_MOUNT_PATH.match(x)
+            mm = SR_MOUNT_PATH.match(x[3:] if x.startswith('if=') else x)
             if mm:
                 out.setdefault(mm.group(1), []).append(p)
     return out
@@ -2003,8 +2006,8 @@ def mount_stuck(path):
     left = _STUCK[0].get(mm.group(1))
     if not left:
         return None
-    return ('not probed: an earlier stat, ls or vhd-util on that SR mount (pid %s) is still stuck in D state, so its '
-            'server does not answer, and another probe would only be stuck beside it'
+    return ('not probed: an earlier stat, ls, dd, vhd-util or qemu-img on that SR mount (pid %s) is still stuck in D '
+            'state, so its server does not answer, and another probe would only be stuck beside it'
             % ', '.join(str(x) for x in left[:4]))
 
 
@@ -2159,8 +2162,102 @@ def f_vhdcheck(paths):
         if not is_image_path(p):
             out[p] = {'ok': False, 'detail': 'not an SR image path'}
             continue
-        out[p] = vhd_check_one(p)
+        out[p] = qcow2_check_one(p, True) if image_kind(p) == 'qcow2' else vhd_check_one(p)
     return out
+
+
+def f_headcheck(paths):
+    out = {}
+    for p in paths or []:
+        if not is_image_path(p) or image_kind(p) != 'qcow2':
+            out[p] = {'ok': False, 'detail': 'not a QCOW2 image path'}
+            continue
+        out[p] = qcow2_check_one(p, False)
+    return out
+
+
+QCOW2_MAGIC = b'QFI\xfb'
+QCOW2_HEAD = 65536
+QCOW2_CORRUPT = 0x2
+QCOW2_DIRTY = 0x1
+
+
+def image_kind(p):
+    b = os.path.basename(p or '')
+    return 'qcow2' if b.startswith('QCOW2-') or b.endswith('.qcow2') else 'vhd'
+
+
+def qcow2_header(p):
+    r = run([DD, 'if=' + p, 'iflag=direct', 'bs=%d' % QCOW2_HEAD, 'count=1', 'status=none'], 60, raw=True)
+    if not r.ok:
+        return None, ('its first %d bytes were not read (dd %s)'
+                      % (QCOW2_HEAD, 'timed out' if r.timed_out else 'exit %d: %s' % (r.rc, r.err.strip()[:200]))), \
+            r.timed_out
+    d = r.out
+    if len(d) < 72 or d[:4] != QCOW2_MAGIC:
+        return None, 'it has no QCOW2 header (it starts %s)' % canon(d[:8].hex() if d else 'empty'), False
+    version = int(struct.unpack('>I', d[4:8])[0])
+    boff, bsize, cbits = struct.unpack('>QII', d[8:24])
+    if version not in (2, 3) or not 9 <= cbits <= 21:
+        return None, 'its QCOW2 header reads version %d, cluster bits %d' % (version, cbits), False
+    head = {'version': version, 'incompat': int(struct.unpack('>Q', d[72:80])[0]) if version == 3 and len(d) >= 80
+            else 0}
+    if not boff:
+        head['backing'] = ''
+    elif bsize > 1023 or boff + bsize > len(d):
+        head['backing_error'] = ('its backing-file name (%d bytes at offset %d) is not within its first %d bytes'
+                                 % (bsize, boff, QCOW2_HEAD))
+    else:
+        head['backing'] = d[boff:boff + bsize].decode('utf-8', 'replace')
+    return head, None, False
+
+
+def qcow2_check_one(p, full):
+    why = mount_stuck(p)
+    if why:
+        return {'ok': False, 'detail': why, 'timed_out': True, 'parent_error': why, 'format': 'qcow2'}
+    head, why, slow = qcow2_header(p)
+    rec = {'format': 'qcow2', 'full': bool(full)}
+    if head is None:
+        rec.update({'ok': False, 'detail': why[:400], 'parent_error': why[:400]})
+        if slow:
+            rec['timed_out'] = True
+        return rec
+    bad, notes = [], []
+    if head['incompat'] & QCOW2_CORRUPT:
+        bad.append('its header carries the corrupt bit')
+    if head['incompat'] & QCOW2_DIRTY:
+        notes.append('its header carries the dirty bit (refcounts not written back)')
+    if 'backing_error' in head:
+        rec['parent_error'] = head['backing_error']
+    elif not head['backing']:
+        rec['parent'] = ''
+    else:
+        names = re.findall(UUID_PAT, os.path.basename(head['backing']))
+        rec['parent_raw'] = head['backing'][:300]
+        if len(names) == 1:
+            rec['parent'] = names[0]
+        else:
+            rec['parent_error'] = 'the parent cannot be named from %s' % canon(head['backing'][:200])
+    if full and not bad:
+        r = run([QEMU_IMG, 'check', '--output=json', '-f', 'qcow2', '-T', 'none', p], 120)
+        try:
+            res = json.loads(r.out) if r.out.strip() else {}
+        except ValueError:
+            res = {}
+        n = dict((k, res.get(k)) for k in ('corruptions', 'leaks', 'check-errors'))
+        if r.timed_out:
+            rec['timed_out'] = True
+            bad.append('qemu-img check did not finish in time')
+        elif r.rc not in (0, 3) or n['corruptions'] or n['check-errors'] or not res:
+            bad.append('qemu-img check: %s' % (', '.join('%s %s' % (k, v) for k, v in sorted(n.items()) if v) or
+                                               r.why()))
+        elif n['leaks']:
+            notes.append('qemu-img check finds %d leaked cluster(s), which only waste space' % n['leaks'])
+        rec['qemu_rc'] = r.rc
+    rec['ok'] = not bad
+    rec['detail'] = '; '.join(bad + notes)[:400] or ('qemu-img check passes' if full else 'its QCOW2 header is valid')
+    return rec
 
 
 CHAIN_RESERVE = 60
@@ -3470,6 +3567,22 @@ def reset_vdi_probe(data):
     return {'args': None, 'is_open': False, 'remove': False, 'false': False}
 
 
+def is_open_probe(data):
+    found = {}
+    for node in ast.walk(ast.parse(data.decode('utf-8', 'replace'))):
+        if isinstance(node, ast.FunctionDef) and node.name in ('_is_open', 'is_open'):
+            mods, prefixes = set(), set()
+            for n in ast.walk(node):
+                if isinstance(n, ast.Import):
+                    mods.update(x.name for x in n.names)
+                elif isinstance(n, ast.ImportFrom) and n.module:
+                    mods.add(n.module)
+                elif isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == 'startswith':
+                    prefixes.update(s for s in (_ast_str(x) for x in n.args) if s)
+            found[node.name] = {'modules': sorted(mods), 'prefixes': sorted(prefixes)}
+    return found.get('_is_open') or found.get('is_open')
+
+
 def plugin_funcs(data):
     out = []
     for node in ast.walk(ast.parse(data.decode('utf-8', 'replace'))):
@@ -3517,6 +3630,8 @@ def f_caps():
             data, sha = _file_info(PLUGIN_DIR + '/' + name)
             found = plugin_funcs(data)
             caps[key] = {'sha256': sha, 'funcs': [f for f in funcs if f in found]}
+            if key == 'on_slave':
+                caps[key]['is_open_reads'] = is_open_probe(data)
         except EnvironmentError as exc:
             caps[key] = {'error': _text(exc)}
         except SyntaxError as exc:
@@ -4740,6 +4855,7 @@ def facts_doc(args):
         doc['srdir'] = fact(f_srdir, args.get('srdirs') or [])
         doc['xsread'] = fact(f_xsread, args.get('xsread') or [])
         doc['vhdcheck'] = fact(f_vhdcheck, args.get('vhdcheck') or [])
+        doc['headcheck'] = fact(f_headcheck, args.get('headcheck') or [])
         doc['dmcheck'] = fact(f_dmcheck, args.get('dmcheck') or [])
     if 'xlog' in want:
         doc['xlog'] = fact(f_xlog, args.get('xlog') or {})
@@ -8599,17 +8715,22 @@ def agent_reset_marker(args, source):
         if keys != sorted(stale + keep):
             return {'done': False, 'answers': {}, 'problems': ['the VDI now carries %s, not %s' % (
                 ', '.join(keys) or 'no host_ key', ', '.join(sorted(stale + keep)))]}
-        if SM_DIR not in sys.path:
-            sys.path.insert(0, SM_DIR)
-        import resetvdis
-        cleared = sorted(k for k in ('paused', 'activating') if k in rec['sm_config'] and
-                         k not in (args.get('clear') or []))
-        if cleared and hasattr(resetvdis, 'clean_vdi_status'):
-            return {'done': False, 'answers': {}, 'problems': ['the VDI now carries %s, which SM\'s reset would '
-                                                               'remove too' % ', '.join(cleared)]}
+        direct = bool(args.get('direct'))
+        if not direct:
+            if SM_DIR not in sys.path:
+                sys.path.insert(0, SM_DIR)
+            import resetvdis
+            cleared = sorted(k for k in ('paused', 'activating') if k in rec['sm_config'] and
+                             k not in (args.get('clear') or []))
+            if cleared and hasattr(resetvdis, 'clean_vdi_status'):
+                return {'done': False, 'answers': {}, 'problems': ['the VDI now carries %s, which SM\'s reset would '
+                                                                   'remove too' % ', '.join(cleared)]}
         answers, problems = {}, []
         for k in keys:
             href = k[len('host_'):]
+            if direct and k not in gone:
+                answers[k] = 'not asked: it cannot answer for this SR type'
+                continue
             if k in gone:
                 try:
                     x.host.get_record(href)
@@ -8639,6 +8760,12 @@ def agent_reset_marker(args, source):
             if k in rec['sm_config']:
                 x.VDI.remove_from_sm_config(vref, k)
                 removed.append(k)
+        if direct:
+            for k in stale:
+                x.VDI.remove_from_sm_config(vref, k)
+            left = sorted(k for k in x.VDI.get_sm_config(vref) if k.startswith('host_'))
+            return {'done': True, 'clean': not keep, 'answers': answers, 'left': left, 'problems': [],
+                    'flags_removed': removed, 'retried': None, 'direct': True}
         if SM_DIR not in sys.path:
             sys.path.insert(0, SM_DIR)
         saved = sys.stdout
@@ -10928,6 +11055,29 @@ def is_vhd(vdi, sr_type):
     return (smc.get('image-format') or smc.get('vdi_type')) == 'vhd'
 
 
+COW_FORMATS = ('vhd', 'qcow2')
+COW_LV_PREFIX = {'vhd': 'VHD-', 'qcow2': 'QCOW2-'}
+COW_TEXT = 'VHD and QCOW2'
+
+
+def image_format(vdi):
+    smc = vdi['sm_config']
+    return smc.get('image-format') or smc.get('vdi_type')
+
+
+def is_cow(vdi, sr_type):
+    fmt = image_format(vdi)
+    return fmt == 'vhd' or (fmt == 'qcow2' and sr_type in LVM_SR_TYPES + FILE_SR_TYPES)
+
+
+def cow_lv(name):
+    return name.startswith(tuple(COW_LV_PREFIX.values()))
+
+
+def check_name(fmt):
+    return 'qemu-img check' if fmt == 'qcow2' else 'vhd-util check'
+
+
 def vdi_vbds(model, vdi_ref):
     return [(r, model.vbds[r]) for r in model.vdis[vdi_ref]['VBDs'] if r in model.vbds]
 
@@ -11078,6 +11228,7 @@ CLASS_TITLES = {
     'C20': 'backend node pointing at another disk\'s tapdisk', 'C21': 'tapdisk in an abnormal state',
     'C22': 'dying domain', 'C23': 'disk chain', 'C24': 'stuck operation', 'C25': 'dead NBD export',
     'C26': 'VM recorded running whose domain is gone', 'C27': 'HA restart priority held off by this tool',
+    'C28': 'VM disk with no tapdisk behind it',
     'C00': 'not audited'}
 TARGET_CLASSES = ('C23', 'C24', 'C25')
 NBD_SLACK = 60
@@ -12272,10 +12423,12 @@ def lv_listed(a, hv, sr, vdi):
     return hit[0] if len(hit) == 1 else False
 
 
-def chain_refresh(a, hv, sr, vref):
+def chain_refresh(a, hv, sr, vref, sm_reads=False):
     m = a.model
     out, unknowns, problems = [], [], []
     seen = set([m.vdis[vref]['uuid']])
+    fmt = image_format(m.vdis[vref])
+    pre = COW_LV_PREFIX.get(fmt, 'VHD-')
     p = m.vdis[vref]['sm_config'].get('vhd-parent')
     while p:
         if p in seen:
@@ -12292,7 +12445,7 @@ def chain_refresh(a, hv, sr, vref):
             unknowns.append(why)
         elif act is None:
             unknowns.append('the device-mapper devices on %s were not read: %s' % (hv.name, hv.why('blockmap')))
-        elif not act and not sum(rc):
+        elif not act and not sum(rc) and not (sm_reads and fmt == 'qcow2'):
             problems.append('its parent %s is not active on %s, and SM counts no activation of it there, so SM '
                             'cannot read the chain there' % (p, hv.name))
         elif not act:
@@ -12302,10 +12455,10 @@ def chain_refresh(a, hv, sr, vref):
             elif listed is False:
                 problems.append('the volume group on %s does not list exactly one LV for its parent %s'
                                 % (hv.name, p))
-            elif not listed[0].startswith('VHD-'):
-                problems.append('its parent %s is %s, and this tool refreshes only VHD LVs through SM (it is not '
-                                'verified against other image formats)' % (p, listed[0]))
-            else:
+            elif not listed[0].startswith(pre):
+                problems.append('its parent %s is %s, not a %s LV like the disk, and this tool refreshes only %s '
+                                'chains of one format through SM' % (p, listed[0], pre.rstrip('-'), COW_TEXT))
+            elif sum(rc):
                 out.append(listed[0])
         p = m.vdis[r]['sm_config'].get('vhd-parent')
     return out, unknowns, problems
@@ -12329,9 +12482,10 @@ def c03_tap(a, opts, hv, domid, sr, vdi, sr_type, vref, rows, state, at, gone_vd
             [], [], [], None
     row = rows[0]
     label = 'tapdisk pid %s' % row['pid']
-    if sr_type not in LVM_SR_TYPES + FILE_SR_TYPES or (vref is not None and not is_vhd(m.vdis[vref], sr_type)):
+    if sr_type not in LVM_SR_TYPES + FILE_SR_TYPES or (vref is not None and not is_cow(m.vdis[vref], sr_type)):
         return ['%s serves it, and nothing on this host accounts for that; this tool ends the tapdisk of a leaked '
-                'datapath only for VHD images on LVM and %s SRs' % (label, '/'.join(FILE_SR_TYPES))], [], [], [], None
+                'datapath only for %s images on LVM and %s SRs' % (label, COW_TEXT, '/'.join(FILE_SR_TYPES))], \
+            [], [], [], None
     ident = set(hv.row_ident.get((row['pid'], row['minor'])) or ())
     if ident != set([vdi]):
         return ['%s serves it, but is not established as this datapath\'s own tapdisk (it is known to serve %s), and '
@@ -12470,9 +12624,9 @@ def paused_stale(a, opts, hv, vref, tap, attached_ok=False):
     if alien:
         problems.append('it also carries %s: SM marks it activated on another host (a stale marker is cleared by '
                         'SM\'s own reset first, see C13)' % ', '.join(alien))
-    if sr is None or sr['type'] not in LVM_SR_TYPES + FILE_SR_TYPES or not is_vhd(v, sr['type']):
-        problems.append('a paused key is removed by this tool only for VHD images on LVM and %s SRs'
-                        % '/'.join(FILE_SR_TYPES))
+    if sr is None or sr['type'] not in LVM_SR_TYPES + FILE_SR_TYPES or not is_cow(v, sr['type']):
+        problems.append('a paused key is removed by this tool only for %s images on LVM and %s SRs'
+                        % (COW_TEXT, '/'.join(FILE_SR_TYPES)))
         return problems, unknowns, waits, evidence
     for r, vbd in vdi_vbds(m, vref):
         vm = m.vms.get(vbd['VM']) or {}
@@ -12926,6 +13080,24 @@ def teardown_args(fg):
             'ended': dict((k, p['tap'][k]) for k in ('pid', 'minor')) if p['tap'] and 'end' in fg['steps'] else None}
 
 
+def moved_vm(m, hv, vref):
+    for r, vbd in vdi_vbds(m, vref):
+        vm = m.vms.get(vbd['VM'])
+        if vm is None or vm['is_control_domain'] or not vbd['currently_attached'] or \
+                vm['power_state'] not in ('Running', 'Paused') or vm['resident_on'] == hv.href:
+            continue
+        return [vm['name_label'], m.name_host(vm['resident_on']), _text(vm.get('domid', '?'))]
+    return None
+
+
+def moved_text(m, hv, vref, domid):
+    mv = moved_vm(m, hv, vref)
+    if mv is None:
+        return None
+    return ('VM "%s" runs on %s (domain %s) and has this disk attached there; this datapath is what domain %s left '
+            'on %s' % (mv[0], mv[1], mv[2], domid, hv.name))
+
+
 def eval_guest_dp(a, opts, hv, dp, cl, sr, vdi, st):
     m = a.model
     gm = GUEST_DP_RE.match(dp)
@@ -13247,7 +13419,7 @@ def eval_guest_dp(a, opts, hv, dp, cl, sr, vdi, st):
                                     'a stale mapping; refresh it through SM first (on-slave refresh)'
                                     % (hv.name, canon(dmc['value'].get('dm'))[:200],
                                        canon(dmc['value'].get('lvm'))[:200]))
-            anc, au, ap = chain_refresh(a, hv, sr, vref) if rc[1] >= 1 else ([], [], [])
+            anc, au, ap = chain_refresh(a, hv, sr, vref, sm_reads=True) if rc[1] >= 1 else ([], [], [])
             unknowns.extend(au)
             problems.extend(ap)
             stale = (sum(rc) >= 1 and not act) or rc[0] >= 1 or bool(anc)
@@ -13263,19 +13435,22 @@ def eval_guest_dp(a, opts, hv, dp, cl, sr, vdi, st):
                                     'there does not list exactly one LV for it' % (hv.name, rc[0], rc[1]))
                 else:
                     lv['lv'] = listed[0]
-                    if sum(rc) >= 1 and not act and not listed[0].startswith('VHD-'):
+                    fmt = image_format(m.vdis[vref])
+                    if sum(rc) >= 1 and not act and not listed[0].startswith(COW_LV_PREFIX.get(fmt, '?')):
                         problems.append('SM counts an activation of its LV %s on %s (refcount %d %d), but the LV is '
                                         'not active there, so SM\'s own detach of it would fail; this tool activates '
-                                        'only VHD LVs through SM (it is not verified against other image formats)'
-                                        % (listed[0], hv.name, rc[0], rc[1]))
+                                        'only %s LVs through SM, each under the name of the disk\'s own format, and '
+                                        'this disk\'s format is %s' % (listed[0], hv.name, rc[0], rc[1], COW_TEXT,
+                                                                       fmt or 'not recorded'))
                     elif sum(rc) >= 1 and not act:
                         lv['refresh'].append(listed[0])
                     lv['refresh'].extend(anc)
                     if lv['refresh']:
                         steps.append('refresh')
                         evidence.append('SM counts an activation of %s on %s, but %s not active there, so SM\'s own '
-                                        'detach would fail (vhd-util: -2): %s first activated through SM (on-slave '
-                                        'refresh), and the device-mapper table checked against the LVM metadata'
+                                        'detach would fail (it reads the image to walk its chain): %s first activated '
+                                        'through SM (on-slave refresh), and the device-mapper table checked against '
+                                        'the LVM metadata'
                                         % (', '.join(lv['refresh']), hv.name,
                                            'it is' if len(lv['refresh']) == 1 else 'they are',
                                            'it is' if len(lv['refresh']) == 1 else 'they are'))
@@ -13323,6 +13498,9 @@ def eval_guest_dp(a, opts, hv, dp, cl, sr, vdi, st):
                 sorted(k for k in entry_dps if k != dp))
         if len(run_steps) > 1:
             reason += '; in order: %s' % ', then '.join(STEP_TEXT[s] for s in run_steps)
+    moved = moved_text(m, hv, vref, domid) if vref is not None and not sxm else None
+    if moved:
+        reason = moved + ('; ' + reason if reason else '')
     tsig = [tap['pid'], tap['minor'], tap['start_ticks'] if tap.get('start_ticks') is not None else int(tap['start'] or 0),
             tap['kind']] if tap else None
     item = {'cls': 'C03', 'phase': 'L', 'action': 'dp-destroy', 'host': hv.uuid, 'sr': sr, 'vdi': vdi, 'dp': dp,
@@ -13338,6 +13516,14 @@ def eval_guest_dp(a, opts, hv, dp, cl, sr, vdi, st):
         item['sxm'] = True
     if no_sm:
         item['no_sm'] = True
+    if moved:
+        item['moved'] = moved_vm(m, hv, vref)
+    if tap is not None and tap.get('state') is not None and tap['state'] & PAUSED and vref is not None and \
+            'host_' + hv.href not in m.vdis[vref]['sm_config'] and 'refresh' in run_steps:
+        item['paused_orphan'] = True
+        evidence.append('its tapdisk is paused, and the VDI carries no sm-config host_ of %s: SM pauses and unpauses '
+                        'a tapdisk only on the hosts its host_ keys name, so nothing will unpause this one, and the LV '
+                        'refresh takes SM\'s VDI lock next to it (it stops if that key appears)' % hv.name)
     if seen_tap is not None:
         item['seen_tap'] = seen_tap
     if after:
@@ -14178,10 +14364,10 @@ def flag_common(a, vref, v, key):
             unknowns.append('VBD %s of it was made while the pool was read, so whether it is attached is not '
                             'established' % r)
     fmt = v['sm_config'].get('image-format') or v['sm_config'].get('vdi_type')
-    if sr is None or (not is_vhd(v, sr['type']) and not (key == 'activating' and fmt in TAPDISK_FORMATS)):
+    if sr is None or (not is_cow(v, sr['type']) and not (key == 'activating' and fmt in TAPDISK_FORMATS)):
         problems.append('its image format is not established as %s (%s)' % (
-            'one SM serves through a tapdisk (vhd, aio, qcow2)' if key == 'activating' else 'vhd, which is the only '
-            'format this tool removes %s from' % key, fmt or 'no format key: an xe sr-scan of the SR records it'))
+            'one SM serves through a tapdisk (vhd, aio, qcow2)' if key == 'activating' else 'vhd or qcow2, the only '
+            'formats this tool removes %s from' % key, fmt or 'no format key: an xe sr-scan of the SR records it'))
     plugged = m.plugged_hosts(sref) if sr else []
     if not plugged:
         unknowns.append('no host has the SR plugged, so no host can be asked whether it is open')
@@ -14608,6 +14794,38 @@ def marker_state(a, vref, key):
     return 'stale', hv
 
 
+def isopen_cannot(a, hv, sr_type):
+    c = ((a.caps.get(hv.uuid) or {}).get('on_slave') or {}).get('is_open_reads')
+    if not c or not sr_type:
+        return None
+    t = sr_type.lower()
+    if any(t.startswith(p.lower()) for p in c.get('prefixes') or []):
+        return None
+    mods = [x for x in c.get('modules') or [] if x.lower().endswith('sr') and len(x) > 2]
+    if any(x.lower()[:-2] == t for x in mods):
+        return None
+    return ('the is_open of the on-slave plugin there imports SR drivers only for %s'
+            % ', '.join(sorted(set([p + '*' for p in c.get('prefixes') or []] + [x[:-2].lower() for x in mods])))
+            or 'no SR type')
+
+
+def isopen_direct(a, vref, key):
+    m = a.model
+    v = m.vdis[vref]
+    sr = m.srs.get(v['SR'])
+    href = key[len('host_'):]
+    if sr is None or href not in m.hosts:
+        return None
+    hv = a.view(href)
+    ans = a.probes.get((v['uuid'], hv.uuid)) or ''
+    if not ans.startswith('probe failed'):
+        return None
+    why = isopen_cannot(a, hv, sr['type'])
+    return ('SM\'s is_open on %s cannot answer for a %s SR (%s; asked anyway, it failed: %s), so SM\'s own reset, '
+            'which asks it, never clears this key' % (hv.name, sr['type'], why, ans[len('probe failed: '):][:160])
+            if why else None)
+
+
 def marker_proof(a, vref, key, hv):
     m = a.model
     v = m.vdis[vref]
@@ -14618,10 +14836,14 @@ def marker_proof(a, vref, key, hv):
                         'outright' % key)
         return problems, unknowns, waits, evidence
     ans = a.probes.get((v['uuid'], hv.uuid))
+    direct = isopen_direct(a, vref, key)
     if ans == 'False':
         evidence.append('SM\'s own is_open on %s answers False' % hv.name)
     elif ans == 'True':
         problems.append('SM\'s own is_open on %s says a tapdisk there has it open' % hv.name)
+    elif direct:
+        evidence.append('%s; this tool\'s own reading of %s (its tapdisks, backend nodes, openers, kernel users and '
+                        'attached VBDs) stands in for it' % (direct, hv.name))
     else:
         unknowns.append('SM\'s is_open on %s: %s' % (hv.name, ans or 'not asked'))
     if sr is None:
@@ -14761,6 +14983,11 @@ def eval_marker(a, opts, vref, v, key):
         evidence.append('it also carries relinking, which SM\'s reset leaves alone (C09 judges it)')
     if v.get('current_operations'):
         waits.append('the VDI has %s in progress' % ', '.join(sorted(set(v['current_operations'].values()))))
+    direct = sorted(x for x in stale if isopen_direct(a, vref, x))
+    if direct:
+        evidence.append('SM\'s reset cannot run for %s (its is_open cannot answer for this SR type), so this tool '
+                        'removes the stale key(s) itself with VDI.remove_from_sm_config, the call SM\'s reset makes '
+                        'once is_open answers False, under the same locks' % ', '.join(direct))
     sref = v['SR']
     mref = m.sr_master(sref) if sr else None
     if sr is not None:
@@ -14772,7 +14999,7 @@ def eval_marker(a, opts, vref, v, key):
             problems.append('its SR has no master here, where SM\'s reset would run')
         elif not m.host_live(mref):
             unknowns.append('%s, the master of its SR, is not live' % m.name_host(mref))
-        else:
+        elif not direct:
             ok, why = reset_ready(a, mref)
             if ok is None:
                 unknowns.append(why)
@@ -14801,18 +15028,26 @@ def eval_marker(a, opts, vref, v, key):
     if smc.get(key) == 'RO':
         impact = ('read-only, and nothing on that host has it attached. %s on that host fails (SM finds the marker '
                   'already set after it has added activating), and leaves that stale activating key (C10) behind, '
-                  'which then blocks every read-only attach of it; the next read-write activation of the disk clears '
-                  'both through SM\'s own reset' % ('Inserting this ISO in a VM' if sr and sr['type'] == 'iso'
-                                                     else 'A read-only attach of it'))
+                  'which then blocks every read-only attach of it; %s' % (
+                      'Inserting this ISO in a VM' if sr and sr['type'] == 'iso' else 'A read-only attach of it',
+                      'nothing clears them on its own, since an ISO is never activated read-write'
+                      if sr and sr['type'] == 'iso' else
+                      'the next read-write activation of the disk clears both through SM\'s own reset'))
     else:
         impact = ('nothing on that host has it attached; SM clears it only on the next read-write activation of the '
                   'disk, and a teardown elsewhere treats the disk as in use until then')
     if hv is None:
         impact = 'the marker names a host that is not in the pool any more'
     if verdict == FIX and key != min(stale):
-        return ev(k, 'C13', INFO, None, title, 'removed by the same SM reset as %s (see that line)' % min(stale),
-                  evidence)
-    if verdict == FIX:
+        return ev(k, 'C13', INFO, None, title, 'removed by the same %s as %s (see that line)'
+                  % ('change' if direct else 'SM reset', min(stale)), evidence)
+    if verdict == FIX and direct:
+        reason = ('%s. Nothing on %s has it open: no tapdisk, backend node, opener, kernel user or attached VBD of it '
+                  'is there, and SM\'s is_open cannot answer for a %s SR, so SM\'s own reset never clears it. This '
+                  'tool removes it itself (VDI.remove_from_sm_config, what SM\'s reset does once is_open answers '
+                  'False), with SM\'s VDI lock held on every host that has its SR, after checking that host once '
+                  'more under those locks' % (impact, hname, sr['type']))
+    elif verdict == FIX:
         reason = ('%s. Nothing on %s has it open (SM\'s own is_open answers False there, and no tapdisk, backend '
                   'node, opener, kernel user or attached VBD is there), so it is removed by SM\'s own reset '
                   '(resetvdis.reset_vdi on the SR master, which asks that host once more), with SM\'s VDI lock held '
@@ -14824,6 +15059,8 @@ def eval_marker(a, opts, vref, v, key):
     item = {'cls': 'C13', 'phase': 'F', 'action': 'reset-marker', 'vdi': v['uuid'], 'key': key,
             'stale': sorted(stale), 'keep': sorted(keep), 'gone': sorted(gone), 'sr': sr['uuid'] if sr else None,
             'host': None, 'clear': sorted(clear)}
+    if direct:
+        item['direct'] = True
     return ev(k, 'C13', verdict, None, title, reason, evidence,
               sig=[sorted(stale), sorted(keep), [smc.get(x) for x in sorted(stale + keep)],
                    [[f, smc.get(f)] for f in ('paused', 'activating')]],
@@ -15417,12 +15654,56 @@ def minor_age(a, hv, minor):
     return host_time(hv, a) - rec['mtime'], None
 
 
+def dead_disks(a, hv, minor):
+    m = a.model
+    out = []
+    if hv.xenstore is None or hv.tap_major is None:
+        return out
+    dev = '%x:%x' % (hv.tap_major, minor)
+    for k, v in sorted(hv.xenstore.items()):
+        mm = re.match(r'^/local/domain/0/backend/vbd3?/(\d+)/(\d+)/physical-device$', k)
+        if not mm or v != dev:
+            continue
+        domid, devid = mm.group(1), mm.group(2)
+        for vmref in m.domids.get((hv.href, domid)) or []:
+            vm = m.vms[vmref]
+            if vm['is_control_domain'] or vm['power_state'] not in ('Running', 'Paused'):
+                continue
+            pm = re.match(r'^/dev/sm/backend/(' + UUID_PAT + ')/(' + UUID_PAT + ')$',
+                          hv.xenstore.get(k[:-len('physical-device')] + 'params') or '')
+            vu = pm.group(2) if pm else None
+            device = None
+            for r, vbd in vdi_vbds(m, m.vdi_by_uuid.get(vu)) if vu in m.vdi_by_uuid else []:
+                if vbd['VM'] == vmref:
+                    device = vbd.get('device') or 'userdevice %s' % vbd.get('userdevice')
+            link = (hv.nbd_link.get((pm.group(1), vu)) or {}).get('target') if pm else None
+            pid = re.search(r'nbd(\d+)\.%d$' % minor, link or '')
+            out.append({'vm': vm['name_label'], 'vm_uuid': vm['uuid'], 'domid': domid, 'devid': devid,
+                        'device': device or 'device %s' % devid, 'vdi': vu, 'pid': pid.group(1) if pid else None})
+    return out
+
+
 def eval_minor(a, opts, hv, row):
     k = ('C16', 'minor', hv.uuid, row['minor'])
     title = 'C16 tap minor %s on %s has no tapdisk' % (row['minor'], hv.name)
     named, unknown = minor_named(hv, row['minor'])
     if hv.tap_major is None:
         unknown.append('the tapdev major is not known')
+    dead = dead_disks(a, hv, row['minor'])
+    if dead:
+        d = dead[0]
+        return ev(('C28', hv.uuid, d['domid'], d['devid']), 'C28', REPORT, hv.uuid,
+                  'C28 VM "%s" on %s runs with no tapdisk behind its disk %s' % (d['vm'], hv.name, d['device']),
+                  'its disk %s (VDI %s, domain %s) is served by tap minor %s, and no tapdisk is behind that minor any '
+                  'more%s: the guest gets no I/O on that disk, and nothing on the host can reconnect it. A hard '
+                  'reboot of the VM (force shutdown, then start) tears the dead disk down and attaches it afresh; '
+                  'this tool does not reboot VMs' % (
+                      d['device'], d['vdi'] or 'unknown', d['domid'], row['minor'],
+                      (' (the tapdisk that served it, pid %s, is gone; its last messages are in daemon.log as '
+                       'tapdisk[%s])' % (d['pid'], d['pid'])) if d['pid'] else ''),
+                  ['xenstore backend vbd3/%s/%s names tap minor %s; %s' % (d['domid'], d['devid'], row['minor'],
+                                                                       '; '.join(named[:3]) or 'nothing else')],
+                  sig=[row['minor'], d['domid']])
     if named:
         return ev(k, 'C16', INFO, hv.uuid, title, 'tap-ctl lists it as allocated with no tapdisk behind it (what a '
                   'killed tapdisk leaves), and it is still named (%s), so it is not released on its own'
@@ -15696,6 +15977,81 @@ def lv_put_proof(a, hv, sr, vdi, want):
     return problems, waits
 
 
+def lv_forget_proof(a, hv, sr, vdi, want, held=False):
+    m = a.model
+    problems, unknowns, waits, evidence = [], [], [], []
+    rc, why = refcount_of(hv, sr, vdi)
+    if rc is None:
+        unknowns.append(why)
+    elif rc != want or not sum(rc):
+        problems.append('SM counts %s activation(s) of it on %s, not the %s expected' % (canon(rc), hv.name,
+                                                                                      canon(want)))
+    if m.vdi_by_uuid.get(vdi) is not None:
+        problems.append('the VDI is in xapi')
+    kids = sorted(v['uuid'] for v in m.vdis.values() if v['sm_config'].get('vhd-parent') == vdi)
+    if kids:
+        problems.append('VDI %s names it as its parent' % ', '.join(kids[:3]))
+    unread = use_unread(hv)
+    if unread:
+        unknowns.append('%s on %s were not read, so what uses it there is not established'
+                        % (', '.join(unread), hv.name))
+    use = in_use_here(a, hv, vdi)
+    if use:
+        problems.append('it is in use on %s (%s)' % (hv.name, ', '.join(use)))
+    sref = m.sr_by_uuid.get(sr)
+    if sref is None or m.srs[sref]['type'] not in LVM_SR_TYPES:
+        problems.append('its SR is not an LVM SR known to xapi')
+        return problems, unknowns, waits, evidence
+    mref = m.sr_master(sref)
+    if mref is None:
+        problems.append('its SR has no master here, whose volume group listing would show the LV is gone')
+    looked = []
+    for h2 in [hv] + ([a.view(mref)] if mref is not None and mref != hv.href else []):
+        names = a.lvnames.get((h2.uuid, 'VG_XenStorage-' + sr))
+        if names is None:
+            unknowns.append('the LVs of its SR were not listed on %s' % h2.name)
+            continue
+        hit = sorted(n for n, attr in names if vdi in n)
+        if hit:
+            problems.append('the volume group on %s lists %s' % (h2.name, ', '.join(hit[:3])))
+        else:
+            looked.append(h2.name)
+    act = lv_active(hv, sr, vdi)
+    if act is None:
+        unknowns.append('the device-mapper devices on %s were not read: %s' % (hv.name, hv.why('blockmap')))
+    elif act:
+        problems.append('a device-mapper node of it is still on %s with no LV behind it, which this tool does not '
+                        'remove (SM\'s own clean-up of one falls back to dmsetup remove --force)' % hv.name)
+    if hv.locks is None:
+        unknowns.append('the SM locks on %s were not read' % hv.name)
+    else:
+        for l in hv.locks:
+            if l['path'] == '%s/lvm-%s/%s' % (SM_LOCK_DIR, sr, vdi) or \
+                    (l['path'] == '%s/%s/vdi' % (SM_LOCK_DIR, vdi) and not held):
+                waits.append('its SM lock %s is held by pid %d' % (l['path'], l['pid']))
+    gstate, greasons = gc_state(a, sref)
+    if gstate == 'running' and held:
+        pass
+    elif gstate == 'running':
+        note, wait = gc_running_text(a, sref, greasons, 'the clean-up')
+        if wait:
+            waits.append(wait)
+        else:
+            evidence.append(note)
+    elif gstate != 'idle' and master_gc(a, sref) is None:
+        unknowns.append('whether the GC of its SR runs is not established (%s)' % '; '.join(greasons[:2]))
+    busy = lv_put_busy(a, hv, sr, vdi)
+    if busy is None:
+        unknowns.append('the processes on %s were not read' % hv.name)
+    else:
+        waits.extend(busy)
+    if looked and len(looked) == (1 if mref in (None, hv.href) else 2):
+        evidence.append('xapi has no VDI by that uuid, and no LV of it is left in the volume group (listed on %s): '
+                        'SM\'s GC tells every host to forget the count of an LV it deletes (on-slave '
+                        'cleanupLockAndRefcount), and %s was not told' % (' and '.join(looked), hv.name))
+    return problems, unknowns, waits, evidence
+
+
 def lv_put_busy(a, hv, sr_uuid, vdi_uuid):
     m = a.model
     busy = hv.sm_busy()
@@ -15764,6 +16120,22 @@ def eval_lvrefs(a, opts):
                 evidence.append('SM counts %d %d activation(s) of it here (count, binary), and nothing on %s has it '
                                 'or a disk on top of it attached: no datapath, tapdisk, backend node, phy link or VBD'
                                 % (rc[0], rc[1], hv.name))
+                if vref is None and sref is not None and m.srs[sref]['type'] in LVM_SR_TYPES:
+                    fp, fu, fw, fe = lv_forget_proof(a, hv, sr, vdi, rc)
+                    evidence.extend(fe)
+                    verdict, reason = verdict_of(fp, fu, fw)
+                    if verdict == FIX:
+                        reason = ('xapi no longer has the VDI and no LV of it is left, but SM on %s still counts an '
+                                  'activation of it: the count and its lock file are dropped through SM (on-slave '
+                                  'cleanupLockAndRefcount), the call SM\'s GC makes on every host when it deletes an LV'
+                                  % hv.name)
+                    else:
+                        reason = 'the VDI is not in xapi; %s' % reason
+                    item = {'cls': 'C16', 'phase': 'L', 'action': 'lv-forget', 'host': hv.uuid, 'sr': sr, 'vdi': vdi,
+                            'lv': {'vg': 'VG_XenStorage-' + sr, 'lv': None, 'refcount': rc}}
+                    out.append(ev(k, 'C16', verdict, hv.uuid, title, reason, evidence, sig=[rc],
+                                  item=item if verdict == FIX else None))
+                    continue
                 if sref is None or m.srs[sref]['type'] not in LVM_SR_TYPES:
                     problems.append('its SR is not an LVM SR known to xapi')
                 if vref is None:
@@ -16050,18 +16422,17 @@ def eval_paused_tap(a, opts, hv, row):
     elif last_pause:
         evidence.append('the tapdisk-pause plugin paused it %s ago, with no unpause since' % (
             format_age(host_time(hv, a) - last_pause[0])))
-    if sr is None or sr['type'] not in LVM_SR_TYPES + FILE_SR_TYPES + ('linstor',) or not is_vhd(v, sr['type']):
+    if sr is None or sr['type'] not in LVM_SR_TYPES + FILE_SR_TYPES + ('linstor',) or not is_cow(v, sr['type']):
         if sr is not None and sr['type'] == 'linstor':
             why = ('it is not unpaused by this tool: on LINSTOR SRs that is done only for VHD images, and this one is '
                    '%s. SM unpauses a disk itself only after an interrupted leaf-coalesce (its next GC run on the pool '
                    'master); a pause a snapshot or a relink left behind stays until someone unpauses it'
                    % (v['sm_config'].get('image-format') or v['sm_config'].get('vdi_type') or 'of unknown format'))
         else:
-            why = ('it is not unpaused by this tool: that is only done for VHD images on LVM SRs and on %s SRs, the '
+            why = ('it is not unpaused by this tool: that is only done for %s images on LVM SRs and on %s SRs, the '
                    'ones it is tested on, not for this %s image on a %s SR. If the GC of the SR was interrupted, its '
                    'next run finishes or undoes the work and unpauses the disk itself'
-                   % ('/'.join(FILE_SR_TYPES), v['sm_config'].get('image-format') or v['sm_config'].get('vdi_type')
-                      or 'unknown', sr['type'] if sr else 'unknown'))
+                   % (COW_TEXT, '/'.join(FILE_SR_TYPES), image_format(v) or 'unknown', sr['type'] if sr else 'unknown'))
         return ev(k, 'C12', REPORT, hv.uuid, title, why, evidence + c12_context(a, hv, v, vu, sr),
                   sig=[row['state'], vu])
     if row['minor'] is None:
@@ -16183,12 +16554,14 @@ def eval_paused_tap(a, opts, hv, row):
             if lvr is not None:
                 evidence.append('its LV %s is not active on %s (%s), while SM counts an activation of it there '
                                 '(refcount %d %d): %s activated through SM first (on-slave refresh, which leaves that '
-                                'count as it is), and the device-mapper table, vhd-util check and the parent its '
-                                'header names are checked before the unpause' % (
+                                'count as it is), and the device-mapper table, %s and the parent its header names are '
+                                'checked before the unpause' % (
                                     lvr['lv'], hv.name, phy.get('kind'), lvr['refcount'][0], lvr['refcount'][1],
-                                    ', '.join(lvr['refresh']) + (' are' if len(lvr['refresh']) > 1 else ' is')))
+                                    ', '.join(lvr['refresh']) + (' are' if len(lvr['refresh']) > 1 else ' is'),
+                                    check_name(image_format(v))))
         else:
-            dmc = a.dmchecks.get((hv.uuid, 'VG_XenStorage-%s/VHD-%s' % (sr['uuid'], vu)))
+            dmc = a.dmchecks.get((hv.uuid, 'VG_XenStorage-%s/%s%s' % (sr['uuid'], COW_LV_PREFIX[image_format(v)],
+                                                                      vu)))
             if dmc is None:
                 unknowns.append('the device-mapper table of its LV was not compared with the LVM metadata')
             elif not dmc.get('ok'):
@@ -16231,21 +16604,25 @@ def eval_paused_tap(a, opts, hv, row):
         pass
     elif phy is not None and phy.get('target'):
         chk = a.vhdchecks.get((hv.uuid, phy['target']))
+        cn = check_name(image_format(v))
+        hn = 'QCOW2' if image_format(v) == 'qcow2' else 'VHD'
         if chk is None:
-            unknowns.append('vhd-util check of its image was not run')
+            unknowns.append('%s of its image was not run' % cn)
         elif chk.get('timed_out'):
-            unknowns.append('vhd-util check of its image and its parents did not finish in time, so whether they are '
-                            'valid is not established')
+            unknowns.append('%s of its image and its parents did not finish in time, so whether they are valid is not '
+                            'established' % cn)
         elif not chk.get('ok'):
-            problems.append('vhd-util check of its image and its parents fails: %s' % chk.get('detail'))
+            problems.append('%s of its image and its parents fails: %s' % (cn, chk.get('detail')))
         else:
-            evidence.append('vhd-util check -p: %s and its parents are valid' % phy['target'])
+            evidence.append('%s: %s and its parents are valid%s' % (
+                'vhd-util check -p' if hn == 'VHD' else cn, phy['target'],
+                ' (%s)' % chk['detail'] if hn == 'QCOW2' and chk.get('detail') else ''))
             want = v['sm_config'].get('vhd-parent') or ''
             if 'parent' not in chk:
-                unknowns.append('the parent its VHD header names was not read: %s' % chk.get('parent_error'))
+                unknowns.append('the parent its %s header names was not read: %s' % (hn, chk.get('parent_error')))
             elif chk['parent'] != want:
-                problems.append('its VHD header names parent %s, but xapi records %s'
-                                % (chk['parent'] or 'none', want or 'none'))
+                problems.append('its %s header names parent %s, but xapi records %s'
+                                % (hn, chk['parent'] or 'none', want or 'none'))
     if v.get('cbt_enabled') is True:
         evidence.append('CBT is enabled: the plugin hands its log to the tapdisk')
     owner = [m.vms.get(vbd['VM']) for r, vbd in vdi_vbds(m, vref) if vbd['currently_attached']]
@@ -16293,9 +16670,10 @@ def c12_refresh_plan(a, hv, sr, vdi, vref):
         return [], ['the LVs of its SR were not listed on %s' % hv.name], None
     if listed is False:
         return ['the volume group on %s does not list exactly one LV for it' % hv.name], [], None
-    if not listed[0].startswith('VHD-'):
-        return ['it is %s, and this tool activates only VHD LVs through SM (it is not verified against other image '
-                'formats)' % listed[0]], [], None
+    fmt = image_format(a.model.vdis[vref])
+    if not listed[0].startswith(COW_LV_PREFIX.get(fmt, '?')):
+        return ['it is %s, and this tool activates only %s LVs through SM, each under the name of the disk\'s own '
+                'format (this disk\'s is %s)' % (listed[0], COW_TEXT, fmt or 'not recorded')], [], None
     anc, au, ap = chain_refresh(a, hv, sr, vref)
     if au or ap:
         return ap, au, None
@@ -17689,7 +18067,7 @@ def dependencies(final, audits):
             if note:
                 e['chain_base'] = [e['verdict'], e['reason'], e.get('item')]
                 e['verdict'], e['item'] = INFO, None
-                e['reason'] = '%s. %s' % (note, e['chain_base'][1])
+                e['reason'] = '%s. %s' % (note, e['chain_base'][1][:1].upper() + e['chain_base'][1][1:])
                 break
         else:
             x = leaked_owner(final, e)
@@ -17983,6 +18361,9 @@ def finding_subjects(e, a):
         hv = view(k[1])
         for row in (hv.pinners(_text(k[2])) if hv is not None else ()):
             taps(k[1], pid=row['pid'], minor=row.get('minor'))
+    elif head == 'C28' and n >= 3:
+        href = m.host_by_uuid.get(k[1])
+        vms.update(m.vms[r]['uuid'] for r in m.domids.get((href, _text(k[2])), []))
     elif head == 'ENV' and n >= 3 and k[1] == 'held':
         vms.add(k[2])
     elif head == 'C27' and n >= 2:
@@ -18156,6 +18537,10 @@ def candidates_round2(a, opts):
                 q[href]['vgs'].add(mm.group(1))
             elif p.startswith('/var/run/sr-mount/') or p.startswith('/run/sr-mount/'):
                 q[href]['statfiles'].add(p)
+        for ns, objs in sorted((hv.smrefs or {}).items()):
+            if ns.startswith('lvm-') and m.sr_by_uuid.get(ns[4:]) is not None and \
+                    any(o not in m.vdi_by_uuid for o in objs):
+                q[href]['vgs'].add('VG_XenStorage-' + ns[4:])
         for row in hv.taps or []:
             if row['state'] is not None and row['state'] & PAUSED:
                 vs = set(r['vdi'] for r in hv.back_minor.get(row['minor'], [])) | set(
@@ -18172,13 +18557,14 @@ def candidates_round2(a, opts):
                     if sr is None:
                         continue
                     ph = hv.phy.get((sr['uuid'], vu))
-                    vhd = is_vhd(v, sr['type'])
+                    vhd = is_cow(v, sr['type'])
                     if vhd and ph and ph.get('target'):
                         q[href]['vhdcheck'].add(ph['target'])
                     if sr['type'] in LVM_SR_TYPES:
                         q[href]['vgs'].add('VG_XenStorage-' + sr['uuid'])
                         if vhd:
-                            q[href]['dmcheck'].add(('VG_XenStorage-' + sr['uuid'], 'VHD-' + vu))
+                            q[href]['dmcheck'].add(('VG_XenStorage-' + sr['uuid'],
+                                                    COW_LV_PREFIX[image_format(v)] + vu))
                     elif sr['type'] in FILE_SR_TYPES:
                         q[href]['srdirs'].add(sr['uuid'])
                         if ph and ph.get('target'):
@@ -18738,7 +19124,9 @@ def describe_item(model, it):
                              % ((lv.get('refcount') or [0])[0], hn))
             elif s == 'free':
                 parts.append(u'release tap minor %s on %s (tap-ctl free)' % (it.get('minor'), hn))
-        return u'; then '.join(parts)
+        mv = it.get('moved')
+        return u'; then '.join(parts) + (u' (VM "%s" runs on %s, domain %s, with this disk on a datapath of its own '
+                                         u'there, which this does not touch)' % tuple(mv) if mv else u'')
     if a == 'tap-free':
         return u'release tap minor %s on %s (tap-ctl free), which nothing names any more' % (it['minor'], hn)
     if a == 'sm-teardown':
@@ -18770,6 +19158,20 @@ def describe_item(model, it):
     if a == 'lv-deactivate':
         return u'put back %d stale activation count(s) of the LV of VDI %s on %s through SM (on-slave deactivate)' % (
             (it['lv'].get('refcount') or [0])[0], vdi_text(model, it['vdi']), hn)
+    if a == 'lv-forget':
+        return (u'drop SM\'s activation count (%s) and lock file of VDI %s on %s, which xapi no longer has and of '
+                u'which no LV is left, through SM (on-slave cleanupLockAndRefcount), with SM\'s VDI lock held there '
+                u'and the GC of its SR held off' % (' '.join(str(x) for x in it['lv'].get('refcount') or []),
+                                                   it['vdi'], hn))
+    if a == 'reset-marker' and it.get('direct'):
+        return (u'remove sm-config %s from VDI %s with VDI.remove_from_sm_config (SM\'s is_open cannot answer for its '
+                u'SR type, so SM\'s reset cannot), with SM\'s VDI lock held on every host that has its SR plugged and '
+                u'the SR\'s SR and GC locks on its master (the GC held off), after that host is read once more under '
+                u'them%s%s' % (', '.join(it['stale']), vdi_text(model, it['vdi']),
+                               (u'; it keeps %s, whose host serves the disk' % ', '.join(it['keep']))
+                               if it.get('keep') else u'',
+                               (u'; the stale sm-config %s, proven stale as C11/C10 would, is removed with it'
+                                % ', '.join(it['clear'])) if it.get('clear') else u''))
     if a == 'reset-marker':
         return (u'remove sm-config %s from VDI %s through SM\'s own reset (resetvdis.reset_vdi on the SR master, which '
                 u'asks %s with is_open once more%s), with SM\'s VDI lock held on every host that has its SR plugged and '
@@ -19823,7 +20225,7 @@ class Engine(object):
             return k == ['C16', 'minor', it['host'], it['minor']]
         if it['action'] == 'tap-end':
             return k == ['C15', it['host'], 'wedged', it['pid'], it['minor']]
-        if it['action'] == 'lv-deactivate':
+        if it['action'] in ('lv-deactivate', 'lv-forget'):
             return k == ['C16', 'lvref', it['host'], it['sr'], it['vdi']]
         if it['action'] == 'nbd-end':
             return k == ['C25', it['host']]
@@ -21882,6 +22284,8 @@ class Engine(object):
                 self.free_minor(it)
             elif it['action'] == 'lv-deactivate':
                 self.lv_put_item(it)
+            elif it['action'] == 'lv-forget':
+                self.lv_forget_item(it)
             elif it['action'] == 'sm-teardown':
                 self.lone_teardown(it)
             elif it['action'] == 'ctl-clean':
@@ -22255,11 +22659,15 @@ class Engine(object):
         if moved:
             return self.chain_stop(it, h, done, 'something changed since it was re-checked (%s); run the tool again'
                                    % moved)
+        marked = self.marked_here(it, h)
+        if marked:
+            return self.chain_stop(it, h, done, marked)
         plan, why = self.lv_fence_plan(it, h)
-        fences, why = self.fence_up(it, plan, hold=LV_FENCE_HOLD) if plan else ([], why)
+        fences, why = self.fence_up(it, plan, hold=LV_FENCE_HOLD, paused_ok=bool(it.get('paused_orphan'))) \
+            if plan else ([], why)
         try:
             why = why or self.fence_check(fences, FENCE_MARGIN) or self.count_moved(h, it, lv['refcount']) or \
-                self.fence_check(fences, FENCE_MARGIN)
+                self.marked_here(it, h) or self.fence_check(fences, FENCE_MARGIN)
             if why:
                 return self.chain_stop(it, h, done, '%s not activated: %s' % (', '.join(names), why))
             self.act_on(it)
@@ -22279,21 +22687,31 @@ class Engine(object):
             rb = self.refresh_back(h, it)
             self.fail_item(it, '%s %s activated on %s through SM, but %s; %s'
                            % (', '.join(names), 'was' if len(names) == 1 else 'were', h.name, '; '.join(bad), rb))
+        key, what, hn = self.gate_check(it)
         return ('activated %s on %s through SM (on-slave refresh); the device-mapper table of each matches the LVM '
-                'metadata, vhd-util check of %s and its parents passes, and its header names the parent xapi records'
-                % (', '.join(names), h.name, lv['lv']))
+                'metadata, %s passes, and its header names the parent xapi records'
+                % (', '.join(names), h.name, what % lv['lv']))
+
+    def gate_check(self, it):
+        if not it['lv']['lv'].startswith('QCOW2-'):
+            return 'vhdcheck', 'vhd-util check of %s and its parents', 'VHD'
+        if it.get('cls') == 'C03':
+            return 'headcheck', 'a read of the QCOW2 header of %s and of each LV activated with it', 'QCOW2'
+        return 'vhdcheck', 'qemu-img check of %s and its parents', 'QCOW2'
 
     def gate_h(self, h, it):
         lv = it['lv']
         names = self.refresh_lvs(it)
         path = '/dev/%s/%s' % (lv['vg'], lv['lv'])
+        key, what, hn = self.gate_check(it)
+        paths = [path] + (['/dev/%s/%s' % (lv['vg'], n) for n in names if n != lv['lv']] if key == 'headcheck' else [])
         try:
             val = self.ctx.transport.call(h, 'facts', {'want': ['core', 'extra'],
                                                        'dmcheck': [[lv['vg'], n] for n in names],
-                                                       'vhdcheck': [path], 'vgs': [lv['vg']]}, timeout=AGENT_TIMEOUT)
+                                                       key: paths, 'vgs': [lv['vg']]}, timeout=AGENT_TIMEOUT)
         except CallError as exc:
             return ['its state could not be read back: %s' % _text(exc)]
-        self.j.rec('gate_h', seq=it['seq'], host=h.uuid, dmcheck=val.get('dmcheck'), vhdcheck=val.get('vhdcheck'),
+        self.j.rec('gate_h', seq=it['seq'], host=h.uuid, dmcheck=val.get('dmcheck'), vhdcheck=val.get(key),
                    smrefs=((val.get('smrefs') or {}).get('value') or {}).get('lvm-' + it['sr']))
         bad = []
         for n in names:
@@ -22304,9 +22722,13 @@ class Engine(object):
             elif not dmc['value'].get('match'):
                 bad.append('the device-mapper table of %s (%s) does not match the LVM metadata (%s)'
                            % (n, canon(dmc['value'].get('dm'))[:200], canon(dmc['value'].get('lvm'))[:200]))
-        chk = (((val.get('vhdcheck') or {}).get('value') or {}).get(path)) or {}
-        if not chk.get('ok'):
-            bad.append('vhd-util check of %s and its parents fails: %s' % (path, chk.get('detail') or 'not run'))
+        got = ((val.get(key) or {}).get('value') or {})
+        chk = got.get(path) or {}
+        for p in paths:
+            c = got.get(p) or {}
+            if not c.get('ok'):
+                bad.append('%s fails: %s' % (what % p if p == path else 'a read of the QCOW2 header of %s' % p,
+                                             c.get('detail') or 'not run'))
         try:
             m = Model(pool_snapshot(self.ctx.api))
         except Exception as exc:
@@ -22316,10 +22738,10 @@ class Engine(object):
         if vref is not None:
             want = m.vdis[vref]['sm_config'].get('vhd-parent') or ''
             if 'parent' not in chk:
-                bad.append('the parent its VHD header names was not read (%s)' % chk.get('parent_error'))
+                bad.append('the parent its %s header names was not read (%s)' % (hn, chk.get('parent_error')))
             elif chk['parent'] != want:
-                bad.append('its VHD header names parent %s, where xapi records %s' % (chk['parent'] or 'none',
-                                                                                     want or 'none'))
+                bad.append('its %s header names parent %s, where xapi records %s' % (hn, chk['parent'] or 'none',
+                                                                                    want or 'none'))
         refs = val.get('smrefs') or {}
         if not refs.get('ok'):
             bad.append('its SM activation count was not read back (%s)' % (refs.get('error') or 'not reported'))
@@ -22359,14 +22781,31 @@ class Engine(object):
             return [(h, [['gc', it['sr']], ['vdi', it['vdi']]])], None
         return [(self.host(mu), [['gc', it['sr']]]), (h, [['vdi', it['vdi']]])], None
 
+    def marked_here(self, it, h):
+        if not it.get('paused_orphan'):
+            return None
+        try:
+            m = Model(pool_snapshot(self.ctx.api))
+        except Exception as exc:
+            return 'the pool could not be read again: %s' % _text(exc)
+        vref = m.vdi_by_uuid.get(it['vdi'])
+        href = m.host_by_uuid.get(h.uuid)
+        if vref is None:
+            return 'the VDI is gone'
+        if href is None or 'host_' + href in m.vdis[vref]['sm_config']:
+            return ('SM now marks the VDI activated on %s (sm-config host_), so a snapshot or the GC may unpause its '
+                    'paused tapdisk there under the VDI lock: it is left to them' % h.name)
+        return None
+
     def refresh_back(self, h, it):
         lv = it['lv']
         names = self.refresh_lvs(it)
         left = '%s left as %s' % (', '.join(names), 'it is' if len(names) == 1 else 'they are')
         plan, why = self.lv_fence_plan(it, h)
-        fences, why = self.fence_up(it, plan, hold=LV_FENCE_HOLD) if plan else ([], why)
+        fences, why = self.fence_up(it, plan, hold=LV_FENCE_HOLD, paused_ok=bool(it.get('paused_orphan'))) \
+            if plan else ([], why)
         try:
-            why = why or self.fence_check(fences, FENCE_MARGIN)
+            why = why or self.fence_check(fences, FENCE_MARGIN) or self.marked_here(it, h)
             if why:
                 return ('%s (SM\'s locks could not be held: %s), so nothing is deactivated by this tool: look at '
                         'it' % (left, why))
@@ -22530,6 +22969,42 @@ class Engine(object):
         text = self.lv_put(it, h, it['lv'], [], standalone=True)
         if text is not None:
             self.result(it, 'fixed', text)
+
+    def lv_forget_item(self, it):
+        h = self.host(it['host'])
+        fresh, e, why = self.fresh_check(h, it)
+        if e is None:
+            return self.result(it, 'skipped', why)
+        lv = it['lv']
+        plan, why = self.lv_fence_plan(it, h)
+        fences, why = self.fence_up(it, plan) if plan else ([], why)
+        try:
+            why = why or self.fence_check(fences, FENCE_MARGIN)
+            if not why:
+                a = self.audit(hosts=self.sr_hosts(it['sr'], h), smlog=False,
+                               vgs=dict((u, [lv['vg']]) for u in self.sr_hosts(it['sr'], h)))
+                hv = a.view(a.model.host_by_uuid[h.uuid])
+                p2, u2, w2, e2 = lv_forget_proof(a, hv, it['sr'], it['vdi'], lv['refcount'], held=True)
+                why = '; '.join((p2 + u2 + w2)[:6]) or self.fence_check(fences, FENCE_MARGIN)
+            if why:
+                return self.result(it, 'skipped', 'not dropped (read again under SM\'s locks): %s' % why)
+            self.act_on(it)
+            ok, r = self.on_slave(h, lv['vg'], [{'action': 'cleanupLockAndRefcount', 'ns': 'lvm-' + it['sr'],
+                                                 'uuid': it['vdi']}])
+            lost = self.fence_check(fences, 0)
+            left = self.lv_left(h, it['sr'], it['vdi'])
+        finally:
+            self.fence_down(fences)
+        if not ok or left:
+            self.fail_item(it, 'the on-slave cleanupLockAndRefcount of %s on %s answered %s (%s); %s'
+                           % (it['vdi'], h.name, canon(r.out.strip()[:80]), r.why() if not r.ok else 'ok',
+                              left or 'nothing of it is left'))
+        if lost:
+            self.fail_item(it, 'its count was dropped on %s, but SM\'s VDI lock was not held for the whole step (%s), '
+                               'so that no SM operation ran meanwhile is not established' % (h.name, lost))
+        self.result(it, 'fixed', 'dropped SM\'s stale activation count (%s) and lock file of VDI %s on %s through SM '
+                    '(on-slave cleanupLockAndRefcount), with its VDI lock held and the GC of its SR held off; no LV of '
+                    'it was left in the volume group' % (' '.join(str(x) for x in lv['refcount']), it['vdi'], h.name))
 
     def step_free(self, it, h, fresh, done):
         return self.minor_free(it, h, it['minor'], done)
@@ -23191,13 +23666,16 @@ class Engine(object):
             if why == 'the key is gone':
                 return self.result(it, 'already-fixed', '%s was removed by something else while the SM locks were '
                                    'held' % it['key'])
+            if not why and it.get('direct'):
+                why = self.direct_recheck(it) or self.fence_check(fences, FENCE_MARGIN)
             if why:
                 return self.result(it, 'skipped', 'not reset: %s' % why)
             self.act_on(it)
             try:
                 res = self.ctx.transport.call(hm, 'reset-marker', {'vdi': it['vdi'], 'stale': it['stale'],
                                                                    'keep': it['keep'], 'gone': it.get('gone') or [],
-                                                                   'clear': it.get('clear') or []},
+                                                                   'clear': it.get('clear') or [],
+                                                                   'direct': bool(it.get('direct'))},
                                               timeout=PROBE_TIMEOUT * (len(it['stale']) + len(it['keep']) + 1) + 60)
             except CallError as exc:
                 self.fail_item(it, 'SM\'s reset could not be run on %s: %s' % (hm.name, _text(exc)))
@@ -23226,6 +23704,13 @@ class Engine(object):
             self.fence_down(fences)
         first = [f for f in res.get('flags_removed') or [] if f not in flags]
         gone_flags = [f for f in it.get('clear') or [] if f not in flags and f not in first]
+        if it.get('direct'):
+            return self.result(it, 'fixed', '%s removed by this tool on %s (VDI.remove_from_sm_config: SM\'s is_open '
+                               'cannot answer for this SR type, so SM\'s reset never would), with SM\'s VDI lock held '
+                               'on %s and the GC of its SR held off%s%s' % (
+                                   ', '.join(it['stale']), hm.name, ', '.join(h.name for h, locks in plan),
+                                   ('; the stale %s removed with it' % ', '.join(first)) if first else '',
+                                   ('; %s stays: C11/C10 judge it on its own' % ', '.join(flags)) if flags else ''))
         self.result(it, 'fixed', '%s removed by SM\'s own reset (resetvdis.reset_vdi on %s; is_open: %s), with SM\'s '
                     'VDI lock held on %s and the GC of its SR held off%s%s%s%s' % (
                         ', '.join(it['stale']), hm.name, ', '.join(
@@ -23238,6 +23723,32 @@ class Engine(object):
                         ('; SM\'s reset raised "%s" and was run once more' % res['retried']) if res.get('retried') else '',
                         ('; %s stays (SM clears it only when it asks a host that is still there): C11/C10 judge it '
                          'on its own' % ', '.join(flags)) if flags else ''))
+
+    def direct_recheck(self, it):
+        gone = it.get('gone') or []
+        try:
+            m = Model(pool_snapshot(self.ctx.api))
+            hosts = sorted(set(m.hosts[k[len('host_'):]]['uuid'] for k in it['stale']
+                               if k not in gone and k[len('host_'):] in m.hosts))
+            a = self.audit(hosts=hosts, probes=True, only_vdis=[it['vdi']])
+        except Exception as exc:
+            return 'the host(s) the key(s) name could not be read again under the locks: %s' % _text(exc)
+        vref = a.model.vdi_by_uuid.get(it['vdi'])
+        if vref is None:
+            return 'the VDI is gone'
+        for k in it['stale']:
+            if k in gone:
+                continue
+            st, hv = marker_state(a, vref, k)
+            if st != 'stale':
+                return '%s, read again under the locks: %s' % (k, {
+                    'tapdisk': 'a tapdisk on %s serves it', 'node': 'a backend node of it is on %s',
+                    'vbd': 'it is attached on %s', 'unread': '%s could not be read'}.get(st, '%%s: %s' % st)
+                    % (hv.name if hv is not None else 'its host'))
+            p2, u2, w2, e2 = marker_proof(a, vref, k, hv)
+            if p2 or u2 or w2:
+                return '%s, read again under the locks: %s' % (k, '; '.join(p2 + u2 + w2))
+        return None
 
     def flag_fence_plan(self, fresh, it):
         m = fresh.model

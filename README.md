@@ -5,28 +5,21 @@ Home of the XCP-ng infra health check script & misc xcp tooling
 Both run as root on the pool master, look before they touch anything, and
 ask first. Download the file and run it, don't pipe it in from curl.
 
-**storage-state-fixer.py** (8.3 only) - for when exports, backups or VBD unplugs start failing
-because of storage junk left behind (dead dom0 datapaths, stale dom0 VBDs, leaked datapaths, also of
-failed storage migrations and of disks xapi forgot, and the paused or wedged tapdisks behind them,
-stale sm-config keys, stuck GC flags, dead NBD exports, VMs
-xapi still shows running after a failed reboot), and names the backup client behind refused disk activations.
-Run it with no arguments: it checks, lists what it found and what it would change, and only
-changes anything once you type `yes`; with `--yes` it makes them without asking. Editing storage.db, or fixing
-a VM xapi still shows running, restarts xapi on that host (VMs keep running), with HA turned off and back on
-around it. Such a VM is then recorded halted and never started by the tool: if HA protects it, HA starts it
-once nothing holds its disks.
-When one VM or disk is the problem (snapshots failing, "VDI in use" in backups), give it that VM's or
-VDI's uuid: it then checks only those disks and every disk in their chains, deeper (chain health,
-stuck operations), and reports and fixes only what concerns them.
+**storage-state-fixer.py** (8.3 only) - cleans up the storage junk that makes backups, exports or
+VBD unplugs start failing: leaked datapaths, stuck dom0 VBDs, paused or wedged tapdisks, stale
+sm-config keys, that sort of thing. VHD and QCOW2 both.
+
+Run it with no arguments. It looks around, tells you what it found and what it wants to change, and
+does nothing until you type `yes` (`--yes` skips the question).
 ```
 curl -fsSLO https://raw.githubusercontent.com/Fohdeesha/xcp-stuff/main/storage-state-fixer.py
 python3 storage-state-fixer.py
 ```
-If a run gets cut off, run it again: it offers to put xapi and HA back first. The first
-time it reaches a pool host whose ssh key isn't already known, it shows the fingerprints and asks
-(with `--yes` it uses that key for the run without recording it).
-Run records and storage.db backups go in `storage-state-fixer-data/` next to the script. The locks
-it holds keep SM out; anything else that edits sm-config is caught by a last xapi event check.
+If it's one VM or disk acting up, pass its uuid and it only looks at that disk and its chain.
+
+Some fixes restart xapi on a host (VMs keep running), with HA switched off around it. If a run gets
+cut off, just run it again and it puts things back first. Run records land in
+`storage-state-fixer-data/` next to the script.
 
 **snapshot-fixer.py** (8.2 and 8.3) - fixes broken snapshot links in xapi's database: a VM or
 disk that isn't a snapshot but still claims to be a snapshot of something, or a disk that's a
