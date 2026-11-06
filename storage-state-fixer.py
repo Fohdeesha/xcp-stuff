@@ -29,7 +29,7 @@ import time
 import xml.parsers.expat
 import zlib
 
-VERSION = '2.10'
+VERSION = '2.11'
 PYTHON = sys.version.split()[0]
 PROG = 'storage-state-fixer'
 STORAGE_DB = '/var/run/nonpersistent/xapi/storage.db'
@@ -5095,10 +5095,15 @@ def sm_needle_counts():
 
 
 XENOPS_ENDED = ('["Failed"', '["Completed"')
+XENOPS_TEMP_RE = re.compile(r'^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4})-000000000001$')
 
 
 def xenops_busy(lines, vm):
     return [l for l in lines if vm in l and not any(s in l for s in XENOPS_ENDED)]
+
+
+def xenops_migrating(lines):
+    return [l.strip() for l in lines if 'migrate' in l.lower() and not any(s in l for s in XENOPS_ENDED)]
 
 
 def f_xenops(vms):
@@ -5217,6 +5222,8 @@ def agent_domain_remove(args, source):
         problems.append('xenops-cli tasks %s' % tasks.why())
     elif xenops_busy(tasks.out.splitlines(), vm):
         problems.append('xenopsd has a task on it')
+    elif xenops_migrating(tasks.out.splitlines()):
+        problems.append('xenopsd has a migration task pending (%s)' % xenops_migrating(tasks.out.splitlines())[0][:120])
     if problems:
         return {'done': False, 'problems': problems}
     s = run([XENOPS_CLI, 'shutdown', vm], 300)
@@ -11921,7 +11928,7 @@ CLASS_TITLES = {
     'C26': 'VM recorded running whose domain is gone', 'C27': 'HA restart priority held off by this tool',
     'C28': 'VM disk with no tapdisk behind it', 'C29': 'orphan DRBD resource', 'C30': 'LINSTOR volume with no VDI',
     'C31': 'LINSTOR resource stuck in a delete', 'C32': 'LINSTOR satellite with a stale cache',
-    'C33': 'orphan receiving domain',
+    'C33': 'orphan receiving domain', 'C34': 'receiving domain left under xenopsd\'s temporary id',
     'C00': 'not audited'}
 TARGET_CLASSES = ('C23', 'C24', 'C25')
 NBD_SLACK = 60
@@ -18982,6 +18989,67 @@ def eval_satellites(a, opts):
     return out
 
 
+def eval_temp_domain(a, hv, d, tid, prefix, x):
+    m = a.model
+    vms = sorted((v for v in m.vms.values() if not v.get('is_control_domain') and
+                  (v.get('uuid') or '').startswith(prefix + '-')), key=lambda v: v['uuid'])
+    title = 'C34 domain %s on %s under xenopsd\'s temporary id %s%s' % (
+        d, hv.name, tid, ' of VM "%s"' % vms[0]['name_label'] if len(vms) == 1 else '')
+    evidence = ['xl list: state %s, %s s of CPU, %s MiB' % (x['state'], x.get('time'), x.get('mem'))]
+    unknowns, waits = [], []
+    if not vms:
+        evidence.append('no VM xapi lists has a uuid starting %s' % prefix)
+    for v in vms:
+        ops = sorted(set((v.get('current_operations') or {}).values()))
+        if ops:
+            waits.append('xapi has %s in progress on VM "%s": a migration in flight receives into a domain under this '
+                         'id' % (', '.join(ops), v['name_label']))
+        nxt = v.get('scheduled_to_be_resident_on')
+        if nxt not in (None, NULL_REF, v.get('resident_on')):
+            waits.append('xapi has VM "%s" scheduled to move to %s'
+                         % (v['name_label'], (m.hosts.get(nxt) or {}).get('name_label', nxt)))
+        on = m.hosts.get(v.get('resident_on'))
+        if v.get('power_state') not in ('Running', 'Paused') or on is None:
+            evidence.append('xapi records VM "%s" (%s) %s' % (v['name_label'], v['uuid'],
+                                                             (v.get('power_state') or 'in no state').lower()))
+            continue
+        hb = a.view(v['resident_on'])
+        mine = sorted((dd for dd, vv in (hb.domvms or {}).items() if vv == v['uuid']), key=domain_order)
+        evidence.append('xapi records VM "%s" (%s) %s on %s; %s' % (
+            v['name_label'], v['uuid'], v['power_state'].lower(), on['name_label'],
+            'which VM each domain there runs was not read' if hb.domvms is None else
+            'domain %s there is that VM' % mine[0] if mine else 'no domain there is that VM'))
+    xo = a.xenops.get(hv.uuid)
+    if xo is None or xo.get('error'):
+        unknowns.append('xenopsd on %s was not asked (%s), so whether a receive is still in flight is not established'
+                        % (hv.name, (xo or {}).get('error') or 'not asked'))
+    else:
+        tasks = xo.get('tasks') or []
+        pend = uniq(xenops_migrating(tasks) + [l.strip() for l in xenops_busy(tasks, tid)])
+        if pend:
+            waits.append('xenopsd on %s has a migration task pending (%s): a receive in flight keeps its domain under '
+                         'this id until its connection ends' % (hv.name, pend[0][:120]))
+        evidence.append('xenopsd on %s holds %smetadata under %s'
+                        % (hv.name, '' if (xo.get('meta') or {}).get(tid) else 'no ', tid))
+    if waits:
+        verdict, reason = WAIT, '; '.join(uniq(waits))
+    elif unknowns:
+        verdict, reason = UNKNOWN, '; '.join(uniq(unknowns))
+    else:
+        verdict = REPORT
+        reason = ('the receiving domain of a migration that failed before xenopsd renamed it to its VM, with no migration '
+                  'in progress in xapi and none pending in xenopsd on %s: xenopsd\'s own clean-up of a failed receive '
+                  '(shut down and remove the temporary id) did not run, and it holds %s MiB. Not removed by this tool'
+                  % (hv.name, x.get('mem')))
+        if x['state'][2] != 'p' or x.get('time') is None or float(x['time']) != 0.0:
+            reason += ('. It is not paused or has run (%s, %s s of CPU), which a domain still receiving memory never '
+                       'is: find out what it is before anything is removed' % (x['state'], x.get('time')))
+        else:
+            reason += ('. That clean-up by hand, on %s, once the VM is confirmed running where xapi records it: '
+                       'xenops-cli shutdown %s, then xenops-cli remove %s' % (hv.name, tid, tid))
+    return ev(('C34', hv.uuid, tid), 'C34', verdict, hv.uuid, title, reason, evidence, sig=[tid, d, x['state']])
+
+
 def eval_receiving(a, opts):
     m = a.model
     out = []
@@ -18991,6 +19059,10 @@ def eval_receiving(a, opts):
         if hv.doc is None or hv.domvms is None or hv.xl is None:
             continue
         for d, vu in sorted(hv.domvms.items(), key=lambda kv: domain_order(kv[0])):
+            t = XENOPS_TEMP_RE.match(vu or '')
+            if t and hv.xl.get(d) is not None:
+                out.append(eval_temp_domain(a, hv, d, vu, t.group(1), hv.xl[d]))
+                continue
             vm = by_uuid.get(vu) if vu else None
             if vm is None or vm['is_control_domain'] or vm.get('power_state') not in ('Running', 'Paused') or \
                     vm.get('resident_on') == href or vm.get('resident_on') not in m.hosts:
@@ -19020,6 +19092,11 @@ def eval_receiving(a, opts):
             else:
                 if xenops_busy(xo.get('tasks') or [], vu):
                     problems.append('xenopsd has a task on it')
+                mig = xenops_migrating(xo.get('tasks') or [])
+                if mig:
+                    waits.append('xenopsd on %s has a migration task pending (%s): a receive in flight holds its domain '
+                                 'paused like this one, and xenopsd names its task after the sender, not the VM'
+                                 % (hv.name, mig[0][:120]))
                 if not (xo.get('meta') or {}).get(vu):
                     problems.append('xenopsd on %s holds no metadata for it' % hv.name)
             hb = a.view(vm['resident_on'])
@@ -19242,7 +19319,7 @@ def evaluate(a, opts):
 SNAP_TASKS = ('VDI.snapshot', 'Async.VDI.snapshot', 'VDI.clone', 'Async.VDI.clone', 'VM.snapshot', 'Async.VM.snapshot',
               'VM.clone', 'Async.VM.clone', 'VM.checkpoint', 'Async.VM.checkpoint')
 FLIGHT_CLASSES = ('C11', 'C12', 'C14', 'C20')
-SETTLE_REPORTS = FLIGHT_CLASSES + ('C30',)
+SETTLE_REPORTS = FLIGHT_CLASSES + ('C30', 'C34')
 
 
 def in_flight(a, hv, vdis):
@@ -20153,6 +20230,8 @@ def candidates_round2(a, opts):
     by_uuid = dict((v.get('uuid'), v) for v in m.vms.values())
     for href in m.hosts:
         for d, vu in (a.view(href).domvms or {}).items():
+            if XENOPS_TEMP_RE.match(vu or ''):
+                q[href]['xenops'].add(vu)
             vm = by_uuid.get(vu) if vu else None
             if vm is not None and not vm['is_control_domain'] and vm.get('power_state') in ('Running', 'Paused') and \
                     vm.get('resident_on') != href and vm.get('resident_on') in m.hosts:
