@@ -29,7 +29,7 @@ import time
 import xml.parsers.expat
 import zlib
 
-VERSION = '2.12'
+VERSION = '2.13'
 PYTHON = sys.version.split()[0]
 PROG = 'storage-state-fixer'
 STORAGE_DB = '/var/run/nonpersistent/xapi/storage.db'
@@ -1403,10 +1403,11 @@ def parse_smlog_line(line, now):
     m = SMLOG_RE.match(line)
     if not m:
         return None
-    t = syslog_epoch(m.group(1), m.group(2), m.group(3), m.group(4), m.group(5), now)
+    g = m.groups()
+    t = syslog_epoch(g[0], g[1], g[2], g[3], g[4], now)
     if t is None:
         return None
-    return (t, m.group(6), int(m.group(7)), m.group(8))
+    return (t, g[5], int(g[6]), g[7])
 
 
 RENDER = r'\*?([0-9a-f]{8})(?:\[|\()'
@@ -1429,10 +1430,20 @@ RE_PHY_UPDATE = re.compile(r'Update LINSTOR PhyLink \(previous=(.*?), current=.*
 RE_VOLUME = re.compile(r'xcp-volume-' + UUID_PAT)
 RE_NO_TAPDISK = re.compile(r'tap\.deactivate: Warning, No such Tapdisk\(minor=(\d+)')
 RE_FAILED_TAG = re.compile(r'Failed to tag vdi ' + RENDER)
-SMLOG_PREFILTER = re.compile(br'relinking|Relinking|IPCFlag|: abort ===|/gc_active|/running|SMGC|'
-                             br'vdi_activate|vdi_snapshot|not detached cleanly|is still open on host|ause for |'
-                             br'ause request for |efresh request for |Failed to lock|xcp-volume-|No such Tapdisk|'
-                             br'Failed to tag|: ERROR')
+PAUSE_HEADS = ('Pause for ', 'Unpause for ')
+PAUSE_REQ_HEADS = ('Pause request for ', 'Unpause request for ', 'Refresh request for ')
+SR_ERROR_HEAD = '* * * * * SR '
+SMLOG_NEEDLES = (b'relinking', b'Relinking', b'IPCFlag', b': abort ===', b'/gc_active', b'/running', b'SMGC',
+                 b'vdi_snapshot', b'not detached cleanly', b'is still open on host', b'Failed to lock',
+                 b'No such Tapdisk', b'Failed to tag', b': ERROR')
+SMLOG_PREFILTER = re.compile(b'|'.join(SMLOG_NEEDLES + (b'vdi_activate', b'ause for ', b'ause request for ',
+                                                        b'efresh request for ', b'xcp-volume-')))
+
+
+def smlog_prefilter(activate, pause, phy):
+    extra = ([b'vdi_activate'] if activate else []) + ([b'ause for '] if pause or phy else [])
+    extra += ([b'ause request for ', b'efresh request for '] if pause else []) + ([b'xcp-volume-'] if phy else [])
+    return re.compile(b'|'.join(SMLOG_NEEDLES + tuple(extra)))
 
 
 def lsof_bug_probe(src):
@@ -1597,11 +1608,19 @@ def request_paths(paths):
         raise Failed(why)
 
 
+_TOOK = [None]
+
+
 def fact(fn, *args):
+    t0 = _now()
     try:
         return {'ok': True, 'value': fn(*args)}
     except Exception as exc:
         return {'ok': False, 'error': u'%s: %s' % (exc.__class__.__name__, _text(exc))}
+    finally:
+        if _TOOK[0] is not None:
+            f = args[0] if fn is bounded and args else fn
+            _TOOK[0].append([getattr(f, '__name__', '?'), round(_now() - t0, 3)])
 
 
 def f_identity():
@@ -3854,7 +3873,8 @@ def file_ref_time(path, now):
         return now
 
 
-def scan_log(path, now, sink, deadline=None, stats=None):
+def scan_log(path, now, sink, deadline=None, stats=None, prefilter=None):
+    prefilter = prefilter or SMLOG_PREFILTER
     ref = file_ref_time(path, now)
     n = 0
     seeking = True
@@ -3868,7 +3888,10 @@ def scan_log(path, now, sink, deadline=None, stats=None):
                 if first is not None and first[0] is not None:
                     stats.setdefault('firsts', []).append(first[0])
                     seeking = False
-            if not SMLOG_PREFILTER.search(raw):
+            if not prefilter.search(raw):
+                if stats is not None and not stats['parsed'] and SMLOG_PREFILTER.search(raw):
+                    stats['kept'] += 1
+                    stats['parsed'] += parse_smlog_line(raw.rstrip(b'\n').decode('utf-8', 'replace'), ref) is not None
                 continue
             line = raw.rstrip(b'\n').decode('utf-8', 'replace')
             ev = parse_smlog_line(line, ref)
@@ -3907,19 +3930,47 @@ RE_LEAF_REMOVED = re.compile(r'^Removed leaf-coalesce from ([0-9a-f]{8})')
 LEAF_WHY = ('No progress made for ', 'Max iterations (', 'Unexpected bump in size')
 LEAF_QUIET = ('concurrently deleted', 'concurrently snapshotted', 'altered since', 'no longer leaf-coalesceable',
               'deleted meanwhile')
+RE_LEAF_COW = re.compile(r'^Running COW coalesce on (\*?)([0-9a-f]{8})(?:\[[^\]]*\])?(?:\(([^)]*)\))?')
+RE_LEAF_ROUND = re.compile(r'^Coalescing parent \*?([0-9a-f]{8})')
+RE_LEAF_UNPAUSE = re.compile(r'^Unpausing VDI \*?([0-9a-f]{8})')
+RE_SM_SIZE = re.compile(r'^(\d+(?:\.\d+)?)([GMK]?)$')
+SM_SIZE_UNIT = {'G': 1024 ** 3, 'M': 1024 ** 2, 'K': 1024, '': 1}
+LEAF_FIRST = 'LSRCUINMTAgGl'
 LEAF_KEEP = 12
+LEAF_MERGES = 25
 LEAF_VDIS = 100
 SPEED_DIR = '/var/run'
 SPEED_SUFFIX = '.speed_log'
 
 
+def sm_phys(inner):
+    parts = re.split(r'[/|]', inner or '')
+    if len(parts) < 2:
+        return None
+    m = RE_SM_SIZE.match(parts[1].rstrip('?'))
+    return int(float(m.group(1)) * SM_SIZE_UNIT[m.group(2)]) if m else None
+
+
 def leaf_event(text):
+    if not text or text[0] not in LEAF_FIRST:
+        return None
     m = RE_LEAF_START.match(text)
     if m:
         return 'start', [m.group(1), m.group(2)]
     m = RE_LEAF_SNAP.match(text)
     if m:
         return 'snap', m.group(1)
+    m = RE_LEAF_COW.match(text)
+    if m:
+        return 'cow', [m.group(2), bool(m.group(1)), sm_phys(m.group(3))]
+    if text == 'Child process completed successfully':
+        return 'done', None
+    m = RE_LEAF_ROUND.match(text)
+    if m:
+        return 'round', m.group(1)
+    m = RE_LEAF_UNPAUSE.match(text)
+    if m:
+        return 'unpause', m.group(1)
     m = RE_LEAF_ITER.match(text)
     if m:
         return 'iter', [int(m.group(1)), int(m.group(2))]
@@ -3951,23 +4002,45 @@ def leaf_event(text):
 def leaf_attempts(evs):
     open_, done = {}, []
 
+    def ended(a):
+        return 'merged' if a['live'] else 'unknown'
+
     def close(pid, out, force=False):
         a = open_.pop(pid)
         a['out'] = out if force else (a['out'] or out)
+        a.pop('cow', None)
         done.append(a)
     for t, _num, _seq, pid, kind, data in sorted(evs):
         a = open_.get(pid)
         if kind == 'start':
             if a is not None:
-                close(pid, 'merged' if a['removed'] else 'unknown')
+                close(pid, ended(a))
             open_[pid] = {'vdi': data[0], 'parent': data[1], 'uuid': None, 'pid': pid, 'start': t, 'end': t,
                           'snaps': 0, 'its': [], 'why': None, 'out': None, 'forced': False, 'removed': False,
-                          'exc': None, 'exited': False}
+                          'exc': None, 'exited': False, 'merges': [], 'live': None, 'pause': None, 'round': None,
+                          'cow': None}
             continue
         if a is None:
             continue
         a['end'] = t
-        if kind == 'snap':
+        if kind in ('snap', 'cow', 'done', 'round', 'unpause') and a['removed']:
+            continue
+        if kind == 'cow':
+            a['cow'] = [t] + data
+        elif kind == 'done':
+            c, a['cow'] = a['cow'], None
+            if c is None:
+                continue
+            if c[1] == a['vdi'] and not c[2]:
+                a['live'] = [round(t - c[0], 1), c[3], c[0]]
+            else:
+                a['merges'] = (a['merges'] + [[round(t - c[0], 1), c[3]]])[-LEAF_MERGES:]
+        elif kind == 'round':
+            a['round'] = [data, t]
+        elif kind == 'unpause':
+            if data == a['vdi'] and a['live']:
+                a['pause'] = round(t - a['live'][2], 1)
+        elif kind == 'snap':
             a['snaps'] += 1
         elif kind == 'iter':
             a['its'] = (a['its'] + [data])[-25:]
@@ -3992,7 +4065,7 @@ def leaf_attempts(evs):
             a['exited'] = True
     for pid in sorted(open_):
         a = open_[pid]
-        close(pid, ('merged' if a['removed'] else 'unknown') if a['exited'] else 'running')
+        close(pid, ended(a) if a['exited'] else 'running')
     return sorted(done, key=lambda a: (a['start'], a['pid']))
 
 
@@ -4014,7 +4087,8 @@ def leaf_summary(evs):
                     'snaps': sum(a['snaps'] for a in rows), 'first': rows[0]['start'], 'last': rows[-1]['end'],
                     'streak': streak, 'since': since,
                     'attempts': [dict((k, a[k]) for k in ('pid', 'start', 'end', 'snaps', 'its', 'why', 'out',
-                                                          'forced', 'parent', 'exc')) for a in rows[-LEAF_KEEP:]]}
+                                                          'forced', 'parent', 'exc', 'merges', 'live', 'pause',
+                                                          'round')) for a in rows[-LEAF_KEEP:]]}
     return out
 
 
@@ -4053,6 +4127,7 @@ class SmlogScan(object):
         self.failed_tag = []
         self.snaps = []
         self.leafev = []
+        self.prefilter = smlog_prefilter(self.activate, self.pause, self.phy)
 
     def file(self, num):
         return SmlogFile(self, num)
@@ -4122,19 +4197,19 @@ class SmlogFile(object):
         if t is not None and (s.oldest is None or t < s.oldest):
             s.oldest = t
         text = msg.strip()
-        m = RE_PAUSE.match(text)
+        m = RE_PAUSE.match(text) if text.startswith(PAUSE_HEADS) else None
         if m:
             if m.group(1) == 'Unpause':
                 self.unpausing[pid] = (m.group(2), t)
             if m.group(2) in s.pause:
                 self.events['pause:' + m.group(2)].append([t, m.group(1).lower(), pid])
             return
-        m = RE_PAUSE_REQ.match(text)
+        m = RE_PAUSE_REQ.match(text) if text.startswith(PAUSE_REQ_HEADS) else None
         if m:
             if m.group(2) in s.pause:
                 self.events['preq:' + m.group(2)].append([t, m.group(1).lower(), pid])
             return
-        m = RE_PHY_UPDATE.search(msg)
+        m = RE_PHY_UPDATE.search(msg) if 'Update LINSTOR PhyLink (previous=' in msg else None
         if m:
             u = self.unpausing.get(pid)
             if u is not None and 0 <= t - u[1] <= PHY_UPDATE_WINDOW and u[0] in s.phy:
@@ -4143,25 +4218,25 @@ class SmlogFile(object):
                         self.events['phy:' + u[0]].append([t - 0.001 if t is not None else t, vol, pid])
                 self.events['phy:' + u[0]].append([t, m.group(2), pid])
             return
-        m = RE_SET_RELINK.search(msg)
+        m = RE_SET_RELINK.search(msg) if 'Set relinking = True for ' in msg else None
         if m and m.group(1) in s.relink:
             self.events['relink:' + m.group(1)].append([t, 'set', pid])
             return
-        m = RE_DEL_RELINK.search(msg)
+        m = RE_DEL_RELINK.search(msg) if 'Removed relinking from ' in msg else None
         if m and m.group(1) in s.relink:
             self.events['relink:' + m.group(1)].append([t, 'removed', pid])
             return
-        m = RE_IPC.search(msg)
+        m = RE_IPC.search(msg) if 'IPCFlag: ' in msg else None
         if m and m.group(3) == 'abort':
             self.events['abort:' + m.group(2)].append([t, m.group(1), pid])
             return
-        m = RE_SR_ABORT.search(msg)
+        m = RE_SR_ABORT.search(msg) if ': abort ===' in msg else None
         if m:
             self.events['abort:' + m.group(1)].append([t, 'cleanup-abort', pid])
             if ident == 'SMGC':
                 self.run(pid, t, 'abort', m.group(1))
             return
-        m = RE_GC_LOCK.search(msg)
+        m = RE_GC_LOCK.search(msg) if '/var/lock/sm/' in msg else None
         if m and m.group(2) == 'gc_active':
             r = self.open.get(pid)
             if r is not None and r.get('closing') is not None and t - r['closing'] > GC_TAIL:
@@ -4174,7 +4249,7 @@ class SmlogFile(object):
             lk = leaf_event(text)
             if lk is not None and t is not None:
                 self.leafev.append([t, -self.num, len(self.leafev), pid, lk[0], lk[1]])
-            ms = GC_START.match(text)
+            ms = GC_START.match(text) if text.startswith('=== SR ') else None
             r = self.open.get(pid)
             if ms:
                 r = self.run(pid, t, 'gc', ms.group(1))
@@ -4186,47 +4261,47 @@ class SmlogFile(object):
             if text == 'Aborted':
                 r['aborted'] = True
                 r['outcome'] = 'Aborted'
-            elif ('EXCEPTION' in msg or RE_SR_ERROR.search(msg)) and r['error'] is None:
+            elif ('EXCEPTION' in msg or (SR_ERROR_HEAD in msg and RE_SR_ERROR.search(msg))) and r['error'] is None:
                 r['error'] = msg[:300]
                 r['outcome'] = 'exception' if r['outcome'] in (None, 'exited') else r['outcome']
             elif msg.startswith('GC process exiting'):
                 r['outcome'] = r['outcome'] or 'exited'
                 r['closing'] = t
-            mf = RE_FAILED_TAG.search(msg)
+            mf = RE_FAILED_TAG.search(msg) if 'Failed to tag vdi ' in msg else None
             if mf:
                 self.failed_tag.append([t, pid, mf.group(1)])
             return
-        m = RE_SR_ERROR.search(msg)
+        m = RE_SR_ERROR.search(msg) if SR_ERROR_HEAD in msg else None
         if m:
             r = self.open.get(pid) or self.run(pid, t)
             r['last'] = t
             r['work'] = True
             r['error'] = msg[:300]
             return
-        if s.activate and RE_ACTIVATE.search(msg):
+        if s.activate and "'command': 'vdi_activate'" in msg:
             mv = RE_VDI_UUID.search(msg)
             if mv and mv.group(1) in s.activate:
                 self.events['activate:' + mv.group(1)].append([t, 'activate', pid])
             return
-        if RE_SNAPSHOT.search(msg):
+        if "'command': 'vdi_snapshot'" in msg:
             mv = RE_VDI_UUID.search(msg)
             if mv and t is not None and t >= s.now - SNAP_WINDOW:
                 self.snaps.append([t, mv.group(1), 1 if "'type': 'internal'" in msg else 0])
             return
-        if RE_REFUSAL.search(msg):
+        if 'not detached cleanly' in msg or 'is still open on host' in msg:
             if t >= s.now - 86400:
                 self.refusals.append([t, pid, msg[:240]])
             return
-        m = RE_LOCK_WAIT.search(msg)
+        m = RE_LOCK_WAIT.search(msg) if 'Failed to lock ' in msg else None
         if m:
             if t >= s.now - 86400:
                 self.lockwaits.append([t, pid, m.group(1), int(m.group(2))])
             return
-        m = RE_PHY.search(msg)
+        m = RE_PHY.search(msg) if s.phy and 'phy/' in msg and 'xcp-volume-' in msg else None
         if m and m.group(2) in s.phy:
             self.events['phy:' + m.group(2)].append([t, m.group(3), pid])
             return
-        m = RE_NO_TAPDISK.search(msg)
+        m = RE_NO_TAPDISK.search(msg) if 'No such Tapdisk(minor=' in msg else None
         if m and t >= s.now - 86400:
             self.notap.append([t, pid, int(m.group(1))])
 
@@ -4483,7 +4558,7 @@ def smlog_scan(q):
             if st.st_ino != inos[i]:
                 rotated = path
                 break
-            scan_log(path, now, fs.sink, deadline, stats)
+            scan_log(path, now, fs.sink, deadline, stats, scan.prefilter)
             if file_inode(path) != inos[i]:
                 rotated = path
                 break
@@ -4536,6 +4611,8 @@ def smlog_scan(q):
                 want_pids.add(evs[-1][2])
         elif k.startswith('activate:') and evs:
             want_pids.update(e[2] for e in evs[-3:])
+    leaf = leaf_summary(scan.leafev)
+    want_pids.update(x['pid'] for s in leaf.values() for x in s['attempts'] if x['out'] == 'running')
     try:
         pids_ = bounded(pid_infos, 20, want_pids)
     except (Failed, EnvironmentError, ValueError, IndexError):
@@ -4550,7 +4627,7 @@ def smlog_scan(q):
             'gc': sorted(kept.values(), key=lambda r: r['first']), 'refusals': collapse_refusals(scan.refusals),
             'refusal_count': len(scan.refusals), 'lockwaits': scan.lockwaits[-50:],
             'notap': scan.notap[-50:], 'failed_tag': scan.failed_tag[-200:], 'now': now, 'pids': pids_,
-            'snaps': scan.snaps[-2000:], 'leaf': leaf_summary(scan.leafev), 'speed': speed_logs(),
+            'snaps': scan.snaps[-2000:], 'leaf': leaf, 'speed': speed_logs(),
             'drbd': drbd, 'oldest': None if stats.get('nofirst') or not stats.get('firsts') else min(stats['firsts'])}
 
 
@@ -5536,11 +5613,15 @@ FACTS_BUDGET = AGENT_TIMEOUT - 40
 def agent_facts(args):
     _DEADLINE[0] = _now() + float(args.get('budget') or FACTS_BUDGET)
     _STUCK[0] = None
+    _TOOK[0] = []
     try:
-        return facts_doc(args)
+        doc = facts_doc(args)
+        doc['took'] = _TOOK[0]
+        return doc
     finally:
         _DEADLINE[0] = None
         _STUCK[0] = None
+        _TOOK[0] = None
 
 
 def facts_doc(args):
@@ -10539,6 +10620,7 @@ class Audit(object):
         self.satellite = {}
         self.sm_needles = {}
         self.xenops = {}
+        self.took = None
         self.gc_held = frozenset()
 
     def view(self, href):
@@ -15627,6 +15709,9 @@ def eval_flag(a, opts, vref, v, key, abort_srs, activating_srs):
     if key == 'relinking' and not m.is_leaf(vref):
         return ev(k, cls, INFO, None, title, 'not a leaf: nothing activates a base copy, so the key is inert there; '
                   'left alone', evidence)
+    own = relink_in_try(a, v) if key == 'relinking' else None
+    if own:
+        return ev(k, cls, INFO, None, title, own, evidence, sig=[key, 'try'])
     problems, unknowns, waits = flag_common(a, vref, v, key)
     ob = orphan_block(a, sr_uuid, vref) if sr_uuid else None
     if ob:
@@ -15783,6 +15868,49 @@ def relink_override(a, opts, v, sr):
         return None, 'it was set %s ago, less than %s' % (format_age(age), format_age(ABORT_MIN_AGE))
     return {'set': [last[0], last[2]],
             'text': 'set %s ago by GC pid %d, which is gone, and never removed' % (format_age(age), last[2])}, None
+
+
+RELINK_FLIGHT = 600
+
+
+def leaf_try_live(a, hv, vdi8):
+    s = (((hv.smlog or {}).get('leaf') or {}).get(vdi8)) or {}
+    for x in reversed(s.get('attempts') or []):
+        if x.get('out') != 'running':
+            continue
+        pi = a.pidinfo.get((hv.uuid, x['pid']))
+        if pi and pi.get('alive') and pi.get('sm') and pi.get('start', 0) <= x['start'] + 1:
+            return x
+    return None
+
+
+def leaf_try_text(a, hv, x, vdi):
+    return ('the SR\'s GC (pid %d on %s) is in a leaf-coalesce try on VDI %s, started %s ago, %d round(s) so far'
+            % (x['pid'], hv.name, vdi, format_age(host_time(hv, a) - x['start']), x.get('snaps') or 0))
+
+
+def relink_in_try(a, v):
+    m = a.model
+    smref = m.sr_master(v['SR'])
+    u8 = v['uuid'][:8]
+    if smref is None or m.vdi_uuid8[u8] != 1:
+        return None
+    hv = a.view(smref)
+    x = leaf_try_live(a, hv, u8)
+    if x is None:
+        return None
+    evs = (hv.smlog.get('events') or {}).get('relink:' + u8) or []
+    sets = [e for e in evs if e[1] == 'set']
+    if not sets or sets[-1][2] != x['pid'] or sets[-1][0] < x['start']:
+        return None
+    age = host_time(hv, a) - sets[-1][0]
+    if age > RELINK_FLIGHT:
+        return None
+    gone = [e for e in evs if e[1] == 'removed' and e[0] >= sets[-1][0]]
+    return ('%s: each round sets relinking on the disk for the seconds of its relink step and removes it again (this '
+            'one was set %s ago%s), so this is that round\'s own key, not one left behind'
+            % (leaf_try_text(a, hv, x, m.name_vdi(m.vdi_by_uuid[v['uuid']])), format_age(age),
+               ', and SMlog shows it removed %ds later' % int(round(gone[0][0] - sets[-1][0])) if gone else ''))
 
 
 def eval_paused_key(a, opts, vref, v):
@@ -17879,7 +18007,15 @@ def eval_gc(a, opts):
                            % loop[0])
             hits = [s for s in (hv.smlog or {}).get('snaps') or [] if mm and s[1].startswith(mm.group(1)) and
                     not (len(s) > 2 and s[2])]
-            if hits:
+            tries = (((hv.smlog or {}).get('leaf') or {}).get(mm.group(1)) or {}) if mm else {}
+            ended = [x for x in tries.get('attempts') or [] if x.get('out') not in ('running', None)]
+            sm_why = leaf_why(ended[-1].get('why')) if ended and ended[-1].get('out') == 'failed' else None
+            if hits and not loop and sm_why:
+                why.append('the leaf-coalesce of VDI %s gave up %d time(s) in a row, the last because %s: SM\'s own '
+                           'limit, not a snapshot (it was also snapshotted %d time(s) in the last %s by something '
+                           'other than its GC)' % (hits[-1][1], tries.get('streak') or 1, sm_why, len(hits),
+                                                   format_age(SNAP_WINDOW)))
+            elif hits and not loop:
                 why.append('VDI %s was snapshotted %d time(s) in the last %s by something other than its GC, so its '
                            'leaf-coalesce keeps losing to the snapshots' % (hits[-1][1], len(hits),
                                                                             format_age(SNAP_WINDOW)))
@@ -17949,6 +18085,11 @@ def mbytes(n):
     return u'%d MB' % int(round(n / 1e6))
 
 
+def span(vals, fmt):
+    lo, hi = fmt % min(vals), fmt % max(vals)
+    return lo if lo == hi else '%s-%s' % (lo.rstrip(' MBs'), hi)
+
+
 def leaf_loops(a, href):
     m = a.model
     hv = a.view(href)
@@ -17981,34 +18122,75 @@ def eval_leaf_loop(a, hv, vref, s, sm):
     rec = speed.get(sr['uuid']) or {}
     vals = rec.get('values') or []
     avg = float(sum(vals)) / len(vals) if vals else None
-    if avg:
+    if avg and avg > 0:
         rate = ('the speed SM recorded for the SR, %.1f MB/s over its last %d coalesce(s), so a leaf under %s'
                 % (avg / 1e6, len(vals), mbytes(avg * LIVE_LEAF_SECONDS)))
     elif speed.get('_error') or rec.get('error'):
+        avg = None
         rate = 'the speed SM recorded for the SR (not read on %s: %s)' % (hv.name, speed.get('_error') or rec['error'])
+    elif vals:
+        avg = None
+        rate = ('the speed SM recorded for the SR, which on %s averages 0 and so counts for nothing: a leaf under '
+                '20 MiB' % hv.name)
     else:
-        rate = 'its recorded speed; SM has none for this SR on %s, so a leaf under 20 MiB' % hv.name
+        rate = 'the speed SM recorded for the SR; it has none on %s, so a leaf under 20 MiB' % hv.name
     if last:
+        went = [mbytes(x) for x in sizes]
+        if len(went) > 7:
+            went = went[:3] + ['...'] + went[-3:]
+            went[-1] += ' over %d rounds' % max(last[0].get('snaps') or 0, len(sizes) - 1)
         tried = ('its last try went %s and stopped because %s' %
-                 (' -> '.join(mbytes(x) for x in sizes) if sizes else 'through %d round(s)' % last[0].get('snaps', 0),
+                 (' -> '.join(went) if sizes else 'through %d round(s)' % last[0].get('snaps', 0),
                   leaf_why(last[0].get('why')) or last[0].get('exc') or 'of something SM did not name'))
     else:
         tried = 'its tries are not in the part of SMlog kept here'
-    pause = 'about %ds' % int(round(sizes[-1] / avg)) if avg and sizes else 'as long as merging the whole leaf takes'
+    leaf = sizes[-1] if sizes else None
+    est = leaf / avg if avg and leaf else None
+    merges = [x for att in atts for x in att.get('merges') or [] if x[1]]
+    dsum = sum(x[0] for x in merges)
+    mrate = sum(x[1] for x in merges) / dsum if merges and dsum > 0 else None
+    measured = ''
+    if merges:
+        measured = ('The %d snapshot merge(s) SMlog timed on %s took %s each for %s, %s. '
+                    % (len(merges), hv.name, span([x[0] for x in merges], '%gs'),
+                       span([x[1] / 1e6 for x in merges], '%.0f MB'),
+                       'about %.0f MB/s' % (mrate / 1e6) if mrate else 'each under a second at the log\'s 1 s resolution'))
+        if leaf and est and est > LIVE_LEAF_SECONDS and (mrate is None or leaf / mrate < LIVE_LEAF_SECONDS):
+            measured += ('At that pace the last leaf (%s) merges in %s, inside SM\'s %ds limit, against the %ds SM '
+                         'predicts: what keeps it looping is SM\'s estimate, not how fast the VM writes. '
+                         % (mbytes(leaf), 'about %ds' % max(1, int(round(leaf / mrate))) if mrate else 'about a second',
+                            LIVE_LEAF_SECONDS, int(round(est))))
+    if leaf and mrate:
+        pause = 'about %ds by the merges SMlog timed' % max(1, int(round(leaf / mrate)))
+    elif leaf and merges:
+        pause = 'about a second or two by the merges SMlog timed'
+    elif est:
+        pause = 'about %ds by SM\'s own estimate, which can be far too high' % int(round(est))
+    else:
+        pause = 'as long as merging the whole leaf takes'
+    v8 = v['uuid'][:8]
     reason = ('SM\'s GC gave up merging the leaf of this disk into its parent %d time(s) in a row in the SMlog kept '
-              'on %s, the first %s ago. It '
-              'merges a leaf live only when that takes under %ds at %s; until then it snapshots the disk and merges '
-              'each snapshot into the parent, round after round, and %s. Every GC run starts over, so while the VM '
-              'writes this fast it never ends: %d GC snapshot(s) of this disk since %s ago, each a short pause of its '
-              'I/O%s. To stop it: xe vdi-param-set uuid=%s other-config:leaf-coalesce=false (the chain keeps one more '
-              'level). For one merge with the disk paused for %s: xe vdi-param-set uuid=%s '
-              'other-config:leaf-coalesce=force, then xe sr-scan uuid=%s (SM removes the key after that try). Or halt '
-              'the VM, or stop its writes, until a GC run gets through'
+              'on %s, the first %s ago. It merges a leaf live only when it predicts that merge under %ds: the leaf\'s '
+              'allocated size divided by %s. That speed counts only the bytes each merge actually copied, over the '
+              'whole merge call, so for a disk with scattered writes it comes out far below what a merge really '
+              'takes. Until the prediction fits, it snapshots the disk and merges each snapshot into the parent, round '
+              'after round, and %s. Every GC run starts over, so it does not end by itself: %d GC snapshot(s) of this '
+              'disk since %s ago, each a short pause of its I/O%s. %s'
+              'Ways out: one forced live merge, with the disk paused for %s. Every snapshot of the disk removes the '
+              'key again, so set it once a round\'s snapshot has finished (set during one, it is gone within '
+              'seconds); on %s this waits for that and sets it: tail -n0 -F /var/log/SMlog | awk \'/Single-snapshotting '
+              '%s/ {p = 1} p && /Single-snapshot returned/ {exit}\'; xe vdi-param-set uuid=%s '
+              'other-config:leaf-coalesce=force . The try\'s next check then merges it ("Leaf-coalesce forced" in '
+              'SMlog), and SM removes the key after it; with no try running, xe sr-scan uuid=%s starts one. xe '
+              'vdi-param-set uuid=%s other-config:leaf-coalesce=false stops the tries only until the next snapshot of '
+              'the disk, a backup\'s included, removes the key. A backup snapshot stops the loop while it exists, and '
+              'after a merge every backup gives the disk a parent again: the loop comes back while SM\'s speed figure '
+              'stays this low. Or halt the VM, or stop its writes, until a GC run gets through'
               % (s['streak'], hv.name, format_age(now - s['since']) if s.get('since') else '?', LIVE_LEAF_SECONDS,
                  rate, tried,
                  s.get('snaps') or 0, format_age(now - s['first']) if s.get('first') else '?',
-                 ', and on LINSTOR a new volume on every replica' if sr['type'] == 'linstor' else '',
-                 v['uuid'], pause, v['uuid'], sr['uuid']))
+                 ', and on LINSTOR a new volume on every replica' if sr['type'] == 'linstor' else '', measured,
+                 pause, hv.name, v8, v['uuid'], sr['uuid'], v['uuid']))
     counts = s.get('counts') or {}
     evidence = ['SR %s; SMlog on %s holds %d leaf-coalesce tr%s of this disk (%s)'
                 % (m.name_sr(v['SR']), hv.name, sum(counts.values()), 'y' if sum(counts.values()) == 1 else 'ies',
@@ -18018,6 +18200,11 @@ def eval_leaf_loop(a, hv, vref, s, sm):
                                                            x.get('snaps') or 0,
                                                            (', %s' % leaf_why(x['why'])) if leaf_why(x.get('why'))
                                                            else ''))
+    for x in [x for x in atts if x.get('live')][-3:]:
+        evidence.append('%s ago a live merge of this disk%s took %gs%s%s' % (
+            format_age(now - (x.get('end') or now)), ' (forced)' if x.get('forced') else '', x['live'][0],
+            ' for %s' % mbytes(x['live'][1]) if x['live'][1] else '',
+            ', %gs from its start to the disk\'s unpause' % x['pause'] if x.get('pause') is not None else ''))
     snaps = [x for x in sm.get('snaps') or [] if x[1] == v['uuid']]
     if snaps:
         evidence.append('%d of the %d snapshot(s) of this disk in the last %s were the GC\'s own'
@@ -19506,16 +19693,53 @@ def eval_linstor(a, opts):
         if not jr:
             continue
         named = sorted(set(u for k, x in jr.items() for u in re.findall(UUID_PAT, '%s %s' % (_text(k), _text(x)))))
-        e = ev(('ENV', 'linstor-journal', sru), 'C18', REPORT, None,
-               'the LINSTOR journal of SR %s has %d entr%s' % (
-                   m.name_sr(m.sr_by_uuid[sru]) if sru in m.sr_by_uuid else sru, len(jr), 'y' if len(jr) == 1 else 'ies'),
-               'an SM or GC transaction on LINSTOR was interrupted (%s), and SM refuses to attach the VDI(s) it names '
-               '(%s) until a scan of the SR on its master replays it: xe sr-scan uuid=%s on the pool master'
-               % (', '.join(sorted(_text(k) for k in jr)[:4]), ', '.join(named[:4]) or 'none named', sru),
-               ['%s = %s' % (_text(k), canon(x)[:120]) for k, x in sorted(jr.items())[:8]])
+        title = 'the LINSTOR journal of SR %s has %d entr%s' % (
+            m.name_sr(m.sr_by_uuid[sru]) if sru in m.sr_by_uuid else sru, len(jr), 'y' if len(jr) == 1 else 'ies')
+        evidence = ['%s = %s' % (_text(k), canon(x)[:120]) for k, x in sorted(jr.items())[:8]]
+        own = journal_in_try(a, sru, jr)
+        if own:
+            e = ev(('ENV', 'linstor-journal', sru), 'C18', INFO, None, title, own, evidence,
+                   sig=sorted(_text(k) for k in jr))
+        else:
+            e = ev(('ENV', 'linstor-journal', sru), 'C18', REPORT, None, title,
+                   'an SM or GC transaction on LINSTOR was interrupted (%s), and SM refuses to attach the VDI(s) it names '
+                   '(%s) until a scan of the SR on its master replays it: xe sr-scan uuid=%s on the pool master'
+                   % (', '.join(sorted(_text(k) for k in jr)[:4]), ', '.join(named[:4]) or 'none named', sru),
+                   evidence, sig=sorted(_text(k) for k in jr))
         e['subjects'] = named
         out.append(e)
     return out
+
+
+RE_GC_JOURNAL = re.compile(r'^(?:relink|coalesce)/(' + UUID_PAT + r')$')
+
+
+def journal_in_try(a, sru, jr):
+    m = a.model
+    sref = m.sr_by_uuid.get(sru)
+    smref = m.sr_master(sref) if sref else None
+    if smref is None:
+        return None
+    hv = a.view(smref)
+    now = host_time(hv, a)
+    tries = []
+    for v8 in sorted(((hv.smlog or {}).get('leaf') or {})):
+        x = leaf_try_live(a, hv, v8)
+        if x and x.get('round') and now - x['round'][1] <= RELINK_FLIGHT:
+            tries.append((v8, x))
+    hit = None
+    for k in sorted(_text(k) for k in jr):
+        mm = RE_GC_JOURNAL.match(k)
+        t = next((t for t in tries if mm and t[1]['round'][0] == mm.group(1)[:8]), None)
+        if t is None:
+            return None
+        hit = hit or (t, mm.group(1))
+    (v8, x), snap = hit
+    refs = [r for r, v in m.vdis.items() if v['SR'] == sref and v['uuid'].startswith(v8)]
+    return ('%s, and %s is the snapshot that round is merging (its "Coalescing parent" line %s ago): each round writes '
+            'these entries for the seconds of its merge and relink and removes them again, so this is not an '
+            'interrupted transaction' % (leaf_try_text(a, hv, x, m.name_vdi(refs[0]) if len(refs) == 1 else v8), snap,
+                                         format_age(now - x['round'][1])))
 
 
 def ha_starts(m):
@@ -19681,16 +19905,32 @@ def flight_wait(a, e):
     return e
 
 
+SAME_REPORTS = {'C09': 'SM\'s GC set it again between the two audits (each coalesce round sets it for seconds)',
+                'linstor-journal': 'its entries changed between the two audits, so no one transaction stays stuck'}
+
+
+def same_why(e):
+    k = e['key']
+    return SAME_REPORTS.get(e['cls']) or (SAME_REPORTS.get(k[1]) if k[0] == 'ENV' and len(k) > 1 else None)
+
+
+def settles(e):
+    return e['cls'] in SETTLE_REPORTS or same_why(e) is not None
+
+
 def combine(per, gap_ok):
     last = per[-1]
     final = []
     for key, e in last.items():
         e = dict(e)
-        if e['cls'] in SETTLE_REPORTS and e['verdict'] == REPORT and len(per) > 1:
+        if settles(e) and e['verdict'] == REPORT and len(per) > 1:
             prev = [p.get(key) for p in per[:-1]]
             if any(p is None or p['verdict'] not in (REPORT, UNKNOWN) for p in prev):
                 e['verdict'], e['item'] = WAIT, None
                 e['reason'] = 'seen in one audit only, so it is read again: %s' % e['reason']
+            elif same_why(e) and any(canon(p.get('sig')) != canon(e.get('sig')) for p in prev):
+                e['verdict'], e['item'] = WAIT, None
+                e['reason'] = '%s, so it is read again: %s' % (same_why(e), e['reason'])
         if e['verdict'] == FIX:
             prev = [p.get(key) for p in per[:-1]]
             if not prev:
@@ -20714,8 +20954,11 @@ def collect_audit(ctx, n, first=False, only_hosts=None, probes=True, smlog=True,
     a = Audit(n)
     a.gc_held = frozenset(getattr(ctx, 'gc_held', None) or ())
     a.t0 = time.time()
+    m0 = _now()
+    took = a.took = {'round1': {}, 'round2': {}, 'facts1': {}, 'facts2': {}}
     a.snap = pool_snapshot(ctx.api)
     a.model = Model(a.snap)
+    took['pool'] = round(_now() - m0, 2)
     hosts = ctx.host_objs(a.model)
     targets = [h for h in hosts if (h.live or h.local) and (only_hosts is None or h.uuid in only_hosts)]
     srs = sorted(r['uuid'] for r in a.model.srs.values())
@@ -20724,10 +20967,17 @@ def collect_audit(ctx, n, first=False, only_hosts=None, probes=True, smlog=True,
     def round1(h):
         lin = linstor_groups(a.model, h.ref)
         master = any(a.model.sr_master(a.model.sr_by_uuid[rec['sr']]) == h.ref for rec in lin)
-        return ctx.transport.call(h, 'facts', {'want': want + (['linstor'] if lin else []) +
-                                               (['linstordb'] if master else []), 'srs': srs,
-                                               'roots': sr_roots(a.model, h.ref), 'linstor': lin})
+        t1 = _now()
+        try:
+            return ctx.transport.call(h, 'facts', {'want': want + (['linstor'] if lin else []) +
+                                                   (['linstordb'] if master else []), 'srs': srs,
+                                                   'roots': sr_roots(a.model, h.ref), 'linstor': lin})
+        finally:
+            took['round1'][h.uuid] = round(_now() - t1, 2)
+    m1 = _now()
     for h, (st, val) in parallel(round1, targets):
+        if st == 'ok' and isinstance(val, dict):
+            took['facts1'][h.uuid] = val.pop('took', None)
         if st != 'ok':
             a.errors[h.uuid] = _text(val)
             continue
@@ -20746,6 +20996,8 @@ def collect_audit(ctx, n, first=False, only_hosts=None, probes=True, smlog=True,
     a.caps = ctx.caps
     a.rpm = ctx.rpm
     a.xapi_pkg = ctx.xapi_pkg
+    took['r1'] = round(_now() - m1, 2)
+    m1 = _now()
     merge_linstor(a, targets)
     try:
         divergence(a)
@@ -20762,8 +21014,10 @@ def collect_audit(ctx, n, first=False, only_hosts=None, probes=True, smlog=True,
                 a.vdi2[vbd['VDI']] = _text(ctx.api.x.VDI.get_uuid(vbd['VDI']))
             except Exception:
                 a.vdi2[vbd['VDI']] = None
+    took['between'] = round(_now() - m1, 2)
     if not smlog:
         a.t, a.mono = time.time(), _now()
+        took['total'] = round(a.mono - m0, 2)
         return a
     q = candidates_round2(a, opts)
     known = linstor_known(a)
@@ -20789,8 +21043,15 @@ def collect_audit(ctx, n, first=False, only_hosts=None, probes=True, smlog=True,
                 'statfiles': sorted(qq['statfiles']), 'vgs': sorted(qq['vgs']), 'srdirs': sorted(qq['srdirs']),
                 'xsread': sorted(qq['xsread']), 'vhdcheck': sorted(qq['vhdcheck']), 'drbd': sorted(qq['drbdres']),
                 'dmcheck': sorted([list(x) for x in qq['dmcheck']])}
-        return ctx.transport.call(h, 'facts', args)
+        t2 = _now()
+        try:
+            return ctx.transport.call(h, 'facts', args)
+        finally:
+            took['round2'][h.uuid] = round(_now() - t2, 2)
+    m2 = _now()
     for h, (st, val) in parallel(round2, [h for h in targets if h.uuid in a.facts]):
+        if st == 'ok' and isinstance(val, dict):
+            took['facts2'][h.uuid] = val.pop('took', None)
         if st != 'ok':
             a.errors.setdefault(h.uuid, _text(val))
             a.facts[h.uuid]['round2'] = {'ok': False, 'error': 'the second facts call failed: %s' % _text(val)}
@@ -20850,9 +21111,13 @@ def collect_audit(ctx, n, first=False, only_hosts=None, probes=True, smlog=True,
         if f is not None:
             a.chain[h.uuid] = f.get('value') if f.get('ok') else {'error': f.get('error')}
     a._views = {}
+    took['r2'] = round(_now() - m2, 2)
+    m2 = _now()
     if probes:
         collect_probes(ctx, a)
     a.t, a.mono = time.time(), _now()
+    took['probes'] = round(a.mono - m2, 2)
+    took['total'] = round(a.mono - m0, 2)
     return a
 
 
@@ -26779,7 +27044,7 @@ def save_audits(d, audits):
                           'probes': dict(('%s@%s' % k, v) for k, v in a.probes.items()),
                           'drbd': a.drbd, 'drbd_all': a.drbd_all, 'drbd_detail': a.drbd_detail,
                           'satellite': a.satellite, 'sm_needles': a.sm_needles, 'xenops': a.xenops,
-                          'gc_held': sorted(a.gc_held)})
+                          'gc_held': sorted(a.gc_held), 'took': getattr(a, 'took', None)})
         except Exception as exc:
             warn('the audit record could not be saved: %s' % _text(exc))
 
@@ -27112,7 +27377,8 @@ def needs_second(a, opts):
     else:
         mine = per.values()
     for e in mine:
-        if e['verdict'] in (FIX, WAIT) or e['cls'] in SETTLE_REPORTS + ('C31', 'C32', 'C33'):
+        if e['verdict'] in (FIX, WAIT) or e['cls'] in SETTLE_REPORTS + ('C31', 'C32', 'C33') or \
+                (settles(e) and e['verdict'] == REPORT):
             return True
     return False
 
