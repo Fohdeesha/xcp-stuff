@@ -29,7 +29,7 @@ import time
 import xml.parsers.expat
 import zlib
 
-VERSION = '2.11'
+VERSION = '2.12'
 PYTHON = sys.version.split()[0]
 PROG = 'storage-state-fixer'
 STORAGE_DB = '/var/run/nonpersistent/xapi/storage.db'
@@ -3895,8 +3895,145 @@ NOT_GC_WORK = ('Aborting currently-running instance', 'abort: releasing the proc
                'Will finish as PID [')
 PHY_UPDATE_WINDOW = 300
 GC_TAIL = 900
-SMLOG_LISTS = ('refusals', 'lockwaits', 'notap', 'failed_tag', 'snaps')
+SMLOG_LISTS = ('refusals', 'lockwaits', 'notap', 'failed_tag', 'snaps', 'leafev')
 SNAP_WINDOW = 6 * 3600
+RE_LEAF_START = re.compile(r'^Leaf-coalescing \*?([0-9a-f]{8})\S* -> \*?([0-9a-f]{8})')
+RE_LEAF_SNAP = re.compile(r'^Single-snapshotting \*?([0-9a-f]{8})')
+RE_LEAF_ITER = re.compile(r'^Iteration: \d+ -- Initial size (\d+) --> Final size (\d+)$')
+RE_LEAF_EXC = re.compile(r'^leaf-coalesce: EXCEPTION (.*)$')
+RE_LEAF_VDI = re.compile(r'VDI (' + UUID_PAT + r') could not be coalesced')
+RE_LEAF_FAIL = re.compile(r'^Leaf-coalesce failed on ([0-9a-f]{8})')
+RE_LEAF_REMOVED = re.compile(r'^Removed leaf-coalesce from ([0-9a-f]{8})')
+LEAF_WHY = ('No progress made for ', 'Max iterations (', 'Unexpected bump in size')
+LEAF_QUIET = ('concurrently deleted', 'concurrently snapshotted', 'altered since', 'no longer leaf-coalesceable',
+              'deleted meanwhile')
+LEAF_KEEP = 12
+LEAF_VDIS = 100
+SPEED_DIR = '/var/run'
+SPEED_SUFFIX = '.speed_log'
+
+
+def leaf_event(text):
+    m = RE_LEAF_START.match(text)
+    if m:
+        return 'start', [m.group(1), m.group(2)]
+    m = RE_LEAF_SNAP.match(text)
+    if m:
+        return 'snap', m.group(1)
+    m = RE_LEAF_ITER.match(text)
+    if m:
+        return 'iter', [int(m.group(1)), int(m.group(2))]
+    if text.startswith(LEAF_WHY):
+        return 'why', text[:120]
+    if text == 'Leaf-coalesce forced, will not use timeout':
+        return 'forced', None
+    m = RE_LEAF_REMOVED.match(text)
+    if m:
+        return 'removed', m.group(1)
+    m = RE_LEAF_EXC.match(text)
+    if m:
+        mv = RE_LEAF_VDI.search(text)
+        return 'exc', [mv.group(1) if mv else None, m.group(1)[:200]]
+    m = RE_LEAF_FAIL.match(text)
+    if m:
+        return 'failed', m.group(1)
+    if text.startswith('The VDI') and any(q in text for q in LEAF_QUIET):
+        return 'quiet', text[:120]
+    if text == 'Aborted':
+        return 'aborted', None
+    if text.startswith('gc: EXCEPTION'):
+        return 'gcexc', text[:200]
+    if text.startswith('GC process exiting'):
+        return 'exit', None
+    return None
+
+
+def leaf_attempts(evs):
+    open_, done = {}, []
+
+    def close(pid, out, force=False):
+        a = open_.pop(pid)
+        a['out'] = out if force else (a['out'] or out)
+        done.append(a)
+    for t, _num, _seq, pid, kind, data in sorted(evs):
+        a = open_.get(pid)
+        if kind == 'start':
+            if a is not None:
+                close(pid, 'merged' if a['removed'] else 'unknown')
+            open_[pid] = {'vdi': data[0], 'parent': data[1], 'uuid': None, 'pid': pid, 'start': t, 'end': t,
+                          'snaps': 0, 'its': [], 'why': None, 'out': None, 'forced': False, 'removed': False,
+                          'exc': None, 'exited': False}
+            continue
+        if a is None:
+            continue
+        a['end'] = t
+        if kind == 'snap':
+            a['snaps'] += 1
+        elif kind == 'iter':
+            a['its'] = (a['its'] + [data])[-25:]
+        elif kind == 'why':
+            a['why'] = data
+        elif kind == 'forced':
+            a['forced'] = True
+        elif kind == 'removed':
+            a['removed'] = True
+        elif kind == 'exc':
+            a['uuid'] = data[0] or a['uuid']
+            a['exc'] = data[1]
+        elif kind == 'quiet':
+            a['out'] = a['out'] or 'interrupted'
+        elif kind == 'failed':
+            close(pid, 'failed', force=True)
+        elif kind == 'aborted':
+            close(pid, 'aborted')
+        elif kind == 'gcexc':
+            close(pid, 'error')
+        elif kind == 'exit':
+            a['exited'] = True
+    for pid in sorted(open_):
+        a = open_[pid]
+        close(pid, ('merged' if a['removed'] else 'unknown') if a['exited'] else 'running')
+    return sorted(done, key=lambda a: (a['start'], a['pid']))
+
+
+def leaf_summary(evs):
+    by = collections.OrderedDict()
+    for a in leaf_attempts(evs):
+        by.setdefault(a['vdi'], []).append(a)
+    out = {}
+    for vdi, rows in sorted(by.items(), key=lambda kv: kv[1][-1]['end'])[-LEAF_VDIS:]:
+        streak, since = 0, None
+        for a in reversed(rows):
+            if a['out'] == 'merged':
+                break
+            if a['out'] == 'failed':
+                streak += 1
+                since = a['start']
+        out[vdi] = {'uuid': next((a['uuid'] for a in reversed(rows) if a['uuid']), None),
+                    'counts': dict(collections.Counter(a['out'] for a in rows)),
+                    'snaps': sum(a['snaps'] for a in rows), 'first': rows[0]['start'], 'last': rows[-1]['end'],
+                    'streak': streak, 'since': since,
+                    'attempts': [dict((k, a[k]) for k in ('pid', 'start', 'end', 'snaps', 'its', 'why', 'out',
+                                                          'forced', 'parent', 'exc')) for a in rows[-LEAF_KEEP:]]}
+    return out
+
+
+def speed_logs():
+    out = {}
+    try:
+        names = _listdir(SPEED_DIR)
+    except OSError as exc:
+        return {'_error': '%s was not listed: %s' % (SPEED_DIR, _text(exc) or type(exc).__name__)}
+    for name in names:
+        sr = name[:-len(SPEED_SUFFIX)] if name.endswith(SPEED_SUFFIX) else None
+        if not sr or not re.match('^' + UUID_PAT + '$', sr):
+            continue
+        try:
+            with open(os.path.join(SPEED_DIR, name)) as h:
+                out[sr] = {'values': [float(x) for x in h.read().split()][-10:]}
+        except (EnvironmentError, ValueError) as exc:
+            out[sr] = {'error': _text(exc) or type(exc).__name__}
+    return out
 
 
 class SmlogScan(object):
@@ -3915,6 +4052,7 @@ class SmlogScan(object):
         self.notap = []
         self.failed_tag = []
         self.snaps = []
+        self.leafev = []
 
     def file(self, num):
         return SmlogFile(self, num)
@@ -4033,6 +4171,9 @@ class SmlogFile(object):
             elif r['sr'] is None:
                 r['sr'] = m.group(1)
         if ident == 'SMGC':
+            lk = leaf_event(text)
+            if lk is not None and t is not None:
+                self.leafev.append([t, -self.num, len(self.leafev), pid, lk[0], lk[1]])
             ms = GC_START.match(text)
             r = self.open.get(pid)
             if ms:
@@ -4070,7 +4211,7 @@ class SmlogFile(object):
         if RE_SNAPSHOT.search(msg):
             mv = RE_VDI_UUID.search(msg)
             if mv and t is not None and t >= s.now - SNAP_WINDOW:
-                self.snaps.append([t, mv.group(1)])
+                self.snaps.append([t, mv.group(1), 1 if "'type': 'internal'" in msg else 0])
             return
         if RE_REFUSAL.search(msg):
             if t >= s.now - 86400:
@@ -4409,7 +4550,7 @@ def smlog_scan(q):
             'gc': sorted(kept.values(), key=lambda r: r['first']), 'refusals': collapse_refusals(scan.refusals),
             'refusal_count': len(scan.refusals), 'lockwaits': scan.lockwaits[-50:],
             'notap': scan.notap[-50:], 'failed_tag': scan.failed_tag[-200:], 'now': now, 'pids': pids_,
-            'snaps': scan.snaps[-2000:],
+            'snaps': scan.snaps[-2000:], 'leaf': leaf_summary(scan.leafev), 'speed': speed_logs(),
             'drbd': drbd, 'oldest': None if stats.get('nofirst') or not stats.get('firsts') else min(stats['firsts'])}
 
 
@@ -5273,17 +5414,49 @@ def port_listens(text, port):
     return False
 
 
+def _linstor_rd_names(uri):
+    import linstor
+    lin = linstor.Linstor(uri)
+    lin.connect()
+    try:
+        return sorted(_text(d.name) for d in lin.resource_dfn_list_raise().resource_definitions)
+    finally:
+        lin.disconnect()
+
+
+def linstor_rd_names():
+    try:
+        import linstor
+    except ImportError as exc:
+        raise Failed('the python linstor package is not installed here: %s' % _text(exc))
+    if not hasattr(linstor, 'Linstor'):
+        raise Failed('the python linstor package here has no Linstor class')
+    return bounded(_linstor_rd_names, LINSTOR_DB_TIMEOUT, 'linstor://' + linstor_controller())
+
+
 def f_drbd_detail(q):
     names = set(n for n in q.get('names') or [] if XCP_VOLUME.match(n or ''))
     known = q.get('known')
+    unknown = set()
     if known is not None:
-        names |= set(n for n in f_drbd_all() if XCP_VOLUME.match(n) and n not in set(known))
+        unknown = set(n for n in f_drbd_all() if XCP_VOLUME.match(n) and n not in set(known))
+        names |= unknown
     out = {}
     if not names:
         return out
+    now, now_error = None, None
+    if unknown:
+        try:
+            now = set(linstor_rd_names())
+        except (Failed, EnvironmentError, ValueError, KeyError, IndexError, TypeError) as exc:
+            now_error = _text(exc) or type(exc).__name__
     lvs, listen = local_lvs(), listen_text()
     for res in sorted(names):
         out[res] = drbd_detail_one(res, lvs, listen)
+        if res in unknown:
+            out[res]['linstor_now'] = None if now is None else res in now
+            if now is None:
+                out[res]['linstor_now_error'] = now_error
     return out
 
 
@@ -5335,6 +5508,11 @@ def agent_drbd_down(args, source):
             problems.append('the open files of tapdisk pid %d were not read (%s)' % (pid, fds['unread']))
         elif minor is not None and [DRBD_MAJOR, int(minor)] in [list(i.get('rdev') or []) for i in fds.get('images') or []]:
             problems.append('tapdisk pid %d has its device open' % pid)
+    try:
+        if res in set(linstor_rd_names()):
+            problems.append('LINSTOR has a resource definition for it now, so it is not an orphan')
+    except (Failed, EnvironmentError, ValueError, KeyError, IndexError, TypeError) as exc:
+        problems.append('LINSTOR was not asked whether it knows it now: %s' % (_text(exc) or type(exc).__name__))
     if problems:
         return {'done': False, 'problems': problems}
     r = run([DRBDSETUP, 'down', res], 60)
@@ -17650,6 +17828,11 @@ def c12_refresh_plan(a, hv, sr, vdi, vref):
 def eval_gc(a, opts):
     out = []
     m = a.model
+    loops = []
+    for href in sorted(set(m.sr_master(s) for s in m.srs) - set([None])):
+        loops.extend(leaf_loops(a, href))
+    looping = set(e['key'][2] for e in loops)
+    out.extend(loops)
     for sref, sr in m.srs.items():
         mref = m.sr_master(sref)
         if mref is None:
@@ -17690,10 +17873,17 @@ def eval_gc(a, opts):
             extra.append('journal(s) of an unfinished GC or SM operation on the SR: %s' % ', '.join(jn[:6]))
         for r in bad:
             mm = RE_COALESCE_VDI.search(r.get('error') or '')
-            hits = [s for s in (hv.smlog or {}).get('snaps') or [] if mm and s[1].startswith(mm.group(1))]
+            loop = [u for u in sorted(looping) if mm and u.startswith(mm.group(1))]
+            if loop:
+                why.append('the leaf-coalesce of VDI %s keeps giving up (its own C19 line says why, and what to do)'
+                           % loop[0])
+            hits = [s for s in (hv.smlog or {}).get('snaps') or [] if mm and s[1].startswith(mm.group(1)) and
+                    not (len(s) > 2 and s[2])]
             if hits:
-                why.append('VDI %s was snapshotted %d time(s) in the last %s, so its leaf-coalesce keeps losing to the '
-                           'snapshots' % (hits[-1][1], len(hits), format_age(SNAP_WINDOW)))
+                why.append('VDI %s was snapshotted %d time(s) in the last %s by something other than its GC, so its '
+                           'leaf-coalesce keeps losing to the snapshots' % (hits[-1][1], len(hits),
+                                                                            format_age(SNAP_WINDOW)))
+            if loop or hits:
                 break
         for note in (orphan_block(a, sr['uuid']), orphan_unknown(a, sr['uuid']), orphan_wait(a, sr['uuid'])):
             if note:
@@ -17738,6 +17928,104 @@ def eval_gc(a, opts):
                           ['pid %d, %s ago: %s' % (r['pid'], format_age(host_time(hv, a) - r['last']),
                                                    r.get('outcome') or r.get('error')) for r in runs[-3:]]))
     return out
+
+
+LEAF_LOOP_MIN = 3
+LIVE_LEAF_SECONDS = 5
+LIVE_LEAF_MAX = 20 * 1024 * 1024
+LEAF_WHY_TEXT = (('Unexpected bump in size', 'the leaf grew back past 1.2 times the smallest size it had reached'),
+                 ('No progress made for', 'the leaf stopped shrinking'),
+                 ('Max iterations', 'it used up its 20 rounds'))
+
+
+def leaf_why(text):
+    for k, v in LEAF_WHY_TEXT:
+        if (text or '').startswith(k):
+            return v
+    return None
+
+
+def mbytes(n):
+    return u'%d MB' % int(round(n / 1e6))
+
+
+def leaf_loops(a, href):
+    m = a.model
+    hv = a.view(href)
+    sm = hv.smlog or {}
+    out = []
+    for vdi8, s in sorted((sm.get('leaf') or {}).items()):
+        if (s.get('streak') or 0) < LEAF_LOOP_MIN:
+            continue
+        full = s.get('uuid')
+        hits = [r for r, v in m.vdis.items() if (v['uuid'] == full if full else v['uuid'].startswith(vdi8)) and
+                m.sr_master(v['SR']) == href]
+        if len(hits) == 1:
+            out.append(eval_leaf_loop(a, hv, hits[0], s, sm))
+    return out
+
+
+def eval_leaf_loop(a, hv, vref, s, sm):
+    m = a.model
+    v = m.vdis[vref]
+    sr = m.srs[v['SR']]
+    now = host_time(hv, a)
+    vms = sorted(set(u'"%s"' % m.vms[m.vbds[b]['VM']]['name_label'] for b in v.get('VBDs') or []
+                     if b in m.vbds and m.vbds[b]['VM'] in m.vms and
+                     not m.vms[m.vbds[b]['VM']]['is_control_domain']))
+    atts = s.get('attempts') or []
+    last = [x for x in atts if x.get('out') == 'failed'][-1:]
+    its = last[0].get('its') or [] if last else []
+    sizes = ([its[0][0]] + [x[1] for x in its]) if its else []
+    speed = sm.get('speed') or {}
+    rec = speed.get(sr['uuid']) or {}
+    vals = rec.get('values') or []
+    avg = float(sum(vals)) / len(vals) if vals else None
+    if avg:
+        rate = ('the speed SM recorded for the SR, %.1f MB/s over its last %d coalesce(s), so a leaf under %s'
+                % (avg / 1e6, len(vals), mbytes(avg * LIVE_LEAF_SECONDS)))
+    elif speed.get('_error') or rec.get('error'):
+        rate = 'the speed SM recorded for the SR (not read on %s: %s)' % (hv.name, speed.get('_error') or rec['error'])
+    else:
+        rate = 'its recorded speed; SM has none for this SR on %s, so a leaf under 20 MiB' % hv.name
+    if last:
+        tried = ('its last try went %s and stopped because %s' %
+                 (' -> '.join(mbytes(x) for x in sizes) if sizes else 'through %d round(s)' % last[0].get('snaps', 0),
+                  leaf_why(last[0].get('why')) or last[0].get('exc') or 'of something SM did not name'))
+    else:
+        tried = 'its tries are not in the part of SMlog kept here'
+    pause = 'about %ds' % int(round(sizes[-1] / avg)) if avg and sizes else 'as long as merging the whole leaf takes'
+    reason = ('SM\'s GC gave up merging the leaf of this disk into its parent %d time(s) in a row in the SMlog kept '
+              'on %s, the first %s ago. It '
+              'merges a leaf live only when that takes under %ds at %s; until then it snapshots the disk and merges '
+              'each snapshot into the parent, round after round, and %s. Every GC run starts over, so while the VM '
+              'writes this fast it never ends: %d GC snapshot(s) of this disk since %s ago, each a short pause of its '
+              'I/O%s. To stop it: xe vdi-param-set uuid=%s other-config:leaf-coalesce=false (the chain keeps one more '
+              'level). For one merge with the disk paused for %s: xe vdi-param-set uuid=%s '
+              'other-config:leaf-coalesce=force, then xe sr-scan uuid=%s (SM removes the key after that try). Or halt '
+              'the VM, or stop its writes, until a GC run gets through'
+              % (s['streak'], hv.name, format_age(now - s['since']) if s.get('since') else '?', LIVE_LEAF_SECONDS,
+                 rate, tried,
+                 s.get('snaps') or 0, format_age(now - s['first']) if s.get('first') else '?',
+                 ', and on LINSTOR a new volume on every replica' if sr['type'] == 'linstor' else '',
+                 v['uuid'], pause, v['uuid'], sr['uuid']))
+    counts = s.get('counts') or {}
+    evidence = ['SR %s; SMlog on %s holds %d leaf-coalesce tr%s of this disk (%s)'
+                % (m.name_sr(v['SR']), hv.name, sum(counts.values()), 'y' if sum(counts.values()) == 1 else 'ies',
+                   ', '.join('%s %d' % kv for kv in sorted(counts.items())))]
+    for x in atts[-5:]:
+        evidence.append('%s ago: %s after %d round(s)%s' % (format_age(now - (x.get('end') or now)), x.get('out'),
+                                                           x.get('snaps') or 0,
+                                                           (', %s' % leaf_why(x['why'])) if leaf_why(x.get('why'))
+                                                           else ''))
+    snaps = [x for x in sm.get('snaps') or [] if x[1] == v['uuid']]
+    if snaps:
+        evidence.append('%d of the %d snapshot(s) of this disk in the last %s were the GC\'s own'
+                        % (len([x for x in snaps if len(x) > 2 and x[2]]), len(snaps), format_age(SNAP_WINDOW)))
+    return ev(('C19', 'leaf', v['uuid']), 'C19', REPORT, hv.uuid,
+              'C19 leaf-coalesce of %s keeps giving up%s' % (m.name_vdi(vref), (' (VM %s)' % ', '.join(vms)) if vms
+                                                             else ''),
+              reason, evidence)
 
 
 RE_COALESCE_VDI = re.compile(r'VDI ([0-9a-f]{8})\S* could not be coalesced')
@@ -18786,7 +19074,9 @@ def eval_orphans(a, opts):
             continue
         for res, d in sorted((rec.get('value') or {}).items()):
             if XCP_VOLUME.match(res) and res not in known:
-                out.append(eval_orphan(a, hv, res, d, lin[0][0]))
+                e = eval_orphan(a, hv, res, d, lin[0][0])
+                if e is not None:
+                    out.append(e)
     return out
 
 
@@ -18801,6 +19091,14 @@ def eval_orphan(a, hv, res, d, lin_sr):
     if det is None or det.get('error'):
         return ev(key, 'C29', UNKNOWN, hv.uuid, title, 'LINSTOR does not know it, and its details on %s were not read '
                   '(%s)' % (hv.name, (a.drbd_detail.get(hv.uuid) or {}).get('error') or 'not asked'), evidence)
+    if det.get('linstor_now'):
+        return None
+    if det.get('linstor_now') is False:
+        evidence.append('LINSTOR was asked again on %s right after its kernel was read, and does not know it either'
+                        % hv.name)
+    elif 'linstor_now' in det:
+        evidence.append('LINSTOR was not asked again after the kernel of %s was read (%s), so it may have been made '
+                        'after the list of LINSTOR was read' % (hv.name, det.get('linstor_now_error') or 'no answer'))
     show = det.get('show') or {}
     blocks = []
     if show.get('port'):
@@ -18821,7 +19119,7 @@ def eval_orphan(a, hv, res, d, lin_sr):
         lv = det['lv']
         return ev(key, 'C29', REPORT, hv.uuid, title,
                   'it has a disk: the LV %s/%s (%s bytes, made %s), which may hold the only copy of something, so this '
-                  'tool never takes it down; LINSTOR no longer knows it. Compare it with the volumes of its VDIs before '
+                  'tool never takes it down; LINSTOR does not know it. Compare it with the volumes of its VDIs before '
                   'deciding by hand%s' % (lv.get('vg'), lv.get('name'), lv.get('size'), lv.get('time'),
                                           ('; meanwhile %s' % '; '.join(blocks)) if blocks else ''), evidence, sig=[res])
     if d.get('disk') != 'Diskless':
@@ -19319,7 +19617,7 @@ def evaluate(a, opts):
 SNAP_TASKS = ('VDI.snapshot', 'Async.VDI.snapshot', 'VDI.clone', 'Async.VDI.clone', 'VM.snapshot', 'Async.VM.snapshot',
               'VM.clone', 'Async.VM.clone', 'VM.checkpoint', 'Async.VM.checkpoint')
 FLIGHT_CLASSES = ('C11', 'C12', 'C14', 'C20')
-SETTLE_REPORTS = FLIGHT_CLASSES + ('C30', 'C34')
+SETTLE_REPORTS = FLIGHT_CLASSES + ('C29', 'C30', 'C34')
 
 
 def in_flight(a, hv, vdis):
@@ -19921,6 +20219,8 @@ def finding_subjects(e, a):
         srs.add(k[1])
     elif head == 'C19' and n >= 3 and k[1] == 'task':
         srs.add(k[2])
+    elif head == 'C19' and n >= 3 and k[1] == 'leaf':
+        vdis.add(k[2])
     elif head in ('C12', 'C14', 'C21') and n >= 4:
         taps(k[1], pid=k[2], minor=k[3])
     elif head == 'C15' and n >= 5 and k[2] == 'wedged':
