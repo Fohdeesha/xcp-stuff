@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 import xml.parsers.expat
-VERSION = '1.3'
+VERSION = '1.4'
 PYTHON = sys.version.split()[0]
 DB_PATH = '/var/lib/xcp/state.db'
 BACKUP_SUFFIX = '.snapshot_of.backup'
@@ -57,6 +57,28 @@ REARM_WAIT = 120
 VM_HA_FIELDS = ('ha-restart-priority', 'order', 'start-delay')
 UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
 UUID_ANY = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+SCAN_TASK_RE = re.compile(r'^(?:Async\.|InternalAsync\.)?SR\.scan\Z')
+PLUGIN_TASK_RE = re.compile(r'^(?:Async\.|InternalAsync\.)?host\.call_plugin\Z')
+PLUGIN_QUERIES = {
+    'linstor-manager': ('check', 'getInfo', 'getVHDInfo', 'hasParent', 'getParent', 'getSizeVirt',
+                        'getMaxResizeSize', 'getSizePhys', 'getAllocatedSize', 'getDepth',
+                        'getKeyHash', 'getBlockBitmap', 'getDrbdSize', 'hasControllerRunning',
+                        'listDrbdVolumes', 'getDrbdOpeners', 'healthCheck', 'listNodeInterfaces',
+                        'getNodePreferredInterface'),
+    'lsblk.py': ('list_block_devices',),
+    'hyperthreading.py': ('get_hyperthreading',),
+    'smartctl.py': ('information', 'health'),
+    'raid.py': ('check_raid_pool',),
+    'zfs.py': ('list_zfs_pools',),
+    'updater.py': ('check_update',),
+}
+XAPI_LOG = '/var/log/xensource.log'
+LOG_WINDOW = 16 << 20
+LOG_LAG = 0.5
+CALL_RE = re.compile(br"\|((?:[A-Za-z]+\.)*host\.call_plugin) (R:[0-9a-f]{12})\|[^\]\n]*\] "
+                     br"Host\.call_plugin host = '[^\n]*?'; plugin = '([^'\n]*)'; "
+                     br"fn = '([^'\n]*)' args = \[")
+_CALLS = {}
 _TEXT = type(u'')
 
 def _text(value):
@@ -1028,22 +1050,124 @@ def pool_fields(pool, names):
         raise Failed('xe pool-list uuid=%s answered %d records' % (pool, len(recs)))
     return recs[0]
 
+def short_ref(ref):
+    m = re.match(r'^OpaqueRef:([0-9a-f]{8})-([0-9a-f]{4})-', _text(ref))
+    return u'R:%s%s' % m.groups() if m else None
+
+def task_refs(uuids):
+    refs = {}
+    try:
+        import XenAPI
+        session = XenAPI.xapi_local()
+        session.xenapi.login_with_password('root', '', '', 'snapshot-fixer')
+    except Exception:
+        return refs
+    try:
+        for uuid in uuids:
+            try:
+                refs[uuid] = session.xenapi.task.get_by_uuid(uuid)
+            except Exception:
+                pass
+    finally:
+        try:
+            session.xenapi.session.logout()
+        except Exception:
+            pass
+    return refs
+
+def logged_calls():
+    chunks = []
+    want = LOG_WINDOW
+    for path in (XAPI_LOG, XAPI_LOG + '.1'):
+        try:
+            with open(path, 'rb') as handle:
+                handle.seek(0, 2)
+                size = handle.tell()
+                handle.seek(max(0, size - want))
+                chunks.insert(0, handle.read(want))
+        except EnvironmentError:
+            continue
+        want -= size
+        if want <= 0:
+            break
+    found = {}
+    for m in CALL_RE.finditer(b'\n'.join(chunks)):
+        found[_text(m.group(2))] = tuple(_text(g) for g in m.group(1, 3, 4))
+    return found
+
+def resolve_calls(tasks):
+    labels = dict((t.get('uuid'), t.get('name-label')) for t in tasks if t.get('uuid') and
+                  PLUGIN_TASK_RE.match(t.get('name-label', '')) and t.get('uuid') not in _CALLS)
+    refs = task_refs(sorted(labels)) if labels else {}
+    for attempt in (1, 2):
+        if not refs:
+            return
+        found = logged_calls()
+        for uuid in sorted(refs):
+            hit = found.get(short_ref(refs[uuid]))
+            if hit and hit[0] == labels[uuid]:
+                _CALLS[uuid] = hit[1:]
+                del refs[uuid]
+        if refs and attempt == 1:
+            pause(LOG_LAG)
+
+def uuids(tasks):
+    return set(t.get('uuid') for t in tasks)
+
+def is_query(task):
+    call = _CALLS.get(task.get('uuid'))
+    return call is not None and call[1] in PLUGIN_QUERIES.get(call[0], ())
+
 def pending_tasks():
     try:
-        return xe_records('task-list', 'status=pending', 'params=uuid,name-label')
+        tasks = xe_records('task-list', 'status=pending', 'params=uuid,name-label')
     except Failed as exc:
         raise Failed('cannot list pending tasks: %s' % _text(exc))
+    resolve_calls(tasks)
+    split = ([], [], [])
+    for task in tasks:
+        if SCAN_TASK_RE.match(task.get('name-label', '')):
+            split[1].append(task)
+        elif PLUGIN_TASK_RE.match(task.get('name-label', '')) and is_query(task):
+            split[2].append(task)
+        else:
+            split[0].append(task)
+    return split
 
 def list_tasks(tasks):
     say('Pending tasks - stopping xapi on the master fails them:')
     for task in tasks:
-        say('  %s  %s' % (task.get('uuid', '?'), task.get('name-label', '')))
+        label = task.get('name-label', '')
+        call = _CALLS.get(task.get('uuid'))
+        extra = u''
+        if PLUGIN_TASK_RE.match(label):
+            extra = (u'  (%s %s)' % call if call else
+                     u'  (its plugin and function are not in %s)' % XAPI_LOG)
+        say(u'  %s  %s%s' % (task.get('uuid', '?'), label, extra))
+
+def queries_text(queries):
+    counts = collections.Counter(u'%s %s' % _CALLS[t.get('uuid')] for t in queries)
+    return u', '.join(u'%s x%d' % (k, n) if n > 1 else k for k, n in sorted(counts.items()))
 
 def check_tasks(ignore):
     try:
-        tasks = pending_tasks()
+        tasks, scans, queries = pending_tasks()
+        if tasks and not ignore:
+            seen = uuids(tasks)
+            pause(POLL)
+            tasks, scans, queries = pending_tasks()
+            tasks = [t for t in tasks if t.get('uuid') in seen]
+            if tasks and all(PLUGIN_TASK_RE.match(t.get('name-label', '')) for t in tasks):
+                scans, queries = await_tasks(False, 'asking to go ahead', Refused, uuids(tasks))
+                tasks = []
     except Failed as exc:
         raise Refused(_text(exc))
+    if scans:
+        say('%d SR scan(s) in progress: stopping xapi interrupts them, as any toolstack restart '
+            'does, and the next scan of each SR does the work again.' % len(scans))
+    if queries:
+        say(u'%d plugin call(s) in progress that only query (%s): stopping xapi loses nothing '
+            u'but their answers.' % (len(queries), queries_text(queries)))
     if not tasks:
         return
     list_tasks(tasks)
@@ -1052,24 +1176,27 @@ def check_tasks(ignore):
                       'or pass --ignore-tasks to go ahead and let them fail.' % len(tasks))
     warn('going ahead with %d pending task(s): --ignore-tasks' % len(tasks))
 
-def await_tasks(ignore, before):
+def await_tasks(ignore, before, refuse=Failed, seen=None):
     deadline = _now() + TASK_WAIT
     shown = False
     while True:
-        tasks = pending_tasks()
-        if not tasks:
-            return
+        current, scans, queries = pending_tasks()
         if ignore:
-            list_tasks(tasks)
-            warn('%s with %d pending task(s): --ignore-tasks' % (before, len(tasks)))
-            return
-        if not shown:
+            if current:
+                list_tasks(current)
+                warn('%s with %d pending task(s): --ignore-tasks' % (before, len(current)))
+            return scans, queries
+        tasks = [t for t in current if seen is not None and t.get('uuid') in seen]
+        if not current or (seen is not None and not tasks):
+            return scans, queries
+        if tasks and not shown:
             list_tasks(tasks)
             step('Waiting up to %ds for them to finish before %s...' % (TASK_WAIT, before))
             shown = True
-        if _now() > deadline:
-            raise Failed('%d task(s) still pending after %ds, so this run stopped before %s'
+        if tasks and _now() > deadline:
+            raise refuse('%d task(s) still pending after %ds, so this run stopped before %s'
                          % (len(tasks), TASK_WAIT, before))
+        seen = uuids(current)
         pause(POLL)
 
 class HaSettings(object):
@@ -1608,7 +1735,12 @@ def ha_off(run_):
 def stop_for_edit(run_, xapi_up=True):
     require_disarmed()
     if xapi_up:
-        await_tasks(run_.ignore_tasks, 'stopping xapi')
+        scans, queries = await_tasks(run_.ignore_tasks, 'stopping xapi')
+        if scans:
+            step('%d SR scan(s) in progress: stopping xapi interrupts them.' % len(scans))
+        if queries:
+            step(u'%d plugin call(s) in progress that only query (%s): stopping xapi loses '
+                 u'their answers.' % (len(queries), queries_text(queries)))
     run_.xapi_touched = True
     stop_xapi()
     checkpoint()
@@ -1853,7 +1985,8 @@ def build_parser():
         cmd.add_argument('-y', '--yes', action='store_true',
                          help='do not ask for confirmation')
         cmd.add_argument('--ignore-tasks', action='store_true',
-                         help='go ahead even though xapi has tasks pending')
+                         help='go ahead even though xapi has tasks pending (SR scans and '
+                              'plugin calls that only query never hold a run up)')
         cmd.set_defaults(func=func)
     return parser
 
