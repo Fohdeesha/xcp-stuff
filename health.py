@@ -284,6 +284,11 @@ COREDUMP_DIR = "/var/lib/systemd/coredump"          # anything here means a dom0
 COREDUMP_MAX_LINES = 50          # coredumps listed in the detail block (newest first)
 PKG_DIFF_MAX_LINES = 100         # mismatched yum packages listed
 XOSTOR_QCOW2_MAX_LINES = 50      # qcow2 VDIs on XOSTOR listed
+# packages whose installed versions 'XOSTOR Packages' lists on every host, in print order
+XOSTOR_PACKAGES = (
+    "kmod-drbd", "drbd", "drbd-utils", "drbd-reactor", "linstor-satellite",
+    "linstor-controller", "linstor-client", "python-linstor", "xcp-ng-linstor",
+)
 DMESG_MAX_LINES = 80             # lines of a dmesg detail block (Dmesg Content, OOM Events);
                                  # the newest are kept, and the rollup runs first
 DMESG_ROLLUP_MIN = 3             # consecutive copies of one dmesg message folded into a
@@ -315,6 +320,7 @@ POOL_RUN = {
     "smapi_hidden_leaves": False,
     "rebooted_after_updates": True,
     "yum_patch_level": True,
+    "xostor_versions": True,
 }
 
 
@@ -1325,6 +1331,30 @@ def manifest_versions(text):
     return out
 
 
+def manifest_packages(text):
+    """{name: [version, ...]} with each version as a person reads it: the 0: epoch and
+    the .arch suffix dropped, so 'kmod-drbd 0:9.2.11-1.xcpng8.3.x86_64' gives
+    '9.2.11-1.xcpng8.3'. A list per name because kmod packages can be installed twice."""
+    out = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or " " not in line:
+            continue
+        name, version = line.split(" ", 1)
+        if version.startswith("0:"):
+            version = version[2:]
+        version = re.sub(r"\.(x86_64|noarch|i686)$", "", version)
+        out.setdefault(name, []).append(version)
+    return out
+
+
+def leading_version(text):
+    """'9.2.11' out of '9.2.11-1.xcpng8.3', '9.2.11_4.19.0+1' or '9.2.11 (api:2)' -
+    the part the module and its rpm both carry, so the two can be compared."""
+    m = re.match(r"\s*(\d+(?:\.\d+)*)", text or "")
+    return m.group(1) if m else ""
+
+
 def manifest_diff(master_text, slave_text):
     """The difference lines, sorted, exactly as the report prints them."""
     master = manifest_versions(master_text)
@@ -1341,6 +1371,24 @@ def manifest_diff(master_text, slave_text):
             lines.append("Missing Package: %s %s" % (name, master[name]))
     lines.sort()
     return lines
+
+
+_DIFF_KINDS = (
+    ("Does Not Match Master:", "version differs", "versions differ"),
+    ("Extra Package:", "extra", "extra"),
+    ("Missing Package:", "missing", "missing"),
+)
+
+
+def manifest_diff_summary(lines):
+    """'2 versions differ, 1 extra, 3 missing' - counted from the full diff before any
+    cap, so the status line still gives the true totals when the list below is cut."""
+    parts = []
+    for prefix, one, many in _DIFF_KINDS:
+        n = sum(1 for ln in lines if ln.startswith(prefix))
+        if n:
+            parts.append("%d %s" % (n, one if n == 1 else many))
+    return ", ".join(parts)
 
 
 def cap_lines(lines, limit, noun):
@@ -2903,6 +2951,18 @@ def collect_rpm_manifest():
     return fact("\n".join(lines))
 
 
+def collect_drbd_module():
+    """The DRBD kernel module's own version, which is what is actually running - the
+    kmod-drbd rpm can be updated underneath it and stays inert until the next reboot.
+    '' means the module is not loaded, which is an answer, not a failure to look."""
+    if not os.path.isdir("/sys/module/drbd"):
+        return fact("")
+    text = read_file("/sys/module/drbd/version")
+    if text is None or not text.strip():
+        return err("could not read /sys/module/drbd/version")
+    return fact(text.strip())
+
+
 def collect_yum_check_update():
     """yum check-update: rc 0 = nothing to do, rc 100 = updates listed, anything else
     means yum itself failed (broken repo, no network) - which must never read as zero."""
@@ -3556,6 +3616,7 @@ def collect(spec):
         out["coredumps"] = collect_coredumps(spec.get("coredump_dir") or "")
         out["task_timeout"] = collect_task_timeout_override()
         out["rpm_manifest"] = collect_rpm_manifest()
+        out["drbd_module"] = collect_drbd_module()
         out.update(collect_patch_facts())
 
         if self_uuid:
@@ -5760,8 +5821,103 @@ def yum_patch_level(host, is_master, master_manifest):
         return ok("Yum Patch Level", "Match")
     diff = parsers.manifest_diff(master_manifest, f.value)
     shown = parsers.cap_lines(diff, config.PKG_DIFF_MAX_LINES, "more difference(s)")
-    return flag("Yum Patch Level", "Mismatch, See Below").with_detail(
+    summary = parsers.manifest_diff_summary(diff)
+    status = "Mismatch (%s), See Below" % summary if summary else "Mismatch, See Below"
+    return flag("Yum Patch Level", status).with_detail(
         "Yum Patch Level Differences", "\n".join(shown))
+
+
+def _xostor_signature(host):
+    """(tracked package versions, loaded drbd version) for one host, or None when either
+    fact is missing - unknown is not a difference, same rule as the RAM and NTP lines."""
+    manifest = host.fact("rpm_manifest")
+    module = host.fact("drbd_module")
+    if not manifest.ok or not manifest.value.strip() or not module.ok:
+        return None
+    pkgs = parsers.manifest_packages(manifest.value)
+    tracked = tuple((n, tuple(pkgs[n])) for n in config.XOSTOR_PACKAGES if n in pkgs)
+    return tracked, module.value
+
+
+def _drbd_stale(loaded, kmod_versions):
+    """The running module is not any installed kmod-drbd - updated, not yet rebooted."""
+    return parsers.leading_version(loaded) not in \
+        [parsers.leading_version(v) for v in kmod_versions]
+
+
+def xostor_version_consistency(hosts, details_shown=True):
+    """One pool-level yes/no: do the hosts agree on XOSTOR package versions and the
+    loaded DRBD module, and is each host running the kmod-drbd it has installed?
+
+    Deliberately no detail - the per-host 'XOSTOR Packages' / 'XOSTOR DRBD Module' lines
+    carry it. This line exists so a discrepancy is not missed by someone reading only
+    the pool section. details_shown is False when those per-host lines are switched off
+    for slaves, and then the line must not send the reader to look for them.
+    """
+    key = "XOSTOR Version Consistency"
+    sigs = [s for s in (_xostor_signature(h) for h in hosts) if s is not None]
+    if not sigs:
+        return unknown(key, "Unknown (could not read versions from any host)")
+    stale = any(loaded and dict(tracked).get("kmod-drbd")
+                and _drbd_stale(loaded, dict(tracked)["kmod-drbd"])
+                for tracked, loaded in sigs)
+    if stale or len(set(sigs)) > 1:
+        return flag(key, "Mismatched, See Host Results" if details_shown else "Mismatched")
+    if len(sigs) < len(hosts):
+        return unknown(key, "Matched on %d of %d hosts (rest unreadable)"
+                       % (len(sigs), len(hosts)))
+    return ok(key, "Matched")
+
+
+def xostor_versions(host, pool_uses_xostor):
+    """'XOSTOR Packages' and 'XOSTOR DRBD Module' for one host.
+
+    Shown when the pool says XOSTOR is in use, or when this host carries DRBD/LINSTOR
+    bits anyway - single mode has no pool view, and a host with a stray module loaded is
+    worth seeing. The module line compares what is RUNNING (/sys/module/drbd/version)
+    with what is INSTALLED (kmod-drbd): an updated kmod is inert until the next reboot,
+    and a pool part-way through that is exactly when DRBD versions disagree.
+    """
+    manifest = host.fact("rpm_manifest")
+    module = host.fact("drbd_module")
+    pkgs = parsers.manifest_packages(manifest.value) if manifest.ok else {}
+    tracked = [(n, pkgs[n]) for n in config.XOSTOR_PACKAGES if n in pkgs]
+    loaded = module.value if module.ok else ""
+    if not pool_uses_xostor and not tracked and not loaded:
+        if manifest.ok and module.ok:
+            return None   # established: no XOSTOR here, so nothing to say
+        if not manifest.ok and not module.ok:
+            return None   # cannot tell whether XOSTOR applies; the pool line says if so
+
+    lines = []
+    if not manifest.ok or not manifest.value.strip():
+        lines.append(unknown("XOSTOR Packages", "Unknown (could not read rpm manifest)"))
+    elif not tracked:
+        lines.append(flag("XOSTOR Packages", "None Installed"))
+    else:
+        lines.append(info("XOSTOR Packages", ", ".join(
+            "%s %s" % (n, " + ".join(v)) for n, v in tracked)))
+
+    key = "XOSTOR DRBD Module"
+    if not module.ok:
+        lines.append(unknown(key, "Unknown (%s)" % module.error))
+        return lines
+    kmod = pkgs.get("kmod-drbd") or []
+    if not loaded:
+        lines.append(flag(key, "Not Loaded"))
+        return lines
+    if not manifest.ok:
+        lines.append(unknown(key, "Loaded %s (installed kmod-drbd unknown)" % loaded))
+        return lines
+    if not kmod:
+        lines.append(flag(key, "Loaded %s, but kmod-drbd is not installed" % loaded))
+        return lines
+    if not _drbd_stale(loaded, kmod):
+        lines.append(ok(key, "Loaded %s (matches kmod-drbd)" % loaded))
+    else:
+        lines.append(flag(key, "Loaded %s, Installed kmod-drbd %s (reboot pending?)"
+                          % (loaded, " + ".join(kmod))))
+    return lines
 
 
 # --------------------------------------------------------------------------------------
@@ -8086,6 +8242,12 @@ def pool_status_section(run, rep):
     rep.check("XOSTOR In Use", checks.xostor_in_use, run.pool)
     if run.pool.xostor_in_use():
         rep.check("XOSTOR RAM", checks.xostor_ram, run.pool, memory)
+        if not run.host_solo():
+            # the master always prints its own XOSTOR lines, but a slave's discrepancy
+            # is only spelled out if slaves run them too
+            rep.check("XOSTOR Version Consistency", checks.xostor_version_consistency,
+                      [h for h in run.hosts if h.reachable],
+                      config.POOL_RUN.get("xostor_versions", True))
         rep.check("XOSTOR Faulty Resources", checks.xostor_faulty_resources, run.pool)
         rep.check("XOSTOR Faulty Nodes", checks.xostor_nodes, run.pool)
         rep.check("XOSTOR Controller IP", checks.xostor_controller, run.pool, run.host_names)
@@ -8271,6 +8433,9 @@ def host_section(run, rep, host):
     if run.pool_mode and not run.host_solo() and gated(run, host, "yum_patch_level"):
         rep.check("Yum Patch Level", checks.yum_patch_level, host, host.is_master,
                   run.master_manifest())
+    if gated(run, host, "xostor_versions"):
+        rep.check("XOSTOR Packages", checks.xostor_versions, host,
+                  run.pool.xostor_in_use())
     rep.end_section()
 
 
@@ -8525,16 +8690,16 @@ def _module(name, exported):
     return module
 
 
-config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DMESG_MAX_LINES', 'DMESG_ROLLUP_MIN', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MOUNT_PROBE_RESERVE', 'MOUNT_PROBE_TIMEOUT', 'MOUNT_STALL_FILES', 'MOUNT_STALL_PHRASES', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'NETWORK_FS_TYPES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'PROGRESS_INTERVAL', 'REMOTE_CMD_TIMEOUT', 'RUN_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'STUCK_MAX_LINES', 'STUCK_MIN_AGE', 'STUCK_RECHECK_DELAY', 'STUCK_SAMPLES', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOA_STOCK_PLUGINS', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_QCOW2_MAX_LINES', 'XO_DNS_TIMEOUT', 'XO_PLUGIN_LOOKUP_PATHS', 'XO_PLUGIN_PREFIX', 'XO_PLUGIN_SCOPE_DIR', 'XO_PLUGIN_SCOPE_PREFIX', 'XO_REDIS_TIMEOUT'])
+config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DMESG_MAX_LINES', 'DMESG_ROLLUP_MIN', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MOUNT_PROBE_RESERVE', 'MOUNT_PROBE_TIMEOUT', 'MOUNT_STALL_FILES', 'MOUNT_STALL_PHRASES', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'NETWORK_FS_TYPES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'PROGRESS_INTERVAL', 'REMOTE_CMD_TIMEOUT', 'RUN_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'STUCK_MAX_LINES', 'STUCK_MIN_AGE', 'STUCK_RECHECK_DELAY', 'STUCK_SAMPLES', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOA_STOCK_PLUGINS', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_PACKAGES', 'XOSTOR_QCOW2_MAX_LINES', 'XO_DNS_TIMEOUT', 'XO_PLUGIN_LOOKUP_PATHS', 'XO_PLUGIN_PREFIX', 'XO_PLUGIN_SCOPE_DIR', 'XO_PLUGIN_SCOPE_PREFIX', 'XO_REDIS_TIMEOUT'])
 colors = _module('colors', ['CYAN', 'GREEN', 'RESET', 'YELLOW', 'cyan', 'green', 'init', 'strip_ansi', 'yellow'])
 result = _module('result', ['FLAG', 'Fact', 'INFO', 'Line', 'MISSING', 'OK', 'UNKNOWN', 'flag', 'guard', 'info', 'ok', 'pinned', 'raw', 'unknown', 'wrap'])
-parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', '_LINK_RE', '_LOOSE_URL_RE', '_MANIFEST_PKG_RE', '_MTU_RE', '_PARAM_RE', '_PREMIUM_SUFFIX', '_SCHEME_RE', '_TS_RE', '_XO_URL_RE', '_cidr_range', '_ids_among', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'backup_runners', 'cap_lines', 'classify_multipath_path', 'classify_xo_plugins', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'format_age', 'has_overlapping_subnets', 'has_url_scheme', 'host_records_from_state_db', 'http_proxy_address', 'ip_literal', 'job_field', 'job_touches_pool', 'manifest_diff', 'manifest_plugin_names', 'manifest_versions', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pool_conf', 'parse_timedatectl', 'parse_xe_records', 'plugin_block', 'pool_member_addresses', 'rollup_repeats', 'round_1dp', 'split_host_port', 'split_timestamp', 'truncate_block', 'xo_pattern_match', 'xo_server_address', 'xo_simple_ids'])
+parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', '_DIFF_KINDS', '_LINK_RE', '_LOOSE_URL_RE', '_MANIFEST_PKG_RE', '_MTU_RE', '_PARAM_RE', '_PREMIUM_SUFFIX', '_SCHEME_RE', '_TS_RE', '_XO_URL_RE', '_cidr_range', '_ids_among', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'backup_runners', 'cap_lines', 'classify_multipath_path', 'classify_xo_plugins', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'format_age', 'has_overlapping_subnets', 'has_url_scheme', 'host_records_from_state_db', 'http_proxy_address', 'ip_literal', 'job_field', 'job_touches_pool', 'leading_version', 'manifest_diff', 'manifest_diff_summary', 'manifest_packages', 'manifest_plugin_names', 'manifest_versions', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pool_conf', 'parse_timedatectl', 'parse_xe_records', 'plugin_block', 'pool_member_addresses', 'rollup_repeats', 'round_1dp', 'split_host_port', 'split_timestamp', 'truncate_block', 'xo_pattern_match', 'xo_server_address', 'xo_simple_ids'])
 model = _module('model', ['Host', 'Pool', 'ntp_match', 'ram_match'])
 collectorsrc = _module('collectorsrc', ['EMBEDDED', 'collector_source'])
 transport = _module('transport', ['ASKPASS_ENV', 'ASKPASS_SCRIPT', 'AUTH_ASKPASS', 'AUTH_SSHPASS', 'BEGIN_MARKER', 'CollectError', 'END_MARKER', 'Transport', '_DEBUG_LOCK', '_LIVE', '_LIVE_LOCK', '_REMOTE_LAUNCH', '_REMOTE_LAUNCH_PINNED', '_kill_tree', '_remote_launch', 'cleanup_work_dir', 'debug', 'ensure_sshpass', 'have', 'kill_all_children', 'make_work_dir', 'run_local_cmd', 'which', 'write_askpass'])
 xoredis = _module('xoredis', ['DEFAULT_ADDR', 'ENCRYPTION_PREFIX', 'IDS_KEY', 'PLUGIN_IDS_KEY', 'PLUGIN_RECORD_PREFIX', 'RECORD_PREFIX', 'RedisError', '_config_dirs', '_config_files', '_encode', '_fetch', '_fetch_autoload', '_fetch_collection', '_flatten', '_mentions_redis', '_read_reply', 'read_plugin_autoload', 'read_records', 'read_server_records'])
 xodb = _module('xodb', ['QUOTES', 'SELECT_NONE', 'SELECT_NO_MATCH', 'SELECT_OK', 'SELECT_QUIT', 'SELECT_UNREADABLE', 'Server', '_ALL_SERVERS', '_COLLECTIONS', '_ESCAPE_RE', '_KEY_RE', '_READ_ERROR', '_RESOLVED', '_SIMPLE_ESCAPES', '_describe_failure', '_ls', '_read_servers', '_resolve', '_same_address', '_sort_key', 'all_servers', 'backup_routes', 'clean', 'collection', 'db_address', 'enabled_server_for', 'enabled_servers', 'have_xo_server_db', 'match_record', 'password_for', 'pool_name_for_host', 'read_error', 'record_password', 'reset_cache', 'scan_records', 'select_pool', 'server_for_host', 'unescape'])
-checks = _module('checks', ['_backup_moved_elsewhere', '_dmesg_phrase_blocks', '_first_line', '_linstor_column', '_linstor_has_rows', '_linstor_line', '_linstor_node_addresses', '_linstor_node_offline', '_linstor_table', '_linstor_unknown', '_maps', '_mount_detail', '_multipath_detail', '_multipath_read', '_network_line', '_pool_conf_target', '_pool_roles_detail', '_render_scan_blocks', '_stuck_detail', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_block', 'dmesg_content', 'dmesg_content_of', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mount_stalls', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'network_mounts', 'ntp', 'oom_events', 'overlapping_subnets', 'pool_host_list', 'pool_roles', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'stuck_processes', 'tap_status', 'task_timeout_override', 'vlan0', 'xapi_status', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_nodes', 'xostor_pref_nic', 'xostor_qcow2', 'xostor_ram', 'yum_patch_level'])
+checks = _module('checks', ['_backup_moved_elsewhere', '_dmesg_phrase_blocks', '_drbd_stale', '_first_line', '_linstor_column', '_linstor_has_rows', '_linstor_line', '_linstor_node_addresses', '_linstor_node_offline', '_linstor_table', '_linstor_unknown', '_maps', '_mount_detail', '_multipath_detail', '_multipath_read', '_network_line', '_pool_conf_target', '_pool_roles_detail', '_render_scan_blocks', '_stuck_detail', '_xostor_signature', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_block', 'dmesg_content', 'dmesg_content_of', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mount_stalls', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'network_mounts', 'ntp', 'oom_events', 'overlapping_subnets', 'pool_host_list', 'pool_roles', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'stuck_processes', 'tap_status', 'task_timeout_override', 'vlan0', 'xapi_status', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_nodes', 'xostor_pref_nic', 'xostor_qcow2', 'xostor_ram', 'xostor_version_consistency', 'xostor_versions', 'yum_patch_level'])
 xoa = _module('xoa', ['_dmesg', '_first_token', '_max_old_space', '_meminfo', '_os_version', '_plugin_autoload', '_plugin_scan_targets', '_plugin_version', '_plugins_line', '_service_state', '_updater', 'collect_xoa', 'debian_version_ok', 'lines', 'ping_silent', 'running_as_root', 'scan_plugins'])
 report = _module('report', ['Report', '_as_entry'])
 runcmd = _module('runcmd', ['TRANSPORT_FAILED', '_run_one', 'execute'])
