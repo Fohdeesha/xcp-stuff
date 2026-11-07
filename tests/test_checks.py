@@ -11,6 +11,7 @@ import checks
 import config
 import main
 import model
+import parsers
 import result
 
 OK, FLAG, UNKNOWN, INFO = result.OK, result.FLAG, result.UNKNOWN, result.INFO
@@ -100,7 +101,8 @@ def test_the_check_table_and_the_slave_toggles_stay_in_step():
     table = set(toggle for toggle, _key, _fn in main.per_host_checks())
     # yum_patch_level is gated too, but from its own call site: it needs the master's
     # manifest passed in, so it is not one of the (host) -> Line entries in the table
-    assert table | {"yum_patch_level", "xostor_versions"} == toggles
+    assert table | {"yum_patch_level", "xostor_versions",
+                     "xostor_missing_devices"} == toggles
 
 
 def test_every_host_check_says_unknown_when_the_fact_is_an_error():
@@ -771,3 +773,129 @@ def test_dom0_disk_usage_names_the_mounts():
     df = "Filesystem Size Used Avail Use% Mounted on\n/dev/sda1 1G 1G 0 91% /var/log\n"
     line = checks.dom0_disk_usage(host(df=fact(df)))
     assert line.status == FLAG and "/var/log is at 91%" in line.text
+
+
+# --------------------------------------------------------------------------------------
+# XOSTOR Missing Devices
+# --------------------------------------------------------------------------------------
+
+U1, U2, U3 = "aaaa-1111", "bbbb-2222", "cccc-3333"
+PVS_HEALTHY = ("  /dev/sda3|VG_XenStorage-1234|a--|%s\n"
+               "  /dev/sdb|linstor_group|a--|%s\n"
+               "  /dev/sdc|linstor_group|a--|%s\n" % (U3, U1, U2))
+PVS_MISSING = ("  /dev/sda3|VG_XenStorage-1234|a--|%s\n"
+               "  /dev/sdb|linstor_group|a--|%s\n"
+               "  [unknown]|linstor_group|a-m|%s\n" % (U3, U1, U2))
+# the shape of /etc/lvm/backup/linstor_group's PV section, as collect_lvm_backup sends it
+BACKUP = """\tphysical_volumes {
+
+\t\tpv0 {
+\t\t\tid = "%s"
+\t\t\tdevice = "/dev/sdb"\t# Hint only
+
+\t\t\tstatus = ["ALLOCATABLE"]
+\t\t\tflags = []
+\t\t\tdev_size = 3907029168\t# 1.81935 Terabytes
+\t\t}
+
+\t\tpv1 {
+\t\t\tid = "%s"
+\t\t\tdevice = "/dev/sdc"\t# Hint only
+\t\t}
+\t}""" % (U1, U2)
+
+
+def pvs(rows, warnings=""):
+    return fact({"rows": rows, "warnings": warnings})
+
+
+def xdev(rows, backup=BACKUP, warnings=""):
+    b = backup if isinstance(backup, dict) else fact(backup)
+    return checks.xostor_missing_devices(host(pvs=pvs(rows, warnings), lvm_backup=b))
+
+
+def test_lvm_backup_pvs_are_read_by_uuid_with_the_device_hint():
+    assert parsers.parse_lvm_backup_pvs(BACKUP) == [(U1, "/dev/sdb"), (U2, "/dev/sdc")]
+
+
+def test_xostor_missing_devices_ok_when_every_backed_up_pv_is_present():
+    line = xdev(PVS_HEALTHY)
+    assert line.status == OK and "2 PVs present" in line.text
+
+
+def test_xostor_missing_devices_matches_by_uuid_not_by_device_name():
+    renumbered = ("  /dev/sdd|linstor_group|a--|%s\n  /dev/sde|linstor_group|a--|%s\n"
+                  % (U1, U2))
+    assert xdev(renumbered).status == OK
+
+
+def test_xostor_missing_devices_flags_an_unknown_pv_with_its_last_device_and_warning():
+    line = xdev(PVS_MISSING, warnings="  WARNING: Couldn't find device with uuid %s.\n" % U2)
+    assert line.status == FLAG and line.flags
+    assert "1 of 2 PVs" in line.text
+    detail = line.detail_text
+    assert "/dev/sdc" in detail and "MISSING" in detail and "Couldn't find" in detail
+    assert U3 not in detail
+
+
+def test_xostor_missing_devices_flags_a_whole_vg_that_vanished_from_pvs():
+    line = xdev("  /dev/sda3|VG_XenStorage-1234|a--|%s\n" % U3)
+    assert line.status == FLAG and "All 2 PVs" in line.text
+
+
+def test_xostor_missing_devices_flags_a_pv_lvm_lost_but_the_backup_never_listed():
+    line = xdev(PVS_HEALTHY + "  [unknown]|linstor_group|a-m|dddd-4444\n")
+    assert line.status == FLAG and "1 of 3 PVs" in line.text
+
+
+def test_xostor_missing_devices_falls_back_to_pvs_when_the_backup_is_unreadable():
+    assert xdev(PVS_HEALTHY, err("could not read")).status == OK
+    line = xdev("  [unknown]|linstor_group|a-m|%s\n  /dev/sdb|linstor_group|a--|%s\n"
+                % (U2, U1), err("could not read"))
+    assert line.status == FLAG and "backup unreadable" in line.detail_text
+
+
+def test_xostor_missing_devices_ignores_missing_pvs_in_other_vgs():
+    assert xdev(PVS_HEALTHY + "  [unknown]|VG_XenStorage-9|a-m|eeee\n").status == OK
+
+
+def test_xostor_missing_devices_says_diskless_without_flagging():
+    line = xdev("  /dev/sda3|VG_XenStorage-1|a--|%s\n" % U3, None)
+    assert line.status == INFO and not line.flags
+
+
+def test_xostor_missing_devices_never_green_off_a_missing_fact():
+    for h in (host(), host(pvs=err("pvs timed out"), lvm_backup=fact(BACKUP)),
+              host(pvs=pvs(""), lvm_backup=err("could not read"))):
+        line = checks.xostor_missing_devices(h)
+        assert line.status == UNKNOWN and line.flags
+
+
+def _dhost(label, rows, backup=BACKUP):
+    h = host(pvs=pvs(rows), lvm_backup=backup if isinstance(backup, dict) else fact(backup))
+    h.hostname = label
+    return h
+
+
+def test_xostor_missing_devices_pool_none_when_every_host_is_whole():
+    line = checks.xostor_missing_devices_pool([_dhost("h1", PVS_HEALTHY),
+                                               _dhost("h2", PVS_HEALTHY)])
+    assert line.status == OK and "None" in line.text
+
+
+def test_xostor_missing_devices_pool_names_the_host_and_points_at_its_results():
+    line = checks.xostor_missing_devices_pool([_dhost("h1", PVS_HEALTHY),
+                                               _dhost("h2", PVS_MISSING)])
+    assert line.status == FLAG
+    assert "h2" in line.text and "h1" not in line.text and "See Host Results" in line.text
+    quiet = checks.xostor_missing_devices_pool([_dhost("h2", PVS_MISSING)], False)
+    assert "See Host Results" not in quiet.text
+
+
+def test_xostor_missing_devices_pool_never_green_with_a_host_unread():
+    line = checks.xostor_missing_devices_pool([_dhost("h1", PVS_HEALTHY),
+                                               _dhost("h2", "", err("could not read"))])
+    assert line.status == UNKNOWN and "h2" in line.text
+    line = checks.xostor_missing_devices_pool([_dhost("h1", PVS_MISSING),
+                                               _dhost("h2", "", err("could not read"))])
+    assert line.status == FLAG and "unreadable on: h2" in line.text

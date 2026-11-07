@@ -48,7 +48,7 @@ import unicodedata
 # ======================================================================================
 # --- config ----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "3.24"
+SCRIPT_VERSION = "3.25"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
@@ -316,6 +316,7 @@ XOSTOR_PACKAGES = (
     "kmod-drbd", "drbd", "drbd-utils", "drbd-reactor", "linstor-satellite",
     "linstor-controller", "linstor-client", "python-linstor", "xcp-ng-linstor",
 )
+XOSTOR_VG = "linstor_group"      # the LVM volume group XOSTOR builds its storage pool on
 DMESG_MAX_LINES = 80             # lines of a dmesg detail block (Dmesg Content, OOM Events);
                                  # the newest are kept, and the rollup runs first
 DMESG_ROLLUP_MIN = 3             # consecutive copies of one dmesg message folded into a
@@ -350,6 +351,7 @@ POOL_RUN = {
     "rebooted_after_updates": True,
     "yum_patch_level": True,
     "xostor_versions": True,
+    "xostor_missing_devices": True,
 }
 
 
@@ -833,6 +835,43 @@ def parse_failed_units(text):
             continue
         units.append((parts[0], parts[4] if len(parts) > 4 else ""))
     return units
+
+
+def parse_pvs(text):
+    """[(pv name, vg name, attr, uuid)] from 'pvs --noheadings --separator | -o
+    pv_name,vg_name,pv_attr,pv_uuid'. A line without the separators is a warning that
+    landed on stdout, not a row; uuid is '' from an older collector that did not ask."""
+    rows = []
+    for line in (text or "").splitlines():
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 3 or not parts[0]:
+            continue
+        rows.append((parts[0], parts[1], parts[2], parts[3] if len(parts) > 3 else ""))
+    return rows
+
+
+def parse_lvm_backup_pvs(text):
+    """[(uuid, device hint)] out of the physical_volumes section of an LVM metadata
+    backup, in file order. 'device' is LVM's 'Hint only' - where the PV was last seen,
+    which a reboot can renumber - so the uuid is what identifies it."""
+    pvs, cur = [], None
+    for line in (text or "").splitlines():
+        line = line.split("#", 1)[0].strip()
+        m = re.match(r'^(\S+)\s*\{$', line)
+        if m and m.group(1) != "physical_volumes":
+            cur = {"id": "", "device": ""}
+            pvs.append(cur)
+            continue
+        m = re.match(r'^(id|device)\s*=\s*"([^"]*)"', line)
+        if m and cur is not None:
+            cur[m.group(1)] = m.group(2)
+    return [(p["id"], p["device"]) for p in pvs if p["id"]]
+
+
+def pv_missing(name, attr):
+    """The PV's device is gone: LVM names it '[unknown]' ('unknown device' before lvm2
+    2.02.x) and sets the third attr character to 'm'. Either is enough."""
+    return name in ("[unknown]", "unknown device") or (len(attr) > 2 and attr[2] == "m")
 
 
 def host_records_from_state_db(rows):
@@ -3271,6 +3310,72 @@ def collect_drbd_module():
     return fact(text.strip())
 
 
+PVS_TIMEOUT = 30
+
+
+def collect_pvs():
+    """Every LVM physical volume this host's LVM knows of, one '|'-separated row each
+    (name, VG, attr, uuid), and pvs's own warnings beside them.
+
+    Collected on every host whether or not XOSTOR is in use - which hosts that applies to
+    is a pool fact the collector does not have yet - and judged report-side. A PV that has
+    gone away still has a row, read out of the VG metadata on the PVs that remain, named
+    '[unknown]' with an 'm' in its attr, and its uuid; stderr says which uuid could not be
+    found. pvs may exit non-zero over exactly that, so rows are the test of
+    whether it answered, not the exit code.
+    """
+    if which("pvs") is None:
+        return err("pvs not found")
+    r = run(["pvs", "--noheadings", "--separator", "|",
+             "-o", "pv_name,vg_name,pv_attr,pv_uuid"], timeout=PVS_TIMEOUT)
+    if r.timed_out:
+        return err("pvs timed out")
+    if not r.ok and not r.out.strip():
+        return err("pvs failed (%s)" % r.why())
+    return fact({"rows": r.out, "warnings": r.err})
+
+
+LVM_BACKUP_DIR = "/etc/lvm/backup"
+
+
+def collect_lvm_backup(vg):
+    """The physical_volumes section of LVM's own metadata backup for one VG.
+
+    LVM rewrites /etc/lvm/backup/<vg> on every metadata change, so it is the list of PVs
+    the VG is meant to have - and it survives the case pvs cannot speak to: when every
+    disk of the VG is gone there is no metadata left to read, the VG vanishes from pvs,
+    and only this file still says it existed. None means no backup file, which on a
+    diskless node is the expected answer. Only the PV section is sent; the LV section of a
+    busy XOSTOR VG runs to thousands of lines and is not asked about.
+    """
+    if not vg or "/" in vg:
+        return err("bad volume group name %r" % vg)
+    path = os.path.join(LVM_BACKUP_DIR, vg)
+    if not os.path.exists(path):
+        return fact(None)
+    text = read_file(path)
+    if text is None:
+        return err("could not read %s" % path)
+    return fact(lvm_section(text, "physical_volumes"))
+
+
+def lvm_section(text, name):
+    """The '<name> { ... }' block of an LVM metadata file, braces included; '' if absent.
+    Depth is counted on braces outside quotes - device paths and tags never hold one, but
+    a description string could."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip().startswith(name) and line.rstrip().endswith("{"):
+            depth = 0
+            for j in range(i, len(lines)):
+                bare = re.sub(r'"[^"]*"', "", lines[j].split("#", 1)[0])
+                depth += bare.count("{") - bare.count("}")
+                if depth <= 0:
+                    return "\n".join(lines[i:j + 1])
+            return "\n".join(lines[i:])
+    return ""
+
+
 def collect_yum_check_update():
     """yum check-update: rc 0 = nothing to do, rc 100 = updates listed, anything else
     means yum itself failed (broken repo, no network) - which must never read as zero."""
@@ -3954,6 +4059,8 @@ def collect(spec):
         out["task_timeout"] = collect_task_timeout_override()
         out["rpm_manifest"] = collect_rpm_manifest()
         out["drbd_module"] = collect_drbd_module()
+        out["pvs"] = collect_pvs()
+        out["lvm_backup"] = collect_lvm_backup(spec.get("xostor_vg") or "")
         out.update(collect_patch_facts())
 
         if self_uuid:
@@ -6699,6 +6806,101 @@ def vlan0(pool):
     return ok("VLAN 0 Check", "No")
 
 
+def _plural(n, word):
+    return "%d %s%s" % (n, word, "" if n == 1 else "s")
+
+
+def xostor_missing_devices(host):
+    """PVs of the XOSTOR volume group whose device LVM can no longer find.
+
+    Two sources, checked against each other. pvs: a disk that dropped out from under
+    linstor_group leaves the VG partial, and LVM still lists the PV from the metadata on
+    the disks that remain, as '[unknown]' / attr 'm'. /etc/lvm/backup/linstor_group: the
+    PVs the VG is meant to have, by uuid - which is what catches every disk gone at once,
+    when pvs has no metadata left to show the VG from at all. DRBD may be carrying on from
+    the peers' replicas, so nothing else on the host need look wrong yet. Only asked when
+    the pool uses XOSTOR.
+
+    No PVs and no backup file is said, not flagged: a diskless XOSTOR node is a supported
+    layout. No PVs and an unreadable backup is Unknown - that pair cannot tell a diskless
+    node from one that lost everything.
+    """
+    key = "XOSTOR Missing Devices"
+    vg = config.XOSTOR_VG
+    f = host.fact("pvs")
+    if not f.ok:
+        return unknown(key, "Unknown (%s)" % f.error)
+    rows = [r for r in parsers.parse_pvs(f.value.get("rows")) if r[1] == vg]
+    present = dict((r[3], r[0]) for r in rows if not parsers.pv_missing(r[0], r[2]))
+    flagged = [r for r in rows if parsers.pv_missing(r[0], r[2])]
+
+    b = host.fact("lvm_backup")
+    known = parsers.parse_lvm_backup_pvs(b.value) if b.ok and b.value else []
+
+    detail = []
+    if known:
+        lost = [(u, d) for u, d in known if u not in present]
+        total = len(known)
+        for u, d in known:
+            state = "present as %s" % present[u] if u in present else "MISSING"
+            detail.append("%-40s %-16s %s" % (u, d or "?", state))
+        # a PV pvs calls missing that the backup does not know of is still missing
+        extra = [r for r in flagged if r[3] not in dict(known)]
+        for r in extra:
+            detail.append("%-40s %-16s MISSING (not in %s backup)"
+                          % (r[3] or "?", r[0], vg))
+        n_missing = len(lost) + len(extra)
+        total += len(extra)
+    else:
+        if not rows:
+            if b.ok:
+                return info(key, "None (no %s PVs on this host)" % vg)
+            return unknown(key, "Unknown (no %s PVs, and %s)" % (vg, b.error))
+        total, n_missing = len(rows), len(flagged)
+        detail = ["%-40s %-16s %s" % (r[3] or "?", r[0], r[2]) for r in rows]
+        if not b.ok:
+            detail.append("(%s backup unreadable: %s)" % (vg, b.error))
+
+    if not n_missing:
+        return ok(key, "None (%s present)" % _plural(total, "PV"))
+    warnings = [w.strip() for w in (f.value.get("warnings") or "").splitlines() if w.strip()]
+    if warnings:
+        detail += [""] + warnings
+    what = "All %s" % _plural(total, "PV") if n_missing == total and total > 1 else \
+        "%d of %s" % (n_missing, _plural(total, "PV"))
+    return flag(key, "%s in %s Missing, See Below" % (what, vg)).with_detail(
+        "---xostor missing devices---", "\n".join(["%-40s %-16s %s" % (
+            "PV UUID", "Device (hint)", "State")] + detail))
+
+
+def xostor_missing_devices_pool(hosts, details_shown=True):
+    """One pool-level line rolling up every host's 'XOSTOR Missing Devices', so a lost
+    disk is not missed by someone reading only the pool section - the same reason
+    'XOSTOR Version Consistency' exists. Built from the host line itself, so the two can
+    never disagree. Names the hosts, since that is the first thing to know; the PVs are
+    in each host's own detail. details_shown is False when slaves do not print the
+    per-host line, and then the reader is not sent to look for it.
+    """
+    key = "XOSTOR Missing Devices"
+    missing, unread = [], []
+    for h in hosts:
+        line = xostor_missing_devices(h)
+        if line.status == result.FLAG:
+            missing.append(h.name)
+        elif line.status == result.UNKNOWN:
+            unread.append(h.name)
+    if missing:
+        text = "Yes, on: %s" % ", ".join(missing)
+        if details_shown:
+            text += " - See Host Results"
+        if unread:
+            text += " (unreadable on: %s)" % ", ".join(unread)
+        return flag(key, text)
+    if unread:
+        return unknown(key, "Unknown on: %s" % ", ".join(unread))
+    return ok(key, "None")
+
+
 def xostor_in_use(pool):
     f = pool.fact("xostor_srs")
     if not f.ok:
@@ -8024,6 +8226,7 @@ def _host_spec(with_smapi):
         "want": ["host"],
         "crash_ignore_file": config.CRASH_IGNORE_FILE,
         "coredump_dir": config.COREDUMP_DIR,
+        "xostor_vg": config.XOSTOR_VG,
         "smapi": bool(with_smapi),
         "log_scan": {"files": config.LOG_ERROR_FILES,
                      "phrases": config.LOG_ERROR_PHRASES,
@@ -8802,6 +9005,9 @@ def pool_status_section(run, rep):
             rep.check("XOSTOR Version Consistency", checks.xostor_version_consistency,
                       [h for h in run.hosts if h.reachable],
                       config.POOL_RUN.get("xostor_versions", True))
+            rep.check("XOSTOR Missing Devices", checks.xostor_missing_devices_pool,
+                      [h for h in run.hosts if h.reachable],
+                      config.POOL_RUN.get("xostor_missing_devices", True))
         rep.check("XOSTOR Faulty Resources", checks.xostor_faulty_resources, run.pool)
         rep.check("XOSTOR Faulty Nodes", checks.xostor_nodes, run.pool)
         rep.check("XOSTOR Controller IP", checks.xostor_controller, run.pool, run.host_names)
@@ -8992,6 +9198,8 @@ def host_section(run, rep, host):
     if gated(run, host, "xostor_versions"):
         rep.check("XOSTOR Packages", checks.xostor_versions, host,
                   run.pool.xostor_in_use())
+    if run.pool.xostor_in_use() and gated(run, host, "xostor_missing_devices"):
+        rep.check("XOSTOR Missing Devices", checks.xostor_missing_devices, host)
     rep.end_section()
 
 
@@ -9246,16 +9454,16 @@ def _module(name, exported):
     return module
 
 
-config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DMESG_MAX_LINES', 'DMESG_ROLLUP_MIN', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'FAILED_UNITS_IGNORE', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MOUNT_PROBE_RESERVE', 'MOUNT_PROBE_TIMEOUT', 'MOUNT_STALL_FILES', 'MOUNT_STALL_PHRASES', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'NETWORK_FS_TYPES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'PROGRESS_INTERVAL', 'REMOTE_CMD_TIMEOUT', 'RO_FS_DMESG', 'RO_FS_EXTRA', 'RO_FS_NATIVE_RO', 'RO_FS_SR_DIRS', 'RUN_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'STATIC_VDIS_UNIT', 'STUCK_MAX_LINES', 'STUCK_MIN_AGE', 'STUCK_RECHECK_DELAY', 'STUCK_SAMPLES', 'TASK_PENDING_MAX_HOURS', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOA_STOCK_PLUGINS', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_PACKAGES', 'XOSTOR_QCOW2_MAX_LINES', 'XO_DNS_TIMEOUT', 'XO_PLUGIN_LOOKUP_PATHS', 'XO_PLUGIN_PREFIX', 'XO_PLUGIN_SCOPE_DIR', 'XO_PLUGIN_SCOPE_PREFIX', 'XO_REDIS_TIMEOUT'])
+config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DMESG_MAX_LINES', 'DMESG_ROLLUP_MIN', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'FAILED_UNITS_IGNORE', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MOUNT_PROBE_RESERVE', 'MOUNT_PROBE_TIMEOUT', 'MOUNT_STALL_FILES', 'MOUNT_STALL_PHRASES', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'NETWORK_FS_TYPES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'PROGRESS_INTERVAL', 'REMOTE_CMD_TIMEOUT', 'RO_FS_DMESG', 'RO_FS_EXTRA', 'RO_FS_NATIVE_RO', 'RO_FS_SR_DIRS', 'RUN_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'STATIC_VDIS_UNIT', 'STUCK_MAX_LINES', 'STUCK_MIN_AGE', 'STUCK_RECHECK_DELAY', 'STUCK_SAMPLES', 'TASK_PENDING_MAX_HOURS', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOA_STOCK_PLUGINS', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_PACKAGES', 'XOSTOR_QCOW2_MAX_LINES', 'XOSTOR_VG', 'XO_DNS_TIMEOUT', 'XO_PLUGIN_LOOKUP_PATHS', 'XO_PLUGIN_PREFIX', 'XO_PLUGIN_SCOPE_DIR', 'XO_PLUGIN_SCOPE_PREFIX', 'XO_REDIS_TIMEOUT'])
 colors = _module('colors', ['CYAN', 'GREEN', 'RESET', 'YELLOW', 'cyan', 'green', 'init', 'strip_ansi', 'yellow'])
 result = _module('result', ['FLAG', 'Fact', 'INFO', 'Line', 'MISSING', 'OK', 'UNKNOWN', 'flag', 'guard', 'info', 'ok', 'pinned', 'raw', 'unknown', 'wrap'])
-parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', 'SR_ATTACH_SKIP_TYPES', '_DIFF_KINDS', '_LINK_RE', '_LOOSE_URL_RE', '_MANIFEST_PKG_RE', '_MOUNT_FIELD_ESCAPES', '_MTU_RE', '_PARAM_RE', '_PREMIUM_SUFFIX', '_SCHEME_RE', '_TS_RE', '_XO_URL_RE', '_cidr_range', '_ids_among', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'backup_runners', 'cap_lines', 'classify_multipath_path', 'classify_xo_plugins', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'format_age', 'has_overlapping_subnets', 'has_url_scheme', 'host_records_from_state_db', 'http_proxy_address', 'ip_literal', 'job_field', 'job_touches_pool', 'leading_version', 'manifest_diff', 'manifest_diff_summary', 'manifest_packages', 'manifest_plugin_names', 'manifest_versions', 'mount_field', 'mount_table', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_failed_units', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pending_tasks', 'parse_pool_conf', 'parse_sr_attachment', 'parse_timedatectl', 'parse_xe_records', 'plugin_block', 'pool_member_addresses', 'read_only_mounts', 'rollup_repeats', 'round_1dp', 'split_host_port', 'split_timestamp', 'static_vdis_failure_moot', 'truncate_block', 'unit_display', 'xapi_utc', 'xo_pattern_match', 'xo_server_address', 'xo_simple_ids'])
+parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', 'SR_ATTACH_SKIP_TYPES', '_DIFF_KINDS', '_LINK_RE', '_LOOSE_URL_RE', '_MANIFEST_PKG_RE', '_MOUNT_FIELD_ESCAPES', '_MTU_RE', '_PARAM_RE', '_PREMIUM_SUFFIX', '_SCHEME_RE', '_TS_RE', '_XO_URL_RE', '_cidr_range', '_ids_among', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'backup_runners', 'cap_lines', 'classify_multipath_path', 'classify_xo_plugins', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'format_age', 'has_overlapping_subnets', 'has_url_scheme', 'host_records_from_state_db', 'http_proxy_address', 'ip_literal', 'job_field', 'job_touches_pool', 'leading_version', 'manifest_diff', 'manifest_diff_summary', 'manifest_packages', 'manifest_plugin_names', 'manifest_versions', 'mount_field', 'mount_table', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_failed_units', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_lvm_backup_pvs', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pending_tasks', 'parse_pool_conf', 'parse_pvs', 'parse_sr_attachment', 'parse_timedatectl', 'parse_xe_records', 'plugin_block', 'pool_member_addresses', 'pv_missing', 'read_only_mounts', 'rollup_repeats', 'round_1dp', 'split_host_port', 'split_timestamp', 'static_vdis_failure_moot', 'truncate_block', 'unit_display', 'xapi_utc', 'xo_pattern_match', 'xo_server_address', 'xo_simple_ids'])
 model = _module('model', ['Host', 'Pool', 'ntp_match', 'ram_match'])
 collectorsrc = _module('collectorsrc', ['EMBEDDED', 'collector_source'])
 transport = _module('transport', ['ASKPASS_ENV', 'ASKPASS_SCRIPT', 'AUTH_ASKPASS', 'AUTH_SSHPASS', 'BEGIN_MARKER', 'CollectError', 'END_MARKER', 'Transport', '_DEBUG_LOCK', '_LIVE', '_LIVE_LOCK', '_REMOTE_LAUNCH', '_REMOTE_LAUNCH_PINNED', '_kill_tree', '_remote_launch', 'cleanup_work_dir', 'debug', 'ensure_sshpass', 'have', 'kill_all_children', 'make_work_dir', 'run_local_cmd', 'which', 'write_askpass'])
 xoredis = _module('xoredis', ['DEFAULT_ADDR', 'ENCRYPTION_PREFIX', 'IDS_KEY', 'PLUGIN_IDS_KEY', 'PLUGIN_RECORD_PREFIX', 'RECORD_PREFIX', 'RedisError', '_config_dirs', '_config_files', '_encode', '_fetch', '_fetch_autoload', '_fetch_collection', '_flatten', '_mentions_redis', '_read_reply', 'read_plugin_autoload', 'read_records', 'read_server_records'])
 xodb = _module('xodb', ['QUOTES', 'SELECT_NONE', 'SELECT_NO_MATCH', 'SELECT_OK', 'SELECT_QUIT', 'SELECT_UNREADABLE', 'Server', '_ALL_SERVERS', '_COLLECTIONS', '_ESCAPE_RE', '_KEY_RE', '_READ_ERROR', '_RESOLVED', '_SIMPLE_ESCAPES', '_describe_failure', '_ls', '_read_servers', '_resolve', '_same_address', '_sort_key', 'all_servers', 'backup_routes', 'clean', 'collection', 'db_address', 'enabled_server_for', 'enabled_servers', 'have_xo_server_db', 'match_record', 'password_for', 'pool_name_for_host', 'read_error', 'record_password', 'reset_cache', 'scan_records', 'select_pool', 'server_for_host', 'unescape'])
-checks = _module('checks', ['_backup_moved_elsewhere', '_dmesg_phrase_blocks', '_drbd_stale', '_first_line', '_linstor_column', '_linstor_has_rows', '_linstor_line', '_linstor_node_addresses', '_linstor_node_offline', '_linstor_table', '_linstor_unknown', '_maps', '_mount_detail', '_multipath_detail', '_multipath_read', '_network_line', '_pool_conf_target', '_pool_roles_detail', '_render_scan_blocks', '_ro_detail', '_ro_name', '_stuck_detail', '_xostor_signature', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_block', 'dmesg_content', 'dmesg_content_of', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'failed_units', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'long_running_tasks', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mount_stalls', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'network_mounts', 'ntp', 'oom_events', 'overlapping_subnets', 'pool_host_list', 'pool_roles', 'read_only_filesystems', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'sr_attachment', 'stuck_processes', 'tap_status', 'task_timeout_override', 'vlan0', 'xapi_status', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_nodes', 'xostor_pref_nic', 'xostor_qcow2', 'xostor_ram', 'xostor_version_consistency', 'xostor_versions', 'yum_patch_level'])
+checks = _module('checks', ['_backup_moved_elsewhere', '_dmesg_phrase_blocks', '_drbd_stale', '_first_line', '_linstor_column', '_linstor_has_rows', '_linstor_line', '_linstor_node_addresses', '_linstor_node_offline', '_linstor_table', '_linstor_unknown', '_maps', '_mount_detail', '_multipath_detail', '_multipath_read', '_network_line', '_plural', '_pool_conf_target', '_pool_roles_detail', '_render_scan_blocks', '_ro_detail', '_ro_name', '_stuck_detail', '_xostor_signature', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_block', 'dmesg_content', 'dmesg_content_of', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'failed_units', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'long_running_tasks', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mount_stalls', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'network_mounts', 'ntp', 'oom_events', 'overlapping_subnets', 'pool_host_list', 'pool_roles', 'read_only_filesystems', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'sr_attachment', 'stuck_processes', 'tap_status', 'task_timeout_override', 'vlan0', 'xapi_status', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_missing_devices', 'xostor_missing_devices_pool', 'xostor_nodes', 'xostor_pref_nic', 'xostor_qcow2', 'xostor_ram', 'xostor_version_consistency', 'xostor_versions', 'yum_patch_level'])
 xoa = _module('xoa', ['_dmesg', '_first_token', '_max_old_space', '_meminfo', '_os_version', '_plugin_autoload', '_plugin_scan_targets', '_plugin_version', '_plugins_line', '_service_state', '_updater', 'collect_xoa', 'debian_version_ok', 'lines', 'ping_silent', 'running_as_root', 'scan_plugins'])
 report = _module('report', ['Report', '_as_entry'])
 runcmd = _module('runcmd', ['TRANSPORT_FAILED', '_run_one', 'execute'])
