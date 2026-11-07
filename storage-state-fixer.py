@@ -29,7 +29,7 @@ import time
 import xml.parsers.expat
 import zlib
 
-VERSION = '2.13'
+VERSION = '2.14'
 PYTHON = sys.version.split()[0]
 PROG = 'storage-state-fixer'
 STORAGE_DB = '/var/run/nonpersistent/xapi/storage.db'
@@ -162,6 +162,9 @@ PROBE_TIMEOUT = 60
 VERIFY_DELAY = 30
 RESYNC_WAIT = 120
 RETEST_EVERY = 60
+BATCH_AGE = 60
+GATE_REUSE = 30
+BATCH_ACTIONS = ('attach-clean', 'dps-forget', 'dp0-destroy')
 IO_WAIT = 30
 IO_EVERY = 5
 KICK_WAIT = 60
@@ -1440,9 +1443,12 @@ SMLOG_PREFILTER = re.compile(b'|'.join(SMLOG_NEEDLES + (b'vdi_activate', b'ause 
                                                         b'efresh request for ', b'xcp-volume-')))
 
 
+PHY_NEEDLES = [b'phy/', b'LINSTOR PhyLink']
+
+
 def smlog_prefilter(activate, pause, phy):
     extra = ([b'vdi_activate'] if activate else []) + ([b'ause for '] if pause or phy else [])
-    extra += ([b'ause request for ', b'efresh request for '] if pause else []) + ([b'xcp-volume-'] if phy else [])
+    extra += ([b'ause request for ', b'efresh request for '] if pause else []) + (PHY_NEEDLES if phy else [])
     return re.compile(b'|'.join(SMLOG_NEEDLES + tuple(extra)))
 
 
@@ -3904,6 +3910,42 @@ def scan_log(path, now, sink, deadline=None, stats=None, prefilter=None):
         stats['nofirst'] = True
 
 
+SMLOG_PHY_TOKENS = tuple(PHY_NEEDLES) + (b'ause for ',)
+SMLOG_HEAD = 50
+
+
+def smlog_head(path, ref):
+    n = 0
+    with _open_log(path) as h:
+        for raw in h:
+            n += 1
+            if n > SMLOG_HEAD:
+                break
+            first = parse_smlog_line(raw.rstrip(b'\n').decode('utf-8', 'replace'), ref)
+            if first is not None and first[0] is not None:
+                return n, first[0]
+    return n, None
+
+
+def scan_log_phy(path, now, sink, deadline, stats=None):
+    ref = file_ref_time(path, now)
+    if stats is not None:
+        n, first = smlog_head(path, ref)
+        if first is not None:
+            stats.setdefault('firsts', []).append(first)
+        elif n:
+            stats['nofirst'] = True
+    for n, raw in taplog_lines(path, SMLOG_PHY_TOKENS, deadline, marks=()):
+        if not any(t in raw for t in SMLOG_PHY_TOKENS):
+            continue
+        ev = parse_smlog_line(raw.rstrip(b'\n').decode('utf-8', 'replace'), ref)
+        if stats is not None:
+            stats['kept'] += 1
+            stats['parsed'] += ev is not None
+        if ev is not None:
+            sink(ev)
+
+
 def log_number(path):
     if path == SMLOG:
         return 0
@@ -4129,8 +4171,8 @@ class SmlogScan(object):
         self.leafev = []
         self.prefilter = smlog_prefilter(self.activate, self.pause, self.phy)
 
-    def file(self, num):
-        return SmlogFile(self, num)
+    def file(self, num, phy_only=False):
+        return SmlogFile(self, num, phy_only)
 
     def commit(self, fs):
         for k, v in fs.events.items():
@@ -4172,9 +4214,10 @@ class SmlogScan(object):
 
 
 class SmlogFile(object):
-    def __init__(self, scan, num):
+    def __init__(self, scan, num, phy_only=False):
         self.scan = scan
         self.num = num
+        self.phy_only = phy_only
         self.events = collections.defaultdict(list)
         self.runs = []
         self.open = {}
@@ -4246,6 +4289,8 @@ class SmlogFile(object):
             elif r['sr'] is None:
                 r['sr'] = m.group(1)
         if ident == 'SMGC':
+            if self.phy_only:
+                return
             lk = leaf_event(text)
             if lk is not None and t is not None:
                 self.leafev.append([t, -self.num, len(self.leafev), pid, lk[0], lk[1]])
@@ -4535,14 +4580,16 @@ def smlog_scan(q):
         deadline = min(deadline, _DEADLINE[0] - 20)
     stats = {'kept': 0, 'parsed': 0}
     for i, path in enumerate(files):
+        phy_only = False
         if i >= 2:
             need = [u for u in scan.relink if not any(e[1] == 'set' for e in scan.events.get('relink:' + u, []))]
             need += [s for s in scan.abort_srs if not any(e[1] == 'set' for e in scan.events.get('abort:' + s, []))]
             need += [v for v in scan.pause if not any(e[1] == 'pause' for e in scan.events.get('preq:' + v, []))]
-            need += [v for v in scan.phy if not scan.events.get('phy:' + v)]
-            if not need:
+            phys = [v for v in scan.phy if not scan.events.get('phy:' + v)]
+            if not need and not phys:
                 all_read = False
                 break
+            phy_only = not need
             if _now() > deadline:
                 complete = all_read = False
                 stopped = 'out of time'
@@ -4552,13 +4599,16 @@ def smlog_scan(q):
             complete = all_read = False
             stopped = 'the rotated files are not numbered in sequence at %s' % path
             break
-        fs = scan.file(num)
+        fs = scan.file(num, phy_only)
         try:
             st = os.stat(path)
             if st.st_ino != inos[i]:
                 rotated = path
                 break
-            scan_log(path, now, fs.sink, deadline, stats, scan.prefilter)
+            if phy_only:
+                scan_log_phy(path, now, fs.sink, deadline, stats)
+            else:
+                scan_log(path, now, fs.sink, deadline, stats, scan.prefilter)
             if file_inode(path) != inos[i]:
                 rotated = path
                 break
@@ -4578,7 +4628,8 @@ def smlog_scan(q):
             stopped = '%s could not be read (%s)' % (path, _text(exc) or type(exc).__name__)
             break
         scan.commit(fs)
-        read.append({'path': path, 'ino': st.st_ino, 'size': st.st_size, 'mtime': st.st_mtime})
+        read.append(dict({'path': path, 'ino': st.st_ino, 'size': st.st_size, 'mtime': st.st_mtime},
+                         **({'only': 'phy'} if phy_only else {})))
     if rotated:
         complete = all_read = False
         stopped = '%s was rotated while the logs were read' % rotated
@@ -4678,9 +4729,9 @@ def taplog_stream(path, deadline):
 TAPLOG_CHUNK = 32 << 20
 
 
-def taplog_region(data, first, toks, deadline, path):
+def taplog_region(data, first, toks, deadline, path, marks=TAPLOG_MARKS):
     starts = set([0]) if first and data else set()
-    for tok in list(toks) + list(TAPLOG_MARKS):
+    for tok in list(toks) + list(marks):
         if _now() > deadline:
             raise OutOfTime(path)
         i = data.find(tok)
@@ -4693,7 +4744,7 @@ def taplog_region(data, first, toks, deadline, path):
     return sorted(starts)
 
 
-def taplog_lines(path, toks, deadline, chunk=None):
+def taplog_lines(path, toks, deadline, chunk=None, marks=TAPLOG_MARKS):
     chunk = chunk or TAPLOG_CHUNK
     n, carry, first, given = 1, b'', True, False
     try:
@@ -4728,7 +4779,7 @@ def taplog_lines(path, toks, deadline, chunk=None):
             if not data:
                 return
             last = 0
-            for k, s in enumerate(taplog_region(data, first, toks, deadline, path)):
+            for k, s in enumerate(taplog_region(data, first, toks, deadline, path, marks)):
                 if k and not k % 4096 and _now() > deadline:
                     raise OutOfTime(path)
                 n += data.count(b'\n', last, s)
@@ -4956,16 +5007,31 @@ def parse_drbd_status(text):
     return out
 
 
+DRBD_EACH_MAX = 8
+
+
 def f_drbd(resources):
     out = {}
     if not resources:
         return out
     if not os.path.exists(DRBDSETUP):
         raise Failed('%s is not installed' % DRBDSETUP)
+    names = []
     for res in resources:
-        if not re.match(r'^xcp-volume-' + UUID_PAT + '$', res):
+        if re.match(r'^xcp-volume-' + UUID_PAT + '$', res):
+            names.append(res)
+        else:
             out[res] = {'ok': False, 'error': 'not a LINSTOR volume name'}
-            continue
+    if len(names) > DRBD_EACH_MAX:
+        r = run([DRBDSETUP, 'status', '--verbose'], 30)
+        got = parse_drbd_status(r.out) if r.ok else {}
+        for res in names:
+            if not r.ok:
+                out[res] = {'ok': False, 'error': 'drbdsetup status %s' % r.why()}
+            else:
+                out[res] = {'ok': True, 'value': got.get(res) or {'exists': False}}
+        return out
+    for res in names:
         r = run([DRBDSETUP, 'status', '--verbose', res], 10)
         text = r.out + r.err
         if not r.timed_out and r.rc != 0 and 'No such resource' in text:
@@ -20264,6 +20330,10 @@ def audit_gap(a0, a1):
 
 
 def classify(audits, opts):
+    return classify_per(audits, opts)[:2]
+
+
+def classify_per(audits, opts):
     for a in audits[1:]:
         a.prev = audits[0]
     per = [evaluate(a, opts) for a in audits]
@@ -20290,7 +20360,7 @@ def classify(audits, opts):
         it['seq'] = i + 1
     if getattr(opts, 'target', None):
         final, plan = scope_filter(audits, final, plan, opts)
-    return final, plan
+    return final, plan, per
 
 
 def target_scope(model, uuid):
@@ -20564,6 +20634,44 @@ def scope_filter(audits, final, plan, opts):
     return sorted(keep, key=lambda e: order[id(e)]), plan
 
 
+def batchable(it):
+    if it.get('phase') != 'L':
+        return False
+    if it.get('action') in BATCH_ACTIONS:
+        return True
+    return it.get('action') == 'dp-destroy' and (it.get('steps') or ['destroy']) == ['destroy'] and         not it.get('forgotten')
+
+
+def batch_order(items):
+    out, run = [], []
+
+    def flush():
+        hosts = []
+        for it in run:
+            if it.get('host') not in hosts:
+                hosts.append(it.get('host'))
+        queues = [[it for it in run if it.get('host') == h] for h in hosts]
+        while any(queues):
+            for q in queues:
+                if q:
+                    out.append(q.pop(0))
+        del run[:]
+    for it in items:
+        key = (it.get('cls'), bool(it.get('after')))
+        if run and (not batchable(it) or key != (run[0].get('cls'), bool(run[0].get('after')))):
+            flush()
+        if batchable(it):
+            run.append(it)
+        else:
+            out.append(it)
+    flush()
+    return out
+
+
+def batch_touch(it):
+    return set([('host', it.get('host')), ('vdi', it.get('vdi') or it.get('name') or it.get('seq'))])
+
+
 def item_key(it):
     keep = dict((k, v) for k, v in it.items() if k not in ('seq', 'after', 'later', 'later_own', 'later_taps',
                                                            'later_keys', 'dps_write', 'after_resync', 'strip_risk',
@@ -20603,6 +20711,10 @@ def journal_query(q, mref, sr):
         q[mref]['vgs'].add('VG_XenStorage-' + sr['uuid'])
     elif sr['type'] in PATH_SR_TYPES:
         q[mref]['srdirs'].add(sr['uuid'])
+
+
+def smlog_names_wanted(m, hv, sr, vdi):
+    return vdi not in m.vdi_by_uuid or hv.kv_state(sr, vdi)[0] not in ('name', 'none')
 
 
 def candidates_round2(a, opts):
@@ -20718,7 +20830,8 @@ def candidates_round2(a, opts):
                                 q[href]['taplog'][str(row['pid'])] = \
                                     ((hv.tapinfo or {}).get(str(row['pid'])) or {}).get('start')
                     if t is None or t == 'linstor':
-                        q[href]['smlog']['phy'].add(vdi)
+                        if t is None or smlog_names_wanted(m, hv, sr, vdi):
+                            q[href]['smlog']['phy'].add(vdi)
                         q[href]['smlog']['drbd'] = True
                         if t == 'linstor':
                             q[href]['drbdres'] |= set(hv.linstor_vols(sr, vdi))
@@ -20738,7 +20851,8 @@ def candidates_round2(a, opts):
                 if sr and (sr['uuid'], v['uuid']) not in hv.back_node:
                     q[href]['smlog']['activate'].add(v['uuid'])
                 if sr and sr['type'] == 'linstor':
-                    q[href]['smlog']['phy'].add(v['uuid'])
+                    if smlog_names_wanted(m, hv, sr['uuid'], v['uuid']):
+                        q[href]['smlog']['phy'].add(v['uuid'])
                     if vbd['currently_attached']:
                         q[href]['smlog']['drbd'] = True
                         q[href]['drbdres'] |= set(hv.linstor_vols(sr['uuid'], v['uuid']))
@@ -21799,6 +21913,9 @@ class Engine(object):
         self.opts = ctx.opts
         self.plan = plan
         self.audits = audits
+        self.batch = None
+        self.pending = []
+        self.gate_pass = {}
         self.ha = ha
         self.run_id = run_id
         self.run_dir = run_dir
@@ -22030,8 +22147,10 @@ class Engine(object):
     def audit(self, hosts=None, smlog=True, probes=False, only_vdis=None, vgs=None):
         self.n += 1
         self.gc_renew()
+        start = _now()
         token = self.event_token()
         a = collect_audit(self.ctx, self.n, only_hosts=hosts, probes=False, smlog=smlog, caps=True, xlog=False)
+        a.start = start
         a.prev = self.audits[-1] if self.audits else None
         a.token = token
         a.token_epoch = getattr(self, 'token_epoch', None)
@@ -23027,6 +23146,7 @@ class Engine(object):
                 if passed[h.uuid] >= (2 if twice else 1):
                     ready.append(h)
                     left.remove(h)
+                    self.gate_pass[h.uuid] = getattr(fresh, 'start', None)
                     continue
                 if standing_only(reasons):
                     standing.append((h, reasons))
@@ -23071,6 +23191,11 @@ class Engine(object):
             if self.ha is not None:
                 again = []
                 for h in ready:
+                    t = getattr(self, 'gate_pass', {}).get(h.uuid)
+                    if t is not None and _now() - t <= GATE_REUSE:
+                        self.j.rec('gate_reuse', host=h.uuid, age=round(_now() - t, 1))
+                        again.append(h)
+                        continue
                     reasons, _ = self.wait_gate(h, by[h.uuid], False, self.ha_wait(), 5, 'defer')
                     if reasons:
                         self.skip_host(h, by[h.uuid], 'not stopped: %s' % '; '.join(reasons[:6]), True)
@@ -24288,10 +24413,15 @@ class Engine(object):
                     hosts = sorted(set(hosts) | set([model.hosts[r]['uuid']]))
             kw.setdefault('probes', True)
             kw.setdefault('only_vdis', set([it['vdi']]))
+        first = True
         while True:
-            fresh = self.audit(hosts=hosts, **kw)
+            fresh = self.from_batch(it, hosts, kw) if first else None
+            if fresh is None:
+                fresh = self.batch_audit(it, hosts, kw) if first and batchable(it) else self.audit(hosts=hosts, **kw)
+            first = False
             self.why_later = False
             e, why = (recheck or self.recheck)(fresh, it)
+            self.batch_note(it, fresh, e)
             if e is not None or not (why or '').startswith(WAIT + ':') or _now() + RETEST_EVERY > deadline:
                 if e is None and it.get('later') and getattr(self, 'why_later', False):
                     why = ('%%s did not get quiet in this run, in the last %s (%%s)' % format_age(self.opts.wait)
@@ -24302,6 +24432,43 @@ class Engine(object):
                 return fresh, e, why
             step('  %d. %s: waiting - %s' % (it['seq'], it['cls'], why))
             pause(RETEST_EVERY)
+
+    def from_batch(self, it, hosts, kw):
+        b = self.batch
+        if b is None or not batchable(it) or _now() - b['start'] > BATCH_AGE or not set(hosts) <= b['hosts'] or                 bool(kw.get('probes')) != b['probes'] or not set(kw.get('only_vdis') or ()) <= b['vdis'] or                 (kw.get('only_vdis') is not None) != b['only'] or kw.get('smlog', True) != b['smlog'] or                 kw.get('vgs') != b['vgs'] or batch_touch(it) & b['touched'] or it['seq'] in b['seen']:
+            return None
+        self.j.rec('batch_use', seq=it['seq'], audit=b['audit'].n, age=round(_now() - b['start'], 1))
+        return b['audit']
+
+    def batch_audit(self, it, hosts, kw):
+        more = [x for x in self.pending if x['seq'] not in self.results and x['seq'] != it['seq'] and batchable(x)]
+        hosts = set(hosts)
+        vdis = set(kw.get('only_vdis') or ())
+        model = self.audits[-1].model if self.audits else None
+        for x in more:
+            if x.get('sr'):
+                hosts |= set(self.sr_hosts(x['sr'], self.host(x['host']), model))
+            if x.get('vdi') and kw.get('only_vdis') is not None:
+                vdis.add(x['vdi'])
+        kw = dict(kw, only_vdis=vdis) if kw.get('only_vdis') is not None else kw
+        a = self.audit(hosts=sorted(hosts), **kw)
+        self.batch = {'audit': a, 'start': a.start, 'hosts': hosts, 'probes': bool(kw.get('probes')),
+                      'vdis': vdis, 'only': kw.get('only_vdis') is not None, 'smlog': kw.get('smlog', True),
+                      'vgs': kw.get('vgs'), 'touched': set(), 'seen': set()}
+        self.j.rec('batch_audit', seq=it['seq'], audit=a.n, hosts=sorted(hosts), vdis=sorted(vdis),
+                   pending=[x['seq'] for x in more])
+        return a
+
+    def batch_note(self, it, fresh, e):
+        b = self.batch
+        if not batchable(it):
+            self.batch = None
+        elif b is not None and fresh is b['audit']:
+            b['seen'].add(it['seq'])
+            if e is not None:
+                b['touched'] |= batch_touch(it)
+        elif e is not None:
+            self.batch = None
 
     def s_left(self, it):
         if not it.get('attached') or not self.audits:
@@ -24759,6 +24926,13 @@ class Engine(object):
         return ''
 
     def phase_l(self, items):
+        self.batch, self.pending = None, list(items)
+        try:
+            self.phase_l_items(items)
+        finally:
+            self.batch, self.pending = None, []
+
+    def phase_l_items(self, items):
         for it in items:
             if self.halt:
                 break
@@ -24768,7 +24942,7 @@ class Engine(object):
             elif it['action'] == 'dp-destroy' and (it.get('steps') or [])[:1] == ['end']:
                 checkpoint()
                 self.c03(it, until='end')
-        for it in items:
+        for it in batch_order(items):
             if self.halt:
                 break
             checkpoint()
@@ -27367,16 +27541,49 @@ def settle_wait(seconds, why='only state that persists is acted on'):
     pause(seconds)
 
 
-def needs_second(a, opts):
+def scoped_findings(a, opts):
     scope = audit_scope(a, opts)
     per = evaluate(a, opts)
-    if scope is not None:
-        by = dict((tuple(e['key']), e) for e in per.values())
-        mine = [e for e in per.values() if in_scope(e, a, scope)]
-        mine += [d for e in mine if e['verdict'] == FIX and e.get('item') for d in plan_needs(e, by, a)]
-    else:
-        mine = per.values()
-    for e in mine:
+    if scope is None:
+        return list(per.values())
+    by = dict((tuple(e['key']), e) for e in per.values())
+    mine = [e for e in per.values() if in_scope(e, a, scope)]
+    return mine + [d for e in mine if e['verdict'] == FIX and e.get('item') for d in plan_needs(e, by, a)]
+
+
+def round2_new(eng, a, opts):
+    tried = set(item_key(i) for i in eng.plan)
+    return any(e['verdict'] == FIX and e.get('item') and item_key(e['item']) not in tried
+               for e in scoped_findings(a, opts))
+
+
+CLOSING_ONCE = 'seen only in the final audit, so whether it persists is not established: '
+
+
+CLOSING_HEADS = ('seen in one audit only, so it is read again: ', 'seen in one audit only', 'not in every audit')
+
+
+def closing_classify(eng, a, opts):
+    pre = [x for x in eng.audits or [] if x is not None]
+    final, plan, per = classify_per(pre + [a], opts)
+    for e in final:
+        head = [h for h in CLOSING_HEADS if e['reason'].startswith(h)][:1]
+        if not head or not pre:
+            continue
+        key = tuple(e['key'])
+        detail = e['reason'][len(head[0]):] or ((per[-1].get(key) or {}).get('reason') or '')
+        before = [(x.n, p.get(key)) for x, p in zip(pre, per[:-1])]
+        if not any(p for n, p in before):
+            e['reason'] = CLOSING_ONCE + (detail or 'it was not seen before the changes')
+        else:
+            e['reason'] = 'not settled across the run (%s; the final audit: %s): %s' % (
+                ', '.join('audit %d: %s' % (n, p['verdict'] if p else 'not seen') for n, p in before),
+                (per[-1].get(key) or {}).get('verdict') or 'not seen', detail)
+    return final, plan
+
+
+def needs_second(a, opts):
+    for e in scoped_findings(a, opts):
         if e['verdict'] in (FIX, WAIT) or e['cls'] in SETTLE_REPORTS + ('C31', 'C32', 'C33') or \
                 (settles(e) and e['verdict'] == REPORT):
             return True
@@ -27646,6 +27853,7 @@ def run_locked(opts, lockfd, busy=False):
                 if best else u'')) if cycle else u'')):
         say(u'Nothing was changed.')
         return 1
+    ctx.answered = _now()
     check_lock()
     lock_note('applying the changes')
     return apply_plan(ctx, opts, audits, final, plan, ha)
@@ -27800,7 +28008,17 @@ def apply_plan(ctx, opts, audits, final, plan, ha):
         gc_hold_unused(ctx, pre)
 
 
+APPLY_FRESH = 30
+
+
 def apply_checked(ctx, opts, audits, final, plan, ha):
+    last = audits[-1] if audits else None
+    answered = getattr(ctx, 'answered', None)
+    if answered is not None and getattr(last, 'mono', None) is not None and answered - last.mono <= APPLY_FRESH:
+        step('Audit %d ended %ds before the yes, so the pool is not read again as a whole first: each change re-checks '
+             'its own state just before it is made' % (last.n, max(0, int(round(answered - last.mono)))))
+        eng = execute(ctx, plan, audits, ha, final)
+        return finish(ctx, eng)
     step('Re-checking everything before the first change...')
     audits3 = audits + [collect_audit(ctx, len(audits) + 1)]
     a3 = audits3[-1]
@@ -27933,14 +28151,16 @@ def finish(ctx, eng):
     try:
         b1 = collect_audit(ctx, 101, first=False)
         checkpoint()
-        if needs_second(b1, ctx.opts) and stopping is None:
-            settle_wait(ctx.opts.settle, 'the report below shows only state that persists')
+        if stopping is None and round2_new(eng, b1, ctx.opts):
+            settle_wait(ctx.opts.settle, 'a second round acts only on state that persists')
             last = collect_audit(ctx, 102)
             done = [b1, last]
+            final, again = classify(done, ctx.opts)
         else:
             last = b1
             done = [b1]
-        final, again = classify(done, ctx.opts)
+            final, again = closing_classify(eng, b1, ctx.opts)
+            again = []
         again, ha_next = plan_ha(done, again, final)
         if stopping is None and round2(ctx, eng, done, again, ha_next):
             return finish(ctx, eng)
