@@ -933,6 +933,9 @@ def pool_status_section(run, rep):
             rep.check("XOSTOR Version Consistency", checks.xostor_version_consistency,
                       [h for h in run.hosts if h.reachable],
                       config.POOL_RUN.get("xostor_versions", True))
+            rep.check("XOSTOR Missing Devices", checks.xostor_missing_devices_pool,
+                      [h for h in run.hosts if h.reachable],
+                      config.POOL_RUN.get("xostor_missing_devices", True))
         rep.check("XOSTOR Faulty Resources", checks.xostor_faulty_resources, run.pool)
         rep.check("XOSTOR Faulty Nodes", checks.xostor_nodes, run.pool)
         rep.check("XOSTOR Controller IP", checks.xostor_controller, run.pool, run.host_names)

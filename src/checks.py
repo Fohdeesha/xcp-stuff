@@ -1298,6 +1298,34 @@ def xostor_missing_devices(host):
             "PV UUID", "Device (hint)", "State")] + detail))
 
 
+def xostor_missing_devices_pool(hosts, details_shown=True):
+    """One pool-level line rolling up every host's 'XOSTOR Missing Devices', so a lost
+    disk is not missed by someone reading only the pool section - the same reason
+    'XOSTOR Version Consistency' exists. Built from the host line itself, so the two can
+    never disagree. Names the hosts, since that is the first thing to know; the PVs are
+    in each host's own detail. details_shown is False when slaves do not print the
+    per-host line, and then the reader is not sent to look for it.
+    """
+    key = "XOSTOR Missing Devices"
+    missing, unread = [], []
+    for h in hosts:
+        line = xostor_missing_devices(h)
+        if line.status == result.FLAG:
+            missing.append(h.name)
+        elif line.status == result.UNKNOWN:
+            unread.append(h.name)
+    if missing:
+        text = "Yes, on: %s" % ", ".join(missing)
+        if details_shown:
+            text += " - See Host Results"
+        if unread:
+            text += " (unreadable on: %s)" % ", ".join(unread)
+        return flag(key, text)
+    if unread:
+        return unknown(key, "Unknown on: %s" % ", ".join(unread))
+    return ok(key, "None")
+
+
 def xostor_in_use(pool):
     f = pool.fact("xostor_srs")
     if not f.ok:

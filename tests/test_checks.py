@@ -869,3 +869,33 @@ def test_xostor_missing_devices_never_green_off_a_missing_fact():
               host(pvs=pvs(""), lvm_backup=err("could not read"))):
         line = checks.xostor_missing_devices(h)
         assert line.status == UNKNOWN and line.flags
+
+
+def _dhost(label, rows, backup=BACKUP):
+    h = host(pvs=pvs(rows), lvm_backup=backup if isinstance(backup, dict) else fact(backup))
+    h.hostname = label
+    return h
+
+
+def test_xostor_missing_devices_pool_none_when_every_host_is_whole():
+    line = checks.xostor_missing_devices_pool([_dhost("h1", PVS_HEALTHY),
+                                               _dhost("h2", PVS_HEALTHY)])
+    assert line.status == OK and "None" in line.text
+
+
+def test_xostor_missing_devices_pool_names_the_host_and_points_at_its_results():
+    line = checks.xostor_missing_devices_pool([_dhost("h1", PVS_HEALTHY),
+                                               _dhost("h2", PVS_MISSING)])
+    assert line.status == FLAG
+    assert "h2" in line.text and "h1" not in line.text and "See Host Results" in line.text
+    quiet = checks.xostor_missing_devices_pool([_dhost("h2", PVS_MISSING)], False)
+    assert "See Host Results" not in quiet.text
+
+
+def test_xostor_missing_devices_pool_never_green_with_a_host_unread():
+    line = checks.xostor_missing_devices_pool([_dhost("h1", PVS_HEALTHY),
+                                               _dhost("h2", "", err("could not read"))])
+    assert line.status == UNKNOWN and "h2" in line.text
+    line = checks.xostor_missing_devices_pool([_dhost("h1", PVS_MISSING),
+                                               _dhost("h2", "", err("could not read"))])
+    assert line.status == FLAG and "unreadable on: h2" in line.text
