@@ -29,7 +29,7 @@ import time
 import xml.parsers.expat
 import zlib
 
-VERSION = '2.14'
+VERSION = '2.15'
 PYTHON = sys.version.split()[0]
 PROG = 'storage-state-fixer'
 STORAGE_DB = '/var/run/nonpersistent/xapi/storage.db'
@@ -151,6 +151,10 @@ LINSTOR_READS = ('check', 'getInfo', 'getVHDInfo', 'hasParent', 'getParent', 'ge
                  'hasControllerRunning', 'listDrbdVolumes', 'getDrbdOpeners', 'healthCheck', 'listNodeInterfaces',
                  'getNodePreferredInterface')
 PLUGIN_TASKS = ('host.call_plugin', 'Async.host.call_plugin')
+PLUGIN_LOOKS = 2
+PLUGIN_RECHECK = 2
+PLUGIN_READS = 2
+TASK_RUNNING = ('pending', 'cancelling')
 SR_VDI_OPS = ('vdi_create', 'vdi_introduce', 'vdi_destroy', 'vdi_resize', 'vdi_clone', 'vdi_snapshot', 'vdi_mirror',
               'vdi_enable_cbt', 'vdi_disable_cbt', 'vdi_data_destroy', 'vdi_list_changed_blocks', 'vdi_set_on_boot')
 UNPLUG_TIMEOUT = 300
@@ -183,6 +187,8 @@ STATUS_HISTORY = 200
 ATTACH_INFO_AGE = 300
 API_TIMEOUT = 120
 QUIET_WAIT = 30
+QUIET_LAST = 5
+QUIET_POLL = 0.5
 FENCE_HOLD = 45
 FENCE_ACQUIRE = 10
 FENCE_POLL = 0.2
@@ -1566,6 +1572,7 @@ BOOT = ('import sys,base64,json;d=sys.stdin.buffer.read();r,s=d.split(b"\\n",1);
 WATCH_COMMS = ('vhd-tool', 'sparse_dd', 'xapi-nbd', 'qemu-img', 'qemu-nbd', 'xhad', 'xapi', 'lsof',
                'vhd-util', 'tap-ctl')
 SM_PREFIXES = (SM_DIR + '/', PLUGIN_DIR + '/')
+PLUGIN_SHELLS = ('sh', 'bash', 'dash', 'ksh', 'zsh', 'perl', 'ruby')
 TERMINAL = ('done', 'refused', 'rolled-back', 'failed', 'superseded')
 ACT_ENDS = TERMINAL + ('unverified',)
 PATH_KEYS = ('STORAGE_DB', 'STORAGE_DPS', 'SXM_DIR', 'SM_BACKEND', 'SM_PHY', 'BLKTAP_DIR', 'SYS_BLKTAP', 'SYS_DEV_BLOCK',
@@ -1911,6 +1918,12 @@ def sm_script(argv):
             i += 1
         if i < len(argv) and argv[i].startswith(SM_PREFIXES):
             return argv[i]
+    if base in PLUGIN_SHELLS and len(argv) > 1:
+        i = 1
+        while i < len(argv) and argv[i].startswith('-') and argv[i] != '-c':
+            i += 1
+        if i < len(argv) and argv[i].startswith(PLUGIN_DIR + '/'):
+            return argv[i]
     return None
 
 
@@ -1930,6 +1943,15 @@ def sm_housekeeping(argv, reads=True):
     if script.startswith(SM_DIR + '/'):
         return found.group(1) in SM_HOUSEKEEPING
     return reads and script == PLUGIN_DIR + '/linstor-manager' and found.group(1) in LINSTOR_READS
+
+
+def window_work(procs):
+    out = [dict(p, what='plugin') for p in plugin_work(procs)]
+    for p in procs or []:
+        script = sm_script(p.get('argv') or []) or ''
+        if script.startswith(SM_DIR + '/') and not script.endswith('cleanup.py') and not sm_housekeeping(p.get('argv')):
+            out.append(dict(p, what='SM'))
+    return out
 
 
 def plugin_work(procs):
@@ -3908,6 +3930,7 @@ def scan_log(path, now, sink, deadline=None, stats=None, prefilter=None):
                 sink(ev)
     if stats is not None and seeking and n:
         stats['nofirst'] = True
+        stats['nofirst_n'] = stats.get('nofirst_n', 0) + 1
 
 
 SMLOG_PHY_TOKENS = tuple(PHY_NEEDLES) + (b'ause for ',)
@@ -3935,6 +3958,7 @@ def scan_log_phy(path, now, sink, deadline, stats=None):
             stats.setdefault('firsts', []).append(first)
         elif n:
             stats['nofirst'] = True
+            stats['nofirst_n'] = stats.get('nofirst_n', 0) + 1
     for n, raw in taplog_lines(path, SMLOG_PHY_TOKENS, deadline, marks=()):
         if not any(t in raw for t in SMLOG_PHY_TOKENS):
             continue
@@ -3961,6 +3985,45 @@ NOT_GC_WORK = ('Aborting currently-running instance', 'abort: releasing the proc
 PHY_UPDATE_WINDOW = 300
 GC_TAIL = 900
 SMLOG_LISTS = ('refusals', 'lockwaits', 'notap', 'failed_tag', 'snaps', 'leafev')
+SMLOG_RUN_KEYS = frozenset(('pid', 'first', 'last', 'outcome', 'sr', 'aborted', 'error', 'kind', 'file', 'work',
+                            'into'))
+SMLOG_ROW_LEN = {'refusals': 3, 'lockwaits': 4, 'notap': 3, 'failed_tag': 3, 'snaps': 3, 'leafev': 6}
+
+
+def _int(x):
+    return isinstance(x, int) and not isinstance(x, bool)
+
+
+def _opt(x, kind):
+    return x is None or isinstance(x, kind)
+
+
+def smlog_run_ok(r):
+    return isinstance(r, dict) and SMLOG_RUN_KEYS <= set(r) and _int(r['pid']) and _num(r['first']) and \
+        _num(r['last']) and _opt(r['outcome'], str) and _opt(r['sr'], str) and isinstance(r['aborted'], bool) and \
+        _opt(r['error'], str) and r['kind'] in (None, 'gc', 'abort') and _int(r['file']) and \
+        isinstance(r['work'], bool) and r['into'] is None and _num(r.get('closing'), True)
+
+
+def smlog_row_ok(name, row):
+    if not isinstance(row, list) or len(row) != SMLOG_ROW_LEN[name] or not _num(row[0]):
+        return False
+    if name == 'leafev':
+        return _int(row[1]) and _int(row[2]) and _int(row[3]) and isinstance(row[4], str)
+    if name == 'snaps':
+        return isinstance(row[1], str) and _int(row[2])
+    return _int(row[1])
+
+
+def smlog_part_ok(doc):
+    evs, runs, lists = doc.get('events'), doc.get('runs'), doc.get('lists')
+    return isinstance(evs, dict) and all(
+        isinstance(k, str) and isinstance(v, list) and all(
+            isinstance(e, list) and len(e) == 3 and _num(e[0]) and isinstance(e[1], str) and _int(e[2]) for e in v)
+        for k, v in evs.items()) and \
+        isinstance(runs, list) and all(smlog_run_ok(r) for r in runs) and \
+        isinstance(lists, dict) and all(isinstance(lists.get(n), list) and all(smlog_row_ok(n, row) for row in lists[n])
+                                        for n in SMLOG_LISTS)
 SNAP_WINDOW = 6 * 3600
 RE_LEAF_START = re.compile(r'^Leaf-coalescing \*?([0-9a-f]{8})\S* -> \*?([0-9a-f]{8})')
 RE_LEAF_SNAP = re.compile(r'^Single-snapshotting \*?([0-9a-f]{8})')
@@ -4223,8 +4286,48 @@ class SmlogFile(object):
         self.open = {}
         self.lock_sr = {}
         self.unpausing = {}
+        self.phy_fall = False
         for name in SMLOG_LISTS:
             setattr(self, name, [])
+
+    def part(self, delta):
+        s = self.scan
+        return {'now': s.now, 'phy_fall': self.phy_fall, 'events': dict(self.events), 'runs': self.runs,
+                'subjects': {'relink': sorted(s.relink), 'pause': sorted(s.pause), 'phy': sorted(s.phy),
+                             'activate': sorted(s.activate)},
+                'lists': dict((n, getattr(self, n)) for n in SMLOG_LISTS), 'stats': delta}
+
+    def restore(self, doc):
+        s = self.scan
+        if not isinstance(doc, dict) or not isinstance(doc.get('now'), (int, float)) or s.now < doc['now']:
+            return False
+        if not smlog_part_ok(doc):
+            return False
+        sub = doc.get('subjects') or {}
+        old = dict((k, set(sub.get(k) or [])) for k in ('relink', 'pause', 'phy', 'activate'))
+        if s.relink != old['relink'] or not s.pause <= old['pause'] or not s.activate <= old['activate'] or \
+                bool(s.activate) != bool(old['activate']) or not s.phy <= old['phy'] or \
+                (doc.get('phy_fall') and s.phy != old['phy']):
+            return False
+        keep = {'relink': s.relink, 'pause': s.pause, 'preq': s.pause, 'phy': s.phy, 'activate': s.activate}
+        for k, evs in sorted((doc.get('events') or {}).items()):
+            kind, _, subject = k.partition(':')
+            if kind not in keep or subject in keep[kind]:
+                self.events[k] = evs
+        for r in doc.get('runs') or []:
+            r['file'] = self.num
+            self.runs.append(r)
+        for name in SMLOG_LISTS:
+            rows = (doc.get('lists') or {}).get(name) or []
+            if name == 'leafev':
+                for row in rows:
+                    row[1] = -self.num
+            elif name == 'snaps':
+                rows = [row for row in rows if row[0] >= s.now - SNAP_WINDOW]
+            elif name in ('refusals', 'lockwaits', 'notap'):
+                rows = [row for row in rows if row[0] >= s.now - 86400]
+            setattr(self, name, rows)
+        return True
 
     def run(self, pid, t, kind=None, sr=None):
         held = self.lock_sr.pop(pid, None)
@@ -4345,6 +4448,8 @@ class SmlogFile(object):
         m = RE_PHY.search(msg) if s.phy and 'phy/' in msg and 'xcp-volume-' in msg else None
         if m and m.group(2) in s.phy:
             self.events['phy:' + m.group(2)].append([t, m.group(3), pid])
+            if 'No such Tapdisk(minor=' in msg:
+                self.phy_fall = True
             return
         m = RE_NO_TAPDISK.search(msg) if 'No such Tapdisk(minor=' in msg else None
         if m and t >= s.now - 86400:
@@ -4548,6 +4653,249 @@ def collapse_refusals(rows, keep=None):
     return [out[i][1] for i in chosen]
 
 
+CACHE_ROOT = '/run/storage-state-fixer/cache'
+CACHE_KEEP = 12 * 3600
+CACHE_MAX = 64 << 20
+CACHE_ITEM_MAX = 8 << 20
+CACHE_VERSION = 2
+CACHE_NAME = re.compile(r'^[0-9A-Za-z][0-9A-Za-z-]{7,63}$')
+
+
+def own_dir(path):
+    st = os.lstat(path)
+    uid = os.getuid() if hasattr(os, 'getuid') else None
+    if not stat.S_ISDIR(st.st_mode) or (uid is not None and (st.st_uid != uid or st.st_mode & 0o022)):
+        raise ValueError('%s is not a directory of this user that only it can write' % path)
+
+
+def dir_size(path):
+    total = 0
+    for name in _listdir(path):
+        try:
+            total += os.lstat(os.path.join(path, name)).st_size
+        except OSError as exc:
+            if not gone(exc):
+                raise
+    return total
+
+
+def file_id(st):
+    return [st.st_ino, st.st_size, repr(st.st_mtime)]
+
+
+class LogCache(object):
+    def __init__(self, session, kind, now):
+        self.kind, self.now, self.dir, self.used, self.problem = kind, now, None, 0, None
+        self.stats = {'hits': 0, 'misses': 0, 'stored': 0, 'unstored': 0}
+        self.reached = None
+        if session is None:
+            return
+        session = _text(session)
+        if not CACHE_NAME.match(session):
+            self.problem = 'not a session name'
+            return
+        try:
+            self.dir = self.open(session)
+        except (EnvironmentError, ValueError) as exc:
+            self.dir = None
+            self.problem = _text(exc) or type(exc).__name__
+
+    def open(self, session):
+        for d in (os.path.dirname(CACHE_ROOT), CACHE_ROOT):
+            if not os.path.lexists(d):
+                try:
+                    os.mkdir(d, 0o700)
+                except OSError as exc:
+                    if exc.errno != errno.EEXIST:
+                        raise
+            own_dir(d)
+        others = []
+        for name in _listdir(CACHE_ROOT):
+            p = os.path.join(CACHE_ROOT, name)
+            try:
+                st = os.lstat(p)
+            except OSError as exc:
+                if gone(exc):
+                    continue
+                raise
+            if name == session or not stat.S_ISDIR(st.st_mode):
+                continue
+            if self.now - st.st_mtime > CACHE_KEEP:
+                shutil.rmtree(p, True)
+            else:
+                others.append([st.st_mtime, p, dir_size(p)])
+        d = os.path.join(CACHE_ROOT, session)
+        try:
+            os.mkdir(d, 0o700)
+        except OSError as exc:
+            if exc.errno != errno.EEXIST:
+                raise
+        own_dir(d)
+        os.utime(d, None)
+        mine = dir_size(d)
+        others.sort()
+        while others and mine + sum(x[2] for x in others) > CACHE_MAX:
+            shutil.rmtree(others.pop(0)[1], True)
+        self.used = mine + sum(x[2] for x in others)
+        return d
+
+    def head(self, path, st, mode):
+        return {'v': CACHE_VERSION, 'kind': self.kind, 'path': path, 'ino': st.st_ino, 'size': st.st_size,
+                'mtime': repr(st.st_mtime), 'ctime': repr(st.st_ctime),
+                'tz': [time.timezone, time.altzone, time.daylight], 'mode': mode}
+
+    def item(self, path, st, mode):
+        key = json.dumps(self.head(path, st, mode), sort_keys=True)
+        return os.path.join(self.dir, '%s-%s' % (self.kind, hashlib.sha1(key.encode('utf-8')).hexdigest()))
+
+    def load(self, target):
+        try:
+            with open(target, 'rb') as h:
+                raw = h.read(CACHE_ITEM_MAX + 1)
+            doc = json.loads(zlib.decompress(raw).decode('utf-8'))
+        except (EnvironmentError, ValueError, zlib.error, UnicodeDecodeError):
+            return None
+        return doc if isinstance(doc, dict) else None
+
+    def save(self, target, doc, excl=False):
+        try:
+            raw = zlib.compress(json.dumps(doc, sort_keys=True).encode('utf-8'), 6)
+        except (TypeError, ValueError):
+            self.stats['unstored'] += 1
+            return False
+        if len(raw) > CACHE_ITEM_MAX or self.used + len(raw) > CACHE_MAX:
+            self.stats['unstored'] += 1
+            return False
+        tmp = '%s.%d.%s.tmp' % (target, os.getpid(), hashlib.sha1(os.urandom(8)).hexdigest()[:8])
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_BINARY', 0), 0o600)
+            try:
+                append_all(fd, raw)
+            finally:
+                os.close(fd)
+            if excl:
+                os.link(tmp, target)
+            else:
+                getattr(os, 'replace', os.rename)(tmp, target)
+        except EnvironmentError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            self.stats['unstored'] += 1
+            return False
+        if excl:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        self.used += len(raw)
+        self.stats['stored'] += 1
+        return True
+
+    def get(self, path, st, mode):
+        if self.dir is None:
+            return None
+        doc = self.load(self.item(path, st, mode))
+        if doc is None or doc.get('head') != json.loads(json.dumps(self.head(path, st, mode))) or \
+                not isinstance(doc.get('value'), dict):
+            return None
+        return doc['value']
+
+    def put(self, path, st, mode, value):
+        if self.dir is not None:
+            self.save(self.item(path, st, mode), {'head': self.head(path, st, mode), 'value': value})
+
+    def reach_path(self, query):
+        key = json.dumps(query, sort_keys=True)
+        return os.path.join(self.dir, '%s-reach-%s' % (self.kind, hashlib.sha1(key.encode('utf-8')).hexdigest()))
+
+    def reach(self, query):
+        if self.dir is None:
+            return None
+        doc = self.load(self.reach_path(query))
+        if doc is None or doc.get('query') != json.loads(json.dumps(query)) or not isinstance(doc.get('value'), dict):
+            return None
+        return doc['value']
+
+    def set_reach(self, query, value):
+        if self.dir is not None:
+            self.save(self.reach_path(query), {'query': query, 'value': value}, excl=True)
+
+    def report(self):
+        return dict(self.stats, used=self.dir is not None, problem=self.problem, reach=self.reached)
+
+
+def reach_at(reach, st):
+    return reach is not None and st is not None and reach.get('id') == file_id(st)
+
+
+def deadline_bound(budget):
+    own = _now() + budget
+    if _DEADLINE[0] is not None and _DEADLINE[0] - 20 < own:
+        return _DEADLINE[0] - 20, 'facts'
+    return own, 'budget'
+
+
+def cacheable(path, st, now):
+    return file_ref_time(path, now) == st.st_mtime + 60
+
+
+def stats_mark(stats):
+    return stats['kept'], stats['parsed'], len(stats.get('firsts') or []), stats.get('nofirst_n', 0)
+
+
+def stats_delta(stats, mark):
+    return {'kept': stats['kept'] - mark[0], 'parsed': stats['parsed'] - mark[1],
+            'firsts': list((stats.get('firsts') or [])[mark[2]:]), 'nofirst': stats.get('nofirst_n', 0) > mark[3]}
+
+
+def stats_valid(delta):
+    return isinstance(delta, dict) and all(isinstance(delta.get(k), int) and not isinstance(delta.get(k), bool)
+                                           for k in ('kept', 'parsed')) and \
+        isinstance(delta.get('firsts'), list) and all(isinstance(x, (int, float)) and not isinstance(x, bool)
+                                                       for x in delta['firsts']) and \
+        isinstance(delta.get('nofirst'), bool)
+
+
+def stats_apply(stats, delta):
+    if not stats_valid(delta):
+        return
+    stats['kept'] += delta['kept']
+    stats['parsed'] += delta['parsed']
+    if delta['firsts']:
+        stats.setdefault('firsts', []).extend(delta['firsts'])
+    if delta['nofirst']:
+        stats['nofirst'] = True
+        stats['nofirst_n'] = stats.get('nofirst_n', 0) + 1
+
+
+def smlog_take(fs, doc, stats):
+    try:
+        if not stats_valid(doc.get('stats')) or not fs.restore(doc):
+            return False
+    except (TypeError, KeyError, IndexError, AttributeError, ValueError):
+        return False
+    stats_apply(stats, doc['stats'])
+    return True
+
+
+def agent_cache_drop(args, source):
+    session = _text(args.get('session') or '')
+    if not CACHE_NAME.match(session):
+        raise Failed('not a session name')
+    for p in (os.path.dirname(CACHE_ROOT), CACHE_ROOT):
+        if not os.path.lexists(p):
+            return {'dropped': False}
+        own_dir(p)
+    d = os.path.join(CACHE_ROOT, session)
+    if not os.path.lexists(d):
+        return {'dropped': False}
+    own_dir(d)
+    shutil.rmtree(d)
+    return {'dropped': True}
+
+
 def f_smlog(q):
     for attempt in (0, 1):
         res = smlog_scan(q)
@@ -4569,15 +4917,17 @@ def smlog_scan(q):
         raise Failed('%s is missing' % SMLOG)
     inos = [file_inode(p) for p in files]
     scan = SmlogScan(q, now)
+    cache = LogCache(q.get('cache'), 'smlog', now)
+    asked = dict((k, sorted(set(q.get(k) or []))) for k in ('relink', 'abort', 'activate', 'pause', 'phy'))
+    asked['budget'] = q.get('budget')
+    reach = cache.reach(asked)
     read = []
     complete = True
     all_read = True
     rotated = None
     stopped = None
     budget = float(q.get('budget') or 150)
-    deadline = _now() + budget
-    if _DEADLINE[0] is not None:
-        deadline = min(deadline, _DEADLINE[0] - 20)
+    deadline, bound = deadline_bound(budget)
     stats = {'kept': 0, 'parsed': 0}
     for i, path in enumerate(files):
         phy_only = False
@@ -4590,9 +4940,21 @@ def smlog_scan(q):
                 all_read = False
                 break
             phy_only = not need
+            try:
+                here = os.stat(path)
+            except OSError:
+                here = None
+            if here is not None and here.st_ino == inos[i] and reach_at(reach, here):
+                stats_apply(stats, reach.get('stats'))
+                cache.reached = {'applied': True, 'bound': reach.get('bound')}
+                complete = all_read = False
+                stopped = 'out of time'
+                break
             if _now() > deadline:
                 complete = all_read = False
                 stopped = 'out of time'
+                if here is not None and here.st_ino == inos[i]:
+                    cache.set_reach(asked, {'id': file_id(here), 'stats': None, 'bound': bound})
                 break
         num = log_number(path)
         if num is None or num != (log_number(files[i - 1]) + 1 if i else 0):
@@ -4600,15 +4962,28 @@ def smlog_scan(q):
             stopped = 'the rotated files are not numbered in sequence at %s' % path
             break
         fs = scan.file(num, phy_only)
+        mode = 'phy' if phy_only else 'full'
+        mark = stats_mark(stats)
         try:
             st = os.stat(path)
             if st.st_ino != inos[i]:
                 rotated = path
                 break
-            if phy_only:
-                scan_log_phy(path, now, fs.sink, deadline, stats)
+            use = i >= 1 and cache.dir is not None and cacheable(path, st, now) and (phy_only or stats['parsed'] > 0)
+            doc = cache.get(path, st, mode) if use else None
+            if doc is not None and not smlog_take(fs, doc, stats):
+                fs, doc = scan.file(num, phy_only), None
+            if doc is not None:
+                cache.stats['hits'] += 1
             else:
-                scan_log(path, now, fs.sink, deadline, stats, scan.prefilter)
+                if phy_only:
+                    scan_log_phy(path, now, fs.sink, deadline, stats)
+                else:
+                    scan_log(path, now, fs.sink, deadline, stats, scan.prefilter)
+                if use:
+                    cache.stats['misses'] += 1
+                    if file_inode(path) == inos[i]:
+                        cache.put(path, st, mode, fs.part(stats_delta(stats, mark)))
             if file_inode(path) != inos[i]:
                 rotated = path
                 break
@@ -4617,6 +4992,7 @@ def smlog_scan(q):
                 raise Failed('%s was not read within the %ds budget' % (path, budget))
             complete = all_read = False
             stopped = 'out of time'
+            cache.set_reach(asked, {'id': file_id(st), 'stats': stats_delta(stats, mark), 'bound': bound})
             break
         except (EnvironmentError, EOFError, zlib.error) as exc:
             if isinstance(exc, EnvironmentError) and exc.errno == errno.ENOENT:
@@ -4679,7 +5055,8 @@ def smlog_scan(q):
             'refusal_count': len(scan.refusals), 'lockwaits': scan.lockwaits[-50:],
             'notap': scan.notap[-50:], 'failed_tag': scan.failed_tag[-200:], 'now': now, 'pids': pids_,
             'snaps': scan.snaps[-2000:], 'leaf': leaf, 'speed': speed_logs(),
-            'drbd': drbd, 'oldest': None if stats.get('nofirst') or not stats.get('firsts') else min(stats['firsts'])}
+            'drbd': drbd, 'oldest': None if stats.get('nofirst') or not stats.get('firsts') else min(stats['firsts']),
+            'cache': cache.report()}
 
 
 def rotated_files(base):
@@ -4710,6 +5087,7 @@ TAPLOG_EVENTS = (
     ('dropped', re.compile(r'tapdisk-syslog: (\d+) messages dropped')),
 )
 TAPLOG_LINE = re.compile(r'tapdisk\[(\d+)\]: (.*)$')
+TAPLOG_KINDS = frozenset(k for k, rx in TAPLOG_EVENTS)
 CLOCK_STEP = re.compile(r'(?:chronyd\[\d+\]: System clock was stepped by|ntpdate\[\d+\]: step time server \S+ offset) '
                         r'(-?[0-9.]+)')
 TAPLOG_TAIL = 40
@@ -4793,6 +5171,105 @@ def taplog_lines(path, toks, deadline, chunk=None, marks=TAPLOG_MARKS):
                 return
 
 
+TAPLOG_NEAR_MAX = 2000
+
+
+class TaplogRotated(Exception):
+    pass
+
+
+def taplog_part(want):
+    return {'start': None, 'pieces': dict((str(p), []) for p in want), 'near': dict((str(p), []) for p in want),
+            'steps': []}
+
+
+def taplog_file(path, ino, want, toks, deadline, now, part):
+    ref = file_ref_time(path, now)
+    if os.stat(path).st_ino != ino:
+        raise TaplogRotated(path)
+    for n, raw in taplog_lines(path, toks, deadline):
+        if n == 1:
+            m0 = SYSLOG_TS.match(raw.decode('utf-8', 'replace'))
+            part['start'] = syslog_epoch(*(m0.groups() + (ref,))) if m0 else None
+        if b'tapdisk[' not in raw:
+            if b'stepped by' in raw or b'step time server' in raw:
+                line = raw.rstrip(b'\n').decode('utf-8', 'replace')
+                mc = CLOCK_STEP.search(line)
+                ts = SYSLOG_TS.match(line)
+                if mc and ts:
+                    part['steps'].append([syslog_epoch(*(ts.groups() + (ref,))), abs(float(mc.group(1)))])
+            continue
+        if not any(tok in raw for tok in toks):
+            continue
+        line = raw.rstrip(b'\n').decode('utf-8', 'replace')
+        m = TAPLOG_LINE.search(line)
+        if not m or int(m.group(1)) not in want:
+            continue
+        ts = SYSLOG_TS.match(line)
+        t = syslog_epoch(*(ts.groups() + (ref,))) if ts else None
+        born = want[int(m.group(1))]
+        msg = m.group(2)
+        hit = [(kind, mm) for kind, mm in ((k, rx.search(msg)) for k, rx in TAPLOG_EVENTS) if mm][:1]
+        if hit and born is not None and t is not None and abs(t - born) <= 3600:
+            if len(part['near'][m.group(1)]) <= TAPLOG_NEAR_MAX:
+                part['near'][m.group(1)].append(t)
+        if born is not None and (t is None or t < born - 2):
+            continue
+        for kind, mm in hit:
+            evs = part['pieces'][m.group(1)]
+            if evs and evs[-1][3] == kind:
+                evs[-1][0], evs[-1][2], evs[-1][4] = n, t, list(mm.groups())
+                evs[-1][5] += 1
+            else:
+                evs.append([n, t, t, kind, list(mm.groups()), 1, msg[-200:]])
+            break
+
+
+def _num(x, none=False):
+    return (x is None and none) or (isinstance(x, (int, float)) and not isinstance(x, bool))
+
+
+def taplog_valid(part, keys):
+    if not isinstance(part, dict) or not _num(part.get('start'), True) or \
+            not isinstance(part.get('steps'), list) or \
+            not all(isinstance(x, list) and len(x) == 2 and _num(x[0], True) and _num(x[1]) for x in part['steps']):
+        return False
+    for name in ('pieces', 'near'):
+        d = part.get(name)
+        if not isinstance(d, dict) or not all(isinstance(d.get(k), list) for k in keys):
+            return False
+    for k in keys:
+        if not all(_num(t) for t in part['near'][k]):
+            return False
+        for e in part['pieces'][k]:
+            if not (isinstance(e, list) and len(e) == 7 and _int(e[0]) and _num(e[1], True) and
+                    _num(e[2], True) and e[3] in TAPLOG_KINDS and isinstance(e[4], list) and _int(e[5]) and
+                    isinstance(e[6], str)):
+                return False
+    return True
+
+
+def taplog_cached(doc, wanted):
+    if not isinstance(doc, dict) or not isinstance(doc.get('want'), dict):
+        return None
+    old = doc['want']
+    if any(k not in old or old[k] != v for k, v in wanted.items()) or not taplog_valid(doc.get('part'), wanted):
+        return None
+    part = doc['part']
+    return {'start': part['start'], 'steps': part['steps'], 'pieces': dict((k, part['pieces'][k]) for k in wanted),
+            'near': dict((k, part['near'][k]) for k in wanted)}
+
+
+def taplog_reach(reach, wanted):
+    if not isinstance(reach, dict) or not isinstance(reach.get('want'), dict):
+        return None
+    keys = dict((k, v) for k, v in wanted.items() if k in reach['want'] and reach['want'][k] == v)
+    part = reach.get('part')
+    if not isinstance(part, dict):
+        return None
+    return taplog_cached({'want': reach['want'], 'part': dict(part, pieces=dict((k, []) for k in keys))}, keys)
+
+
 def f_taplog(q):
     want = dict((int(p), s) for p, s in (q.get('pids') or {}).items())
     if not want:
@@ -4802,9 +5279,7 @@ def f_taplog(q):
     if not files or files[0] != DAEMON_LOG:
         raise Failed('%s is missing' % DAEMON_LOG)
     budget = float(q.get('budget') or 45)
-    deadline = _now() + budget
-    if _DEADLINE[0] is not None:
-        deadline = min(deadline, _DEADLINE[0] - 20)
+    deadline, bound = deadline_bound(budget)
     cap = int(q.get('bytes') or 400 << 20)
     chosen, size = [], 0
     for p in files:
@@ -4814,6 +5289,10 @@ def f_taplog(q):
             break
         chosen.append((p, st.st_ino))
         size += sz
+    wanted = dict((str(p), s) for p, s in want.items())
+    cache = LogCache(q.get('cache'), 'taplog', now)
+    asked = {'pids': wanted, 'bytes': q.get('bytes'), 'budget': q.get('budget')}
+    reach = cache.reach(asked)
     kinds = dict((str(p), {}) for p in want)
     tails = dict((str(p), []) for p in want)
     toks = [('tapdisk[%d]' % p).encode('ascii') for p in sorted(want)]
@@ -4823,63 +5302,19 @@ def f_taplog(q):
     steps = []
     near = dict((str(p), []) for p in want)
     crowded = set()
-    for idx, (path, ino) in enumerate(chosen):
-        base = (len(chosen) - idx) * 10 ** 10
-        ref = file_ref_time(path, now)
-        pieces = dict((str(p), []) for p in want)
-        n = 0
-        start_t = None
-        try:
-            if os.stat(path).st_ino != ino:
-                stopped = '%s (rotated while it was being read)' % path
-                break
-            for n, raw in taplog_lines(path, toks, deadline):
-                if n == 1:
-                    m0 = SYSLOG_TS.match(raw.decode('utf-8', 'replace'))
-                    start_t = syslog_epoch(*(m0.groups() + (ref,))) if m0 else None
-                if b'tapdisk[' not in raw:
-                    if b'stepped by' in raw or b'step time server' in raw:
-                        line = raw.rstrip(b'\n').decode('utf-8', 'replace')
-                        mc = CLOCK_STEP.search(line)
-                        ts = SYSLOG_TS.match(line)
-                        if mc and ts:
-                            steps.append([syslog_epoch(*(ts.groups() + (ref,))), abs(float(mc.group(1)))])
-                    continue
-                if not any(tok in raw for tok in toks):
-                    continue
-                line = raw.rstrip(b'\n').decode('utf-8', 'replace')
-                m = TAPLOG_LINE.search(line)
-                if not m or int(m.group(1)) not in want:
-                    continue
-                ts = SYSLOG_TS.match(line)
-                t = syslog_epoch(*(ts.groups() + (ref,))) if ts else None
-                born = want[int(m.group(1))]
-                msg = m.group(2)
-                hit = [(kind, mm) for kind, mm in ((k, rx.search(msg)) for k, rx in TAPLOG_EVENTS) if mm][:1]
-                if hit and born is not None and t is not None and abs(t - born) <= 3600:
-                    if len(near[m.group(1)]) < 2000:
-                        near[m.group(1)].append(t)
-                    else:
-                        crowded.add(m.group(1))
-                if born is not None and (t is None or t < born - 2):
-                    continue
-                for kind, mm in hit:
-                    evs = pieces[m.group(1)]
-                    if evs and evs[-1][3] == kind:
-                        evs[-1][0], evs[-1][2], evs[-1][4] = base + n, t, list(mm.groups())
-                        evs[-1][5] += 1
-                    else:
-                        evs.append([base + n, t, t, kind, list(mm.groups()), 1, msg[-200:]])
-                    break
-        except OutOfTime:
-            stopped = '%s (out of time)' % path
-            break
-        except (EnvironmentError, EOFError, zlib.error) as exc:
-            stopped = '%s (%s)' % (path, _text(exc) or type(exc).__name__)
-            break
-        read += 1
-        since = start_t
-        for p, evs in pieces.items():
+
+    def take(part, base, whole):
+        steps.extend(part['steps'])
+        for p in near:
+            for t in part['near'].get(p) or []:
+                if len(near[p]) < TAPLOG_NEAR_MAX:
+                    near[p].append(t)
+                else:
+                    crowded.add(p)
+        if not whole:
+            return
+        for p in kinds:
+            evs = [[base + e[0]] + list(e[1:]) for e in part['pieces'].get(p) or []]
             for s, t0, t, kind, groups, cnt, msg in evs:
                 k = kinds[p].setdefault(kind, {'n': 0})
                 k['n'] += cnt
@@ -4888,6 +5323,57 @@ def f_taplog(q):
                 if 'first' not in k or (t0 is not None and (k['first'] is None or t0 < k['first'])):
                     k['first'] = t0
             tails[p] = (evs + tails[p])[-TAPLOG_TAIL * 4:]
+    for idx, (path, ino) in enumerate(chosen):
+        base = (len(chosen) - idx) * 10 ** 10
+        try:
+            here = os.stat(path)
+        except OSError:
+            here = None
+        if idx and here is not None and here.st_ino == ino and reach_at(reach, here):
+            part = taplog_reach(reach, wanted)
+            if part is not None:
+                take(part, base, False)
+            cache.reached = {'applied': True, 'bound': reach.get('bound')}
+            stopped = '%s (out of time)' % path
+            break
+        part = None
+        try:
+            st = os.stat(path)
+            if st.st_ino != ino:
+                stopped = '%s (rotated while it was being read)' % path
+                break
+            use = idx > 0 and cache.dir is not None and cacheable(path, st, now)
+            if use:
+                part = taplog_cached(cache.get(path, st, 'taplog'), wanted)
+            if part is not None:
+                cache.stats['hits'] += 1
+            else:
+                part = taplog_part(want)
+                try:
+                    taplog_file(path, ino, want, toks, deadline, now, part)
+                except TaplogRotated:
+                    stopped = '%s (rotated while it was being read)' % path
+                    break
+                except OutOfTime:
+                    take(part, base, False)
+                    stopped = '%s (out of time)' % path
+                    if idx:
+                        cache.set_reach(asked, {'id': file_id(st), 'bound': bound, 'want': wanted, 'part': {
+                            'start': None, 'steps': part['steps'], 'near': part['near'], 'pieces': {}}})
+                    break
+                except (EnvironmentError, EOFError, zlib.error) as exc:
+                    take(part, base, False)
+                    stopped = '%s (%s)' % (path, _text(exc) or type(exc).__name__)
+                    break
+                if use:
+                    cache.stats['misses'] += 1
+                    cache.put(path, st, 'taplog', {'want': wanted, 'part': part})
+        except (EnvironmentError, EOFError, zlib.error) as exc:
+            stopped = '%s (%s)' % (path, _text(exc) or type(exc).__name__)
+            break
+        read += 1
+        since = part['start']
+        take(part, base, True)
     out = {}
     for p, start in want.items():
         if not read:
@@ -4914,7 +5400,7 @@ def f_taplog(q):
             not any(abs(since - start) <= x + 2 for t0, x in steps_since)
         out[str(p)] = {'kinds': kinds[str(p)], 'tail': tail[-TAPLOG_TAIL:], 'complete': bool(complete)}
     return {'pids': out, 'since': since, 'files': read, 'all_files': len(files), 'stopped': stopped,
-            'steps': steps[-20:]}
+            'steps': steps[-20:], 'cache': cache.report()}
 
 
 DRBD_ROLE = re.compile(r'\brole:(\S+)')
@@ -5756,6 +6242,8 @@ def facts_doc(args):
         doc['identity_after'] = fact(f_identity)
     if 'backend' in want and 'core' not in want:
         doc['backend'] = fact(f_backend)
+    if 'procs' in want and 'core' not in want:
+        doc['procs'] = fact(bounded, f_procs, 30)
     if 'ha' in want and 'core' not in want:
         doc['ha'] = fact(f_ha)
         doc['xapi'] = fact(f_xapi_state)
@@ -6367,7 +6855,11 @@ def resync_problems(spec, info=None):
     return problems
 
 
-def quiet_here(spec, wait=None, need_api=True):
+def final_quiet(spec, info):
+    return quiet_here(spec, wait=QUIET_LAST, poll=QUIET_POLL) + resync_problems(spec, info)
+
+
+def quiet_here(spec, wait=None, need_api=True, poll=1):
     wait = QUIET_WAIT if wait is None else wait
     try:
         s = local_session()
@@ -6385,7 +6877,7 @@ def quiet_here(spec, wait=None, need_api=True):
                 return []
             if _now() > deadline:
                 return ['xapi and SM are not quiet here after %ds: %s' % (wait, '; '.join(busy[:5]))]
-            time.sleep(1)
+            time.sleep(poll)
     except Failed as exc:
         return [_text(exc)]
     except Exception as exc:
@@ -7176,7 +7668,7 @@ def act_main(spec_path):
             problems.append('the guardian is not running')
         info = {}
         if not problems:
-            again = quiet_here(spec, wait=0) + resync_problems(spec, info)
+            again = final_quiet(spec, info)
             if again:
                 problems.append('just before the stop: %s' % '; '.join(again[:5]))
         if not problems:
@@ -10119,7 +10611,7 @@ VERBS = {'facts': lambda a, s: agent_facts(a), 'act-start': agent_act_start, 'ac
          'fence-start': agent_fence_start, 'fence-status': agent_fence_status, 'fence-release': agent_fence_release,
          'fence-extend': agent_fence_extend, 'domains': agent_domains, 'drbd-down': agent_drbd_down,
          'satellite-restart': agent_satellite_restart, 'linstor-delete': agent_linstor_delete,
-         'domain-remove': agent_domain_remove}
+         'domain-remove': agent_domain_remove, 'cache-drop': agent_cache_drop}
 
 
 def agent_entry(request, source):
@@ -20679,6 +21171,25 @@ def item_key(it):
     return canon(keep)
 
 
+_CTX = [None]
+
+
+def new_session():
+    return '%s-%s' % (time.strftime('%Y%m%d%H%M%S'), hashlib.sha1(os.urandom(16)).hexdigest()[:12])
+
+
+def drop_caches(ctx):
+    if ctx is None or ctx.transport is None or not ctx.hosts:
+        return
+    hosts = [h for h in ctx.hosts.values() if h.live and h.uuid in ctx.cache_hosts]
+    if not hosts:
+        return
+    try:
+        parallel(lambda h: ctx.transport.call(h, 'cache-drop', {'session': ctx.session}, timeout=15), hosts)
+    except Exception:
+        pass
+
+
 class Ctx(object):
     def __init__(self, opts):
         self.opts = opts
@@ -20693,6 +21204,8 @@ class Ctx(object):
         self.hosts = {}
         self.gc_held = set()
         self.pre_engine = None
+        self.session = new_session()
+        self.cache_hosts = set()
 
     def host_objs(self, model):
         out = []
@@ -21150,14 +21663,15 @@ def collect_audit(ctx, n, first=False, only_hosts=None, probes=True, smlog=True,
                 'drbddetail': {'names': sorted(qq['detail']), 'known': known if qq['drbdall'] else None},
                 'xenops': sorted(qq['xenops']),
                 'chain': {'vgs': sorted(ch['vgs']), 'srdirs': sorted(ch['srdirs']), 'vhd': list(ch['vhd'])},
-                'taplog': {'pids': qq['taplog']},
+                'taplog': {'pids': qq['taplog'], 'cache': ctx.session},
                 'smlog': {'relink': sorted(qq['smlog']['relink']), 'abort': sorted(qq['smlog']['abort']),
                           'activate': sorted(qq['smlog']['activate']), 'pause': sorted(qq['smlog']['pause']),
-                          'phy': sorted(qq['smlog']['phy']), 'drbd': qq['smlog']['drbd']},
+                          'phy': sorted(qq['smlog']['phy']), 'drbd': qq['smlog']['drbd'], 'cache': ctx.session},
                 'statfiles': sorted(qq['statfiles']), 'vgs': sorted(qq['vgs']), 'srdirs': sorted(qq['srdirs']),
                 'xsread': sorted(qq['xsread']), 'vhdcheck': sorted(qq['vhdcheck']), 'drbd': sorted(qq['drbdres']),
                 'dmcheck': sorted([list(x) for x in qq['dmcheck']])}
         t2 = _now()
+        ctx.cache_hosts.add(h.uuid)
         try:
             return ctx.transport.call(h, 'facts', args)
         finally:
@@ -22218,76 +22732,166 @@ class Engine(object):
         owners |= set(r for r, v in m.vms.items() if v['uuid'] in vms)
         names = set(vdis) | set(srs) | set(m.vdis[r]['uuid'] for r in chain_refs) | set(
             m.vms[r]['uuid'] for r in owners if r in m.vms)
-        out = []
-        seen = 0
-        for e in sanitize(res.get('events') or []):
-            seen += 1
-            cls, ref = e.get('class'), e.get('ref')
-            op, snap = e.get('operation'), e.get('snapshot') or {}
-            if not isinstance(snap, dict):
-                snap = {}
-            if cls == 'task':
-                label = snap.get('name_label') or ''
-                if op == 'del' or snap.get('status') != 'pending' or label in HOUSEKEEPING_TASKS:
-                    continue
-                if label == 'Garbage Collection':
-                    gsr = [s for s in srs if (snap.get('name_description') or '').endswith(s)]
-                    if ref in m.tasks and m.tasks[ref].get('status') == 'pending':
+
+        def scan(events):
+            out = []
+            plugins = collections.OrderedDict()
+            seen = 0
+            for e in sanitize(events or []):
+                seen += 1
+                cls, ref = e.get('class'), e.get('ref')
+                op, snap = e.get('operation'), e.get('snapshot') or {}
+                if not isinstance(snap, dict):
+                    snap = {}
+                if cls == 'task':
+                    label = snap.get('name_label') or ''
+                    if op == 'del' or snap.get('status') != 'pending' or label in HOUSEKEEPING_TASKS:
                         continue
-                    if any((snap.get('name_description') or '').endswith(s) for s in self.gc_run):
+                    if label == 'Garbage Collection':
+                        gsr = [s for s in srs if (snap.get('name_description') or '').endswith(s)]
+                        if ref in m.tasks and m.tasks[ref].get('status') == 'pending':
+                            continue
+                        if any((snap.get('name_description') or '').endswith(s) for s in self.gc_run):
+                            continue
+                        if gsr:
+                            out.append('the GC of SR %s started' % gsr[0])
+                        elif h is not None and h.is_master:
+                            out.append('a GC started (%s)' % (snap.get('name_description') or 'no SR named'))
+                    elif whole and h is not None and (h.is_master or snap.get('resident_on') == href):
+                        if label in PLUGIN_TASKS and not any(n in _text(snap.get('name_description')) for n in names):
+                            plugins.setdefault(ref, snap.get('resident_on'))
+                        else:
+                            out.append('task "%s" started' % label)
+                    elif any(n in u'%s %s' % (_text(snap.get('name_label')), _text(snap.get('name_description')))
+                             for n in names):
+                        out.append('task "%s" started' % label)
+                elif cls == 'vbd':
+                    if ref in mine:
                         continue
-                    if gsr:
-                        out.append('the GC of SR %s started' % gsr[0])
-                    elif h is not None and h.is_master:
-                        out.append('a GC started (%s)' % (snap.get('name_description') or 'no SR named'))
-                elif whole and h is not None and (h.is_master or snap.get('resident_on') == href):
-                    out.append('task "%s" started' % label)
-                elif any(n in u'%s %s' % (_text(snap.get('name_label')), _text(snap.get('name_description')))
-                         for n in names):
-                    out.append('task "%s" started' % label)
-            elif cls == 'vbd':
-                if ref in mine:
-                    continue
-                if ref in known or (whole and dom0 and snap.get('VM') == dom0) or snap.get('VDI') in chain_refs:
-                    out.append('VBD %s: %s' % (snap.get('uuid') or ref, op))
-            elif cls == 'vm':
-                ops = snap.get('current_operations') or {}
-                if ref in owners or (whole and href and ops and href in (snap.get('resident_on'),
-                                                                         snap.get('scheduled_to_be_resident_on'))):
-                    out.append('VM "%s": %s' % (snap.get('name_label') or ref, op))
-            elif cls == 'vdi':
-                if ref in vdi_refs:
-                    out.append('VDI %s: %s' % (snap.get('uuid') or ref, op))
-                elif ref in busy_refs and (op == 'del' or snap.get('current_operations') or any(
-                        k in (snap.get('sm_config') or {}) for k in ('paused', 'relinking', 'activating'))):
-                    out.append('VDI %s, served on the host, is busy (%s)' % (snap.get('uuid') or ref, op))
-                elif ref in chain_refs and snap.get('current_operations'):
-                    out.append('VDI %s, in the chain of its disk, has %s in progress' % (
-                        snap.get('uuid') or ref, ', '.join(sorted(set(snap['current_operations'].values())))))
-            elif cls == 'pbd':
-                was = m.pbds.get(ref)
-                if op == 'mod' and was is not None and all(snap.get(k) == was.get(k) for k in PBD_STATE):
-                    continue
-                if snap.get('SR') in sr_refs or (was or {}).get('SR') in sr_refs or \
-                        (op == 'del' and any(ref in m.srs[s]['PBDs'] for s in sr_refs)):
-                    out.append('PBD %s of SR %s: %s' % (snap.get('uuid') or ref, m.srs.get(
-                        snap.get('SR') or (was or {}).get('SR'), {}).get('uuid') or '?', op))
-            elif cls == 'sr':
-                if ref in sr_refs and (op == 'del' or sorted(snap.get('PBDs') or []) != sorted(m.srs[ref]['PBDs'])):
-                    out.append('SR %s: %s' % (snap.get('uuid') or ref, op))
-                elif ref in sr_refs and set((snap.get('current_operations') or {}).values()) - set(SR_HOUSEKEEPING) - (
-                        set(SR_VDI_OPS) if h is None or not whole else set()):
-                    out.append('SR %s has %s in progress' % (snap.get('uuid') or ref, ', '.join(sorted(
-                        set((snap.get('current_operations') or {}).values()) - set(SR_HOUSEKEEPING) - (
-                            set(SR_VDI_OPS) if h is None or not whole else set())))))
-            elif cls == 'pool':
-                if op == 'del' or snap.get('master') != m.pool.get('master') or \
-                        snap.get('ha_enabled') != m.pool.get('ha_enabled'):
-                    out.append('the pool master or HA changed')
+                    if ref in known or (whole and dom0 and snap.get('VM') == dom0) or snap.get('VDI') in chain_refs:
+                        out.append('VBD %s: %s' % (snap.get('uuid') or ref, op))
+                elif cls == 'vm':
+                    ops = snap.get('current_operations') or {}
+                    if ref in owners or (whole and href and ops and href in (snap.get('resident_on'),
+                                                                             snap.get('scheduled_to_be_resident_on'))):
+                        out.append('VM "%s": %s' % (snap.get('name_label') or ref, op))
+                elif cls == 'vdi':
+                    if ref in vdi_refs:
+                        out.append('VDI %s: %s' % (snap.get('uuid') or ref, op))
+                    elif ref in busy_refs and (op == 'del' or snap.get('current_operations') or any(
+                            k in (snap.get('sm_config') or {}) for k in ('paused', 'relinking', 'activating'))):
+                        out.append('VDI %s, served on the host, is busy (%s)' % (snap.get('uuid') or ref, op))
+                    elif ref in chain_refs and snap.get('current_operations'):
+                        out.append('VDI %s, in the chain of its disk, has %s in progress' % (
+                            snap.get('uuid') or ref, ', '.join(sorted(set(snap['current_operations'].values())))))
+                    elif whole and h is not None and h.is_master:
+                        was = ((m.vdis.get(ref) or {}).get('sm_config') or {})
+                        now_ = snap.get('sm_config') or {}
+                        got = [k for k in ('paused', 'relinking', 'activating') if k in now_ and k not in was]
+                        if got:
+                            out.append('VDI %s now carries %s' % (snap.get('uuid') or ref, ', '.join(got)))
+                elif cls == 'pbd':
+                    was = m.pbds.get(ref)
+                    if op == 'mod' and was is not None and all(snap.get(k) == was.get(k) for k in PBD_STATE):
+                        continue
+                    if snap.get('SR') in sr_refs or (was or {}).get('SR') in sr_refs or \
+                            (op == 'del' and any(ref in m.srs[s]['PBDs'] for s in sr_refs)):
+                        out.append('PBD %s of SR %s: %s' % (snap.get('uuid') or ref, m.srs.get(
+                            snap.get('SR') or (was or {}).get('SR'), {}).get('uuid') or '?', op))
+                elif cls == 'sr':
+                    if ref in sr_refs and (op == 'del' or sorted(snap.get('PBDs') or []) != sorted(m.srs[ref]['PBDs'])):
+                        out.append('SR %s: %s' % (snap.get('uuid') or ref, op))
+                    elif ref in sr_refs and set((snap.get('current_operations') or {}).values()) - set(
+                            SR_HOUSEKEEPING) - (set(SR_VDI_OPS) if h is None or not whole else set()):
+                        out.append('SR %s has %s in progress' % (snap.get('uuid') or ref, ', '.join(sorted(
+                            set((snap.get('current_operations') or {}).values()) - set(SR_HOUSEKEEPING) - (
+                                set(SR_VDI_OPS) if h is None or not whole else set())))))
+                elif cls == 'pool':
+                    if op == 'del' or snap.get('master') != m.pool.get('master') or \
+                            snap.get('ha_enabled') != m.pool.get('ha_enabled'):
+                        out.append('the pool master or HA changed')
+            return out, plugins, seen
+        out, plugins, seen = scan(res.get('events'))
+        reads = 1
+        judged = collections.OrderedDict()
+        pending = plugins
+        while pending and not out:
+            out.extend(self.plugin_moves(m, pending))
+            judged.update(pending)
+            if out or reads >= PLUGIN_READS:
+                break
+            try:
+                res = getattr(self.ctx.api.x.event, 'from')(EVENT_CLASSES, token, 0.0)
+            except Exception as exc:
+                out.append('the event check failed on its read %d: %s' % (reads + 1, _text(exc)))
+                break
+            reads += 1
+            more, later, seen = scan(res.get('events'))
+            out.extend(more)
+            pending = collections.OrderedDict((r, v) for r, v in later.items() if r not in judged)
         out = list(collections.OrderedDict.fromkeys(out))
         self.j.rec('event_check', host=h.uuid if h is not None else None, vdis=list(vdis), srs=list(srs),
-                   seen=seen, changed=out[:8])
+                   seen=seen, changed=out[:8], plugins=len(judged) or len(plugins), reads=reads)
         return '; '.join(out[:4]) if out else None
+
+    def plugin_moves(self, m, plugins):
+        rec = {'started': len(plugins), 'running': [], 'hosts': [], 'work': [], 'looks': 0}
+
+        def done(out):
+            rec['changed'] = out[:4]
+            self.j.rec('plugin_check', **rec)
+            return out
+        live = list(plugins)
+        for look in range(PLUGIN_LOOKS):
+            rec['looks'] = look + 1
+            try:
+                now = self.ctx.api.x.task.get_all_records()
+            except Exception as exc:
+                return done(['%d plugin call(s) started since the read, and whether they still run is not '
+                             'established (%s)' % (len(plugins), _text(exc))])
+            snaps = sorted((t for t in now.values() if t.get('status') in TASK_RUNNING and
+                            t.get('name_label') in SNAP_TASKS), key=lambda t: t.get('uuid') or '')
+            if snaps:
+                return done(['a plugin call started since the read, and task "%s" (%s) is pending in the pool and '
+                             'may be what called it' % (snaps[0].get('name_label'), snaps[0].get('uuid'))])
+            live = [ref for ref in live if ref in now and now[ref].get('status') in TASK_RUNNING]
+            rec['running'] = [now[ref].get('uuid') for ref in live]
+            if not live:
+                return done([])
+            where = collections.OrderedDict()
+            for ref in live:
+                where.setdefault(now[ref].get('resident_on'), []).append(now[ref])
+            stray = [ts[0] for r, ts in where.items() if r not in m.hosts]
+            if stray:
+                return done(['task "%s" (%s) started since the read and still runs, on no host of the pool'
+                             % (stray[0].get('name_label'), stray[0].get('uuid'))])
+            hosts = [(r, self.host(m.hosts[r]['uuid'])) for r in where]
+            lost = [where[r][0] for r, hh in hosts if hh is None]
+            if lost:
+                return done(['task "%s" (%s) started since the read and still runs, on a host this run cannot reach'
+                             % (lost[0].get('name_label'), lost[0].get('uuid'))])
+            out = []
+            for (r, hh), (st, val) in parallel(lambda rh: self.ctx.transport.call(
+                    rh[1], 'facts', {'want': ['procs']}, timeout=60), hosts):
+                t = where[r][0]
+                rec['hosts'].append(hh.uuid)
+                pr = (val or {}).get('procs') if st == 'ok' and isinstance(val, dict) else None
+                if not (isinstance(pr, dict) and pr.get('ok') and isinstance(pr.get('value'), list)):
+                    why = _text(val) if st != 'ok' else ((pr or {}).get('error') or 'no process list came back')
+                    out.append('task "%s" (%s) started since the read and still runs on %s, and its processes there '
+                               'were not read (%s)' % (t.get('name_label'), t.get('uuid'), hh.name, why[:200]))
+                    continue
+                work = window_work(pr['value'])
+                if work:
+                    rec['work'].append([hh.uuid, work[0]['pid'], sm_what(work[0].get('argv'))])
+                    out.append('task "%s" (%s) started since the read and still runs, and %s process %d runs %s '
+                               'on %s' % (t.get('name_label'), t.get('uuid'), work[0]['what'], work[0]['pid'],
+                                          sm_what(work[0].get('argv')), hh.name))
+            if out:
+                return done(out)
+            if look + 1 < PLUGIN_LOOKS:
+                pause(PLUGIN_RECHECK)
+        return done([])
 
     def fence_up(self, it, plan, hold=None, action=None, paused_ok=False):
         hold = FENCE_HOLD if hold is None else hold
@@ -27513,6 +28117,7 @@ def preflight(opts):
         raise Refused('xapi says the pool master is %s, but this host is %s' % (master_uuid, ctx.my_uuid))
     ctx.workdir = make_workdir()
     ctx.transport = new_transport(ctx.workdir)
+    _CTX[0] = ctx
     snap = pool_snapshot(ctx.api)
     model = Model(snap)
     hosts = ctx.host_objs(model)
@@ -28910,8 +29515,11 @@ def main(argv=None):
     try:
         return main_run(opts)
     finally:
-        logout_all()
-        output_end()
+        try:
+            drop_caches(_CTX[0])
+        finally:
+            logout_all()
+            output_end()
 
 
 def main_run(opts):
