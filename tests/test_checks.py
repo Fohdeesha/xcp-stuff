@@ -51,11 +51,13 @@ def all_silent(ips):
 
 UNCOLLECTED = [
     ("Dom0 Disk Usage", checks.dom0_disk_usage),
+    ("Read-Only Filesystems", checks.read_only_filesystems),
     ("MTU Issues", checks.mtu_issues),
     ("Dmesg Content", checks.dmesg_content),
     ("OOM Events", checks.oom_events),
     ("Crash Logs Present", checks.crash_logs),
     ("Coredumps Present", checks.coredumps),
+    ("Failed Systemd Units", checks.failed_units),
     ("XAPI Task Timeout Override", checks.task_timeout_override),
     ("LACP Negotiation Issues", checks.lacp),
     ("Tapdisk Status", checks.tap_status),
@@ -102,7 +104,8 @@ def test_the_check_table_and_the_slave_toggles_stay_in_step():
 
 
 def test_every_host_check_says_unknown_when_the_fact_is_an_error():
-    broken = host(df=err(), dmesg=err(), crash_dumps=err(), coredumps=err(), lacp=err(),
+    broken = host(df=err(), proc_mounts=err(), fstab=err(), dmesg=err(), crash_dumps=err(),
+                  coredumps=err(), failed_units=err(), lacp=err(),
                   iplink=err(), pifs_dns_gw=err(), ipaddr=err(), log_scan=err(),
                   lun_scan=err(), smapi=err(), boot_epoch=err(), task_timeout=err(),
                   multipath=err(), multipath_scan=err(), tap_status=err())

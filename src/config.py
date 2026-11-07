@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Every threshold, list and toggle, in one place. Same names and values as health.sh."""
 
-SCRIPT_VERSION = "3.23"
+SCRIPT_VERSION = "3.24"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
@@ -25,6 +25,32 @@ DOM0_MAX_USED = 75               # dom0 disk use % allowed before flagging
 DOM0_MEM_USED_MAX_PCT = 65       # dom0 memory use % allowed before flagging
 XOSTOR_MIN_RAM_GB = 15           # minimum dom0 RAM (GB) when XOSTOR is in use
 TIME_SYNC_ALLOWANCE_SECS = 300   # max clock difference between a host and this machine
+
+# Read-Only Filesystems judges the root filesystem, what fstab mounts without asking for ro,
+# and two kinds of mount that are only ever made writable: what SM mounts from a block device
+# for a local SR, and the LINSTOR controller's database. Everything else is left alone, since a
+# dom0 has read-only mounts on purpose (systemd's cgroup tmpfs, an ISO on a loop). It catches
+# what the kernel remounts read-only (ext3/ext4 with errors=remount-ro, vfat); an XFS that hits
+# an I/O error shuts down instead and stays rw in /proc/mounts, so that is not seen here.
+RO_FS_SR_DIRS = ["/run/sr-mount/", "/var/run/sr-mount/"]
+RO_FS_EXTRA = ["/var/lib/linstor"]
+RO_FS_NATIVE_RO = ["iso9660", "udf", "squashfs", "cramfs", "erofs"]  # read-only by nature
+
+# Long-Running Tasks: a xapi task still pending after this many hours. xapi destroys a pending
+# task itself after pending_task_timeout (86400 s by default, /etc/xapi.conf), so this has to
+# stay under 24 to be able to say anything at all.
+TASK_PENDING_MAX_HOURS = 16
+
+# Failed Systemd Units: units left out, by name prefix. SMGC@<sr>.service is one GC run of an
+# SR; a failed one stays 'failed' until that SR's next GC run, and GC health is judged from
+# SMlog by storage-state-fixer (C19), not from a unit state.
+FAILED_UNITS_IGNORE = ["SMGC@"]
+# attach-static-vdis is left out only when no static-VDI entry existed when it failed: its
+# script, before xen-api ae4d3ec4, fails on an empty directory (a host booted with HA off)
+STATIC_VDIS_UNIT = "attach-static-vdis.service"
+# dmesg lines quoted as evidence under a finding, case-insensitive; never part of the verdict.
+# Not a bare "read-only": every boot prints "Write protecting the kernel read-only data".
+RO_FS_DMESG = ["remounting filesystem read-only", "has been set read-only", "aborting journal"]
 
 MTU_DMESG_KEYWORDS = ["mtu", "large", "fragment"]      # whole-word, case-insensitive
 DMESG_ISSUE_WORDS = ["panic", "crash", "rip", "kill"]  # whole-word, case-insensitive
@@ -252,12 +278,14 @@ DMESG_ROLLUP_MIN = 3             # consecutive copies of one dmesg message folde
 # so does single mode / a solo host run; these toggles exist only to keep a sweep short.
 POOL_RUN = {
     "dom0_disk_usage": True,
+    "read_only_filesystems": True,
     "dom0_memory": True,
     "mtu_issues": True,
     "dmesg_content": True,
     "oom_events": True,
     "crash_logs_present": True,
     "coredumps_present": True,
+    "failed_units": True,
     "tap_ctl_list": True,
     "task_timeout_override": True,
     "lacp_negotiation": True,
