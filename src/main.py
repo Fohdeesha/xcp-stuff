@@ -924,6 +924,12 @@ def pool_status_section(run, rep):
     rep.check("XOSTOR In Use", checks.xostor_in_use, run.pool)
     if run.pool.xostor_in_use():
         rep.check("XOSTOR RAM", checks.xostor_ram, run.pool, memory)
+        if not run.host_solo():
+            # the master always prints its own XOSTOR lines, but a slave's discrepancy
+            # is only spelled out if slaves run them too
+            rep.check("XOSTOR Version Consistency", checks.xostor_version_consistency,
+                      [h for h in run.hosts if h.reachable],
+                      config.POOL_RUN.get("xostor_versions", True))
         rep.check("XOSTOR Faulty Resources", checks.xostor_faulty_resources, run.pool)
         rep.check("XOSTOR Faulty Nodes", checks.xostor_nodes, run.pool)
         rep.check("XOSTOR Controller IP", checks.xostor_controller, run.pool, run.host_names)
@@ -1109,6 +1115,9 @@ def host_section(run, rep, host):
     if run.pool_mode and not run.host_solo() and gated(run, host, "yum_patch_level"):
         rep.check("Yum Patch Level", checks.yum_patch_level, host, host.is_master,
                   run.master_manifest())
+    if gated(run, host, "xostor_versions"):
+        rep.check("XOSTOR Packages", checks.xostor_versions, host,
+                  run.pool.xostor_in_use())
     rep.end_section()
 
 

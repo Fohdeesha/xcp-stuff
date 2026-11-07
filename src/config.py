@@ -238,6 +238,11 @@ COREDUMP_DIR = "/var/lib/systemd/coredump"          # anything here means a dom0
 COREDUMP_MAX_LINES = 50          # coredumps listed in the detail block (newest first)
 PKG_DIFF_MAX_LINES = 100         # mismatched yum packages listed
 XOSTOR_QCOW2_MAX_LINES = 50      # qcow2 VDIs on XOSTOR listed
+# packages whose installed versions 'XOSTOR Packages' lists on every host, in print order
+XOSTOR_PACKAGES = (
+    "kmod-drbd", "drbd", "drbd-utils", "drbd-reactor", "linstor-satellite",
+    "linstor-controller", "linstor-client", "python-linstor", "xcp-ng-linstor",
+)
 DMESG_MAX_LINES = 80             # lines of a dmesg detail block (Dmesg Content, OOM Events);
                                  # the newest are kept, and the rollup runs first
 DMESG_ROLLUP_MIN = 3             # consecutive copies of one dmesg message folded into a
@@ -269,4 +274,5 @@ POOL_RUN = {
     "smapi_hidden_leaves": False,
     "rebooted_after_updates": True,
     "yum_patch_level": True,
+    "xostor_versions": True,
 }
