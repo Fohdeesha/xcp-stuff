@@ -6873,6 +6873,34 @@ def xostor_missing_devices(host):
             "PV UUID", "Device (hint)", "State")] + detail))
 
 
+def xostor_missing_devices_pool(hosts, details_shown=True):
+    """One pool-level line rolling up every host's 'XOSTOR Missing Devices', so a lost
+    disk is not missed by someone reading only the pool section - the same reason
+    'XOSTOR Version Consistency' exists. Built from the host line itself, so the two can
+    never disagree. Names the hosts, since that is the first thing to know; the PVs are
+    in each host's own detail. details_shown is False when slaves do not print the
+    per-host line, and then the reader is not sent to look for it.
+    """
+    key = "XOSTOR Missing Devices"
+    missing, unread = [], []
+    for h in hosts:
+        line = xostor_missing_devices(h)
+        if line.status == result.FLAG:
+            missing.append(h.name)
+        elif line.status == result.UNKNOWN:
+            unread.append(h.name)
+    if missing:
+        text = "Yes, on: %s" % ", ".join(missing)
+        if details_shown:
+            text += " - See Host Results"
+        if unread:
+            text += " (unreadable on: %s)" % ", ".join(unread)
+        return flag(key, text)
+    if unread:
+        return unknown(key, "Unknown on: %s" % ", ".join(unread))
+    return ok(key, "None")
+
+
 def xostor_in_use(pool):
     f = pool.fact("xostor_srs")
     if not f.ok:
@@ -8977,6 +9005,9 @@ def pool_status_section(run, rep):
             rep.check("XOSTOR Version Consistency", checks.xostor_version_consistency,
                       [h for h in run.hosts if h.reachable],
                       config.POOL_RUN.get("xostor_versions", True))
+            rep.check("XOSTOR Missing Devices", checks.xostor_missing_devices_pool,
+                      [h for h in run.hosts if h.reachable],
+                      config.POOL_RUN.get("xostor_missing_devices", True))
         rep.check("XOSTOR Faulty Resources", checks.xostor_faulty_resources, run.pool)
         rep.check("XOSTOR Faulty Nodes", checks.xostor_nodes, run.pool)
         rep.check("XOSTOR Controller IP", checks.xostor_controller, run.pool, run.host_names)
@@ -9432,7 +9463,7 @@ collectorsrc = _module('collectorsrc', ['EMBEDDED', 'collector_source'])
 transport = _module('transport', ['ASKPASS_ENV', 'ASKPASS_SCRIPT', 'AUTH_ASKPASS', 'AUTH_SSHPASS', 'BEGIN_MARKER', 'CollectError', 'END_MARKER', 'Transport', '_DEBUG_LOCK', '_LIVE', '_LIVE_LOCK', '_REMOTE_LAUNCH', '_REMOTE_LAUNCH_PINNED', '_kill_tree', '_remote_launch', 'cleanup_work_dir', 'debug', 'ensure_sshpass', 'have', 'kill_all_children', 'make_work_dir', 'run_local_cmd', 'which', 'write_askpass'])
 xoredis = _module('xoredis', ['DEFAULT_ADDR', 'ENCRYPTION_PREFIX', 'IDS_KEY', 'PLUGIN_IDS_KEY', 'PLUGIN_RECORD_PREFIX', 'RECORD_PREFIX', 'RedisError', '_config_dirs', '_config_files', '_encode', '_fetch', '_fetch_autoload', '_fetch_collection', '_flatten', '_mentions_redis', '_read_reply', 'read_plugin_autoload', 'read_records', 'read_server_records'])
 xodb = _module('xodb', ['QUOTES', 'SELECT_NONE', 'SELECT_NO_MATCH', 'SELECT_OK', 'SELECT_QUIT', 'SELECT_UNREADABLE', 'Server', '_ALL_SERVERS', '_COLLECTIONS', '_ESCAPE_RE', '_KEY_RE', '_READ_ERROR', '_RESOLVED', '_SIMPLE_ESCAPES', '_describe_failure', '_ls', '_read_servers', '_resolve', '_same_address', '_sort_key', 'all_servers', 'backup_routes', 'clean', 'collection', 'db_address', 'enabled_server_for', 'enabled_servers', 'have_xo_server_db', 'match_record', 'password_for', 'pool_name_for_host', 'read_error', 'record_password', 'reset_cache', 'scan_records', 'select_pool', 'server_for_host', 'unescape'])
-checks = _module('checks', ['_backup_moved_elsewhere', '_dmesg_phrase_blocks', '_drbd_stale', '_first_line', '_linstor_column', '_linstor_has_rows', '_linstor_line', '_linstor_node_addresses', '_linstor_node_offline', '_linstor_table', '_linstor_unknown', '_maps', '_mount_detail', '_multipath_detail', '_multipath_read', '_network_line', '_plural', '_pool_conf_target', '_pool_roles_detail', '_render_scan_blocks', '_ro_detail', '_ro_name', '_stuck_detail', '_xostor_signature', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_block', 'dmesg_content', 'dmesg_content_of', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'failed_units', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'long_running_tasks', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mount_stalls', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'network_mounts', 'ntp', 'oom_events', 'overlapping_subnets', 'pool_host_list', 'pool_roles', 'read_only_filesystems', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'sr_attachment', 'stuck_processes', 'tap_status', 'task_timeout_override', 'vlan0', 'xapi_status', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_missing_devices', 'xostor_nodes', 'xostor_pref_nic', 'xostor_qcow2', 'xostor_ram', 'xostor_version_consistency', 'xostor_versions', 'yum_patch_level'])
+checks = _module('checks', ['_backup_moved_elsewhere', '_dmesg_phrase_blocks', '_drbd_stale', '_first_line', '_linstor_column', '_linstor_has_rows', '_linstor_line', '_linstor_node_addresses', '_linstor_node_offline', '_linstor_table', '_linstor_unknown', '_maps', '_mount_detail', '_multipath_detail', '_multipath_read', '_network_line', '_plural', '_pool_conf_target', '_pool_roles_detail', '_render_scan_blocks', '_ro_detail', '_ro_name', '_stuck_detail', '_xostor_signature', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_block', 'dmesg_content', 'dmesg_content_of', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'failed_units', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'long_running_tasks', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mount_stalls', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'network_mounts', 'ntp', 'oom_events', 'overlapping_subnets', 'pool_host_list', 'pool_roles', 'read_only_filesystems', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'sr_attachment', 'stuck_processes', 'tap_status', 'task_timeout_override', 'vlan0', 'xapi_status', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_missing_devices', 'xostor_missing_devices_pool', 'xostor_nodes', 'xostor_pref_nic', 'xostor_qcow2', 'xostor_ram', 'xostor_version_consistency', 'xostor_versions', 'yum_patch_level'])
 xoa = _module('xoa', ['_dmesg', '_first_token', '_max_old_space', '_meminfo', '_os_version', '_plugin_autoload', '_plugin_scan_targets', '_plugin_version', '_plugins_line', '_service_state', '_updater', 'collect_xoa', 'debian_version_ok', 'lines', 'ping_silent', 'running_as_root', 'scan_plugins'])
 report = _module('report', ['Report', '_as_entry'])
 runcmd = _module('runcmd', ['TRANSPORT_FAILED', '_run_one', 'execute'])
