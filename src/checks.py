@@ -136,6 +136,77 @@ def dom0_disk_usage(host):
     return flag("Dom0 Disk Usage", "Fail", " - " + ", ".join(bad))
 
 
+def read_only_filesystems(host):
+    """A filesystem that should be writable and is mounted read-only.
+
+    That is mostly the kernel's answer to an I/O error it could not get past
+    (errors=remount-ro), and every write there fails from then on: /var/log stops logging,
+    a local SR stops taking VM writes. /proc/mounts says what is in effect, and fstab says
+    what was asked for, which is what keeps the read-only mounts a dom0 makes on purpose
+    out of it. The root filesystem is judged whatever fstab says, and a /proc/mounts with
+    no root in it is not read as a clean one. Without fstab the host's other filesystems
+    are not judged, so a clean answer is Unknown, while a read-only mount found anyway is
+    still reported.
+    """
+    mounts = host.fact("proc_mounts")
+    if not mounts.ok:
+        return unknown("Read-Only Filesystems", "Unknown (%s)" % mounts.error)
+    fstab = host.fact("fstab")
+    bad = parsers.read_only_mounts(mounts.value, fstab.value if fstab.ok else None,
+                                   config.RO_FS_SR_DIRS, config.RO_FS_EXTRA,
+                                   config.RO_FS_NATIVE_RO)
+    if bad is None:
+        return unknown("Read-Only Filesystems", "Unknown (/proc/mounts names no root filesystem)")
+    if bad:
+        return flag("Read-Only Filesystems", "Yes",
+                    " - " + ", ".join(_ro_name(row) for row in bad)).with_detail(
+            "Read-Only Filesystems", _ro_detail(bad, fstab, host.fact("dmesg")))
+    if not fstab.ok:
+        return unknown("Read-Only Filesystems", "Unknown (%s)" % fstab.error)
+    return ok("Read-Only Filesystems", "None")
+
+
+def _ro_name(row):
+    for d in config.RO_FS_SR_DIRS:
+        if row["target"].startswith(d):
+            return "SR %s" % row["target"][len(d):][:8]
+    return row["target"]
+
+
+def _ro_detail(bad, fstab, dmesg):
+    lines = []
+    for row in bad:
+        asked = "; fstab asks for %s" % row["fstab"] if row["fstab"] else ""
+        lines.append("  %s  %s on %s, mounted %s%s"
+                     % (row["target"], row["type"], row["source"], row["options"], asked))
+    if not fstab.ok:
+        lines.append("  fstab was not read (%s), so only /, SR mounts and %s were judged"
+                     % (fstab.error, ", ".join(config.RO_FS_EXTRA)))
+    lines.append("The kernel remounts a filesystem read-only after an I/O error it cannot get "
+                 "past (errors=remount-ro); every write to it fails from then on.")
+    if not dmesg.ok:
+        lines.append("dmesg was not read (%s)." % dmesg.error)
+        return "\n".join(lines)
+    said = [l.strip() for l in dmesg.value.splitlines()
+            if any(p in l.lower() for p in config.RO_FS_DMESG)]
+    devs = sorted(set(row["source"].rsplit("/", 1)[-1] for row in bad))
+    about = [l for l in said if set(devs) & set(
+        l.replace("(", " ").replace(")", " ").replace("-", " ").replace(":", " ").split())]
+    if about:
+        lines.append("What dmesg says about %s:" % ", ".join(devs))
+        lines.extend("  " + l for l in about[-6:])
+    elif said:
+        # a device-mapper source shows up in dmesg as dm-N, which /proc/mounts does not
+        # name, so these may well be about it - or about something else entirely
+        lines.append("dmesg has lines about a filesystem going read-only, none naming %s:"
+                     % ", ".join(devs))
+        lines.extend("  " + l for l in said[-6:])
+    else:
+        lines.append("dmesg holds no line about a filesystem going read-only: the ring may "
+                     "have wrapped since, and kern.log may still have it.")
+    return "\n".join(lines)
+
+
 def dom0_memory(host):
     """Two lines from one fact. A percentage computed off a missing meminfo used to read
     exactly like a healthy host, with only an stderr line to say otherwise."""
@@ -258,6 +329,49 @@ def coredumps(host):
     shown = parsers.cap_lines(rows, config.COREDUMP_MAX_LINES, "older coredump(s)")
     return flag("Coredumps Present", "Yes - %d file(s), see below" % len(rows)).with_detail(
         "Coredumps (%s)" % config.COREDUMP_DIR, "\n".join(shown))
+
+
+def failed_units(host):
+    """A systemd unit in the failed state: a service that did not start, or died since.
+
+    systemctl's own answer, with the prefixes in FAILED_UNITS_IGNORE left out - SM's GC
+    runs, whose health is judged from SMlog rather than from the state of the last run's
+    unit. A unit stays failed until it is started again, reset or the host reboots, so the
+    finding can be days old: the detail says what systemd says, and that is all it claims.
+
+    attach-static-vdis is left out only when its failure was about nothing: no static-VDI
+    entry existed when it failed (a host booted with HA off, which its script fails on
+    before xen-api ae4d3ec4). When that is not established it stays in, and says why.
+    """
+    f = host.fact("failed_units")
+    if not f.ok:
+        return unknown("Failed Systemd Units", "Unknown (%s)" % f.error)
+    units = [(u, d) for u, d in parsers.parse_failed_units(f.value)
+             if not any(u.startswith(p) for p in config.FAILED_UNITS_IGNORE)]
+    notes = []
+    if any(u == config.STATIC_VDIS_UNIT for u, _d in units):
+        sv, boot = host.fact("static_vdis"), host.fact("boot_epoch")
+        moot = parsers.static_vdis_failure_moot(sv.value if sv.ok else None,
+                                                boot.value if boot.ok else None)
+        if moot:
+            units = [x for x in units if x[0] != config.STATIC_VDIS_UNIT]
+        elif moot is False:
+            notes.append("%s failed while a static-VDI entry already existed: a VDI HA needs "
+                         "(statefile or metadata) did not attach at boot" % config.STATIC_VDIS_UNIT)
+        else:
+            notes.append("whether %s failed about anything was not established (%s), so it is "
+                         "reported" % (config.STATIC_VDIS_UNIT,
+                                       sv.error if not sv.ok else boot.error if not boot.ok
+                                       else "an entry's creation time or the exit time was not read"))
+    if not units:
+        return ok("Failed Systemd Units", "None")
+    lines = ["  %s  %s" % (parsers.unit_display(u), d) for u, d in units]
+    lines.extend("  " + n for n in notes)
+    lines.append("systemctl status <unit> says when and why; systemctl reset-failed <unit> "
+                 "clears one that no longer matters.")
+    return flag("Failed Systemd Units", "Yes",
+                " - " + ", ".join(parsers.unit_display(u) for u, _d in units)).with_detail(
+        "Failed Systemd Units", "\n".join(lines))
 
 
 def lacp(host):
@@ -881,6 +995,107 @@ def ha_enabled(pool):
     if value == "true":
         return flag("HA Enabled", "Yes")
     return unknown("HA Enabled", "Unknown")
+
+
+def sr_attachment(pool):
+    """A shared SR that a live host cannot use: VMs on it will not start there, migrate
+    there or back up from there, and nothing else in the report says so.
+
+    That flags when some live hosts have it and another does not. An SR plugged on no live
+    host at all - shared or local - is yellow and does not flag: an SR detached on purpose
+    reads exactly like one whose storage was down at boot, and the owner's call
+    (2026-11-07) is that a deliberate detach must not fail the run. Yellow still survives
+    -f, so the outage case is on screen. Hosts xapi does not see as live are not judged,
+    their own local SRs included: their PBD state is the last one recorded, not the
+    present. With no live host at all nothing was judged, which is Unknown.
+    """
+    f = pool.fact("sr_attachment")
+    if not f.ok:
+        return unknown("SR Attachment", "Unknown (%s)" % f.error)
+    v = f.value if isinstance(f.value, dict) else {}
+    res = parsers.parse_sr_attachment(v.get("pbds") or "", v.get("srs") or "", v.get("hosts") or "")
+    if res is None:
+        return unknown("SR Attachment", "Unknown (the PBD, SR or host listing from xe could not "
+                                        "be read, or xapi sees no host as live)")
+    lines = []
+    for sr_name, sr_uuid, everywhere, missing in res["shared"]:
+        if everywhere:
+            lines.append("  %s (%s): shared, and plugged on no live host" % (sr_name, sr_uuid))
+        for host_name, why, pbd in missing:
+            lines.append("  %s (%s): %s on %s%s" % (
+                sr_name, sr_uuid, why, host_name,
+                "  ->  xe pbd-plug uuid=%s" % pbd if pbd else ""))
+    for sr_name, sr_uuid, host_name, pbd in res["local"]:
+        lines.append("  %s (%s): local, %s" % (
+            sr_name, sr_uuid, "not plugged on %s  ->  xe pbd-plug uuid=%s" % (host_name, pbd)
+            if host_name else "and it has no PBD at all"))
+    if res["down"]:
+        lines.append("  not judged on %s: xapi does not see %s as live"
+                     % (", ".join(res["down"]), "it" if len(res["down"]) == 1 else "them"))
+    detail = "\n".join(lines)
+    partial = [s for s in res["shared"] if not s[2]]
+    detached = ["%s (shared, on no live host)" % s[0] for s in res["shared"] if s[2]] + \
+        ["%s on %s" % (n, h) if h else "%s (no PBD)" % n for n, _u, h, _p in res["local"]]
+    if partial:
+        names = []
+        for sr_name, _uuid, _everywhere, missing in partial:
+            for why in ("not plugged", "no PBD"):
+                hosts = [m[0] for m in missing if m[1] == why]
+                if hosts:
+                    names.append("%s %s on %s" % (sr_name, "not plugged" if why == "not plugged"
+                                                  else "has no PBD", ", ".join(hosts)))
+        return flag("SR Attachment", "Fail", " - " + "; ".join(names)).with_detail(
+            "SR Attachment", detail)
+    if detached or res["down"]:
+        parts = []
+        if detached:
+            parts.append("Detached - " + ", ".join(detached))
+        if res["down"]:
+            parts.append("not judged on %s" % ", ".join(res["down"]))
+        text = "; ".join(parts)
+        return info("SR Attachment", text[:1].upper() + text[1:], "yellow").with_detail(
+            "SR Attachment", detail)
+    return ok("SR Attachment", "OK")
+
+
+def long_running_tasks(pool):
+    """A xapi task still pending after TASK_PENDING_MAX_HOURS.
+
+    It holds whatever it was working on - a VM, a VDI, an SR operation - and every later
+    operation on that object waits behind it or fails with an 'operation in progress'
+    that names nothing. One reading only, so the line says how long a task has been
+    pending, never that it is stuck: progress is shown, not judged. xapi destroys a
+    pending task itself at pending_task_timeout (24 h by default), so the window this can
+    see is the hours before that.
+    """
+    f = pool.fact("tasks")
+    if not f.ok:
+        return unknown("Long-Running Tasks", "Unknown (%s)" % f.error)
+    v = f.value if isinstance(f.value, dict) else {}
+    now = v.get("now")
+    old = parsers.parse_pending_tasks(v.get("text") or "", now,
+                                      config.TASK_PENDING_MAX_HOURS * 3600) \
+        if isinstance(now, (int, float)) else None
+    if old is None:
+        return unknown("Long-Running Tasks",
+                       "Unknown (the task listing from xe could not be read)")
+    if not old:
+        return ok("Long-Running Tasks", "None")
+    names = {}
+    att = pool.fact("sr_attachment")
+    if att.ok and isinstance(att.value, dict):
+        for rec in parsers.parse_xe_records(att.value.get("hosts") or ""):
+            names[rec.get("uuid")] = rec.get("name-label") or rec.get("uuid")
+    lines = ["  %s (%s): pending for %.1fh, progress %s, on %s" % (
+        name, uuid, age / 3600.0, progress, names.get(host, host))
+        for name, uuid, age, progress, host in old]
+    lines.append("A task xapi still calls pending holds what it works on; if it is not "
+                 "moving, xe task-cancel uuid=<uuid> asks it to stop.")
+    return flag("Long-Running Tasks", "Yes",
+                " - %d pending over %dh: %s" % (len(old), config.TASK_PENDING_MAX_HOURS,
+                                                ", ".join(t[0] for t in old[:3]) +
+                                                (", ..." if len(old) > 3 else ""))).with_detail(
+        "Long-Running Tasks", "\n".join(lines))
 
 
 def migration_compression(pool):

@@ -491,6 +491,65 @@ def collect_df():
     return fact(r.out)
 
 
+def collect_failed_units():
+    """systemctl's own list of failed units. rc 0 with no line is a real 'none'; a
+    systemctl that fails is an error, never an empty list."""
+    r = run(["systemctl", "--failed", "--no-legend", "--plain"], timeout=20)
+    if not r.ok:
+        return err("systemctl --failed failed (%s)" % r.why())
+    return fact(r.out)
+
+
+STATIC_VDIS_DIR = "/etc/xensource/static-vdis"
+STATIC_VDIS_UNIT = "attach-static-vdis.service"
+
+
+def collect_static_vdis():
+    """When attach-static-vdis last exited, and when each entry it attaches was created.
+
+    Before xen-api ae4d3ec4 (2026-08-03) its script loops over the directory without
+    nullglob, so on an EMPTY directory - a host booted while HA was off, as a rolling pool
+    reboot leaves it - it tries to attach a VDI with no uuid and fails, about nothing. Telling
+    that apart from a statefile that really did not attach needs the two times: the exit as
+    microseconds of uptime (no wall-clock string, so no timezone to parse), and each entry's
+    vdi-uuid file mtime, which 'static-vdis add' writes once - the entry directory's own
+    mtime moves whenever its disk link is made or removed. Dot names are skipped, as the
+    script's glob skips them.
+    """
+    r = run(["systemctl", "show", STATIC_VDIS_UNIT, "-p", "ExecMainExitTimestampMonotonic"],
+            timeout=20)
+    if not r.ok:
+        return err("systemctl show %s failed (%s)" % (STATIC_VDIS_UNIT, r.why()))
+    m = re.search(r"^ExecMainExitTimestampMonotonic=(\d+)\s*$", r.out, re.M)
+    if not m:
+        return err("systemctl show %s gave no ExecMainExitTimestampMonotonic" % STATIC_VDIS_UNIT)
+    entries = []
+    if os.path.isdir(STATIC_VDIS_DIR):
+        try:
+            names = sorted(n for n in os.listdir(STATIC_VDIS_DIR) if not n.startswith("."))
+        except OSError as exc:
+            return err("could not list %s (%s)" % (STATIC_VDIS_DIR, exc))
+        for name in names:
+            try:
+                created = os.stat(os.path.join(STATIC_VDIS_DIR, name, "vdi-uuid")).st_mtime
+            except OSError:
+                created = None
+            entries.append({"name": name, "created": created})
+    return fact({"exit_mono_us": int(m.group(1)), "entries": entries})
+
+
+def collect_text_file(path):
+    """A small file shipped whole, as text, to be judged on the other side.
+
+    /proc/mounts is the kernel's own mount table, so reading it cannot block on a mount
+    that has stopped answering; /etc/fstab is a plain file on the root filesystem.
+    """
+    text = read_file(path)
+    if text is None:
+        return err("could not read %s" % path)
+    return fact(text)
+
+
 # --------------------------------------------------------------------------------------
 # stuck mounts, and the processes they take down with them
 # --------------------------------------------------------------------------------------
@@ -1663,6 +1722,30 @@ def collect_pool(spec, self_uuid):
         out["other_config"] = fact(r.out) if r.ok else \
             err("xe pool-param-get other-config failed (%s)" % r.why())
 
+    # SR Attachment: every PBD, SR and host, each in the labelled form (a multi-param
+    # --minimal prints one value) and each with its uuid, which is what the records are
+    # split on. None of them names a uuid, so none can make xapi log a missing-uuid
+    # exception.
+    att = {}
+    for key, args in (("pbds", ["pbd-list", "params=uuid,host-uuid,sr-uuid,currently-attached"]),
+                      ("srs", ["sr-list", "params=uuid,name-label,type,shared"]),
+                      ("hosts", ["host-list", "params=uuid,name-label,host-metrics-live"])):
+        r = xe(args)
+        if not r.ok:
+            att = None
+            out["sr_attachment"] = err("xe %s failed (%s)" % (args[0], r.why()))
+            break
+        att[key] = r.out
+    if att is not None:
+        out["sr_attachment"] = fact(att)
+
+    # Long-Running Tasks: every task, labelled, with this host's clock beside it - 'created'
+    # is UTC, and the age is worked out against the clock of the host xapi answered on,
+    # never the XOA's
+    r = xe(["task-list", "params=uuid,name-label,status,created,progress,resident-on"])
+    out["tasks"] = fact({"text": r.out, "now": time.time()}) if r.ok else \
+        err("xe task-list failed (%s)" % r.why())
+
     r = xe(["sr-list", "type=linstor", "--minimal"])
     if not r.ok:
         out["xostor_srs"] = err("xe sr-list type=linstor failed (%s)" % r.why())
@@ -1766,6 +1849,8 @@ def collect(spec):
         out["meminfo"] = collect_meminfo()
         out["timedatectl"] = collect_timedatectl()
         out["df"] = collect_df()
+        out["proc_mounts"] = collect_text_file("/proc/mounts")
+        out["fstab"] = collect_text_file("/etc/fstab")
         out["dmesg"] = collect_dmesg()
         out["iplink"] = collect_iplink()
         out["ipaddr"] = collect_ipaddr()
@@ -1774,6 +1859,9 @@ def collect(spec):
         out["tap_status"] = collect_tap_status()
         out["crash_dumps"] = collect_crash_dumps(spec.get("crash_ignore_file") or "")
         out["coredumps"] = collect_coredumps(spec.get("coredump_dir") or "")
+        out["failed_units"] = collect_failed_units()
+        if out["failed_units"]["ok"] and STATIC_VDIS_UNIT in out["failed_units"]["value"]:
+            out["static_vdis"] = collect_static_vdis()
         out["task_timeout"] = collect_task_timeout_override()
         out["rpm_manifest"] = collect_rpm_manifest()
         out.update(collect_patch_facts())

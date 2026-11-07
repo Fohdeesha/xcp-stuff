@@ -7,9 +7,11 @@ diff that dropped duplicate package names, the util.inspect scan, the timedatect
 generations, the record splitting that merged two SRs' VDIs into one.
 """
 
+import calendar
 import ipaddress
 import json
 import re
+import time
 from urllib.parse import urlsplit
 
 # --------------------------------------------------------------------------------------
@@ -168,6 +170,141 @@ def parse_host_list(text):
             "multipathing": rec.get("multipathing") or "Unknown",
         })
     return hosts
+
+
+SR_ATTACH_SKIP_TYPES = ("udev",)
+
+
+def parse_sr_attachment(pbd_text, sr_text, host_text):
+    """Where each SR is plugged, from xe's PBD, SR and host listings.
+
+    Returns None when nothing can be judged: a listing that cannot be read as what xe
+    prints (a record without a field it was asked for), no host at all, or no host xapi
+    sees as live. Otherwise a dict:
+      shared [(sr_name, sr_uuid, everywhere, [(host_name, why, pbd_uuid)])] - a shared SR
+             that a live host cannot use; why is 'not plugged' (pbd_uuid names the PBD) or
+             'no PBD' (pbd_uuid None); everywhere is True when that is every live host
+      local  [(sr_name, sr_uuid, host_name, pbd_uuid)] - a local SR its own live host has
+             not plugged (host_name and pbd_uuid None for a local SR with no PBD at all)
+      down   [host_name] - hosts xapi does not see as live; their PBDs are not judged,
+             a down host's own local SRs included
+    sr_name is the name-label, or the uuid when the label is empty. udev SRs (DVD drives,
+    removable storage) are left out: they come and go with media.
+    """
+    hosts = parse_xe_records(host_text)
+    srs = parse_xe_records(sr_text)
+    pbds = parse_xe_records(pbd_text)
+    wants = ((hosts, {"uuid", "name-label", "host-metrics-live"}),
+             (srs, {"uuid", "name-label", "type", "shared"}),
+             (pbds, {"uuid", "host-uuid", "sr-uuid", "currently-attached"}))
+    if not hosts or any(not want <= set(r) for recs, want in wants for r in recs):
+        return None
+    name = dict((h["uuid"], h["name-label"] or h["uuid"]) for h in hosts)
+    live = [h["uuid"] for h in hosts if h["host-metrics-live"] == "true"]
+    if not live:
+        return None
+    out = {"shared": [], "local": [],
+           "down": sorted(name[h["uuid"]] for h in hosts if h["uuid"] not in live)}
+    for sr in sorted(srs, key=lambda r: (r["name-label"], r["uuid"])):
+        if sr["type"] in SR_ATTACH_SKIP_TYPES:
+            continue
+        label = sr["name-label"] or sr["uuid"]
+        mine = [p for p in pbds if p["sr-uuid"] == sr["uuid"]]
+        if sr["shared"] != "true":
+            if not mine:
+                out["local"].append((label, sr["uuid"], None, None))
+            for p in mine:
+                if p["host-uuid"] in live and p["currently-attached"] != "true":
+                    out["local"].append((label, sr["uuid"], name[p["host-uuid"]], p["uuid"]))
+            continue
+        plugged = set(p["host-uuid"] for p in mine if p["currently-attached"] == "true")
+        missing = []
+        for h in live:
+            here = [p for p in mine if p["host-uuid"] == h]
+            if not here:
+                missing.append((name[h], "no PBD", None))
+            elif h not in plugged:
+                missing.append((name[h], "not plugged", here[0]["uuid"]))
+        if missing:
+            out["shared"].append((label, sr["uuid"], len(missing) == len(live),
+                                  sorted(missing, key=lambda m: (m[0], m[1]))))
+    return out
+
+
+def xapi_utc(text):
+    """xapi's '20261106T19:39:59Z' (UTC) as an epoch, or None if it is not that."""
+    try:
+        return calendar.timegm(time.strptime(text, "%Y%m%dT%H:%M:%SZ"))
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_pending_tasks(text, now, max_age):
+    """Pending xapi tasks older than max_age seconds, from xe task-list's labelled output.
+
+    Returns None when the listing cannot be read as what xe prints - a record without a
+    field it was asked for, or a pending task whose 'created' is not xapi's UTC stamp -
+    else [(name_label, uuid, age_seconds, progress, resident_on)], oldest first. Only a
+    pending task is judged: a finished one is xapi's to clean up.
+    """
+    old = []
+    for rec in parse_xe_records(text):
+        if not {"uuid", "name-label", "status", "created", "progress", "resident-on"} <= set(rec):
+            return None
+        if rec["status"] != "pending":
+            continue
+        created = xapi_utc(rec["created"])
+        if created is None:
+            return None
+        if now - created > max_age:
+            old.append((rec["name-label"], rec["uuid"], now - created, rec["progress"],
+                        rec["resident-on"]))
+    return sorted(old, key=lambda t: -t[2])
+
+
+def unit_display(name):
+    """systemd's \\xHH escaping undone for display: 'SMGC@a112\\x2d8923' -> 'SMGC@a112-8923'."""
+    return re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), name)
+
+
+def static_vdis_failure_moot(value, boot_epoch):
+    """Was attach-static-vdis's last failure about nothing?
+
+    True when no static-VDI entry existed when it failed: the directory empty or absent,
+    or every entry created after the failure (HA enabled afterwards, as a rolling pool
+    reboot does). False when an entry was already there - a VDI HA needs did not attach
+    at boot. None when that is not established: no exit time, no boot time, or an entry
+    whose creation time could not be read. value is the collector's static_vdis fact.
+    """
+    if not isinstance(value, dict) or not isinstance(boot_epoch, (int, float)):
+        return None
+    mono = value.get("exit_mono_us")
+    entries = value.get("entries")
+    if not isinstance(mono, int) or mono <= 0 or not isinstance(entries, list):
+        return None
+    failed_at = boot_epoch + mono / 1e6
+    for entry in entries:
+        created = entry.get("created") if isinstance(entry, dict) else None
+        if not isinstance(created, (int, float)):
+            return None
+        if created <= failed_at:
+            return False
+    return True
+
+
+def parse_failed_units(text):
+    """[(unit, description)] from 'systemctl --failed --no-legend --plain', in its order.
+
+    The columns are UNIT LOAD ACTIVE SUB DESCRIPTION; a systemd that ignores --plain puts
+    a bullet in front, which is dropped. The unit name stays escaped, as systemctl takes it.
+    """
+    units = []
+    for line in (text or "").splitlines():
+        parts = line.replace("●", " ").split(None, 4)
+        if not parts:
+            continue
+        units.append((parts[0], parts[4] if len(parts) > 4 else ""))
+    return units
 
 
 def host_records_from_state_db(rows):
@@ -333,6 +470,91 @@ def parse_df(text, max_used):
             continue
         if int(digits) > max_used:
             bad.append("%s is at %s%%" % (mount, digits))
+    return bad
+
+
+_MOUNT_FIELD_ESCAPES = {"040": " ", "011": "\t", "012": "\n", "134": "\\"}
+
+
+def mount_field(field):
+    """Undo the octal escaping /proc/mounts and fstab both use: a space in a path is
+    written as a backslash and 040."""
+    if "\\" not in field:
+        return field
+    out = []
+    i = 0
+    while i < len(field):
+        if field[i] == "\\" and field[i + 1:i + 4] in _MOUNT_FIELD_ESCAPES:
+            out.append(_MOUNT_FIELD_ESCAPES[field[i + 1:i + 4]])
+            i += 4
+        else:
+            out.append(field[i])
+            i += 1
+    return "".join(out)
+
+
+def mount_table(text):
+    """[(source, target, fstype, [options])] for each entry of /proc/mounts or fstab, in
+    file order. A target loses a trailing slash, so fstab's '/var/log/' is /proc/mounts'
+    '/var/log'; an entry with no options field reads as 'defaults', as mount reads it."""
+    rows = []
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = stripped.split()
+        if len(parts) < 3:
+            continue
+        target = mount_field(parts[1])
+        if len(target) > 1:
+            target = target.rstrip("/") or "/"
+        opts = parts[3].split(",") if len(parts) > 3 else ["defaults"]
+        rows.append((mount_field(parts[0]), target, parts[2], opts))
+    return rows
+
+
+def read_only_mounts(proc_text, fstab_text, sr_dirs, extra_targets, native_ro=()):
+    """The filesystems that should be writable and are mounted read-only.
+
+    Judged: the root filesystem, which the kernel mounts whatever fstab says; what fstab
+    mounts at boot (not swap, not noauto, not asked to be ro); what is mounted from a block
+    device under one of sr_dirs (SM's local SRs); and each of extra_targets when mounted
+    from a block device. fstab_text None means fstab was not read, and then fstab's half is
+    not judged. A type in native_ro (iso9660 and the like) is never judged: the kernel
+    mounts it read-only whatever was asked.
+
+    The LAST /proc/mounts entry for a mount point is the one in effect: a mount stacked on
+    top of another hides it. Returns None when /proc/mounts has no root filesystem (it
+    cannot be the table it claims to be), else [{target, source, type, options, fstab}] in
+    /proc/mounts order; 'fstab' holds the options fstab asked for, or None.
+    """
+    current = {}
+    order = []
+    for source, target, fstype, opts in mount_table(proc_text):
+        if target not in current:
+            order.append(target)
+        current[target] = (source, fstype, opts)
+    if "/" not in current:
+        return None
+    asked = {}
+    root_ro = False
+    for _source, target, fstype, opts in mount_table(fstab_text):
+        if target == "/" and "ro" in opts:
+            root_ro = True
+        if fstype == "swap" or not target.startswith("/") or "noauto" in opts or "ro" in opts:
+            continue
+        asked[target] = ",".join(opts)
+    bad = []
+    for target in order:
+        source, fstype, opts = current[target]
+        if fstype in native_ro:
+            continue
+        block = source.startswith("/dev/")
+        judged = target in asked or (target == "/" and not root_ro) or (block and (
+            any(target.startswith(d) for d in sr_dirs) or target in extra_targets))
+        if judged and "ro" in opts:
+            bad.append({"target": target, "source": source, "type": fstype,
+                        "options": ",".join(opts), "fstab": asked.get(target)})
     return bad
 
 

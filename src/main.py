@@ -913,6 +913,8 @@ def pool_status_section(run, rep):
         rep.check("Multipath Path Counts", checks.multipath_path_counts, reachable)
 
     rep.check("HA Enabled", checks.ha_enabled, run.pool)
+    rep.check("SR Attachment", checks.sr_attachment, run.pool)
+    rep.check("Long-Running Tasks", checks.long_running_tasks, run.pool)
     rep.check("Migration Compression", checks.migration_compression, run.pool)
     rep.check("Missing Patches", checks.missing_patches, run.pool)
 
@@ -1034,12 +1036,14 @@ def per_host_checks():
     """
     return [
         ("dom0_disk_usage", "Dom0 Disk Usage", checks.dom0_disk_usage),
+        ("read_only_filesystems", "Read-Only Filesystems", checks.read_only_filesystems),
         ("dom0_memory", "Dom0 Memory", checks.dom0_memory),
         ("mtu_issues", "MTU Issues", checks.mtu_issues),
         ("dmesg_content", "Dmesg Content", checks.dmesg_content),
         ("oom_events", "OOM Events", checks.oom_events),
         ("crash_logs_present", "Crash Logs Present", checks.crash_logs),
         ("coredumps_present", "Coredumps Present", checks.coredumps),
+        ("failed_units", "Failed Systemd Units", checks.failed_units),
         ("tap_ctl_list", "Tapdisk Status", checks.tap_status),
         ("task_timeout_override", "XAPI Task Timeout Override", checks.task_timeout_override),
         ("lacp_negotiation", "LACP Negotiation Issues", checks.lacp),
