@@ -1194,6 +1194,72 @@ def collect_drbd_module():
     return fact(text.strip())
 
 
+PVS_TIMEOUT = 30
+
+
+def collect_pvs():
+    """Every LVM physical volume this host's LVM knows of, one '|'-separated row each
+    (name, VG, attr, uuid), and pvs's own warnings beside them.
+
+    Collected on every host whether or not XOSTOR is in use - which hosts that applies to
+    is a pool fact the collector does not have yet - and judged report-side. A PV that has
+    gone away still has a row, read out of the VG metadata on the PVs that remain, named
+    '[unknown]' with an 'm' in its attr, and its uuid; stderr says which uuid could not be
+    found. pvs may exit non-zero over exactly that, so rows are the test of
+    whether it answered, not the exit code.
+    """
+    if which("pvs") is None:
+        return err("pvs not found")
+    r = run(["pvs", "--noheadings", "--separator", "|",
+             "-o", "pv_name,vg_name,pv_attr,pv_uuid"], timeout=PVS_TIMEOUT)
+    if r.timed_out:
+        return err("pvs timed out")
+    if not r.ok and not r.out.strip():
+        return err("pvs failed (%s)" % r.why())
+    return fact({"rows": r.out, "warnings": r.err})
+
+
+LVM_BACKUP_DIR = "/etc/lvm/backup"
+
+
+def collect_lvm_backup(vg):
+    """The physical_volumes section of LVM's own metadata backup for one VG.
+
+    LVM rewrites /etc/lvm/backup/<vg> on every metadata change, so it is the list of PVs
+    the VG is meant to have - and it survives the case pvs cannot speak to: when every
+    disk of the VG is gone there is no metadata left to read, the VG vanishes from pvs,
+    and only this file still says it existed. None means no backup file, which on a
+    diskless node is the expected answer. Only the PV section is sent; the LV section of a
+    busy XOSTOR VG runs to thousands of lines and is not asked about.
+    """
+    if not vg or "/" in vg:
+        return err("bad volume group name %r" % vg)
+    path = os.path.join(LVM_BACKUP_DIR, vg)
+    if not os.path.exists(path):
+        return fact(None)
+    text = read_file(path)
+    if text is None:
+        return err("could not read %s" % path)
+    return fact(lvm_section(text, "physical_volumes"))
+
+
+def lvm_section(text, name):
+    """The '<name> { ... }' block of an LVM metadata file, braces included; '' if absent.
+    Depth is counted on braces outside quotes - device paths and tags never hold one, but
+    a description string could."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip().startswith(name) and line.rstrip().endswith("{"):
+            depth = 0
+            for j in range(i, len(lines)):
+                bare = re.sub(r'"[^"]*"', "", lines[j].split("#", 1)[0])
+                depth += bare.count("{") - bare.count("}")
+                if depth <= 0:
+                    return "\n".join(lines[i:j + 1])
+            return "\n".join(lines[i:])
+    return ""
+
+
 def collect_yum_check_update():
     """yum check-update: rc 0 = nothing to do, rc 100 = updates listed, anything else
     means yum itself failed (broken repo, no network) - which must never read as zero."""
@@ -1877,6 +1943,8 @@ def collect(spec):
         out["task_timeout"] = collect_task_timeout_override()
         out["rpm_manifest"] = collect_rpm_manifest()
         out["drbd_module"] = collect_drbd_module()
+        out["pvs"] = collect_pvs()
+        out["lvm_backup"] = collect_lvm_backup(spec.get("xostor_vg") or "")
         out.update(collect_patch_facts())
 
         if self_uuid:

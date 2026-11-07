@@ -307,6 +307,43 @@ def parse_failed_units(text):
     return units
 
 
+def parse_pvs(text):
+    """[(pv name, vg name, attr, uuid)] from 'pvs --noheadings --separator | -o
+    pv_name,vg_name,pv_attr,pv_uuid'. A line without the separators is a warning that
+    landed on stdout, not a row; uuid is '' from an older collector that did not ask."""
+    rows = []
+    for line in (text or "").splitlines():
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 3 or not parts[0]:
+            continue
+        rows.append((parts[0], parts[1], parts[2], parts[3] if len(parts) > 3 else ""))
+    return rows
+
+
+def parse_lvm_backup_pvs(text):
+    """[(uuid, device hint)] out of the physical_volumes section of an LVM metadata
+    backup, in file order. 'device' is LVM's 'Hint only' - where the PV was last seen,
+    which a reboot can renumber - so the uuid is what identifies it."""
+    pvs, cur = [], None
+    for line in (text or "").splitlines():
+        line = line.split("#", 1)[0].strip()
+        m = re.match(r'^(\S+)\s*\{$', line)
+        if m and m.group(1) != "physical_volumes":
+            cur = {"id": "", "device": ""}
+            pvs.append(cur)
+            continue
+        m = re.match(r'^(id|device)\s*=\s*"([^"]*)"', line)
+        if m and cur is not None:
+            cur[m.group(1)] = m.group(2)
+    return [(p["id"], p["device"]) for p in pvs if p["id"]]
+
+
+def pv_missing(name, attr):
+    """The PV's device is gone: LVM names it '[unknown]' ('unknown device' before lvm2
+    2.02.x) and sets the third attr character to 'm'. Either is enough."""
+    return name in ("[unknown]", "unknown device") or (len(attr) > 2 and attr[2] == "m")
+
+
 def host_records_from_state_db(rows):
     """The collector's state.db host rows, in parse_host_list's shape.
 

@@ -154,6 +154,7 @@ def _host_spec(with_smapi):
         "want": ["host"],
         "crash_ignore_file": config.CRASH_IGNORE_FILE,
         "coredump_dir": config.COREDUMP_DIR,
+        "xostor_vg": config.XOSTOR_VG,
         "smapi": bool(with_smapi),
         "log_scan": {"files": config.LOG_ERROR_FILES,
                      "phrases": config.LOG_ERROR_PHRASES,
@@ -1122,6 +1123,8 @@ def host_section(run, rep, host):
     if gated(run, host, "xostor_versions"):
         rep.check("XOSTOR Packages", checks.xostor_versions, host,
                   run.pool.xostor_in_use())
+    if run.pool.xostor_in_use() and gated(run, host, "xostor_missing_devices"):
+        rep.check("XOSTOR Missing Devices", checks.xostor_missing_devices, host)
     rep.end_section()
 
 

@@ -1231,6 +1231,73 @@ def vlan0(pool):
     return ok("VLAN 0 Check", "No")
 
 
+def _plural(n, word):
+    return "%d %s%s" % (n, word, "" if n == 1 else "s")
+
+
+def xostor_missing_devices(host):
+    """PVs of the XOSTOR volume group whose device LVM can no longer find.
+
+    Two sources, checked against each other. pvs: a disk that dropped out from under
+    linstor_group leaves the VG partial, and LVM still lists the PV from the metadata on
+    the disks that remain, as '[unknown]' / attr 'm'. /etc/lvm/backup/linstor_group: the
+    PVs the VG is meant to have, by uuid - which is what catches every disk gone at once,
+    when pvs has no metadata left to show the VG from at all. DRBD may be carrying on from
+    the peers' replicas, so nothing else on the host need look wrong yet. Only asked when
+    the pool uses XOSTOR.
+
+    No PVs and no backup file is said, not flagged: a diskless XOSTOR node is a supported
+    layout. No PVs and an unreadable backup is Unknown - that pair cannot tell a diskless
+    node from one that lost everything.
+    """
+    key = "XOSTOR Missing Devices"
+    vg = config.XOSTOR_VG
+    f = host.fact("pvs")
+    if not f.ok:
+        return unknown(key, "Unknown (%s)" % f.error)
+    rows = [r for r in parsers.parse_pvs(f.value.get("rows")) if r[1] == vg]
+    present = dict((r[3], r[0]) for r in rows if not parsers.pv_missing(r[0], r[2]))
+    flagged = [r for r in rows if parsers.pv_missing(r[0], r[2])]
+
+    b = host.fact("lvm_backup")
+    known = parsers.parse_lvm_backup_pvs(b.value) if b.ok and b.value else []
+
+    detail = []
+    if known:
+        lost = [(u, d) for u, d in known if u not in present]
+        total = len(known)
+        for u, d in known:
+            state = "present as %s" % present[u] if u in present else "MISSING"
+            detail.append("%-40s %-16s %s" % (u, d or "?", state))
+        # a PV pvs calls missing that the backup does not know of is still missing
+        extra = [r for r in flagged if r[3] not in dict(known)]
+        for r in extra:
+            detail.append("%-40s %-16s MISSING (not in %s backup)"
+                          % (r[3] or "?", r[0], vg))
+        n_missing = len(lost) + len(extra)
+        total += len(extra)
+    else:
+        if not rows:
+            if b.ok:
+                return info(key, "None (no %s PVs on this host)" % vg)
+            return unknown(key, "Unknown (no %s PVs, and %s)" % (vg, b.error))
+        total, n_missing = len(rows), len(flagged)
+        detail = ["%-40s %-16s %s" % (r[3] or "?", r[0], r[2]) for r in rows]
+        if not b.ok:
+            detail.append("(%s backup unreadable: %s)" % (vg, b.error))
+
+    if not n_missing:
+        return ok(key, "None (%s present)" % _plural(total, "PV"))
+    warnings = [w.strip() for w in (f.value.get("warnings") or "").splitlines() if w.strip()]
+    if warnings:
+        detail += [""] + warnings
+    what = "All %s" % _plural(total, "PV") if n_missing == total and total > 1 else \
+        "%d of %s" % (n_missing, _plural(total, "PV"))
+    return flag(key, "%s in %s Missing, See Below" % (what, vg)).with_detail(
+        "---xostor missing devices---", "\n".join(["%-40s %-16s %s" % (
+            "PV UUID", "Device (hint)", "State")] + detail))
+
+
 def xostor_in_use(pool):
     f = pool.fact("xostor_srs")
     if not f.ok:

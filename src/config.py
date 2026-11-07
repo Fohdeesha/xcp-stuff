@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Every threshold, list and toggle, in one place. Same names and values as health.sh."""
 
-SCRIPT_VERSION = "3.24"
+SCRIPT_VERSION = "3.25"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
@@ -269,6 +269,7 @@ XOSTOR_PACKAGES = (
     "kmod-drbd", "drbd", "drbd-utils", "drbd-reactor", "linstor-satellite",
     "linstor-controller", "linstor-client", "python-linstor", "xcp-ng-linstor",
 )
+XOSTOR_VG = "linstor_group"      # the LVM volume group XOSTOR builds its storage pool on
 DMESG_MAX_LINES = 80             # lines of a dmesg detail block (Dmesg Content, OOM Events);
                                  # the newest are kept, and the rollup runs first
 DMESG_ROLLUP_MIN = 3             # consecutive copies of one dmesg message folded into a
@@ -303,4 +304,5 @@ POOL_RUN = {
     "rebooted_after_updates": True,
     "yum_patch_level": True,
     "xostor_versions": True,
+    "xostor_missing_devices": True,
 }
