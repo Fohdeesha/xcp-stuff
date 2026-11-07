@@ -1052,6 +1052,30 @@ def manifest_versions(text):
     return out
 
 
+def manifest_packages(text):
+    """{name: [version, ...]} with each version as a person reads it: the 0: epoch and
+    the .arch suffix dropped, so 'kmod-drbd 0:9.2.11-1.xcpng8.3.x86_64' gives
+    '9.2.11-1.xcpng8.3'. A list per name because kmod packages can be installed twice."""
+    out = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or " " not in line:
+            continue
+        name, version = line.split(" ", 1)
+        if version.startswith("0:"):
+            version = version[2:]
+        version = re.sub(r"\.(x86_64|noarch|i686)$", "", version)
+        out.setdefault(name, []).append(version)
+    return out
+
+
+def leading_version(text):
+    """'9.2.11' out of '9.2.11-1.xcpng8.3', '9.2.11_4.19.0+1' or '9.2.11 (api:2)' -
+    the part the module and its rpm both carry, so the two can be compared."""
+    m = re.match(r"\s*(\d+(?:\.\d+)*)", text or "")
+    return m.group(1) if m else ""
+
+
 def manifest_diff(master_text, slave_text):
     """The difference lines, sorted, exactly as the report prints them."""
     master = manifest_versions(master_text)
@@ -1068,6 +1092,24 @@ def manifest_diff(master_text, slave_text):
             lines.append("Missing Package: %s %s" % (name, master[name]))
     lines.sort()
     return lines
+
+
+_DIFF_KINDS = (
+    ("Does Not Match Master:", "version differs", "versions differ"),
+    ("Extra Package:", "extra", "extra"),
+    ("Missing Package:", "missing", "missing"),
+)
+
+
+def manifest_diff_summary(lines):
+    """'2 versions differ, 1 extra, 3 missing' - counted from the full diff before any
+    cap, so the status line still gives the true totals when the list below is cut."""
+    parts = []
+    for prefix, one, many in _DIFF_KINDS:
+        n = sum(1 for ln in lines if ln.startswith(prefix))
+        if n:
+            parts.append("%d %s" % (n, one if n == 1 else many))
+    return ", ".join(parts)
 
 
 def cap_lines(lines, limit, noun):

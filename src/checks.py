@@ -804,8 +804,103 @@ def yum_patch_level(host, is_master, master_manifest):
         return ok("Yum Patch Level", "Match")
     diff = parsers.manifest_diff(master_manifest, f.value)
     shown = parsers.cap_lines(diff, config.PKG_DIFF_MAX_LINES, "more difference(s)")
-    return flag("Yum Patch Level", "Mismatch, See Below").with_detail(
+    summary = parsers.manifest_diff_summary(diff)
+    status = "Mismatch (%s), See Below" % summary if summary else "Mismatch, See Below"
+    return flag("Yum Patch Level", status).with_detail(
         "Yum Patch Level Differences", "\n".join(shown))
+
+
+def _xostor_signature(host):
+    """(tracked package versions, loaded drbd version) for one host, or None when either
+    fact is missing - unknown is not a difference, same rule as the RAM and NTP lines."""
+    manifest = host.fact("rpm_manifest")
+    module = host.fact("drbd_module")
+    if not manifest.ok or not manifest.value.strip() or not module.ok:
+        return None
+    pkgs = parsers.manifest_packages(manifest.value)
+    tracked = tuple((n, tuple(pkgs[n])) for n in config.XOSTOR_PACKAGES if n in pkgs)
+    return tracked, module.value
+
+
+def _drbd_stale(loaded, kmod_versions):
+    """The running module is not any installed kmod-drbd - updated, not yet rebooted."""
+    return parsers.leading_version(loaded) not in \
+        [parsers.leading_version(v) for v in kmod_versions]
+
+
+def xostor_version_consistency(hosts, details_shown=True):
+    """One pool-level yes/no: do the hosts agree on XOSTOR package versions and the
+    loaded DRBD module, and is each host running the kmod-drbd it has installed?
+
+    Deliberately no detail - the per-host 'XOSTOR Packages' / 'XOSTOR DRBD Module' lines
+    carry it. This line exists so a discrepancy is not missed by someone reading only
+    the pool section. details_shown is False when those per-host lines are switched off
+    for slaves, and then the line must not send the reader to look for them.
+    """
+    key = "XOSTOR Version Consistency"
+    sigs = [s for s in (_xostor_signature(h) for h in hosts) if s is not None]
+    if not sigs:
+        return unknown(key, "Unknown (could not read versions from any host)")
+    stale = any(loaded and dict(tracked).get("kmod-drbd")
+                and _drbd_stale(loaded, dict(tracked)["kmod-drbd"])
+                for tracked, loaded in sigs)
+    if stale or len(set(sigs)) > 1:
+        return flag(key, "Mismatched, See Host Results" if details_shown else "Mismatched")
+    if len(sigs) < len(hosts):
+        return unknown(key, "Matched on %d of %d hosts (rest unreadable)"
+                       % (len(sigs), len(hosts)))
+    return ok(key, "Matched")
+
+
+def xostor_versions(host, pool_uses_xostor):
+    """'XOSTOR Packages' and 'XOSTOR DRBD Module' for one host.
+
+    Shown when the pool says XOSTOR is in use, or when this host carries DRBD/LINSTOR
+    bits anyway - single mode has no pool view, and a host with a stray module loaded is
+    worth seeing. The module line compares what is RUNNING (/sys/module/drbd/version)
+    with what is INSTALLED (kmod-drbd): an updated kmod is inert until the next reboot,
+    and a pool part-way through that is exactly when DRBD versions disagree.
+    """
+    manifest = host.fact("rpm_manifest")
+    module = host.fact("drbd_module")
+    pkgs = parsers.manifest_packages(manifest.value) if manifest.ok else {}
+    tracked = [(n, pkgs[n]) for n in config.XOSTOR_PACKAGES if n in pkgs]
+    loaded = module.value if module.ok else ""
+    if not pool_uses_xostor and not tracked and not loaded:
+        if manifest.ok and module.ok:
+            return None   # established: no XOSTOR here, so nothing to say
+        if not manifest.ok and not module.ok:
+            return None   # cannot tell whether XOSTOR applies; the pool line says if so
+
+    lines = []
+    if not manifest.ok or not manifest.value.strip():
+        lines.append(unknown("XOSTOR Packages", "Unknown (could not read rpm manifest)"))
+    elif not tracked:
+        lines.append(flag("XOSTOR Packages", "None Installed"))
+    else:
+        lines.append(info("XOSTOR Packages", ", ".join(
+            "%s %s" % (n, " + ".join(v)) for n, v in tracked)))
+
+    key = "XOSTOR DRBD Module"
+    if not module.ok:
+        lines.append(unknown(key, "Unknown (%s)" % module.error))
+        return lines
+    kmod = pkgs.get("kmod-drbd") or []
+    if not loaded:
+        lines.append(flag(key, "Not Loaded"))
+        return lines
+    if not manifest.ok:
+        lines.append(unknown(key, "Loaded %s (installed kmod-drbd unknown)" % loaded))
+        return lines
+    if not kmod:
+        lines.append(flag(key, "Loaded %s, but kmod-drbd is not installed" % loaded))
+        return lines
+    if not _drbd_stale(loaded, kmod):
+        lines.append(ok(key, "Loaded %s (matches kmod-drbd)" % loaded))
+    else:
+        lines.append(flag(key, "Loaded %s, Installed kmod-drbd %s (reboot pending?)"
+                          % (loaded, " + ".join(kmod))))
+    return lines
 
 
 # --------------------------------------------------------------------------------------

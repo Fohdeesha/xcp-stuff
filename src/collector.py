@@ -1182,6 +1182,18 @@ def collect_rpm_manifest():
     return fact("\n".join(lines))
 
 
+def collect_drbd_module():
+    """The DRBD kernel module's own version, which is what is actually running - the
+    kmod-drbd rpm can be updated underneath it and stays inert until the next reboot.
+    '' means the module is not loaded, which is an answer, not a failure to look."""
+    if not os.path.isdir("/sys/module/drbd"):
+        return fact("")
+    text = read_file("/sys/module/drbd/version")
+    if text is None or not text.strip():
+        return err("could not read /sys/module/drbd/version")
+    return fact(text.strip())
+
+
 def collect_yum_check_update():
     """yum check-update: rc 0 = nothing to do, rc 100 = updates listed, anything else
     means yum itself failed (broken repo, no network) - which must never read as zero."""
@@ -1864,6 +1876,7 @@ def collect(spec):
             out["static_vdis"] = collect_static_vdis()
         out["task_timeout"] = collect_task_timeout_override()
         out["rpm_manifest"] = collect_rpm_manifest()
+        out["drbd_module"] = collect_drbd_module()
         out.update(collect_patch_facts())
 
         if self_uuid:

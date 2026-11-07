@@ -100,7 +100,7 @@ def test_the_check_table_and_the_slave_toggles_stay_in_step():
     table = set(toggle for toggle, _key, _fn in main.per_host_checks())
     # yum_patch_level is gated too, but from its own call site: it needs the master's
     # manifest passed in, so it is not one of the (host) -> Line entries in the table
-    assert table | {"yum_patch_level"} == toggles
+    assert table | {"yum_patch_level", "xostor_versions"} == toggles
 
 
 def test_every_host_check_says_unknown_when_the_fact_is_an_error():
@@ -248,6 +248,90 @@ def test_yum_patch_level_match_and_mismatch():
     diff = checks.yum_patch_level(host(rpm_manifest=fact("a 0:2\n")), False, "a 0:1\n")
     assert diff.status == FLAG
     assert "Does Not Match Master: a 0:2" in diff.detail_text
+    assert "Mismatch (1 version differs), See Below" in diff.text
+
+
+MANIFEST = ("kernel 0:4.19.19-8.0.38.1.xcpng8.3.x86_64\n"
+            "kmod-drbd 0:9.2.11-1.xcpng8.3.x86_64\n"
+            "linstor-satellite 0:1.29.0-1.noarch\n")
+
+
+def test_xostor_versions_lists_tracked_packages_and_matches_the_loaded_module():
+    pkgs, mod = checks.xostor_versions(
+        host(rpm_manifest=fact(MANIFEST), drbd_module=fact("9.2.11")), True)
+    assert pkgs.status == INFO
+    assert "kmod-drbd 9.2.11-1.xcpng8.3, linstor-satellite 1.29.0-1" in pkgs.text
+    assert "kernel" not in pkgs.text
+    assert mod.status == OK and "9.2.11" in mod.text
+
+
+def test_xostor_versions_flags_a_loaded_module_older_than_the_installed_kmod():
+    _pkgs, mod = checks.xostor_versions(
+        host(rpm_manifest=fact(MANIFEST), drbd_module=fact("9.2.10")), True)
+    assert mod.status == FLAG and "9.2.10" in mod.text and "9.2.11-1.xcpng8.3" in mod.text
+
+
+def test_xostor_versions_flags_drbd_not_loaded_when_the_pool_uses_xostor():
+    _pkgs, mod = checks.xostor_versions(
+        host(rpm_manifest=fact(MANIFEST), drbd_module=fact("")), True)
+    assert mod.status == FLAG and "Not Loaded" in mod.text
+
+
+def test_xostor_versions_says_nothing_on_a_host_with_no_xostor():
+    plain = host(rpm_manifest=fact("kernel 0:4.19-1.x86_64\n"), drbd_module=fact(""))
+    assert checks.xostor_versions(plain, False) is None
+
+
+def test_xostor_versions_shows_on_a_non_xostor_pool_host_carrying_drbd():
+    # single mode has no pool view: the host's own packages are what bring the lines up
+    lines = checks.xostor_versions(
+        host(rpm_manifest=fact(MANIFEST), drbd_module=fact("9.2.11")), False)
+    assert [l.status for l in lines] == [INFO, OK]
+
+
+def test_xostor_versions_never_green_off_missing_facts_when_xostor_is_in_use():
+    lines = checks.xostor_versions(host(rpm_manifest=err(), drbd_module=err()), True)
+    assert [l.status for l in lines] == [UNKNOWN, UNKNOWN]
+    lines = checks.xostor_versions(host(rpm_manifest=err(), drbd_module=fact("9.2.11")),
+                                   True)
+    assert [l.status for l in lines] == [UNKNOWN, UNKNOWN]
+
+
+def _xhost(manifest=MANIFEST, module="9.2.11"):
+    return host(rpm_manifest=fact(manifest), drbd_module=fact(module))
+
+
+def test_xostor_version_consistency_matched():
+    line = checks.xostor_version_consistency([_xhost(), _xhost()])
+    assert line.status == OK and "Matched" in line.text
+
+
+def test_xostor_version_consistency_flags_hosts_that_disagree():
+    newer = MANIFEST.replace("1.29.0-1", "1.30.0-1")
+    line = checks.xostor_version_consistency([_xhost(), _xhost(manifest=newer)])
+    assert line.status == FLAG and "Mismatched" in line.text
+    line = checks.xostor_version_consistency([_xhost(), _xhost(module="")])
+    assert line.status == FLAG
+
+
+def test_xostor_version_consistency_does_not_point_at_host_lines_that_are_switched_off():
+    newer = MANIFEST.replace("1.29.0-1", "1.30.0-1")
+    line = checks.xostor_version_consistency([_xhost(), _xhost(manifest=newer)], False)
+    assert line.status == FLAG and "Mismatched" in line.text
+    assert "See Host Results" not in line.text
+
+
+def test_xostor_version_consistency_flags_a_host_running_a_stale_module():
+    # every host alike, but all updated and none rebooted - still a discrepancy
+    line = checks.xostor_version_consistency([_xhost(module="9.2.10")] * 2)
+    assert line.status == FLAG
+
+
+def test_xostor_version_consistency_unreadable_host_is_unknown_not_a_mismatch():
+    line = checks.xostor_version_consistency([_xhost(), host(rpm_manifest=err())])
+    assert line.status == UNKNOWN and "1 of 2" in line.text
+    line = checks.xostor_version_consistency([host(drbd_module=err())])
+    assert line.status == UNKNOWN
 
 
 # --------------------------------------------------------------------------------------
