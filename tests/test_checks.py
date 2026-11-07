@@ -245,6 +245,7 @@ def test_yum_patch_level_match_and_mismatch():
     diff = checks.yum_patch_level(host(rpm_manifest=fact("a 0:2\n")), False, "a 0:1\n")
     assert diff.status == FLAG
     assert "Does Not Match Master: a 0:2" in diff.detail_text
+    assert "Mismatch (1 version differs), See Below" in diff.text
 
 
 # --------------------------------------------------------------------------------------

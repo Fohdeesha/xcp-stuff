@@ -690,7 +690,9 @@ def yum_patch_level(host, is_master, master_manifest):
         return ok("Yum Patch Level", "Match")
     diff = parsers.manifest_diff(master_manifest, f.value)
     shown = parsers.cap_lines(diff, config.PKG_DIFF_MAX_LINES, "more difference(s)")
-    return flag("Yum Patch Level", "Mismatch, See Below").with_detail(
+    summary = parsers.manifest_diff_summary(diff)
+    status = "Mismatch (%s), See Below" % summary if summary else "Mismatch, See Below"
+    return flag("Yum Patch Level", status).with_detail(
         "Yum Patch Level Differences", "\n".join(shown))
 
 

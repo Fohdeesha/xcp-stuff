@@ -848,6 +848,24 @@ def manifest_diff(master_text, slave_text):
     return lines
 
 
+_DIFF_KINDS = (
+    ("Does Not Match Master:", "version differs", "versions differ"),
+    ("Extra Package:", "extra", "extra"),
+    ("Missing Package:", "missing", "missing"),
+)
+
+
+def manifest_diff_summary(lines):
+    """'2 versions differ, 1 extra, 3 missing' - counted from the full diff before any
+    cap, so the status line still gives the true totals when the list below is cut."""
+    parts = []
+    for prefix, one, many in _DIFF_KINDS:
+        n = sum(1 for ln in lines if ln.startswith(prefix))
+        if n:
+            parts.append("%d %s" % (n, one if n == 1 else many))
+    return ", ".join(parts)
+
+
 def cap_lines(lines, limit, noun):
     """First `limit` lines plus a count of what was left out.
 

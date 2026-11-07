@@ -506,6 +506,19 @@ def test_manifest_diff_no_stray_separator_on_single_version_packages():
     assert out == ["Does Not Match Master: a 0:2-1.x86_64 (Master: a 0:1-1.x86_64)"]
 
 
+def test_manifest_diff_summary_counts_each_kind_and_pluralises():
+    master = "a 0:1\nb 0:1\nc 0:1\nd 0:1\n"
+    slave = "a 0:2\nb 0:2\nc 0:1\ne 0:1\n"
+    diff = parsers.manifest_diff(master, slave)
+    assert parsers.manifest_diff_summary(diff) == "2 versions differ, 1 extra, 1 missing"
+
+
+def test_manifest_diff_summary_omits_absent_kinds():
+    diff = parsers.manifest_diff("a 0:1\n", "a 0:1\nb 0:1\n")
+    assert parsers.manifest_diff_summary(diff) == "1 extra"
+    assert parsers.manifest_diff_summary([]) == ""
+
+
 def test_manifest_diff_identical_is_empty():
     text = "a 0:1-1.x86_64\nb 0:2-1.x86_64\n"
     assert parsers.manifest_diff(text, text) == []
