@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 import xml.parsers.expat
-VERSION = '1.4'
+VERSION = '1.5'
 PYTHON = sys.version.split()[0]
 DB_PATH = '/var/lib/xcp/state.db'
 BACKUP_SUFFIX = '.snapshot_of.backup'
@@ -52,6 +52,11 @@ HA_ENABLE_TIMEOUT = 900
 HA_ENABLE_WINDOW = 300
 HA_ENABLE_RETRY = 20
 TASK_WAIT = 60
+GC_ABORT_WAIT = 120
+GC_EXIT_WAIT = 30
+GC_POLL = 0.2
+SCAN_TIMEOUT = 120
+PAUSED_WAIT = 30
 LIVE_WAIT = 300
 REARM_WAIT = 120
 VM_HA_FIELDS = ('ha-restart-priority', 'order', 'start-delay')
@@ -59,6 +64,10 @@ UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 UUID_ANY = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
 SCAN_TASK_RE = re.compile(r'^(?:Async\.|InternalAsync\.)?SR\.scan\Z')
 PLUGIN_TASK_RE = re.compile(r'^(?:Async\.|InternalAsync\.)?host\.call_plugin\Z')
+GC_TASK = 'Garbage Collection'
+GC_DESC_RE = re.compile(r'^Garbage collection for SR (%s)\Z' % UUID_ANY.pattern)
+SM_LOCKS = '/var/lock/sm'
+SM_IPC = '/var/run/sm/ipc'
 PLUGIN_QUERIES = {
     'linstor-manager': ('check', 'getInfo', 'getVHDInfo', 'hasParent', 'getParent', 'getSizeVirt',
                         'getMaxResizeSize', 'getSizePhys', 'getAllocatedSize', 'getDepth',
@@ -79,6 +88,8 @@ CALL_RE = re.compile(br"\|((?:[A-Za-z]+\.)*host\.call_plugin) (R:[0-9a-f]{12})\|
                      br"Host\.call_plugin host = '[^\n]*?'; plugin = '([^'\n]*)'; "
                      br"fn = '([^'\n]*)' args = \[")
 _CALLS = {}
+_GC_HELD = {}
+_GC_ASKED = {}
 _TEXT = type(u'')
 
 def _text(value):
@@ -133,7 +144,8 @@ def _log(level, text):
             syslog.openlog('snapshot-fixer', syslog.LOG_PID, syslog.LOG_USER)
             _SYSLOG[0] = syslog
         mod = _SYSLOG[0]
-        prio = {'info': mod.LOG_INFO, 'warning': mod.LOG_WARNING, 'err': mod.LOG_ERR}[level]
+        prio = {'info': mod.LOG_INFO, 'warning': mod.LOG_WARNING, 'err': mod.LOG_ERR,
+                'sm': mod.LOG_INFO | mod.LOG_LOCAL2}[level]
         for line in _text(text).splitlines():
             if line.strip():
                 mod.syslog(prio, _native(line))
@@ -1118,16 +1130,23 @@ def is_query(task):
     call = _CALLS.get(task.get('uuid'))
     return call is not None and call[1] in PLUGIN_QUERIES.get(call[0], ())
 
+def gc_task_sr(task):
+    m = GC_DESC_RE.match(task.get('name-description', ''))
+    return m.group(1) if m and task.get('name-label') == GC_TASK else None
+
 def pending_tasks():
     try:
-        tasks = xe_records('task-list', 'status=pending', 'params=uuid,name-label')
+        tasks = xe_records('task-list', 'status=pending',
+                           'params=uuid,name-label,name-description')
     except Failed as exc:
         raise Failed('cannot list pending tasks: %s' % _text(exc))
     resolve_calls(tasks)
-    split = ([], [], [])
+    split = ([], [], [], [])
     for task in tasks:
         if SCAN_TASK_RE.match(task.get('name-label', '')):
             split[1].append(task)
+        elif gc_task_sr(task):
+            split[3].append(task)
         elif PLUGIN_TASK_RE.match(task.get('name-label', '')) and is_query(task):
             split[2].append(task)
         else:
@@ -1151,17 +1170,30 @@ def queries_text(queries):
 
 def check_tasks(ignore):
     try:
-        tasks, scans, queries = pending_tasks()
+        tasks, scans, queries, gcs = pending_tasks()
         if tasks and not ignore:
             seen = uuids(tasks)
             pause(POLL)
-            tasks, scans, queries = pending_tasks()
+            tasks, scans, queries, gcs = pending_tasks()
             tasks = [t for t in tasks if t.get('uuid') in seen]
             if tasks and all(PLUGIN_TASK_RE.match(t.get('name-label', '')) for t in tasks):
                 scans, queries = await_tasks(False, 'asking to go ahead', Refused, uuids(tasks))
                 tasks = []
+        here = [(sr, pid) for sr, pid in ((sr, gc_pid(sr)) for sr in sm_srs()) if pid]
     except Failed as exc:
         raise Refused(_text(exc))
+    away = sorted(set(gc_task_sr(t) for t in gcs) - set(sr for sr, pid in here))
+    if here:
+        say(u'Garbage collection is running on this host for %d SR(s) (%s). Stopping xapi under '
+            u'it can leave a VM disk paused, so it is stopped first, with SM\'s own abort, and '
+            u'started again afterwards: a coalesce it is in the middle of starts over.'
+            % (len(here), u', '.join(u'%s: %s' % (sr, who(pid)) for sr, pid in here)))
+    if away:
+        say('%d SR(s) have a garbage collection task while none runs on this host (%s). One '
+            'that runs on another host is left alone: its calls to xapi wait while xapi is '
+            'down. As after any toolstack restart on the master, its task is gone once xapi is '
+            'back, so its run ends at its next progress update, and SM starts it again at the '
+            'next scan of the SR.' % (len(away), ', '.join(away)))
     if scans:
         say('%d SR scan(s) in progress: stopping xapi interrupts them, as any toolstack restart '
             'does, and the next scan of each SR does the work again.' % len(scans))
@@ -1180,7 +1212,7 @@ def await_tasks(ignore, before, refuse=Failed, seen=None):
     deadline = _now() + TASK_WAIT
     shown = False
     while True:
-        current, scans, queries = pending_tasks()
+        current, scans, queries = pending_tasks()[:3]
         if ignore:
             if current:
                 list_tasks(current)
@@ -1198,6 +1230,268 @@ def await_tasks(ignore, before, refuse=Failed, seen=None):
                          % (len(tasks), TASK_WAIT, before))
         seen = uuids(current)
         pause(POLL)
+
+def sm_srs():
+    try:
+        names = os.listdir(SM_LOCKS)
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            return []
+        raise Failed('cannot read %s: %s' % (SM_LOCKS, _describe(exc)))
+    return sorted(n for n in names if UUID_RE.match(n) and any(
+        os.path.exists(os.path.join(SM_LOCKS, n, f)) for f in ('sr', 'gc_active')))
+
+def lock_owner(fd):
+    import fcntl
+    got = struct.unpack('hhqql', fcntl.fcntl(fd, fcntl.F_GETLK,
+                                             struct.pack('hhqql', fcntl.F_WRLCK, 0, 0, 0, 0)))
+    return None if got[0] == fcntl.F_UNLCK else got[4]
+
+def gc_pid(sr):
+    if sr in _GC_HELD:
+        return None
+    try:
+        fd = os.open(os.path.join(SM_LOCKS, sr, 'gc_active'), os.O_RDWR)
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            return None
+        raise Failed('cannot open the garbage collection lock of SR %s: %s'
+                     % (sr, _describe(exc)))
+    try:
+        return lock_owner(fd)
+    except (IOError, OSError, struct.error) as exc:
+        raise Failed('cannot test the garbage collection lock of SR %s: %s' % (sr, _text(exc)))
+    finally:
+        os.close(fd)
+
+def lock_gc(sr):
+    import fcntl
+    if sr in _GC_HELD:
+        return True, None
+    try:
+        fd = os.open(os.path.join(SM_LOCKS, sr, 'gc_active'), os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            return True, None
+        raise Failed('cannot open the garbage collection lock of SR %s: %s'
+                     % (sr, _describe(exc)))
+    try:
+        fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (IOError, OSError) as exc:
+        try:
+            if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                raise Failed('cannot take the garbage collection lock of SR %s: %s'
+                             % (sr, _text(exc)))
+            try:
+                return False, lock_owner(fd)
+            except (IOError, OSError, struct.error):
+                return False, None
+        finally:
+            os.close(fd)
+    _GC_HELD[sr] = fd
+    return True, None
+
+def who(pid):
+    try:
+        argv = read_file(os.path.join(PROC, str(pid), 'cmdline')).split(b'\0')
+    except EnvironmentError:
+        argv = []
+    words = u' '.join(_text(a)[:60] for a in argv[:2] if a)
+    return u'pid %s (%s)' % (pid, words) if words else u'pid %s' % (pid or u'unknown')
+
+def drop_dead_flag(sr):
+    path = os.path.join(SM_IPC, sr, 'abort')
+    try:
+        pid = read_text(path).strip()
+    except EnvironmentError:
+        return
+    if pid.isdigit() and not os.path.exists(os.path.join(PROC, pid)):
+        _unlink_quietly(path)
+        _log('sm', 'IPCFlag: clear %s:abort' % sr)
+        step('Removed the abort request a process now gone (pid %s) had left for SR %s: it '
+             'kept the garbage collection of that SR from running.' % (pid, sr))
+
+def ask_abort(sr):
+    path = os.path.join(SM_IPC, sr, 'abort')
+    try:
+        try:
+            os.makedirs(os.path.dirname(path))
+        except OSError as exc:
+            if exc.errno != errno.EEXIST:
+                raise
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except OSError as exc:
+        if exc.errno == errno.EEXIST:
+            return False
+        raise Failed('cannot ask the garbage collection of SR %s to abort: %s'
+                     % (sr, _describe(exc)))
+    try:
+        os.write(fd, ('%d\n' % os.getpid()).encode('ascii'))
+    except OSError as exc:
+        _unlink_quietly(path)
+        raise Failed('cannot ask the garbage collection of SR %s to abort: %s'
+                     % (sr, _describe(exc)))
+    finally:
+        os.close(fd)
+    _log('sm', 'IPCFlag: set %s:abort' % sr)
+    return True
+
+def unask_abort(sr):
+    path = os.path.join(SM_IPC, sr, 'abort')
+    try:
+        if read_text(path).strip() == str(os.getpid()):
+            os.unlink(path)
+            _log('sm', 'IPCFlag: clear %s:abort' % sr)
+    except EnvironmentError:
+        pass
+
+def alive(pids):
+    found = []
+    for pid in pids:
+        try:
+            state = read_file(os.path.join(PROC, str(pid), 'stat')).rsplit(b')', 1)[-1].split()
+        except EnvironmentError:
+            continue
+        if state[:1] != [b'Z']:
+            found.append(pid)
+    return sorted(found)
+
+def hold_gc(ignore):
+    stopped = False
+    for sr in sm_srs():
+        drop_dead_flag(sr)
+        held, pid = lock_gc(sr)
+        if held:
+            continue
+        step(u'Stopping the garbage collection of SR %s, %s, with SM\'s abort request...'
+             % (sr, who(pid)))
+        pids = _GC_ASKED.setdefault(sr, set())
+        pids.add(pid)
+        mine = False
+        try:
+            deadline = _now() + GC_ABORT_WAIT
+            while not held and _now() <= deadline:
+                mine = ask_abort(sr) or mine
+                pause(GC_POLL)
+                held, pid = lock_gc(sr)
+                pids.add(pid)
+        finally:
+            if mine:
+                unask_abort(sr)
+        deadline = _now() + GC_EXIT_WAIT
+        while held and alive(pids) and _now() <= deadline:
+            pause(GC_POLL)
+        if held and not alive(pids):
+            stopped = True
+            continue
+        if held:
+            text = (u'the garbage collection of SR %s gave up its lock, but %s is still there '
+                    u'%ds later' % (sr, who(alive(pids)[0]), GC_EXIT_WAIT))
+        else:
+            text = (u'the garbage collection lock of SR %s is still held by %s, %ds after it '
+                    u'was asked to abort%s' % (sr, who(pid), GC_ABORT_WAIT, u'' if mine else
+                                               u' by a request that was already there'))
+        if not ignore:
+            raise Failed(text + u', so this run stopped there. Run it again once that process '
+                                u'is done')
+        warn(text + u': --ignore-tasks')
+    if stopped:
+        step('Garbage collection is stopped on this host, and held off until xapi is back.')
+
+def release_gc():
+    for sr in sorted(_GC_HELD):
+        try:
+            os.close(_GC_HELD.pop(sr))
+        except OSError:
+            pass
+
+def restart_gc():
+    for sr in sorted(_GC_ASKED):
+        try:
+            pid = gc_pid(sr)
+        except Failed:
+            pid = None
+        if pid and pid in _GC_ASKED[sr]:
+            warn(u'the garbage collection of SR %s, %s, was asked to abort and is still there. '
+                 u'If it ends now, SM starts it again at its next scan of the SR, or at once '
+                 u'with: xe sr-scan uuid=%s' % (sr, who(pid), sr))
+            continue
+        if pid:
+            step('The garbage collection of SR %s is running again.' % sr)
+            continue
+        r = xe('sr-scan', 'uuid=' + sr, timeout=SCAN_TIMEOUT)
+        if r.ok:
+            step('SR %s scanned, which starts its garbage collection again.' % sr)
+        else:
+            warn('the garbage collection of SR %s, stopped for this run, was not started again '
+                 '(xe sr-scan: %s). SM starts it at its next scan of the SR, or now with: '
+                 'xe sr-scan uuid=%s' % (sr, r.why(), sr))
+    _GC_ASKED.clear()
+
+def paused_vdis():
+    r = xe('vdi-list', 'sm-config:paused=true', 'params=uuid', '--minimal')
+    if not r.ok:
+        raise Failed('cannot list the disks SM has paused: %s' % r.why())
+    return set(u for u in r.out.strip().split(',') if UUID_RE.match(u))
+
+def wait_unpaused(ignore):
+    first = now = paused_vdis()
+    if now:
+        step('SM has %d disk(s) paused for a storage operation (%s): waiting up to %ds for it '
+             'to unpause them before stopping xapi...'
+             % (len(now), ', '.join(sorted(now)), PAUSED_WAIT))
+    deadline = _now() + PAUSED_WAIT
+    while now and _now() <= deadline:
+        pause(POLL)
+        now = paused_vdis()
+    fresh = sorted(now - first)
+    if fresh and not ignore:
+        raise Failed('SM keeps pausing disks (now %s), and stopping xapi while one is being '
+                     'paused or unpaused can leave it paused, so xapi was not stopped. Run this '
+                     'again when the storage operation is over' % ', '.join(fresh))
+    if now:
+        warn('%d disk(s) have been marked paused for all of the last %ds (%s)%s. Stopping xapi '
+             'does not unpause them: check them afterwards.'
+             % (len(now), PAUSED_WAIT, ', '.join(sorted(now)),
+                ': --ignore-tasks' if fresh else ': left over from an earlier failure, or held '
+                'by a storage operation on another host, whose unpause waits for xapi'))
+    return now
+
+def quiet_moment(run_):
+    for attempt in range(3):
+        run_.paused = wait_unpaused(run_.ignore_tasks)
+        found = await_tasks(run_.ignore_tasks, 'stopping xapi')
+        fresh = sorted(paused_vdis() - run_.paused)
+        if not fresh:
+            return found
+    if not run_.ignore_tasks:
+        raise Failed('SM keeps pausing disks (now %s), and stopping xapi while one is being '
+                     'paused or unpaused can leave it paused, so xapi was not stopped. Run this '
+                     'again when the storage operation is over' % ', '.join(fresh))
+    warn('SM keeps pausing disks (now %s): --ignore-tasks' % ', '.join(fresh))
+    return found
+
+def check_paused(run_):
+    try:
+        now = paused_vdis()
+        left = now - run_.paused
+        deadline = _now() + PAUSED_WAIT
+        while left and _now() <= deadline:
+            pause(POLL, False)
+            left &= paused_vdis()
+    except Failed as exc:
+        warn('%s, so whether a disk was left paused is not known' % _text(exc))
+        return
+    still = sorted(now & run_.paused)
+    if still:
+        warn('%d disk(s) are still marked paused, as they were before xapi was stopped (%s).'
+             % (len(still), ', '.join(still)))
+    if left:
+        run_.fail('%d disk(s) were not marked paused before xapi was stopped, and have been '
+                  'for %ds since it is back (%s). Unless a storage operation is still at work '
+                  'on them, one lost xapi while it had them paused: a VM using such a disk '
+                  'hangs on it until its tapdisk is unpaused, on the host that runs the VM'
+                  % (len(left), PAUSED_WAIT, ', '.join(sorted(left))))
 
 class HaSettings(object):
     def __init__(self, pool, srs, statefiles, config, tolerate, overcommit, stack, vms):
@@ -1425,6 +1719,7 @@ class Run(object):
         self.repairs = []
         self.written = []
         self.problems = []
+        self.paused = None
     def fail(self, text):
         self.problems.append(_text(text))
         error(text)
@@ -1449,6 +1744,9 @@ def settle(run_):
                 warn(up.detail)
         except Exception as exc:
             run_.fail('starting xapi failed: %s' % _text(exc))
+    if run_.xapi_touched and run_.paused is not None and xapi_answers():
+        check_paused(run_)
+    release_gc()
     if run_.installed and run_.repairs:
         if xapi_answers():
             problems = verify_live(run_.repairs)
@@ -1461,6 +1759,12 @@ def settle(run_):
             run_.fail('xapi is not answering, so the repair could not be read back')
     if run_.ha is not None and run_.ha_touched:
         settle_ha(run_)
+    if _GC_ASKED and xapi_answers():
+        restart_gc()
+    elif _GC_ASKED:
+        warn('xapi is not answering, so the garbage collection stopped for this run was not '
+             'started again. Once xapi is back: %s'
+             % '; '.join('xe sr-scan uuid=%s' % sr for sr in sorted(_GC_ASKED)))
 
 def settle_ha(run_):
     stage = 'enable'
@@ -1735,7 +2039,7 @@ def ha_off(run_):
 def stop_for_edit(run_, xapi_up=True):
     require_disarmed()
     if xapi_up:
-        scans, queries = await_tasks(run_.ignore_tasks, 'stopping xapi')
+        scans, queries = quiet_moment(run_)
         if scans:
             step('%d SR scan(s) in progress: stopping xapi interrupts them.' % len(scans))
         if queries:
@@ -1747,6 +2051,7 @@ def stop_for_edit(run_, xapi_up=True):
 
 def do_rewrite(run_):
     recheck(run_)
+    hold_gc(run_.ignore_tasks)
     if run_.ha:
         ha_off(run_)
     stop_for_edit(run_)
@@ -1865,6 +2170,7 @@ def live_restore(args, inv):
 def do_restore(run_, saved, bscan, was_up):
     if was_up:
         recheck(run_)
+        hold_gc(run_.ignore_tasks)
     if run_.ha:
         ha_off(run_)
     stop_for_edit(run_, was_up)
@@ -1985,8 +2291,9 @@ def build_parser():
         cmd.add_argument('-y', '--yes', action='store_true',
                          help='do not ask for confirmation')
         cmd.add_argument('--ignore-tasks', action='store_true',
-                         help='go ahead even though xapi has tasks pending (SR scans and '
-                              'plugin calls that only query never hold a run up)')
+                         help='go ahead even though xapi has tasks pending (SR scans, '
+                              'garbage collection and plugin calls that only query never '
+                              'hold a run up)')
         cmd.set_defaults(func=func)
     return parser
 
