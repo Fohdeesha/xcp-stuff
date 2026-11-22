@@ -60,7 +60,11 @@ def last_booted(host):
 
 def last_patched(host):
     f = host.fact("update_disp")
-    return raw("Last Patched", f.value if f.ok and f.value else "Unknown")
+    if f.ok and f.value:
+        return raw("Last Patched", f.value)
+    upd = host.fact("update_epoch")
+    return raw("Last Patched", "Unknown (%s)" % upd.error if not upd.ok and upd.error
+               else "Unknown")
 
 
 def host_enabled(host):
@@ -769,7 +773,7 @@ def rebooted_after_updates(host):
     upd_disp = host.fact("update_disp")
 
     if not boot.ok or not boot.value:
-        return unknown("Rebooted After Updates", "Unknown (could not read update or boot time)")
+        return unknown("Rebooted After Updates", "Unknown (could not read boot time)")
 
     if not upd.ok or not upd.value:
         # rpm is still a backstop: if nothing at all has been installed since boot then
@@ -1216,12 +1220,15 @@ def migration_compression(pool):
 
 
 def missing_patches(pool):
+    """'yum check-update' on the host the pool questions were asked of. A yum that could
+    not reach its repos is Unknown with yum's own reason - which is usually the mirror,
+    and 'Update Mirror Access' on that host says which part of the path failed."""
     f = pool.fact("yum_check")
     if not f.ok:
-        return unknown("Missing Patches", "Unknown")
+        return unknown("Missing Patches", "Unknown (%s)" % f.error if f.error else "Unknown")
     if f.value == 0:
         return ok("Missing Patches", "0")
-    return flag("Missing Patches", str(f.value))
+    return flag("Missing Patches", "%d available" % f.value)
 
 
 def update_mirror_access(host):
@@ -1361,24 +1368,50 @@ def xostor_missing_devices_pool(hosts, details_shown=True):
     in each host's own detail. details_shown is False when slaves do not print the
     per-host line, and then the reader is not sent to look for it.
     """
-    key = "XOSTOR Missing Devices"
-    missing, unread = [], []
+    return _pool_rollup("XOSTOR Missing Devices", hosts, xostor_missing_devices,
+                        details_shown)
+
+
+def _pool_rollup(key, hosts, host_check, details_shown=True, flagged_as="Yes, on",
+                 clean="None"):
+    """One pool line built from each host's own line for the same check, so the two can
+    never disagree: the hosts it flags, then the hosts it could not read, else clean.
+    An INFO host line (not applicable there) counts as neither. 'See Host Results' only
+    when every flagged host prints its line - the master always does, a slave only when
+    details_shown (its POOL_RUN toggle) says so.
+    """
+    flagged, unread = [], []
     for h in hosts:
-        line = xostor_missing_devices(h)
+        line = host_check(h)
         if line.status == result.FLAG:
-            missing.append(h.name)
+            flagged.append(h)
         elif line.status == result.UNKNOWN:
             unread.append(h.name)
-    if missing:
-        text = "Yes, on: %s" % ", ".join(missing)
-        if details_shown:
+    if flagged:
+        text = "%s: %s" % (flagged_as, ", ".join(h.name for h in flagged))
+        if details_shown or all(h.is_master for h in flagged):
             text += " - See Host Results"
         if unread:
             text += " (unreadable on: %s)" % ", ".join(unread)
         return flag(key, text)
     if unread:
         return unknown(key, "Unknown on: %s" % ", ".join(unread))
-    return ok(key, "None")
+    return ok(key, clean)
+
+
+def pending_reboot_pool(hosts, details_shown=True):
+    """Hosts that took updates after their last boot, named in the pool section so they
+    are not missed by someone reading only that - each host's own 'Rebooted After
+    Updates' line holds the dates."""
+    return _pool_rollup("Hosts Pending Reboot", hosts, rebooted_after_updates,
+                        details_shown, flagged_as="Yes")
+
+
+def update_mirror_access_pool(hosts, details_shown=True):
+    """Hosts that cannot reach the XCP-ng update mirrors. Hosts on a local mirror are
+    left out rather than counted as fine or failing."""
+    return _pool_rollup("Update Mirror Access", hosts, update_mirror_access,
+                        details_shown, flagged_as="Failing on", clean="OK")
 
 
 def xostor_in_use(pool):

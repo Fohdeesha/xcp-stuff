@@ -1534,7 +1534,9 @@ def _is_patch_line(action, pkg):
     """
     if action == "Updated":
         return True
-    return action == "Installed" and (pkg.startswith("kernel") or pkg.startswith("xen"))
+    # yum.log writes a non-zero epoch in front of the name: 'Installed: 2:xen-...'
+    name = re.sub(r"^\d+:", "", pkg)
+    return action == "Installed" and (name.startswith("kernel") or name.startswith("xen"))
 
 
 def find_last_update_line(text):

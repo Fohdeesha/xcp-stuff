@@ -99,10 +99,11 @@ def test_the_check_table_and_the_slave_toggles_stay_in_step():
     """
     toggles = set(config.POOL_RUN)
     table = set(toggle for toggle, _key, _fn in main.per_host_checks())
-    # yum_patch_level is gated too, but from its own call site: it needs the master's
-    # manifest passed in, so it is not one of the (host) -> Line entries in the table
-    assert table | {"yum_patch_level", "xostor_versions",
-                     "xostor_missing_devices"} == toggles
+    # these are gated too, but from their own call sites: yum_patch_level needs the
+    # master's manifest passed in, the XOSTOR ones depend on the pool, and
+    # rebooted_after_updates prints up beside Last Booted / Last Patched
+    assert table | {"yum_patch_level", "xostor_versions", "xostor_missing_devices",
+                     "rebooted_after_updates"} == toggles
 
 
 def test_every_host_check_says_unknown_when_the_fact_is_an_error():
@@ -368,9 +369,26 @@ def test_migration_compression_true_and_false():
 def test_missing_patches():
     assert checks.missing_patches(pool(yum_check=fact(0))).status == OK
     flagged = checks.missing_patches(pool(yum_check=fact(7)))
-    assert flagged.status == FLAG and "7" in flagged.text
-    # a yum that failed must never read as zero
-    assert checks.missing_patches(pool(yum_check=err())).status == UNKNOWN
+    assert flagged.status == FLAG and "7 available" in flagged.text
+    # a yum that failed must never read as zero, and says why
+    broken = checks.missing_patches(pool(yum_check=err("yum check-update timed out")))
+    assert broken.status == UNKNOWN and "timed out" in broken.text
+
+
+def test_last_patched_says_why_it_is_unknown():
+    assert checks.last_patched(host(update_disp=fact("2026-11-01 10:00:00"))).text \
+        == "2026-11-01 10:00:00"
+    line = checks.last_patched(host(update_disp=err("no timestamp"),
+                                    update_epoch=err("no update found in yum.log")))
+    assert line.text == "Unknown (no update found in yum.log)"
+    assert checks.last_patched(host()).text.startswith("Unknown")
+
+
+def test_rebooted_after_updates_prints_beside_last_patched():
+    import inspect
+    src = inspect.getsource(main.host_section)
+    assert src.index('"Last Patched"') < src.index('"Rebooted After Updates"') \
+        < src.index("per_host_checks()")
 
 
 def test_vlan0():
@@ -954,3 +972,52 @@ def test_update_mirror_access_never_green_off_nothing():
     for h in (host(), host(update_mirror=err("curl not found")),
               host(update_mirror=mirror_fact([]))):
         assert checks.update_mirror_access(h).status == UNKNOWN
+
+
+# --------------------------------------------------------------------------------------
+# pool roll-ups: Hosts Pending Reboot, Update Mirror Access
+# --------------------------------------------------------------------------------------
+
+def _named(label, master=False, **facts):
+    h = host(**facts)
+    h.hostname = label
+    h.is_master = master
+    return h
+
+
+def _rebooted(label, booted_after, master=False):
+    boot, upd = (200, 100) if booted_after else (100, 200)
+    return _named(label, master, boot_epoch=fact(boot), boot_disp=fact("B"),
+                  update_epoch=fact(upd), update_disp=fact("U"))
+
+
+def test_pending_reboot_pool_none_when_every_host_rebooted():
+    line = checks.pending_reboot_pool([_rebooted("h1", True), _rebooted("h2", True)])
+    assert line.status == OK and line.text.endswith("None")
+
+
+def test_pending_reboot_pool_names_the_hosts_and_points_at_their_results():
+    line = checks.pending_reboot_pool([_rebooted("h1", True), _rebooted("h2", False),
+                                       _rebooted("h3", False)])
+    assert line.status == FLAG and "Yes: h2, h3 - See Host Results" in line.text
+    # slaves not printing the line: no pointer, unless only the master is flagged
+    quiet = checks.pending_reboot_pool([_rebooted("h2", False)], False)
+    assert "See Host Results" not in quiet.text
+    master = checks.pending_reboot_pool([_rebooted("m", False, master=True)], False)
+    assert "See Host Results" in master.text
+
+
+def test_pending_reboot_pool_never_green_with_a_host_unread():
+    line = checks.pending_reboot_pool([_rebooted("h1", True), _named("h2")])
+    assert line.status == UNKNOWN and "h2" in line.text
+    line = checks.pending_reboot_pool([_rebooted("h1", False), _named("h2")])
+    assert line.status == FLAG and "unreadable on: h2" in line.text
+
+
+def test_update_mirror_access_pool_skips_local_mirror_hosts():
+    good = _named("h1", update_mirror=mirror_fact([mrow("a")]))
+    local = _named("h2", update_mirror=fact({"skipped": True, "repo_hosts": ["repo.lan"]}))
+    bad = _named("h3", update_mirror=mirror_fact(redirector_error="(6) Could not resolve"))
+    assert checks.update_mirror_access_pool([good, local]).status == OK
+    line = checks.update_mirror_access_pool([good, local, bad])
+    assert line.status == FLAG and "Failing on: h3" in line.text and "h2" not in line.text

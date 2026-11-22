@@ -922,6 +922,13 @@ def pool_status_section(run, rep):
     rep.check("Long-Running Tasks", checks.long_running_tasks, run.pool)
     rep.check("Migration Compression", checks.migration_compression, run.pool)
     rep.check("Missing Patches", checks.missing_patches, run.pool)
+    if not run.host_solo():
+        # roll-ups of per-host lines, next to the patch line they explain
+        reachable = [h for h in run.hosts if h.reachable]
+        rep.check("Hosts Pending Reboot", checks.pending_reboot_pool, reachable,
+                  config.POOL_RUN.get("rebooted_after_updates", True))
+        rep.check("Update Mirror Access", checks.update_mirror_access_pool, reachable,
+                  config.POOL_RUN.get("update_mirror_access", True))
 
     if run.pw_has_backslash:
         rep.add(result.info("Root Password", "Contains Backslash", "yellow"))
@@ -1072,7 +1079,6 @@ def per_host_checks():
         ("log_errors", "Log Errors", checks.log_errors),
         ("lun_assignments", "LUN Assignments", checks.lun_assignments),
         ("smapi_hidden_leaves", "SMAPI Hidden Leaves", checks.smapi_hidden_leaves),
-        ("rebooted_after_updates", "Rebooted After Updates", checks.rebooted_after_updates),
         ("update_mirror_access", "Update Mirror Access", checks.update_mirror_access),
     ]
 
@@ -1111,6 +1117,9 @@ def host_section(run, rep, host):
     rep.check("Hypervisor Version", checks.hypervisor_version, host)
     rep.check("Last Booted", checks.last_booted, host)
     rep.check("Last Patched", checks.last_patched, host)
+    # the conclusion drawn from the two dates above, so it prints beside them
+    if gated(run, host, "rebooted_after_updates"):
+        rep.check("Rebooted After Updates", checks.rebooted_after_updates, host)
     # ahead of the xe-sourced lines it explains
     rep.check("XAPI Status", checks.xapi_status, host)
     rep.check("Host Enabled", checks.host_enabled, host)

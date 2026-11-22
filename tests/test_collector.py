@@ -17,6 +17,11 @@ import pytest
 import collector
 
 
+def test_patch_predicate_sees_through_a_yum_epoch_prefix():
+    assert collector._is_patch_line("Installed", "2:xen-hypervisor-4.17.x86_64") is True
+    assert collector._is_patch_line("Installed", "1:sshpass-1.06.x86_64") is False
+
+
 def test_patch_predicate_updated_always_counts():
     assert collector._is_patch_line("Updated", "zlib-1.2-3.x86_64") is True
 
