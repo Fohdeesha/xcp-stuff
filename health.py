@@ -48,7 +48,7 @@ import unicodedata
 # ======================================================================================
 # --- config ----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "3.25"
+SCRIPT_VERSION = "3.26"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
@@ -316,6 +316,10 @@ XOSTOR_PACKAGES = (
     "kmod-drbd", "drbd", "drbd-utils", "drbd-reactor", "linstor-satellite",
     "linstor-controller", "linstor-client", "python-linstor", "xcp-ng-linstor",
 )
+UPDATE_MIRROR_REDIRECTOR = "mirrors.xcp-ng.org"   # the mirrorbits host the XCP-ng repos use
+UPDATE_MIRROR_TIMEOUT = 10       # seconds per request to the redirector or one mirror
+UPDATE_MIRROR_BUDGET = 60        # seconds for the whole mirror probe on one host
+UPDATE_MIRROR_MAX_PROBES = 6     # mirrors fetched from, of those the redirector hands out
 XOSTOR_VG = "linstor_group"      # the LVM volume group XOSTOR builds its storage pool on
 DMESG_MAX_LINES = 80             # lines of a dmesg detail block (Dmesg Content, OOM Events);
                                  # the newest are kept, and the rollup runs first
@@ -352,6 +356,7 @@ POOL_RUN = {
     "yum_patch_level": True,
     "xostor_versions": True,
     "xostor_missing_devices": True,
+    "update_mirror_access": True,
 }
 
 
@@ -3376,6 +3381,222 @@ def lvm_section(text, name):
     return ""
 
 
+YUM_CONF = "/etc/yum.conf"
+YUM_REPOS_DIR = "/etc/yum.repos.d"
+
+
+def parse_yum_ini(text):
+    """{section: {key: value}} from a yum .conf/.repo file. yum's own parser takes only
+    whole-line comments, so a '#' inside a value (a proxy password) is kept."""
+    out, cur = {}, None
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line[0] in "#;":
+            continue
+        m = re.match(r"^\[([^\]]+)\]$", line)
+        if m:
+            cur = out.setdefault(m.group(1).strip(), {})
+            continue
+        if cur is not None and "=" in line:
+            k, v = line.split("=", 1)
+            cur[k.strip().lower()] = v.strip()
+    return out
+
+
+def _url_host(url):
+    m = re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://(?:[^@/]*@)?([^/:?#]+)", url or "")
+    return m.group(1).lower() if m else ""
+
+
+def enabled_repo_urls():
+    """[(repo id, url)] for every enabled repo's baseurl and mirrorlist, in file order."""
+    try:
+        names = sorted(n for n in os.listdir(YUM_REPOS_DIR) if n.endswith(".repo"))
+    except OSError:
+        return None
+    urls = []
+    for name in names:
+        for section, kv in parse_yum_ini(read_file(os.path.join(YUM_REPOS_DIR, name))).items():
+            if kv.get("enabled", "1").strip() not in ("1", "yes", "true", "True"):
+                continue
+            for key in ("baseurl", "mirrorlist", "metalink"):
+                for u in re.split(r"[\s,]+", kv.get(key, "")):
+                    if u:
+                        urls.append((section, u))
+    return urls
+
+
+def yum_proxy():
+    """yum's [main] proxy as a URL curl reads from its environment, credentials folded in,
+    or ''. Credentials never go on an argv: argv is in ps, and in the debug timings."""
+    main = parse_yum_ini(read_file(YUM_CONF)).get("main", {})
+    proxy = main.get("proxy", "")
+    if not proxy or proxy == "_none_":
+        return ""
+    user = main.get("proxy_username", "")
+    if user and "@" not in proxy and "://" in proxy:
+        try:
+            from urllib import quote          # 2.7
+        except ImportError:
+            from urllib.parse import quote    # 3
+        scheme, rest = proxy.split("://", 1)
+        proxy = "%s://%s:%s@%s" % (scheme, quote(user, ""),
+                                   quote(main.get("proxy_password", ""), ""), rest)
+    return proxy
+
+
+_MIRRORLIST_IP_RE = re.compile(r"connecting with IP address <i>([^<]+)</i>"
+                               r"(?:, which belongs to autonomous system <i>([^<]+)</i>)?")
+_MIRRORLIST_ROW_RE = re.compile(
+    r"<td>([^<]+)</td>\s*<td[^>]*>\s*<a href=\"([^\"]+)\"(.*?)</tr>", re.S)
+_MIRRORLIST_SHARE_RE = re.compile(r">\s*(\d+)%\s*<")
+
+
+def parse_mirrorlist(html):
+    """(public ip, asn, [(mirror host, url, share %)]) out of a mirrorbits '?mirrorlist'
+    page. Only the 'Mirrors' table, not 'Excluded Mirrors'. share is the % of this
+    client's redirects that mirror gets; None ('n/a') is a fallback that only serves when
+    every one with a share fails, so those are the mirrors yum is actually sent to."""
+    html = html or ""
+    m = _MIRRORLIST_IP_RE.search(html)
+    ip, asn = (m.group(1).strip(), (m.group(2) or "").strip()) if m else ("", "")
+    start = html.find("<h3>Mirrors</h3>")
+    if start < 0:
+        return ip, asn, []
+    end = html.find("<h3>Excluded Mirrors</h3>", start)
+    table = html[start:end if end > 0 else len(html)]
+    mirrors = []
+    for row in _MIRRORLIST_ROW_RE.finditer(table):
+        s = _MIRRORLIST_SHARE_RE.search(row.group(3))
+        mirrors.append((row.group(1).strip(), row.group(2).strip(),
+                        int(s.group(1)) if s else None))
+    return ip, asn, mirrors
+
+
+def _curl_fail(r):
+    """curl's own one-line reason ('curl: (6) Could not resolve host: x'), or why()."""
+    if r.timed_out:
+        return "timed out"
+    for line in r.err.splitlines():
+        if line.strip():
+            return line.strip().replace("curl: ", "")[:200]
+    return r.why()
+
+
+def _curl(args, timeout):
+    return run(["curl", "-sS", "--connect-timeout", str(max(1, min(5, timeout))),
+                "-m", str(timeout)] + args, timeout=timeout + 5)
+
+
+def collect_update_mirror(opts):
+    """Can this host reach the XCP-ng update mirrors yum would be sent to?
+
+    The repos point at a mirrorbits redirector (mirrors.xcp-ng.org), which answers every
+    file with a redirect to a mirror picked by the client's public IP - so two hosts
+    behind different egress, or one behind a firewall that allows the redirector and not
+    the mirror, see different things. Asked from the host itself, so the IP the redirector
+    geolocates is the one yum is judged by and no '?fromip=' is needed:
+
+      1. '?mirrorlist' - the public IP and ASN the redirector sees, and the mirrors it
+         will hand this host, with their share of the redirects;
+      2. the plain URL, unfollowed - the mirror it picks right now;
+      3. repomd.xml from each mirror with a share (and the one picked), which is the
+         first file yum fetches from a repo.
+
+    Goes through yum's [main] proxy when one is set, as yum would. A host whose enabled
+    repos do not use the redirector (a local mirror) is not asked about it at all.
+    """
+    opts = opts or {}
+    redirector = (opts.get("redirector") or "").lower()
+    if not redirector:
+        return err("no redirector configured")
+    if which("curl") is None:
+        return err("curl not found")
+    urls = enabled_repo_urls()
+    if urls is None:
+        return err("could not read %s" % YUM_REPOS_DIR)
+    ours = [(s, u) for s, u in urls if _url_host(u) == redirector]
+    if not ours:
+        others = sorted(set(_url_host(u) for _s, u in urls if _url_host(u)))
+        return fact({"skipped": True, "repo_hosts": others})
+
+    # base repo's own path when it has no unexpanded yum variables in it
+    path = ""
+    for section, u in ours:
+        if "$" not in u and (section.endswith("-base") or not path):
+            path = re.sub(r"^[a-zA-Z]+://[^/]+", "", u).rstrip("/") + "/repodata/repomd.xml"
+    if not path:
+        osr = os_release()
+        ver = osr["value"].get("VERSION_ID", "") if osr["ok"] else ""
+        mm = re.match(r"^(\d+)\.(\d+)", ver)
+        if not mm:
+            return err("could not tell the XCP-ng version to build a repo URL from")
+        path = "/%s/%s.%s/base/x86_64/repodata/repomd.xml" % (mm.group(1), mm.group(1),
+                                                              mm.group(2))
+    url = "https://%s%s" % (redirector, path)
+
+    timeout = int(opts.get("timeout") or 10)
+    budget_end = time.time() + int(opts.get("budget") or 60)
+    proxy = yum_proxy()
+    saved = dict((k, os.environ.get(k)) for k in ("http_proxy", "https_proxy"))
+    out = {"url": url, "proxy": bool(proxy), "public_ip": "", "asn": "", "selected": "",
+           "redirector_error": "", "mirrors": []}
+    try:
+        if proxy:
+            os.environ["http_proxy"] = os.environ["https_proxy"] = proxy
+
+        r = _curl(["-L", "--max-redirs", "3", url + "?mirrorlist"], timeout)
+        if not r.ok:
+            out["redirector_error"] = _curl_fail(r)
+            return fact(out)
+        ip, asn, listed = parse_mirrorlist(r.out)
+        out["public_ip"], out["asn"] = ip, asn
+
+        r = _curl(["-o", os.devnull, "-w", "%{http_code} %{redirect_url}", url], timeout)
+        picked = ""
+        if r.ok:
+            parts = r.out.strip().split(None, 1)
+            if len(parts) == 2 and parts[0].startswith("3"):
+                picked = parts[1].strip()
+                out["selected"] = _url_host(picked)
+
+        # no shares at all means the page changed shape, not that none are used
+        probe = [(h, u, share) for h, u, share in listed if share] or listed[:3]
+        if picked and _url_host(picked) not in [_url_host(u) for _h, u, _s in probe]:
+            probe.insert(0, (_url_host(picked), picked, None))
+        probe = probe[:int(opts.get("max_mirrors") or 6)]
+        if not probe and not listed:
+            out["redirector_error"] = "redirector answered but listed no mirrors"
+            return fact(out)
+
+        for host, murl, share in probe:
+            left = int(budget_end - time.time())
+            row = {"host": host, "url": murl, "share": share, "ok": False, "error": ""}
+            out["mirrors"].append(row)
+            if left < 2:
+                row["error"] = "not tried - out of time"
+                continue
+            t = min(timeout, left)
+            r = _curl(["-L", "--max-redirs", "3", "-w", "\n%{http_code}", murl], t)
+            if not r.ok:
+                row["error"] = _curl_fail(r)
+                continue
+            body, _, code = r.out.rpartition("\n")
+            if code.strip() != "200":
+                row["error"] = "HTTP %s" % code.strip()
+            elif "<repomd" not in body:
+                row["error"] = "HTTP 200 but not repo metadata (captive portal or proxy page?)"
+            else:
+                row["ok"] = True
+        return fact(out)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def collect_yum_check_update():
     """yum check-update: rc 0 = nothing to do, rc 100 = updates listed, anything else
     means yum itself failed (broken repo, no network) - which must never read as zero."""
@@ -3434,7 +3655,9 @@ def _is_patch_line(action, pkg):
     """
     if action == "Updated":
         return True
-    return action == "Installed" and (pkg.startswith("kernel") or pkg.startswith("xen"))
+    # yum.log writes a non-zero epoch in front of the name: 'Installed: 2:xen-...'
+    name = re.sub(r"^\d+:", "", pkg)
+    return action == "Installed" and (name.startswith("kernel") or name.startswith("xen"))
 
 
 def find_last_update_line(text):
@@ -3878,6 +4101,32 @@ def _qcow2_vdis(sr_uuids, cap):
     return fact(rows[:cap] if cap and len(rows) > cap else rows), len(rows)
 
 
+_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def collect_ha_statefile_srs(pool_uuid):
+    """[{vdi, sr, name}] for each HA statefile VDI and the SR it lives on - the SR HA was
+    enabled with, which every host has to keep reaching or it fences itself. Only uuids
+    xapi handed back are ever asked about, so none of these can log a missing-uuid
+    exception; a lookup that fails leaves '' in its field rather than losing the rest."""
+    r = xe(["pool-param-get", "uuid=" + pool_uuid, "param-name=ha-statefiles"])
+    if not r.ok:
+        return err("xe pool-param-get ha-statefiles failed (%s)" % r.why())
+    rows = []
+    for vdi in _UUID_RE.findall(r.out):
+        row = {"vdi": vdi, "sr": "", "name": ""}
+        rows.append(row)
+        v = xe(["vdi-list", "uuid=" + vdi, "params=sr-uuid", "--minimal"])
+        m = _UUID_RE.search(v.out) if v.ok else None
+        if not m:
+            continue
+        row["sr"] = m.group(0)
+        s = xe(["sr-list", "uuid=" + row["sr"], "params=name-label", "--minimal"])
+        if s.ok:
+            row["name"] = s.out.strip()
+    return fact(rows)
+
+
 def collect_pool(spec, self_uuid):
     out = {}
 
@@ -3901,6 +4150,8 @@ def collect_pool(spec, self_uuid):
         r = xe(["pool-param-get", "uuid=" + pool_uuid, "param-name=ha-enabled"])
         out["ha_enabled"] = fact(r.out.strip()) if r.ok else \
             err("xe pool-param-get ha-enabled failed (%s)" % r.why())
+        if r.ok and r.out.strip() == "true":
+            out["ha_statefile_srs"] = collect_ha_statefile_srs(pool_uuid)
 
         # the list form, never 'pool-param-get param-name=migration-compression': the
         # param does not exist before 8.3 and param-get on a missing param logs a
@@ -4062,6 +4313,8 @@ def collect(spec):
         out["pvs"] = collect_pvs()
         out["lvm_backup"] = collect_lvm_backup(spec.get("xostor_vg") or "")
         out.update(collect_patch_facts())
+        if spec.get("update_mirror"):
+            out["update_mirror"] = collect_update_mirror(spec.get("update_mirror"))
 
         if self_uuid:
             r = xe(["pif-list", "params=gateway,DNS", "management=false",
@@ -5633,7 +5886,11 @@ def last_booted(host):
 
 def last_patched(host):
     f = host.fact("update_disp")
-    return raw("Last Patched", f.value if f.ok and f.value else "Unknown")
+    if f.ok and f.value:
+        return raw("Last Patched", f.value)
+    upd = host.fact("update_epoch")
+    return raw("Last Patched", "Unknown (%s)" % upd.error if not upd.ok and upd.error
+               else "Unknown")
 
 
 def host_enabled(host):
@@ -6342,7 +6599,7 @@ def rebooted_after_updates(host):
     upd_disp = host.fact("update_disp")
 
     if not boot.ok or not boot.value:
-        return unknown("Rebooted After Updates", "Unknown (could not read update or boot time)")
+        return unknown("Rebooted After Updates", "Unknown (could not read boot time)")
 
     if not upd.ok or not upd.value:
         # rpm is still a backstop: if nothing at all has been installed since boot then
@@ -6663,8 +6920,24 @@ def ha_enabled(pool):
     if value == "false":
         return ok("HA Enabled", "No")
     if value == "true":
-        return flag("HA Enabled", "Yes")
+        return flag("HA Enabled", "Yes (%s)" % _ha_statefile_sr_text(pool))
     return unknown("HA Enabled", "Unknown")
+
+
+def _ha_statefile_sr_text(pool):
+    """'SR: <name> (<uuid>)' for the SR(s) holding HA's statefile, or why it is not known."""
+    f = pool.fact("ha_statefile_srs")
+    if not f.ok:
+        return "statefile SR unknown: %s" % f.error
+    if not f.value:
+        return "no statefile listed"
+    named = []
+    for row in f.value:
+        if row.get("sr"):
+            named.append("%s (%s)" % (row.get("name") or "?", row["sr"]))
+        else:
+            named.append("SR of statefile VDI %s unknown" % row.get("vdi", "?"))
+    return "SR: %s" % ", ".join(sorted(set(named)))
 
 
 def sr_attachment(pool):
@@ -6789,12 +7062,68 @@ def migration_compression(pool):
 
 
 def missing_patches(pool):
+    """'yum check-update' on the host the pool questions were asked of. A yum that could
+    not reach its repos is Unknown with yum's own reason - which is usually the mirror,
+    and 'Update Mirror Access' on that host says which part of the path failed."""
     f = pool.fact("yum_check")
     if not f.ok:
-        return unknown("Missing Patches", "Unknown")
+        return unknown("Missing Patches", "Unknown (%s)" % f.error if f.error else "Unknown")
     if f.value == 0:
         return ok("Missing Patches", "0")
-    return flag("Missing Patches", str(f.value))
+    return flag("Missing Patches", "%d available" % f.value)
+
+
+def update_mirror_access(host):
+    """Whether this host can fetch repo metadata from the mirrors the XCP-ng redirector
+    sends it to - the usual cause of a 'yum update' that cannot find anything, and one
+    'Missing Patches' can only call Unknown. Every mirror with a share of this host's
+    redirects is tried, not just the one picked this time: the pick is weighted-random,
+    so a single bad mirror fails some yum runs and not others.
+
+    A host whose repos point somewhere else (a local mirror) is said, not flagged.
+    """
+    key = "Update Mirror Access"
+    f = host.fact("update_mirror")
+    if not f.ok:
+        return unknown(key, "Unknown (%s)" % f.error)
+    v = f.value or {}
+    if v.get("skipped"):
+        return info(key, "N/A (repos use %s)" % (", ".join(v.get("repo_hosts") or [])
+                                                  or "no enabled repos"))
+    redirector = _url_host_of(v.get("url", "")) or config.UPDATE_MIRROR_REDIRECTOR
+    seen = "Public IP: %s%s" % (v.get("public_ip") or "unknown",
+                                " - %s" % v["asn"] if v.get("asn") else "")
+    head = ["Repo URL:  %s" % v.get("url", "?"), seen,
+            "Via yum proxy: %s" % ("yes" if v.get("proxy") else "no")]
+    if v.get("redirector_error"):
+        return flag(key, "Cannot reach %s, See Below" % redirector).with_detail(
+            "---update mirror access---",
+            "\n".join(head + ["", "%s: %s" % (redirector, v["redirector_error"])]))
+
+    mirrors = v.get("mirrors") or []
+    bad = [m for m in mirrors if not m.get("ok")]
+    selected = v.get("selected") or ""
+    if mirrors and not bad:
+        return ok(key, "Yes (%s, via %s)" % (_plural(len(mirrors), "mirror"),
+                                             selected or mirrors[0].get("host")))
+    if not mirrors:
+        return unknown(key, "Unknown (no mirror was tried)")
+    rows = ["%-40s %-6s %s" % ("Mirror", "Share", "Result")]
+    for m in mirrors:
+        share = "%d%%" % m["share"] if m.get("share") is not None else "-"
+        name = m.get("host", "?") + (" *" if m.get("host") == selected else "")
+        rows.append("%-40s %-6s %s" % (name, share, "OK" if m.get("ok") else m.get("error")))
+    if selected:
+        rows.append("(* = the mirror %s picked for this host)" % redirector)
+    what = "All %s" % _plural(len(mirrors), "mirror") if len(bad) == len(mirrors) \
+        else "%d of %s" % (len(bad), _plural(len(mirrors), "mirror"))
+    return flag(key, "%s Unreachable, See Below" % what).with_detail(
+        "---update mirror access---", "\n".join(head + [""] + rows))
+
+
+def _url_host_of(url):
+    m = re.match(r"^[a-zA-Z]+://([^/:?#]+)", url or "")
+    return m.group(1) if m else ""
 
 
 def vlan0(pool):
@@ -6881,24 +7210,50 @@ def xostor_missing_devices_pool(hosts, details_shown=True):
     in each host's own detail. details_shown is False when slaves do not print the
     per-host line, and then the reader is not sent to look for it.
     """
-    key = "XOSTOR Missing Devices"
-    missing, unread = [], []
+    return _pool_rollup("XOSTOR Missing Devices", hosts, xostor_missing_devices,
+                        details_shown)
+
+
+def _pool_rollup(key, hosts, host_check, details_shown=True, flagged_as="Yes, on",
+                 clean="None"):
+    """One pool line built from each host's own line for the same check, so the two can
+    never disagree: the hosts it flags, then the hosts it could not read, else clean.
+    An INFO host line (not applicable there) counts as neither. 'See Host Results' only
+    when every flagged host prints its line - the master always does, a slave only when
+    details_shown (its POOL_RUN toggle) says so.
+    """
+    flagged, unread = [], []
     for h in hosts:
-        line = xostor_missing_devices(h)
+        line = host_check(h)
         if line.status == result.FLAG:
-            missing.append(h.name)
+            flagged.append(h)
         elif line.status == result.UNKNOWN:
             unread.append(h.name)
-    if missing:
-        text = "Yes, on: %s" % ", ".join(missing)
-        if details_shown:
+    if flagged:
+        text = "%s: %s" % (flagged_as, ", ".join(h.name for h in flagged))
+        if details_shown or all(h.is_master for h in flagged):
             text += " - See Host Results"
         if unread:
             text += " (unreadable on: %s)" % ", ".join(unread)
         return flag(key, text)
     if unread:
         return unknown(key, "Unknown on: %s" % ", ".join(unread))
-    return ok(key, "None")
+    return ok(key, clean)
+
+
+def pending_reboot_pool(hosts, details_shown=True):
+    """Hosts that took updates after their last boot, named in the pool section so they
+    are not missed by someone reading only that - each host's own 'Rebooted After
+    Updates' line holds the dates."""
+    return _pool_rollup("Hosts Pending Reboot", hosts, rebooted_after_updates,
+                        details_shown, flagged_as="Yes")
+
+
+def update_mirror_access_pool(hosts, details_shown=True):
+    """Hosts that cannot reach the XCP-ng update mirrors. Hosts on a local mirror are
+    left out rather than counted as fine or failing."""
+    return _pool_rollup("Update Mirror Access", hosts, update_mirror_access,
+                        details_shown, flagged_as="Failing on", clean="OK")
 
 
 def xostor_in_use(pool):
@@ -8227,6 +8582,10 @@ def _host_spec(with_smapi):
         "crash_ignore_file": config.CRASH_IGNORE_FILE,
         "coredump_dir": config.COREDUMP_DIR,
         "xostor_vg": config.XOSTOR_VG,
+        "update_mirror": {"redirector": config.UPDATE_MIRROR_REDIRECTOR,
+                          "timeout": config.UPDATE_MIRROR_TIMEOUT,
+                          "budget": config.UPDATE_MIRROR_BUDGET,
+                          "max_mirrors": config.UPDATE_MIRROR_MAX_PROBES},
         "smapi": bool(with_smapi),
         "log_scan": {"files": config.LOG_ERROR_FILES,
                      "phrases": config.LOG_ERROR_PHRASES,
@@ -8990,6 +9349,13 @@ def pool_status_section(run, rep):
     rep.check("Long-Running Tasks", checks.long_running_tasks, run.pool)
     rep.check("Migration Compression", checks.migration_compression, run.pool)
     rep.check("Missing Patches", checks.missing_patches, run.pool)
+    if not run.host_solo():
+        # roll-ups of per-host lines, next to the patch line they explain
+        reachable = [h for h in run.hosts if h.reachable]
+        rep.check("Hosts Pending Reboot", checks.pending_reboot_pool, reachable,
+                  config.POOL_RUN.get("rebooted_after_updates", True))
+        rep.check("Update Mirror Access", checks.update_mirror_access_pool, reachable,
+                  config.POOL_RUN.get("update_mirror_access", True))
 
     if run.pw_has_backslash:
         rep.add(result.info("Root Password", "Contains Backslash", "yellow"))
@@ -9140,7 +9506,7 @@ def per_host_checks():
         ("log_errors", "Log Errors", checks.log_errors),
         ("lun_assignments", "LUN Assignments", checks.lun_assignments),
         ("smapi_hidden_leaves", "SMAPI Hidden Leaves", checks.smapi_hidden_leaves),
-        ("rebooted_after_updates", "Rebooted After Updates", checks.rebooted_after_updates),
+        ("update_mirror_access", "Update Mirror Access", checks.update_mirror_access),
     ]
 
 
@@ -9178,6 +9544,9 @@ def host_section(run, rep, host):
     rep.check("Hypervisor Version", checks.hypervisor_version, host)
     rep.check("Last Booted", checks.last_booted, host)
     rep.check("Last Patched", checks.last_patched, host)
+    # the conclusion drawn from the two dates above, so it prints beside them
+    if gated(run, host, "rebooted_after_updates"):
+        rep.check("Rebooted After Updates", checks.rebooted_after_updates, host)
     # ahead of the xe-sourced lines it explains
     rep.check("XAPI Status", checks.xapi_status, host)
     rep.check("Host Enabled", checks.host_enabled, host)
@@ -9454,7 +9823,7 @@ def _module(name, exported):
     return module
 
 
-config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DMESG_MAX_LINES', 'DMESG_ROLLUP_MIN', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'FAILED_UNITS_IGNORE', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MOUNT_PROBE_RESERVE', 'MOUNT_PROBE_TIMEOUT', 'MOUNT_STALL_FILES', 'MOUNT_STALL_PHRASES', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'NETWORK_FS_TYPES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'PROGRESS_INTERVAL', 'REMOTE_CMD_TIMEOUT', 'RO_FS_DMESG', 'RO_FS_EXTRA', 'RO_FS_NATIVE_RO', 'RO_FS_SR_DIRS', 'RUN_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'STATIC_VDIS_UNIT', 'STUCK_MAX_LINES', 'STUCK_MIN_AGE', 'STUCK_RECHECK_DELAY', 'STUCK_SAMPLES', 'TASK_PENDING_MAX_HOURS', 'TIME_SYNC_ALLOWANCE_SECS', 'XOA_CHECK_TIMEOUT', 'XOA_STOCK_PLUGINS', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_PACKAGES', 'XOSTOR_QCOW2_MAX_LINES', 'XOSTOR_VG', 'XO_DNS_TIMEOUT', 'XO_PLUGIN_LOOKUP_PATHS', 'XO_PLUGIN_PREFIX', 'XO_PLUGIN_SCOPE_DIR', 'XO_PLUGIN_SCOPE_PREFIX', 'XO_REDIS_TIMEOUT'])
+config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DMESG_MAX_LINES', 'DMESG_ROLLUP_MIN', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'FAILED_UNITS_IGNORE', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MOUNT_PROBE_RESERVE', 'MOUNT_PROBE_TIMEOUT', 'MOUNT_STALL_FILES', 'MOUNT_STALL_PHRASES', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'NETWORK_FS_TYPES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'PROGRESS_INTERVAL', 'REMOTE_CMD_TIMEOUT', 'RO_FS_DMESG', 'RO_FS_EXTRA', 'RO_FS_NATIVE_RO', 'RO_FS_SR_DIRS', 'RUN_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'STATIC_VDIS_UNIT', 'STUCK_MAX_LINES', 'STUCK_MIN_AGE', 'STUCK_RECHECK_DELAY', 'STUCK_SAMPLES', 'TASK_PENDING_MAX_HOURS', 'TIME_SYNC_ALLOWANCE_SECS', 'UPDATE_MIRROR_BUDGET', 'UPDATE_MIRROR_MAX_PROBES', 'UPDATE_MIRROR_REDIRECTOR', 'UPDATE_MIRROR_TIMEOUT', 'XOA_CHECK_TIMEOUT', 'XOA_STOCK_PLUGINS', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_PACKAGES', 'XOSTOR_QCOW2_MAX_LINES', 'XOSTOR_VG', 'XO_DNS_TIMEOUT', 'XO_PLUGIN_LOOKUP_PATHS', 'XO_PLUGIN_PREFIX', 'XO_PLUGIN_SCOPE_DIR', 'XO_PLUGIN_SCOPE_PREFIX', 'XO_REDIS_TIMEOUT'])
 colors = _module('colors', ['CYAN', 'GREEN', 'RESET', 'YELLOW', 'cyan', 'green', 'init', 'strip_ansi', 'yellow'])
 result = _module('result', ['FLAG', 'Fact', 'INFO', 'Line', 'MISSING', 'OK', 'UNKNOWN', 'flag', 'guard', 'info', 'ok', 'pinned', 'raw', 'unknown', 'wrap'])
 parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', 'SR_ATTACH_SKIP_TYPES', '_DIFF_KINDS', '_LINK_RE', '_LOOSE_URL_RE', '_MANIFEST_PKG_RE', '_MOUNT_FIELD_ESCAPES', '_MTU_RE', '_PARAM_RE', '_PREMIUM_SUFFIX', '_SCHEME_RE', '_TS_RE', '_XO_URL_RE', '_cidr_range', '_ids_among', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'backup_runners', 'cap_lines', 'classify_multipath_path', 'classify_xo_plugins', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'format_age', 'has_overlapping_subnets', 'has_url_scheme', 'host_records_from_state_db', 'http_proxy_address', 'ip_literal', 'job_field', 'job_touches_pool', 'leading_version', 'manifest_diff', 'manifest_diff_summary', 'manifest_packages', 'manifest_plugin_names', 'manifest_versions', 'mount_field', 'mount_table', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_failed_units', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_lvm_backup_pvs', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pending_tasks', 'parse_pool_conf', 'parse_pvs', 'parse_sr_attachment', 'parse_timedatectl', 'parse_xe_records', 'plugin_block', 'pool_member_addresses', 'pv_missing', 'read_only_mounts', 'rollup_repeats', 'round_1dp', 'split_host_port', 'split_timestamp', 'static_vdis_failure_moot', 'truncate_block', 'unit_display', 'xapi_utc', 'xo_pattern_match', 'xo_server_address', 'xo_simple_ids'])
@@ -9463,7 +9832,7 @@ collectorsrc = _module('collectorsrc', ['EMBEDDED', 'collector_source'])
 transport = _module('transport', ['ASKPASS_ENV', 'ASKPASS_SCRIPT', 'AUTH_ASKPASS', 'AUTH_SSHPASS', 'BEGIN_MARKER', 'CollectError', 'END_MARKER', 'Transport', '_DEBUG_LOCK', '_LIVE', '_LIVE_LOCK', '_REMOTE_LAUNCH', '_REMOTE_LAUNCH_PINNED', '_kill_tree', '_remote_launch', 'cleanup_work_dir', 'debug', 'ensure_sshpass', 'have', 'kill_all_children', 'make_work_dir', 'run_local_cmd', 'which', 'write_askpass'])
 xoredis = _module('xoredis', ['DEFAULT_ADDR', 'ENCRYPTION_PREFIX', 'IDS_KEY', 'PLUGIN_IDS_KEY', 'PLUGIN_RECORD_PREFIX', 'RECORD_PREFIX', 'RedisError', '_config_dirs', '_config_files', '_encode', '_fetch', '_fetch_autoload', '_fetch_collection', '_flatten', '_mentions_redis', '_read_reply', 'read_plugin_autoload', 'read_records', 'read_server_records'])
 xodb = _module('xodb', ['QUOTES', 'SELECT_NONE', 'SELECT_NO_MATCH', 'SELECT_OK', 'SELECT_QUIT', 'SELECT_UNREADABLE', 'Server', '_ALL_SERVERS', '_COLLECTIONS', '_ESCAPE_RE', '_KEY_RE', '_READ_ERROR', '_RESOLVED', '_SIMPLE_ESCAPES', '_describe_failure', '_ls', '_read_servers', '_resolve', '_same_address', '_sort_key', 'all_servers', 'backup_routes', 'clean', 'collection', 'db_address', 'enabled_server_for', 'enabled_servers', 'have_xo_server_db', 'match_record', 'password_for', 'pool_name_for_host', 'read_error', 'record_password', 'reset_cache', 'scan_records', 'select_pool', 'server_for_host', 'unescape'])
-checks = _module('checks', ['_backup_moved_elsewhere', '_dmesg_phrase_blocks', '_drbd_stale', '_first_line', '_linstor_column', '_linstor_has_rows', '_linstor_line', '_linstor_node_addresses', '_linstor_node_offline', '_linstor_table', '_linstor_unknown', '_maps', '_mount_detail', '_multipath_detail', '_multipath_read', '_network_line', '_plural', '_pool_conf_target', '_pool_roles_detail', '_render_scan_blocks', '_ro_detail', '_ro_name', '_stuck_detail', '_xostor_signature', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_block', 'dmesg_content', 'dmesg_content_of', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'failed_units', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'long_running_tasks', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mount_stalls', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'network_mounts', 'ntp', 'oom_events', 'overlapping_subnets', 'pool_host_list', 'pool_roles', 'read_only_filesystems', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'sr_attachment', 'stuck_processes', 'tap_status', 'task_timeout_override', 'vlan0', 'xapi_status', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_missing_devices', 'xostor_missing_devices_pool', 'xostor_nodes', 'xostor_pref_nic', 'xostor_qcow2', 'xostor_ram', 'xostor_version_consistency', 'xostor_versions', 'yum_patch_level'])
+checks = _module('checks', ['_backup_moved_elsewhere', '_dmesg_phrase_blocks', '_drbd_stale', '_first_line', '_ha_statefile_sr_text', '_linstor_column', '_linstor_has_rows', '_linstor_line', '_linstor_node_addresses', '_linstor_node_offline', '_linstor_table', '_linstor_unknown', '_maps', '_mount_detail', '_multipath_detail', '_multipath_read', '_network_line', '_plural', '_pool_conf_target', '_pool_roles_detail', '_pool_rollup', '_render_scan_blocks', '_ro_detail', '_ro_name', '_stuck_detail', '_url_host_of', '_xostor_signature', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_block', 'dmesg_content', 'dmesg_content_of', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'failed_units', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'long_running_tasks', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mount_stalls', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'network_mounts', 'ntp', 'oom_events', 'overlapping_subnets', 'pending_reboot_pool', 'pool_host_list', 'pool_roles', 'read_only_filesystems', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'sr_attachment', 'stuck_processes', 'tap_status', 'task_timeout_override', 'update_mirror_access', 'update_mirror_access_pool', 'vlan0', 'xapi_status', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_missing_devices', 'xostor_missing_devices_pool', 'xostor_nodes', 'xostor_pref_nic', 'xostor_qcow2', 'xostor_ram', 'xostor_version_consistency', 'xostor_versions', 'yum_patch_level'])
 xoa = _module('xoa', ['_dmesg', '_first_token', '_max_old_space', '_meminfo', '_os_version', '_plugin_autoload', '_plugin_scan_targets', '_plugin_version', '_plugins_line', '_service_state', '_updater', 'collect_xoa', 'debian_version_ok', 'lines', 'ping_silent', 'running_as_root', 'scan_plugins'])
 report = _module('report', ['Report', '_as_entry'])
 runcmd = _module('runcmd', ['TRANSPORT_FAILED', '_run_one', 'execute'])
