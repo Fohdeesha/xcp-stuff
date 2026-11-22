@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Every threshold, list and toggle, in one place. Same names and values as health.sh."""
 
-SCRIPT_VERSION = "3.25"
+SCRIPT_VERSION = "3.26"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
@@ -269,6 +269,10 @@ XOSTOR_PACKAGES = (
     "kmod-drbd", "drbd", "drbd-utils", "drbd-reactor", "linstor-satellite",
     "linstor-controller", "linstor-client", "python-linstor", "xcp-ng-linstor",
 )
+UPDATE_MIRROR_REDIRECTOR = "mirrors.xcp-ng.org"   # the mirrorbits host the XCP-ng repos use
+UPDATE_MIRROR_TIMEOUT = 10       # seconds per request to the redirector or one mirror
+UPDATE_MIRROR_BUDGET = 60        # seconds for the whole mirror probe on one host
+UPDATE_MIRROR_MAX_PROBES = 6     # mirrors fetched from, of those the redirector hands out
 XOSTOR_VG = "linstor_group"      # the LVM volume group XOSTOR builds its storage pool on
 DMESG_MAX_LINES = 80             # lines of a dmesg detail block (Dmesg Content, OOM Events);
                                  # the newest are kept, and the rollup runs first
@@ -305,4 +309,5 @@ POOL_RUN = {
     "yum_patch_level": True,
     "xostor_versions": True,
     "xostor_missing_devices": True,
+    "update_mirror_access": True,
 }

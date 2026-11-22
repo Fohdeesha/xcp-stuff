@@ -99,10 +99,11 @@ def test_the_check_table_and_the_slave_toggles_stay_in_step():
     """
     toggles = set(config.POOL_RUN)
     table = set(toggle for toggle, _key, _fn in main.per_host_checks())
-    # yum_patch_level is gated too, but from its own call site: it needs the master's
-    # manifest passed in, so it is not one of the (host) -> Line entries in the table
-    assert table | {"yum_patch_level", "xostor_versions",
-                     "xostor_missing_devices"} == toggles
+    # these are gated too, but from their own call sites: yum_patch_level needs the
+    # master's manifest passed in, the XOSTOR ones depend on the pool, and
+    # rebooted_after_updates prints up beside Last Booted / Last Patched
+    assert table | {"yum_patch_level", "xostor_versions", "xostor_missing_devices",
+                     "rebooted_after_updates"} == toggles
 
 
 def test_every_host_check_says_unknown_when_the_fact_is_an_error():
@@ -343,6 +344,15 @@ def test_xostor_version_consistency_unreadable_host_is_unknown_not_a_mismatch():
 def test_ha_states():
     assert checks.ha_enabled(pool(ha_enabled=fact("false"))).status == OK
     assert checks.ha_enabled(pool(ha_enabled=fact("true"))).status == FLAG
+    line = checks.ha_enabled(pool(ha_enabled=fact("true"), ha_statefile_srs=fact([
+        {"vdi": "v1", "sr": "1111-sr", "name": "iSCSI-HA"}])))
+    assert line.status == FLAG and "SR: iSCSI-HA (1111-sr)" in line.text
+    line = checks.ha_enabled(pool(ha_enabled=fact("true"),
+                                  ha_statefile_srs=err("xe timed out")))
+    assert "statefile SR unknown: xe timed out" in line.text
+    line = checks.ha_enabled(pool(ha_enabled=fact("true"), ha_statefile_srs=fact([
+        {"vdi": "v9", "sr": "", "name": ""}])))
+    assert "SR of statefile VDI v9 unknown" in line.text
     assert checks.ha_enabled(pool(ha_enabled=err())).status == UNKNOWN
     assert checks.ha_enabled(pool(ha_enabled=fact("wat"))).status == UNKNOWN
 
@@ -368,9 +378,26 @@ def test_migration_compression_true_and_false():
 def test_missing_patches():
     assert checks.missing_patches(pool(yum_check=fact(0))).status == OK
     flagged = checks.missing_patches(pool(yum_check=fact(7)))
-    assert flagged.status == FLAG and "7" in flagged.text
-    # a yum that failed must never read as zero
-    assert checks.missing_patches(pool(yum_check=err())).status == UNKNOWN
+    assert flagged.status == FLAG and "7 available" in flagged.text
+    # a yum that failed must never read as zero, and says why
+    broken = checks.missing_patches(pool(yum_check=err("yum check-update timed out")))
+    assert broken.status == UNKNOWN and "timed out" in broken.text
+
+
+def test_last_patched_says_why_it_is_unknown():
+    assert checks.last_patched(host(update_disp=fact("2026-11-01 10:00:00"))).text \
+        == "2026-11-01 10:00:00"
+    line = checks.last_patched(host(update_disp=err("no timestamp"),
+                                    update_epoch=err("no update found in yum.log")))
+    assert line.text == "Unknown (no update found in yum.log)"
+    assert checks.last_patched(host()).text.startswith("Unknown")
+
+
+def test_rebooted_after_updates_prints_beside_last_patched():
+    import inspect
+    src = inspect.getsource(main.host_section)
+    assert src.index('"Last Patched"') < src.index('"Rebooted After Updates"') \
+        < src.index("per_host_checks()")
 
 
 def test_vlan0():
@@ -899,3 +926,107 @@ def test_xostor_missing_devices_pool_never_green_with_a_host_unread():
     line = checks.xostor_missing_devices_pool([_dhost("h1", PVS_MISSING),
                                                _dhost("h2", "", err("could not read"))])
     assert line.status == FLAG and "unreadable on: h2" in line.text
+
+
+# --------------------------------------------------------------------------------------
+# Update Mirror Access
+# --------------------------------------------------------------------------------------
+
+def mirror_fact(mirrors=None, redirector_error="", selected="mirror.b.org"):
+    return fact({"url": "https://mirrors.xcp-ng.org/8/8.3/base/x86_64/repodata/repomd.xml",
+                 "proxy": False, "public_ip": "203.0.113.7", "asn": "Example (ASN64500)",
+                 "selected": selected, "redirector_error": redirector_error,
+                 "mirrors": mirrors if mirrors is not None else []})
+
+
+def mrow(name, ok_=True, share=50, error=""):
+    return {"host": name, "url": "https://%s/x" % name, "share": share, "ok": ok_,
+            "error": error}
+
+
+def test_update_mirror_access_ok_when_every_mirror_answers():
+    line = checks.update_mirror_access(host(update_mirror=mirror_fact(
+        [mrow("mirror.a.org"), mrow("mirror.b.org")])))
+    assert line.status == OK and "2 mirrors" in line.text and "mirror.b.org" in line.text
+
+
+def test_update_mirror_access_flags_one_bad_mirror_and_marks_the_pick():
+    line = checks.update_mirror_access(host(update_mirror=mirror_fact(
+        [mrow("mirror.a.org"), mrow("mirror.b.org", False, error="timed out")])))
+    assert line.status == FLAG and "1 of 2 mirrors" in line.text
+    assert "mirror.b.org *" in line.detail_text and "timed out" in line.detail_text
+    assert "203.0.113.7" in line.detail_text
+
+
+def test_update_mirror_access_flags_an_unreachable_redirector():
+    line = checks.update_mirror_access(host(update_mirror=mirror_fact(
+        redirector_error="(6) Could not resolve host: mirrors.xcp-ng.org")))
+    assert line.status == FLAG and "Cannot reach mirrors.xcp-ng.org" in line.text
+    assert "Could not resolve" in line.detail_text
+
+
+def test_update_mirror_access_flags_all_mirrors_down():
+    line = checks.update_mirror_access(host(update_mirror=mirror_fact(
+        [mrow("a", False, error="x"), mrow("b", False, error="y")])))
+    assert line.status == FLAG and line.text.startswith("All 2 mirrors")
+
+
+def test_update_mirror_access_local_repo_is_said_not_flagged():
+    line = checks.update_mirror_access(host(update_mirror=fact(
+        {"skipped": True, "repo_hosts": ["repo.lan"]})))
+    assert line.status == INFO and not line.flags and "repo.lan" in line.text
+
+
+def test_update_mirror_access_never_green_off_nothing():
+    for h in (host(), host(update_mirror=err("curl not found")),
+              host(update_mirror=mirror_fact([]))):
+        assert checks.update_mirror_access(h).status == UNKNOWN
+
+
+# --------------------------------------------------------------------------------------
+# pool roll-ups: Hosts Pending Reboot, Update Mirror Access
+# --------------------------------------------------------------------------------------
+
+def _named(label, master=False, **facts):
+    h = host(**facts)
+    h.hostname = label
+    h.is_master = master
+    return h
+
+
+def _rebooted(label, booted_after, master=False):
+    boot, upd = (200, 100) if booted_after else (100, 200)
+    return _named(label, master, boot_epoch=fact(boot), boot_disp=fact("B"),
+                  update_epoch=fact(upd), update_disp=fact("U"))
+
+
+def test_pending_reboot_pool_none_when_every_host_rebooted():
+    line = checks.pending_reboot_pool([_rebooted("h1", True), _rebooted("h2", True)])
+    assert line.status == OK and line.text.endswith("None")
+
+
+def test_pending_reboot_pool_names_the_hosts_and_points_at_their_results():
+    line = checks.pending_reboot_pool([_rebooted("h1", True), _rebooted("h2", False),
+                                       _rebooted("h3", False)])
+    assert line.status == FLAG and "Yes: h2, h3 - See Host Results" in line.text
+    # slaves not printing the line: no pointer, unless only the master is flagged
+    quiet = checks.pending_reboot_pool([_rebooted("h2", False)], False)
+    assert "See Host Results" not in quiet.text
+    master = checks.pending_reboot_pool([_rebooted("m", False, master=True)], False)
+    assert "See Host Results" in master.text
+
+
+def test_pending_reboot_pool_never_green_with_a_host_unread():
+    line = checks.pending_reboot_pool([_rebooted("h1", True), _named("h2")])
+    assert line.status == UNKNOWN and "h2" in line.text
+    line = checks.pending_reboot_pool([_rebooted("h1", False), _named("h2")])
+    assert line.status == FLAG and "unreadable on: h2" in line.text
+
+
+def test_update_mirror_access_pool_skips_local_mirror_hosts():
+    good = _named("h1", update_mirror=mirror_fact([mrow("a")]))
+    local = _named("h2", update_mirror=fact({"skipped": True, "repo_hosts": ["repo.lan"]}))
+    bad = _named("h3", update_mirror=mirror_fact(redirector_error="(6) Could not resolve"))
+    assert checks.update_mirror_access_pool([good, local]).status == OK
+    line = checks.update_mirror_access_pool([good, local, bad])
+    assert line.status == FLAG and "Failing on: h3" in line.text and "h2" not in line.text

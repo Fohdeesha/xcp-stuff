@@ -1260,6 +1260,222 @@ def lvm_section(text, name):
     return ""
 
 
+YUM_CONF = "/etc/yum.conf"
+YUM_REPOS_DIR = "/etc/yum.repos.d"
+
+
+def parse_yum_ini(text):
+    """{section: {key: value}} from a yum .conf/.repo file. yum's own parser takes only
+    whole-line comments, so a '#' inside a value (a proxy password) is kept."""
+    out, cur = {}, None
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line[0] in "#;":
+            continue
+        m = re.match(r"^\[([^\]]+)\]$", line)
+        if m:
+            cur = out.setdefault(m.group(1).strip(), {})
+            continue
+        if cur is not None and "=" in line:
+            k, v = line.split("=", 1)
+            cur[k.strip().lower()] = v.strip()
+    return out
+
+
+def _url_host(url):
+    m = re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://(?:[^@/]*@)?([^/:?#]+)", url or "")
+    return m.group(1).lower() if m else ""
+
+
+def enabled_repo_urls():
+    """[(repo id, url)] for every enabled repo's baseurl and mirrorlist, in file order."""
+    try:
+        names = sorted(n for n in os.listdir(YUM_REPOS_DIR) if n.endswith(".repo"))
+    except OSError:
+        return None
+    urls = []
+    for name in names:
+        for section, kv in parse_yum_ini(read_file(os.path.join(YUM_REPOS_DIR, name))).items():
+            if kv.get("enabled", "1").strip() not in ("1", "yes", "true", "True"):
+                continue
+            for key in ("baseurl", "mirrorlist", "metalink"):
+                for u in re.split(r"[\s,]+", kv.get(key, "")):
+                    if u:
+                        urls.append((section, u))
+    return urls
+
+
+def yum_proxy():
+    """yum's [main] proxy as a URL curl reads from its environment, credentials folded in,
+    or ''. Credentials never go on an argv: argv is in ps, and in the debug timings."""
+    main = parse_yum_ini(read_file(YUM_CONF)).get("main", {})
+    proxy = main.get("proxy", "")
+    if not proxy or proxy == "_none_":
+        return ""
+    user = main.get("proxy_username", "")
+    if user and "@" not in proxy and "://" in proxy:
+        try:
+            from urllib import quote          # 2.7
+        except ImportError:
+            from urllib.parse import quote    # 3
+        scheme, rest = proxy.split("://", 1)
+        proxy = "%s://%s:%s@%s" % (scheme, quote(user, ""),
+                                   quote(main.get("proxy_password", ""), ""), rest)
+    return proxy
+
+
+_MIRRORLIST_IP_RE = re.compile(r"connecting with IP address <i>([^<]+)</i>"
+                               r"(?:, which belongs to autonomous system <i>([^<]+)</i>)?")
+_MIRRORLIST_ROW_RE = re.compile(
+    r"<td>([^<]+)</td>\s*<td[^>]*>\s*<a href=\"([^\"]+)\"(.*?)</tr>", re.S)
+_MIRRORLIST_SHARE_RE = re.compile(r">\s*(\d+)%\s*<")
+
+
+def parse_mirrorlist(html):
+    """(public ip, asn, [(mirror host, url, share %)]) out of a mirrorbits '?mirrorlist'
+    page. Only the 'Mirrors' table, not 'Excluded Mirrors'. share is the % of this
+    client's redirects that mirror gets; None ('n/a') is a fallback that only serves when
+    every one with a share fails, so those are the mirrors yum is actually sent to."""
+    html = html or ""
+    m = _MIRRORLIST_IP_RE.search(html)
+    ip, asn = (m.group(1).strip(), (m.group(2) or "").strip()) if m else ("", "")
+    start = html.find("<h3>Mirrors</h3>")
+    if start < 0:
+        return ip, asn, []
+    end = html.find("<h3>Excluded Mirrors</h3>", start)
+    table = html[start:end if end > 0 else len(html)]
+    mirrors = []
+    for row in _MIRRORLIST_ROW_RE.finditer(table):
+        s = _MIRRORLIST_SHARE_RE.search(row.group(3))
+        mirrors.append((row.group(1).strip(), row.group(2).strip(),
+                        int(s.group(1)) if s else None))
+    return ip, asn, mirrors
+
+
+def _curl_fail(r):
+    """curl's own one-line reason ('curl: (6) Could not resolve host: x'), or why()."""
+    if r.timed_out:
+        return "timed out"
+    for line in r.err.splitlines():
+        if line.strip():
+            return line.strip().replace("curl: ", "")[:200]
+    return r.why()
+
+
+def _curl(args, timeout):
+    return run(["curl", "-sS", "--connect-timeout", str(max(1, min(5, timeout))),
+                "-m", str(timeout)] + args, timeout=timeout + 5)
+
+
+def collect_update_mirror(opts):
+    """Can this host reach the XCP-ng update mirrors yum would be sent to?
+
+    The repos point at a mirrorbits redirector (mirrors.xcp-ng.org), which answers every
+    file with a redirect to a mirror picked by the client's public IP - so two hosts
+    behind different egress, or one behind a firewall that allows the redirector and not
+    the mirror, see different things. Asked from the host itself, so the IP the redirector
+    geolocates is the one yum is judged by and no '?fromip=' is needed:
+
+      1. '?mirrorlist' - the public IP and ASN the redirector sees, and the mirrors it
+         will hand this host, with their share of the redirects;
+      2. the plain URL, unfollowed - the mirror it picks right now;
+      3. repomd.xml from each mirror with a share (and the one picked), which is the
+         first file yum fetches from a repo.
+
+    Goes through yum's [main] proxy when one is set, as yum would. A host whose enabled
+    repos do not use the redirector (a local mirror) is not asked about it at all.
+    """
+    opts = opts or {}
+    redirector = (opts.get("redirector") or "").lower()
+    if not redirector:
+        return err("no redirector configured")
+    if which("curl") is None:
+        return err("curl not found")
+    urls = enabled_repo_urls()
+    if urls is None:
+        return err("could not read %s" % YUM_REPOS_DIR)
+    ours = [(s, u) for s, u in urls if _url_host(u) == redirector]
+    if not ours:
+        others = sorted(set(_url_host(u) for _s, u in urls if _url_host(u)))
+        return fact({"skipped": True, "repo_hosts": others})
+
+    # base repo's own path when it has no unexpanded yum variables in it
+    path = ""
+    for section, u in ours:
+        if "$" not in u and (section.endswith("-base") or not path):
+            path = re.sub(r"^[a-zA-Z]+://[^/]+", "", u).rstrip("/") + "/repodata/repomd.xml"
+    if not path:
+        osr = os_release()
+        ver = osr["value"].get("VERSION_ID", "") if osr["ok"] else ""
+        mm = re.match(r"^(\d+)\.(\d+)", ver)
+        if not mm:
+            return err("could not tell the XCP-ng version to build a repo URL from")
+        path = "/%s/%s.%s/base/x86_64/repodata/repomd.xml" % (mm.group(1), mm.group(1),
+                                                              mm.group(2))
+    url = "https://%s%s" % (redirector, path)
+
+    timeout = int(opts.get("timeout") or 10)
+    budget_end = time.time() + int(opts.get("budget") or 60)
+    proxy = yum_proxy()
+    saved = dict((k, os.environ.get(k)) for k in ("http_proxy", "https_proxy"))
+    out = {"url": url, "proxy": bool(proxy), "public_ip": "", "asn": "", "selected": "",
+           "redirector_error": "", "mirrors": []}
+    try:
+        if proxy:
+            os.environ["http_proxy"] = os.environ["https_proxy"] = proxy
+
+        r = _curl(["-L", "--max-redirs", "3", url + "?mirrorlist"], timeout)
+        if not r.ok:
+            out["redirector_error"] = _curl_fail(r)
+            return fact(out)
+        ip, asn, listed = parse_mirrorlist(r.out)
+        out["public_ip"], out["asn"] = ip, asn
+
+        r = _curl(["-o", os.devnull, "-w", "%{http_code} %{redirect_url}", url], timeout)
+        picked = ""
+        if r.ok:
+            parts = r.out.strip().split(None, 1)
+            if len(parts) == 2 and parts[0].startswith("3"):
+                picked = parts[1].strip()
+                out["selected"] = _url_host(picked)
+
+        # no shares at all means the page changed shape, not that none are used
+        probe = [(h, u, share) for h, u, share in listed if share] or listed[:3]
+        if picked and _url_host(picked) not in [_url_host(u) for _h, u, _s in probe]:
+            probe.insert(0, (_url_host(picked), picked, None))
+        probe = probe[:int(opts.get("max_mirrors") or 6)]
+        if not probe and not listed:
+            out["redirector_error"] = "redirector answered but listed no mirrors"
+            return fact(out)
+
+        for host, murl, share in probe:
+            left = int(budget_end - time.time())
+            row = {"host": host, "url": murl, "share": share, "ok": False, "error": ""}
+            out["mirrors"].append(row)
+            if left < 2:
+                row["error"] = "not tried - out of time"
+                continue
+            t = min(timeout, left)
+            r = _curl(["-L", "--max-redirs", "3", "-w", "\n%{http_code}", murl], t)
+            if not r.ok:
+                row["error"] = _curl_fail(r)
+                continue
+            body, _, code = r.out.rpartition("\n")
+            if code.strip() != "200":
+                row["error"] = "HTTP %s" % code.strip()
+            elif "<repomd" not in body:
+                row["error"] = "HTTP 200 but not repo metadata (captive portal or proxy page?)"
+            else:
+                row["ok"] = True
+        return fact(out)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def collect_yum_check_update():
     """yum check-update: rc 0 = nothing to do, rc 100 = updates listed, anything else
     means yum itself failed (broken repo, no network) - which must never read as zero."""
@@ -1318,7 +1534,9 @@ def _is_patch_line(action, pkg):
     """
     if action == "Updated":
         return True
-    return action == "Installed" and (pkg.startswith("kernel") or pkg.startswith("xen"))
+    # yum.log writes a non-zero epoch in front of the name: 'Installed: 2:xen-...'
+    name = re.sub(r"^\d+:", "", pkg)
+    return action == "Installed" and (name.startswith("kernel") or name.startswith("xen"))
 
 
 def find_last_update_line(text):
@@ -1762,6 +1980,32 @@ def _qcow2_vdis(sr_uuids, cap):
     return fact(rows[:cap] if cap and len(rows) > cap else rows), len(rows)
 
 
+_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def collect_ha_statefile_srs(pool_uuid):
+    """[{vdi, sr, name}] for each HA statefile VDI and the SR it lives on - the SR HA was
+    enabled with, which every host has to keep reaching or it fences itself. Only uuids
+    xapi handed back are ever asked about, so none of these can log a missing-uuid
+    exception; a lookup that fails leaves '' in its field rather than losing the rest."""
+    r = xe(["pool-param-get", "uuid=" + pool_uuid, "param-name=ha-statefiles"])
+    if not r.ok:
+        return err("xe pool-param-get ha-statefiles failed (%s)" % r.why())
+    rows = []
+    for vdi in _UUID_RE.findall(r.out):
+        row = {"vdi": vdi, "sr": "", "name": ""}
+        rows.append(row)
+        v = xe(["vdi-list", "uuid=" + vdi, "params=sr-uuid", "--minimal"])
+        m = _UUID_RE.search(v.out) if v.ok else None
+        if not m:
+            continue
+        row["sr"] = m.group(0)
+        s = xe(["sr-list", "uuid=" + row["sr"], "params=name-label", "--minimal"])
+        if s.ok:
+            row["name"] = s.out.strip()
+    return fact(rows)
+
+
 def collect_pool(spec, self_uuid):
     out = {}
 
@@ -1785,6 +2029,8 @@ def collect_pool(spec, self_uuid):
         r = xe(["pool-param-get", "uuid=" + pool_uuid, "param-name=ha-enabled"])
         out["ha_enabled"] = fact(r.out.strip()) if r.ok else \
             err("xe pool-param-get ha-enabled failed (%s)" % r.why())
+        if r.ok and r.out.strip() == "true":
+            out["ha_statefile_srs"] = collect_ha_statefile_srs(pool_uuid)
 
         # the list form, never 'pool-param-get param-name=migration-compression': the
         # param does not exist before 8.3 and param-get on a missing param logs a
@@ -1946,6 +2192,8 @@ def collect(spec):
         out["pvs"] = collect_pvs()
         out["lvm_backup"] = collect_lvm_backup(spec.get("xostor_vg") or "")
         out.update(collect_patch_facts())
+        if spec.get("update_mirror"):
+            out["update_mirror"] = collect_update_mirror(spec.get("update_mirror"))
 
         if self_uuid:
             r = xe(["pif-list", "params=gateway,DNS", "management=false",
