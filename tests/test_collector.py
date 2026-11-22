@@ -587,3 +587,122 @@ def test_collect_lvm_backup_sends_only_the_pv_section(tmp_path, monkeypatch):
     assert f["ok"] and 'id = "aaaa-1111"' in f["value"]
     assert "thin_device" not in f["value"] and "vg-id" not in f["value"]
     assert not collector.collect_lvm_backup("../etc")["ok"]
+
+
+# --------------------------------------------------------------------------------------
+# update mirror access
+# --------------------------------------------------------------------------------------
+
+# trimmed from a real mirrors.xcp-ng.org '?mirrorlist' page
+MIRRORLIST = """<h3>Client</h3>
+<div>You are connecting with IP address <i>203.0.113.7</i>, which belongs to autonomous system <i>Example Net (ASN64500)</i>.<br />
+<h3>Mirrors</h3>
+<table><tr>
+<td style="text-align: right;">1.</td><td>mirror.a.org</td><td style="text-align: right;"><a href="https://mirror.a.org/xcp-ng/8/8.3/base/x86_64/repodata/repomd.xml">https://mirror.a.org/xcp-ng/</a></td><td style="text-align: center;">US</td><td style="text-align: center;">NA</td><td style="text-align: right;">1265 Km</td><td style="text-align: center;">60%</td>
+</tr><tr>
+<td style="text-align: right;">2.</td><td>mirror.b.org</td><td style="text-align: right;"><a href="https://mirror.b.org/8/8.3/base/x86_64/repodata/repomd.xml">https://mirror.b.org/</a></td><td style="text-align: center;">US</td><td style="text-align: center;">NA</td><td style="text-align: right;">1300 Km</td><td style="text-align: center;">40%</td>
+</tr><tr>
+<td style="text-align: right;">3.</td><td>mirror.far.eu</td><td style="text-align: right;"><a href="https://mirror.far.eu/8/8.3/base/x86_64/repodata/repomd.xml">https://mirror.far.eu/</a></td><td style="text-align: center;">FR</td><td style="text-align: center;">EU</td><td style="text-align: right;">7795 Km</td><td style="text-align: center;">n/a</td>
+</tr></table>
+<h3>Excluded Mirrors</h3>
+<table><tr>
+<td>mirror.dead.org<td style="text-align: right;"><a href="https://mirror.dead.org/xcp-ng/">https://mirror.dead.org/xcp-ng/</a></td><td>Unreachable</td>
+</tr></table>
+"""
+
+REPOMD = '<?xml version="1.0"?>\n<repomd xmlns="http://linux.duke.edu/metadata/repo"></repomd>'
+
+
+def test_parse_mirrorlist_reads_ip_and_only_the_mirrors_table():
+    ip, asn, mirrors = collector.parse_mirrorlist(MIRRORLIST)
+    assert ip == "203.0.113.7" and asn == "Example Net (ASN64500)"
+    assert [(h, s) for h, _u, s in mirrors] == [
+        ("mirror.a.org", 60), ("mirror.b.org", 40), ("mirror.far.eu", None)]
+    assert collector.parse_mirrorlist("") == ("", "", [])
+
+
+def test_parse_yum_ini_keeps_a_hash_inside_a_value():
+    ini = collector.parse_yum_ini("[main]\n# comment\nproxy=http://p:3128\n"
+                                  "proxy_password=a#b\n")
+    assert ini["main"] == {"proxy": "http://p:3128", "proxy_password": "a#b"}
+
+
+def _mirror_env(tmp_path, monkeypatch, repo, answers, yum_conf=""):
+    """A repos dir holding `repo`, and a curl that answers by URL from `answers`."""
+    repos = tmp_path / "repos"
+    repos.mkdir()
+    (repos / "xcp-ng.repo").write_text(repo)
+    (tmp_path / "yum.conf").write_text(yum_conf)
+    monkeypatch.setattr(collector, "YUM_REPOS_DIR", str(repos))
+    monkeypatch.setattr(collector, "YUM_CONF", str(tmp_path / "yum.conf"))
+    monkeypatch.setattr(collector, "which", lambda name: "/usr/bin/curl")
+    calls = []
+
+    def fake(argv, timeout=None):
+        assert argv[0] == "curl"
+        url = argv[-1]
+        calls.append((url, dict((k, os.environ.get(k)) for k in ("https_proxy",))))
+        for prefix, ran in answers:
+            if url.startswith(prefix):
+                return ran
+        return collector.Ran(6, "", "curl: (6) Could not resolve host: %s" % url, False)
+    monkeypatch.setattr(collector, "run", fake)
+    return calls
+
+
+BASE_REPO = ("[xcp-ng-base]\nbaseurl=http://mirrors.xcp-ng.org/8/8.3/base/x86_64/\n"
+             "[xcp-ng-testing]\nbaseurl=http://elsewhere.example/x/\nenabled=0\n")
+RL = "https://mirrors.xcp-ng.org/8/8.3/base/x86_64/repodata/repomd.xml"
+OPTS = {"redirector": "mirrors.xcp-ng.org", "timeout": 10, "budget": 60}
+
+
+def test_update_mirror_probes_every_mirror_with_a_share(tmp_path, monkeypatch):
+    calls = _mirror_env(tmp_path, monkeypatch, BASE_REPO, [
+        (RL + "?mirrorlist", collector.Ran(0, MIRRORLIST, "", False)),
+        (RL, collector.Ran(0, "302 https://mirror.b.org/8/8.3/base/x86_64/repodata/"
+                              "repomd.xml", "", False)),
+        ("https://mirror.a.org/", collector.Ran(0, REPOMD + "\n200", "", False)),
+    ])
+    f = collector.collect_update_mirror(OPTS)
+    v = f["value"]
+    assert f["ok"] and v["public_ip"] == "203.0.113.7" and v["selected"] == "mirror.b.org"
+    assert v["url"] == RL
+    rows = dict((m["host"], m) for m in v["mirrors"])
+    assert set(rows) == {"mirror.a.org", "mirror.b.org"}      # n/a fallback not tried
+    assert rows["mirror.a.org"]["ok"]
+    assert "Could not resolve host" in rows["mirror.b.org"]["error"]
+    assert not any(c[1]["https_proxy"] for c in calls)
+
+
+def test_update_mirror_says_why_the_redirector_failed(tmp_path, monkeypatch):
+    _mirror_env(tmp_path, monkeypatch, BASE_REPO, [])
+    v = collector.collect_update_mirror(OPTS)["value"]
+    assert v["redirector_error"].startswith("(6) Could not resolve host")
+    assert v["mirrors"] == []
+
+
+def test_update_mirror_rejects_a_200_that_is_not_repo_metadata(tmp_path, monkeypatch):
+    _mirror_env(tmp_path, monkeypatch, BASE_REPO, [
+        (RL + "?mirrorlist", collector.Ran(0, MIRRORLIST, "", False)),
+        ("https://mirror.", collector.Ran(0, "<html>login</html>\n200", "", False)),
+    ])
+    v = collector.collect_update_mirror(OPTS)["value"]
+    assert v["mirrors"] and all("not repo metadata" in m["error"] for m in v["mirrors"])
+
+
+def test_update_mirror_skips_a_host_on_a_local_mirror(tmp_path, monkeypatch):
+    _mirror_env(tmp_path, monkeypatch,
+                "[xcp-ng-base]\nbaseurl=http://repo.lan/xcp/8.3/base/\n", [])
+    assert collector.collect_update_mirror(OPTS) == {
+        "ok": True, "value": {"skipped": True, "repo_hosts": ["repo.lan"]}}
+
+
+def test_update_mirror_goes_through_yums_proxy_without_putting_it_on_argv(
+        tmp_path, monkeypatch):
+    monkeypatch.delenv("https_proxy", raising=False)
+    calls = _mirror_env(tmp_path, monkeypatch, BASE_REPO, [],
+                        yum_conf="[main]\nproxy=http://proxy:3128\nproxy_username=me\n"
+                                 "proxy_password=p@ss\n")
+    collector.collect_update_mirror(OPTS)
+    assert calls[0][1]["https_proxy"] == "http://me:p%40ss@proxy:3128"
+    assert "https_proxy" not in os.environ          # put back afterwards

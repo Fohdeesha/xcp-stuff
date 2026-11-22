@@ -6,6 +6,8 @@ them answers that with UNKNOWN rather than with a pass. That is the invariant th
 tool is built around, and here it is the only way the code is shaped.
 """
 
+import re
+
 import colors
 import config
 import parsers
@@ -1220,6 +1222,59 @@ def missing_patches(pool):
     if f.value == 0:
         return ok("Missing Patches", "0")
     return flag("Missing Patches", str(f.value))
+
+
+def update_mirror_access(host):
+    """Whether this host can fetch repo metadata from the mirrors the XCP-ng redirector
+    sends it to - the usual cause of a 'yum update' that cannot find anything, and one
+    'Missing Patches' can only call Unknown. Every mirror with a share of this host's
+    redirects is tried, not just the one picked this time: the pick is weighted-random,
+    so a single bad mirror fails some yum runs and not others.
+
+    A host whose repos point somewhere else (a local mirror) is said, not flagged.
+    """
+    key = "Update Mirror Access"
+    f = host.fact("update_mirror")
+    if not f.ok:
+        return unknown(key, "Unknown (%s)" % f.error)
+    v = f.value or {}
+    if v.get("skipped"):
+        return info(key, "N/A (repos use %s)" % (", ".join(v.get("repo_hosts") or [])
+                                                  or "no enabled repos"))
+    redirector = _url_host_of(v.get("url", "")) or config.UPDATE_MIRROR_REDIRECTOR
+    seen = "Public IP: %s%s" % (v.get("public_ip") or "unknown",
+                                " - %s" % v["asn"] if v.get("asn") else "")
+    head = ["Repo URL:  %s" % v.get("url", "?"), seen,
+            "Via yum proxy: %s" % ("yes" if v.get("proxy") else "no")]
+    if v.get("redirector_error"):
+        return flag(key, "Cannot reach %s, See Below" % redirector).with_detail(
+            "---update mirror access---",
+            "\n".join(head + ["", "%s: %s" % (redirector, v["redirector_error"])]))
+
+    mirrors = v.get("mirrors") or []
+    bad = [m for m in mirrors if not m.get("ok")]
+    selected = v.get("selected") or ""
+    if mirrors and not bad:
+        return ok(key, "Yes (%s, via %s)" % (_plural(len(mirrors), "mirror"),
+                                             selected or mirrors[0].get("host")))
+    if not mirrors:
+        return unknown(key, "Unknown (no mirror was tried)")
+    rows = ["%-40s %-6s %s" % ("Mirror", "Share", "Result")]
+    for m in mirrors:
+        share = "%d%%" % m["share"] if m.get("share") is not None else "-"
+        name = m.get("host", "?") + (" *" if m.get("host") == selected else "")
+        rows.append("%-40s %-6s %s" % (name, share, "OK" if m.get("ok") else m.get("error")))
+    if selected:
+        rows.append("(* = the mirror %s picked for this host)" % redirector)
+    what = "All %s" % _plural(len(mirrors), "mirror") if len(bad) == len(mirrors) \
+        else "%d of %s" % (len(bad), _plural(len(mirrors), "mirror"))
+    return flag(key, "%s Unreachable, See Below" % what).with_detail(
+        "---update mirror access---", "\n".join(head + [""] + rows))
+
+
+def _url_host_of(url):
+    m = re.match(r"^[a-zA-Z]+://([^/:?#]+)", url or "")
+    return m.group(1) if m else ""
 
 
 def vlan0(pool):

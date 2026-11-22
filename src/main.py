@@ -155,6 +155,10 @@ def _host_spec(with_smapi):
         "crash_ignore_file": config.CRASH_IGNORE_FILE,
         "coredump_dir": config.COREDUMP_DIR,
         "xostor_vg": config.XOSTOR_VG,
+        "update_mirror": {"redirector": config.UPDATE_MIRROR_REDIRECTOR,
+                          "timeout": config.UPDATE_MIRROR_TIMEOUT,
+                          "budget": config.UPDATE_MIRROR_BUDGET,
+                          "max_mirrors": config.UPDATE_MIRROR_MAX_PROBES},
         "smapi": bool(with_smapi),
         "log_scan": {"files": config.LOG_ERROR_FILES,
                      "phrases": config.LOG_ERROR_PHRASES,
@@ -1069,6 +1073,7 @@ def per_host_checks():
         ("lun_assignments", "LUN Assignments", checks.lun_assignments),
         ("smapi_hidden_leaves", "SMAPI Hidden Leaves", checks.smapi_hidden_leaves),
         ("rebooted_after_updates", "Rebooted After Updates", checks.rebooted_after_updates),
+        ("update_mirror_access", "Update Mirror Access", checks.update_mirror_access),
     ]
 
 

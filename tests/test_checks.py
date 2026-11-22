@@ -899,3 +899,58 @@ def test_xostor_missing_devices_pool_never_green_with_a_host_unread():
     line = checks.xostor_missing_devices_pool([_dhost("h1", PVS_MISSING),
                                                _dhost("h2", "", err("could not read"))])
     assert line.status == FLAG and "unreadable on: h2" in line.text
+
+
+# --------------------------------------------------------------------------------------
+# Update Mirror Access
+# --------------------------------------------------------------------------------------
+
+def mirror_fact(mirrors=None, redirector_error="", selected="mirror.b.org"):
+    return fact({"url": "https://mirrors.xcp-ng.org/8/8.3/base/x86_64/repodata/repomd.xml",
+                 "proxy": False, "public_ip": "203.0.113.7", "asn": "Example (ASN64500)",
+                 "selected": selected, "redirector_error": redirector_error,
+                 "mirrors": mirrors if mirrors is not None else []})
+
+
+def mrow(name, ok_=True, share=50, error=""):
+    return {"host": name, "url": "https://%s/x" % name, "share": share, "ok": ok_,
+            "error": error}
+
+
+def test_update_mirror_access_ok_when_every_mirror_answers():
+    line = checks.update_mirror_access(host(update_mirror=mirror_fact(
+        [mrow("mirror.a.org"), mrow("mirror.b.org")])))
+    assert line.status == OK and "2 mirrors" in line.text and "mirror.b.org" in line.text
+
+
+def test_update_mirror_access_flags_one_bad_mirror_and_marks_the_pick():
+    line = checks.update_mirror_access(host(update_mirror=mirror_fact(
+        [mrow("mirror.a.org"), mrow("mirror.b.org", False, error="timed out")])))
+    assert line.status == FLAG and "1 of 2 mirrors" in line.text
+    assert "mirror.b.org *" in line.detail_text and "timed out" in line.detail_text
+    assert "203.0.113.7" in line.detail_text
+
+
+def test_update_mirror_access_flags_an_unreachable_redirector():
+    line = checks.update_mirror_access(host(update_mirror=mirror_fact(
+        redirector_error="(6) Could not resolve host: mirrors.xcp-ng.org")))
+    assert line.status == FLAG and "Cannot reach mirrors.xcp-ng.org" in line.text
+    assert "Could not resolve" in line.detail_text
+
+
+def test_update_mirror_access_flags_all_mirrors_down():
+    line = checks.update_mirror_access(host(update_mirror=mirror_fact(
+        [mrow("a", False, error="x"), mrow("b", False, error="y")])))
+    assert line.status == FLAG and line.text.startswith("All 2 mirrors")
+
+
+def test_update_mirror_access_local_repo_is_said_not_flagged():
+    line = checks.update_mirror_access(host(update_mirror=fact(
+        {"skipped": True, "repo_hosts": ["repo.lan"]})))
+    assert line.status == INFO and not line.flags and "repo.lan" in line.text
+
+
+def test_update_mirror_access_never_green_off_nothing():
+    for h in (host(), host(update_mirror=err("curl not found")),
+              host(update_mirror=mirror_fact([]))):
+        assert checks.update_mirror_access(h).status == UNKNOWN
