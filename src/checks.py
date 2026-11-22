@@ -1094,8 +1094,24 @@ def ha_enabled(pool):
     if value == "false":
         return ok("HA Enabled", "No")
     if value == "true":
-        return flag("HA Enabled", "Yes")
+        return flag("HA Enabled", "Yes (%s)" % _ha_statefile_sr_text(pool))
     return unknown("HA Enabled", "Unknown")
+
+
+def _ha_statefile_sr_text(pool):
+    """'SR: <name> (<uuid>)' for the SR(s) holding HA's statefile, or why it is not known."""
+    f = pool.fact("ha_statefile_srs")
+    if not f.ok:
+        return "statefile SR unknown: %s" % f.error
+    if not f.value:
+        return "no statefile listed"
+    named = []
+    for row in f.value:
+        if row.get("sr"):
+            named.append("%s (%s)" % (row.get("name") or "?", row["sr"]))
+        else:
+            named.append("SR of statefile VDI %s unknown" % row.get("vdi", "?"))
+    return "SR: %s" % ", ".join(sorted(set(named)))
 
 
 def sr_attachment(pool):

@@ -1980,6 +1980,32 @@ def _qcow2_vdis(sr_uuids, cap):
     return fact(rows[:cap] if cap and len(rows) > cap else rows), len(rows)
 
 
+_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def collect_ha_statefile_srs(pool_uuid):
+    """[{vdi, sr, name}] for each HA statefile VDI and the SR it lives on - the SR HA was
+    enabled with, which every host has to keep reaching or it fences itself. Only uuids
+    xapi handed back are ever asked about, so none of these can log a missing-uuid
+    exception; a lookup that fails leaves '' in its field rather than losing the rest."""
+    r = xe(["pool-param-get", "uuid=" + pool_uuid, "param-name=ha-statefiles"])
+    if not r.ok:
+        return err("xe pool-param-get ha-statefiles failed (%s)" % r.why())
+    rows = []
+    for vdi in _UUID_RE.findall(r.out):
+        row = {"vdi": vdi, "sr": "", "name": ""}
+        rows.append(row)
+        v = xe(["vdi-list", "uuid=" + vdi, "params=sr-uuid", "--minimal"])
+        m = _UUID_RE.search(v.out) if v.ok else None
+        if not m:
+            continue
+        row["sr"] = m.group(0)
+        s = xe(["sr-list", "uuid=" + row["sr"], "params=name-label", "--minimal"])
+        if s.ok:
+            row["name"] = s.out.strip()
+    return fact(rows)
+
+
 def collect_pool(spec, self_uuid):
     out = {}
 
@@ -2003,6 +2029,8 @@ def collect_pool(spec, self_uuid):
         r = xe(["pool-param-get", "uuid=" + pool_uuid, "param-name=ha-enabled"])
         out["ha_enabled"] = fact(r.out.strip()) if r.ok else \
             err("xe pool-param-get ha-enabled failed (%s)" % r.why())
+        if r.ok and r.out.strip() == "true":
+            out["ha_statefile_srs"] = collect_ha_statefile_srs(pool_uuid)
 
         # the list form, never 'pool-param-get param-name=migration-compression': the
         # param does not exist before 8.3 and param-get on a missing param logs a

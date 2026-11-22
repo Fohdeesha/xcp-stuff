@@ -711,3 +711,33 @@ def test_update_mirror_goes_through_yums_proxy_without_putting_it_on_argv(
     collector.collect_update_mirror(OPTS)
     assert calls[0][1]["https_proxy"] == "http://me:p%40ss@proxy:3128"
     assert "https_proxy" not in os.environ          # put back afterwards
+
+
+def test_ha_statefile_srs_follows_vdi_to_sr_by_uuid_only(monkeypatch):
+    VDI, SR = "aaaaaaaa-1111-2222-3333-444444444444", "bbbbbbbb-1111-2222-3333-444444444444"
+    asked = []
+
+    def fake_xe(args, timeout=None):
+        asked.append(args)
+        if args[0] == "pool-param-get":
+            return collector.Ran(0, VDI + "\n", "", False)
+        if args[0] == "vdi-list":
+            assert args[1] == "uuid=" + VDI
+            return collector.Ran(0, SR + "\n", "", False)
+        assert args[:2] == ["sr-list", "uuid=" + SR]
+        return collector.Ran(0, "HA-SR\n", "", False)
+    monkeypatch.setattr(collector, "xe", fake_xe)
+    f = collector.collect_ha_statefile_srs("pool-uuid")
+    assert f == {"ok": True, "value": [{"vdi": VDI, "sr": SR, "name": "HA-SR"}]}
+
+    # the VDI lookup failing must not issue an sr-list with an empty uuid
+    asked[:] = []
+    def failing_vdi(args, timeout=None):
+        asked.append(args)
+        if args[0] == "pool-param-get":
+            return collector.Ran(0, VDI, "", False)
+        return collector.Ran(1, "", "boom", False)
+    monkeypatch.setattr(collector, "xe", failing_vdi)
+    f = collector.collect_ha_statefile_srs("pool-uuid")
+    assert f["value"] == [{"vdi": VDI, "sr": "", "name": ""}]
+    assert not any(a[0] == "sr-list" for a in asked)

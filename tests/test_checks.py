@@ -344,6 +344,15 @@ def test_xostor_version_consistency_unreadable_host_is_unknown_not_a_mismatch():
 def test_ha_states():
     assert checks.ha_enabled(pool(ha_enabled=fact("false"))).status == OK
     assert checks.ha_enabled(pool(ha_enabled=fact("true"))).status == FLAG
+    line = checks.ha_enabled(pool(ha_enabled=fact("true"), ha_statefile_srs=fact([
+        {"vdi": "v1", "sr": "1111-sr", "name": "iSCSI-HA"}])))
+    assert line.status == FLAG and "SR: iSCSI-HA (1111-sr)" in line.text
+    line = checks.ha_enabled(pool(ha_enabled=fact("true"),
+                                  ha_statefile_srs=err("xe timed out")))
+    assert "statefile SR unknown: xe timed out" in line.text
+    line = checks.ha_enabled(pool(ha_enabled=fact("true"), ha_statefile_srs=fact([
+        {"vdi": "v9", "sr": "", "name": ""}])))
+    assert "SR of statefile VDI v9 unknown" in line.text
     assert checks.ha_enabled(pool(ha_enabled=err())).status == UNKNOWN
     assert checks.ha_enabled(pool(ha_enabled=fact("wat"))).status == UNKNOWN
 
