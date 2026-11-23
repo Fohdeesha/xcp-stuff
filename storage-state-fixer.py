@@ -29,7 +29,7 @@ import time
 import xml.parsers.expat
 import zlib
 
-VERSION = '2.15'
+VERSION = '2.16'
 PYTHON = sys.version.split()[0]
 PROG = 'storage-state-fixer'
 STORAGE_DB = '/var/run/nonpersistent/xapi/storage.db'
@@ -8362,7 +8362,9 @@ def inert_locked(args, sr, vdi):
             return {'done': False, 'already': True, 'gone': True, 'problems': [], 'detail': '%s is gone' % path}
         raise
     if stat.S_ISREG(st.st_mode) and read_file(path).startswith(INERT_MARK):
-        return {'done': False, 'already': True, 'problems': [], 'detail': '%s is already inert' % path}
+        if not args.get('remove'):
+            return {'done': False, 'already': True, 'problems': [], 'detail': '%s is already inert' % path}
+        return remove_inert_file(path, st, sr, vdi, exp)
     if not stat.S_ISBLK(st.st_mode):
         return {'done': False, 'problems': ['%s is no longer a block node' % path]}
     rdev = [os.major(st.st_rdev), os.minor(st.st_rdev)]
@@ -8432,8 +8434,79 @@ def inert_locked(args, sr, vdi):
         return {'done': False, 'problems': problems}
     served = None
     if at:
-        served = {'pid': at[0]['pid'], 'minor': at[0]['minor'], 'type': at[0].get('type'), 'path': at[0].get('path')}
+        served = {'pid': at[0]['pid'], 'minor': at[0]['minor'], 'type': at[0].get('type'), 'path': at[0].get('path'),
+                  'state': at[0].get('state')}
+    if args.get('remove'):
+        return remove_stale_node(path, st, sr, vdi, served)
     return make_inert(path, st, sr, vdi, args.get('run_id'), served)
+
+
+def remove_inert_file(path, st, sr, vdi, exp):
+    problems = []
+    if exp.get('inert_file') and exp.get('ino') is not None and st.st_ino != exp['ino']:
+        problems.append('%s is the inert file of inode %d now, not the inode %d audited' % (path, st.st_ino, exp['ino']))
+    phy = phy_record(sr, vdi)
+    target = (phy or {}).get('target')
+    try:
+        rows = f_tapdisks()
+    except Exception as exc:
+        return {'done': False, 'problems': ['tap-ctl list: %s' % _text(exc)]}
+    for row in image_rows(rows, vdi, target):
+        problems.append('tapdisk pid %s minor %s serves this VDI' % (row['pid'], row['minor']))
+    for row in rows:
+        if row.get('pid') is not None and (row.get('minor') is None or not row.get('path')):
+            problems.append('tapdisk pid %s %s, so whether it serves this VDI is not established'
+                            % (row['pid'], unmapped_why(row)))
+    try:
+        for k, v in xs_backend().items():
+            if k.endswith('/params') and v in (path, target):
+                problems.append('xenstore %s = %s' % (k, v))
+    except Failed as exc:
+        problems.append(_text(exc))
+    if problems:
+        return {'done': False, 'problems': problems}
+    st2 = os.lstat(path)
+    if not stat.S_ISREG(st2.st_mode) or st2.st_ino != st.st_ino:
+        return {'done': False, 'problems': ['%s changed while it was being checked' % path]}
+    was = {'inert_file': True, 'ino': st.st_ino}
+    os.unlink(path)
+    removed = [path]
+    for p, kind in ((path + '.attach_info', stat.S_ISREG), (os.path.join(BLKTAP_CTL, 'nbd', sr, vdi), stat.S_ISLNK)):
+        try:
+            sp = os.lstat(p)
+        except OSError as exc:
+            if gone(exc):
+                continue
+            raise
+        if kind(sp.st_mode):
+            os.unlink(p)
+            removed.append(p)
+    left = [p for p in removed if os.path.lexists(p)]
+    return {'done': not left, 'removed': removed, 'problems': ['%s is still there after the unlink' % p for p in left],
+            'was': was, 'minor_serves': None}
+
+
+def remove_stale_node(path, st, sr, vdi, served):
+    was = {'rdev': [os.major(st.st_rdev), os.minor(st.st_rdev)], 'ino': st.st_ino, 'mode': st.st_mode,
+           'mtime': st.st_mtime, 'uid': st.st_uid, 'gid': st.st_gid}
+    st2 = os.lstat(path)
+    if not stat.S_ISBLK(st2.st_mode) or st2.st_rdev != st.st_rdev or st2.st_ino != st.st_ino:
+        return {'done': False, 'problems': ['%s changed while it was being checked' % path]}
+    os.unlink(path)
+    removed = [path]
+    for p, kind in ((path + '.attach_info', stat.S_ISREG), (os.path.join(BLKTAP_CTL, 'nbd', sr, vdi), stat.S_ISLNK)):
+        try:
+            sp = os.lstat(p)
+        except OSError as exc:
+            if gone(exc):
+                continue
+            raise
+        if kind(sp.st_mode):
+            os.unlink(p)
+            removed.append(p)
+    left = [p for p in removed if os.path.lexists(p)]
+    return {'done': not left, 'removed': removed, 'problems': ['%s is still there after the unlink' % p for p in left],
+            'was': was, 'minor_serves': served}
 
 
 def make_inert(path, st, sr, vdi, run_id, served):
@@ -11471,13 +11544,13 @@ class HostView(object):
                 return '%s: %s' % (k, e)
         return None
 
-    def serving(self, sr_type, vdi_uuid, sr_uuid=None):
+    def serving(self, sr_type, vdi_uuid, sr_uuid=None, exclude=None):
         if self.taps is None:
             return None, 'tap-ctl list did not answer'
         if self.tapinfo is None:
             return None, ('the tapdisk processes on %s were not read (%s), so a tapdisk tap-ctl list does not show '
                           'would not be seen' % (self.name, self.why('tapinfo')))
-        rows = list(self.tap_vdis.get(vdi_uuid, []))
+        rows = [r for r in self.tap_vdis.get(vdi_uuid, []) if r is not exclude]
         if rows:
             return rows, None
         young = self.young_taps()
@@ -12084,11 +12157,29 @@ def chain_leaves(m, uuids):
 Gate = collections.namedtuple('Gate', 'block unknown stuck notes hard')
 
 
+def stale_alias(hv, sr, vdi, target):
+    if hv.backend is None or target in path_variants('%s/%s/%s' % (SM_BACKEND, sr, vdi)):
+        return False
+    return hv.node_state(sr, vdi)[0] == 'other'
+
+
+def hit_name(hv, x):
+    for w in x.get('whats') or []:
+        mm = re.match(r'^backend (' + UUID_PAT + ')/(.+)$', w)
+        if mm and x.get('rdev') and stale_alias(hv, mm.group(1), mm.group(2), x.get('target')):
+            continue
+        return w
+    return x.get('what')
+
+
 def hit_vdis(hv, x):
     out = set()
     for w in x.get('whats') or ([x['what']] if x.get('what') else []):
         mm = re.match(r'^(?:backend|phy) (' + UUID_PAT + ')/(.+)$', w)
         mt = re.match(r'^(?:tapdev|blktap)(\d+)$', w)
+        if mm and w.startswith('backend ') and x.get('rdev') and stale_alias(hv, mm.group(1), mm.group(2),
+                                                                              x.get('target')):
+            continue
         if mm:
             out.add(mm.group(2))
         elif mt:
@@ -12124,9 +12215,9 @@ def qemu_vm(a, hv, h, hits):
     for x in hits:
         vdis = hit_vdis(hv, x)
         if not vdis:
-            return None, 'what %s is cannot be mapped to a VDI' % x.get('what')
+            return None, 'what %s is cannot be mapped to a VDI' % hit_name(hv, x)
         if not vdis <= mine:
-            return None, '%s is not a disk VM "%s" has attached' % (x.get('what'), vm['name_label'])
+            return None, '%s is not a disk VM "%s" has attached' % (hit_name(hv, x), vm['name_label'])
     return vm, None
 
 
@@ -12303,7 +12394,7 @@ def host_gate(audit, href, opts, exclude=(), subject=None, outage=False):
                 notes.append('qemu pid %d is the device model of VM "%s" (domain %s), running here, and holds only '
                              'disks that VM has attached (%s): a running VM\'s own disks, so it does not hold this '
                              'host back' % (h['pid'], vm['name_label'], h['xen_domid'],
-                                            ', '.join(x['what'] for x in hits)))
+                                            ', '.join(hit_name(hv, x) for x in hits)))
                 continue
             if subject is not None:
                 held = set()
@@ -12315,12 +12406,12 @@ def host_gate(audit, href, opts, exclude=(), subject=None, outage=False):
                     held |= vs
                 if held is not None and not held & subject['vdis']:
                     notes.append('%s (pid %d) holds %s, none of this disk\'s chain' % (
-                        h['comm'], h['pid'], ', '.join(x['what'] for x in hits)))
+                        h['comm'], h['pid'], ', '.join(hit_name(hv, x) for x in hits)))
                     continue
             age = now - h['start'] if h.get('start') else None
             text = '%s (pid %d, %s) holds %s' % (h['comm'], h['pid'], 'started %s ago' % format_age(age)
                                                  if age is not None else 'age unknown',
-                                                 ', '.join(x['what'] for x in hits))
+                                                 ', '.join(hit_name(hv, x) for x in hits))
             if h['comm'] in DAEMON_HOLDERS and nbd_quiet:
                 notes.append(text + ' with no live NBD connection open on port %d: an export that ended or died, '
                              'which reads nothing (C25)' % NBD_PORT)
@@ -13955,9 +14046,18 @@ def eval_dom0_attached(a, hv, dp, cl, sr, vdi, st, naming, selfcheck, gate, cls,
     return (e, None) if fallback else e
 
 
-INERT_EFFECT = ('until then, a VM start there launches a tapdisk and then fails SM\'s backend-link check, leaving that '
-                'tapdisk running with no node (the next run reports it as C14), and SM\'s pause of the VDI (a snapshot, '
-                'a coalesce) answers False there; SM\'s deactivate of the datapath unlinks the file')
+INERT_EFFECT = ('until then, a start or migration of a VM with this disk onto that host fails while its datapath is in '
+                'storage.db and not marked leaked (xapi hands the new VBD that datapath\'s attach info, which names this '
+                'file; a leaked one is torn down through SM first, which removes the file, and the start goes ahead), '
+                'and once the datapath is gone a VM start there launches a tapdisk and then fails SM\'s backend-link '
+                'check, leaving that tapdisk running with no node (the next run reports it as C14); SM\'s pause of the '
+                'VDI (a snapshot, a coalesce) answers False there, which can leave a host it paused before paused, so '
+                'run this tool again, which removes the file; SM\'s deactivate of the datapath unlinks the file')
+REMOVED_EFFECT = ('SM\'s teardown of the datapath, when it runs, reaches no tapdisk through it and still puts back the LV '
+                  'activation and the host_ key there; until the datapath is gone, a start or migration of a VM with '
+                  'this disk onto that host fails while the datapath is not marked leaked (xapi hands the new VBD the '
+                  'datapath\'s attach info, which names the node that is gone; a leaked one is torn down through SM '
+                  'first and the start goes ahead), and SM\'s pause of the disk passes over that host')
 C03_STEPS = ('end', 'teardown', 'refresh', 'unkey', 'destroy', 'deactivate', 'free')
 STEP_TEXT = {'end': 'end its wedged tapdisk', 'teardown': 'remove what SM left of the VDI in dom0',
              'refresh': 'refresh its LV through SM',
@@ -14911,6 +15011,15 @@ def eval_guest_dp(a, opts, hv, dp, cl, sr, vdi, st):
         waits.extend(w)
         unknowns.extend(u)
         evidence.extend(e2)
+    elif vref is not None and hv.sxm is None:
+        unknowns.append('xapi\'s storage-migration state on %s was not read (%s), and xapi\'s teardown of this datapath '
+                        'runs its storage-migration hooks for the VDI there' % (hv.name, hv.why('sxm')))
+    elif vref is not None:
+        for t in SXM_TABLES:
+            if vdi in canon((hv.sxm.get('tables') or {}).get(t) or {}):
+                waits.append('xapi\'s storage-migration %s table on %s names VDI %s: xapi\'s teardown of this datapath '
+                             'runs its storage-migration hooks for that VDI, so it waits until that migration is over'
+                             % (t, hv.name, vdi))
     entry_dps = dict((sdb_entry(hv, sr, vdi) or {}).get('dps') or {})
     no_sm = sxm and vref is not None and len(entry_dps) > 1 and teardown_ops(entry_dps, dp) == ([], None)
     if vref is None:
@@ -14995,28 +15104,53 @@ def eval_guest_dp(a, opts, hv, dp, cl, sr, vdi, st):
     if ow:
         waits.append(ow)
     inert = None
+    victim = None
     state, node, at = hv.node_state(sr, vdi)
     if state == 'unknown':
         unknowns.append(at)
-    elif state == 'other':
+    elif state == 'other' and vref is None:
         problems.append('its backend node points at tap minor %d, which now belongs to %s (C20)'
                         % (node['rdev'][1], hv.row_label(at)))
+    elif state == 'other':
+        inert, why_inert = plan_inert(hv, sr, vdi, sr_type, node)
+        if inert is None:
+            (problems if inert_refusal_lasts(why_inert) else unknowns).append(
+                'its backend node points at tap minor %d, which now belongs to %s (C20), and it cannot be made '
+                'harmless: %s' % (node['rdev'][1], hv.row_label(at), why_inert))
+        else:
+            victim = victim_of_row(hv, at)
+            if at.get('state') is None:
+                unknowns.append('the state of tapdisk pid %s, which now holds tap minor %d, is not known'
+                                % (at['pid'], node['rdev'][1]))
+            elif at['state'] & ~LOG_DROPPED:
+                waits.append('tapdisk pid %s, which now holds tap minor %d, is in state %s, not running: its backend '
+                             'node is made harmless only while that tapdisk runs (if it was paused through this stale '
+                             'node, its unpause needs the node)'
+                             % (at['pid'], node['rdev'][1], tap_state_text(at['state'])))
+            evidence.append('its tapdisk is gone and tap minor %d now belongs to %s: SM\'s own deactivate would shut '
+                            'that tapdisk down, so the backend node is %s first, and that tapdisk is checked after the '
+                            'teardown' % (node['rdev'][1], hv.row_label(at), node_step_text(hv, vref, inert)))
     elif state == 'free' and vref is not None:
         inert, why_inert = plan_inert(hv, sr, vdi, sr_type, node)
         if inert is None:
             unknowns.append(why_inert)
         else:
-            evidence.append('its backend node points at tap minor %d, on which no tapdisk runs: it is made inert '
-                            'first, so SM\'s deactivate cannot reach whatever tapdisk takes that minor next'
-                            % node['rdev'][1])
+            evidence.append('its backend node points at tap minor %d, on which no tapdisk runs: it is %s first, so '
+                            'SM\'s deactivate cannot reach whatever tapdisk takes that minor next'
+                            % (node['rdev'][1], node_step_text(hv, vref, inert)))
+    elif state == 'inert' and vref is not None:
+        inert, why_inert = plan_inert_file(hv, sr, vdi, sr_type, node)
+        if why_inert:
+            unknowns.append(why_inert)
+        elif inert is not None:
+            evidence.append('its backend node is the inert file an earlier run of this tool left; it is %s first'
+                            % node_step_text(hv, vref, inert))
     ku = hv.kernel_users(sr, vdi)
     if ku is None:
         unknowns.append('the kernel users of its devices were not established')
     elif ku:
         problems.append('the kernel uses it: %s' % '; '.join(ku[:4]))
-    rows, why = hv.serving(sr_type, vdi, sr)
-    if rows is not None and state == 'other':
-        rows = [r for r in rows if r is not at]
+    rows, why = hv.serving(sr_type, vdi, sr, exclude=at if state == 'other' else None)
     tap = None
     if no_sm:
         evidence.append('xapi works out the SM calls for the VDI from all its datapaths on the host, and with %s still '
@@ -15238,6 +15372,10 @@ def eval_guest_dp(a, opts, hv, dp, cl, sr, vdi, st):
             run_steps = [s for s in steps if s != 'free']
             evidence.append('tap minor %d is not released in this run: %s' % (
                 minor, why or 'it was allocated only %s ago, and a later run releases it' % format_age(age)))
+    if deflate_why is not None and state == 'other':
+        problems.append('its backend node points at tap minor %d, which now belongs to %s (C20): this tool does not '
+                        'remove a datapath of it from storage.db by hand while that stale node is there'
+                        % (node['rdev'][1], hv.row_label(at)))
     if deflate_why is not None and problems == [deflate_why]:
         return guest_db_route(a, opts, hv, dp, cl, sr, vdi, st, vref, sr_type, domid, key, title, evidence,
                               deflate_why)
@@ -15275,7 +15413,8 @@ def eval_guest_dp(a, opts, hv, dp, cl, sr, vdi, st):
     tsig = [tap['pid'], tap['minor'], tap['start_ticks'] if tap.get('start_ticks') is not None else int(tap['start'] or 0),
             tap['kind']] if tap else None
     item = {'cls': 'C03', 'phase': 'L', 'action': 'dp-destroy', 'host': hv.uuid, 'sr': sr, 'vdi': vdi, 'dp': dp,
-            'needs': needs, 'inert': inert, 'steps': run_steps, 'tap': tap, 'lv': lv, 'minor': minor, 'domid': domid,
+            'needs': needs, 'inert': inert, 'victim': victim, 'steps': run_steps, 'tap': tap, 'lv': lv, 'minor': minor,
+            'domid': domid,
             'pins': pin_pids, 'dps_write': bool(hv.dps_files is not None and side not in hv.dps_files),
             'vbds': sorted([vbd['uuid'], (m.vms.get(vbd['VM']) or {}).get('uuid'), vbd['userdevice']]
                            for r, vbd in vdi_vbds(m, vref)) if vref else []}
@@ -15515,7 +15654,9 @@ def plan_inert(hv, sr, vdi, sr_type, node):
         return None, ('the tapdisk processes on %s were not read, so a tapdisk tap-ctl list does not show would not '
                       'be seen' % hv.name)
     if sr_type not in PATH_SR_TYPES:
-        rows, why = hv.serving(sr_type, vdi)
+        own = hv.ident_rows(vdi, strict=True)
+        held = [r for r in hv.live_taps() if r['minor'] == node['rdev'][1] and r not in own]
+        rows, why = hv.serving(sr_type, vdi, exclude=held[0] if held else None)
         if rows is None:
             return None, why
         rows = [r for r in rows if r['minor'] != node['rdev'][1]]
@@ -15523,7 +15664,78 @@ def plan_inert(hv, sr, vdi, sr_type, node):
             return None, 'tapdisk pid %s serves it under another minor' % rows[0]['pid']
     if hv.ident_rows(vdi):
         return None, 'a tapdisk serves it under another minor'
-    return {'rdev': list(node['rdev']), 'ino': node['ino'], 'path_sr': sr_type in PATH_SR_TYPES}, None
+    plan = {'rdev': list(node['rdev']), 'ino': node['ino'], 'path_sr': sr_type in PATH_SR_TYPES}
+    if not keep_inert(hv, vdi):
+        plan['remove'] = True
+    return plan, None
+
+
+def keep_inert(hv, vdi):
+    m = hv.audit.model
+    vref = m.vdi_by_uuid.get(vdi)
+    return vref is not None and bool(m.vdis[vref].get('cbt_enabled')) and not live_elsewhere(m, vref, hv.href)
+
+
+def plan_inert_file(hv, sr, vdi, sr_type, node):
+    if keep_inert(hv, vdi):
+        return None, None
+    if node.get('ino') is None:
+        return None, 'the inode of its inert backend node was not read'
+    if sr_type not in ATOMIC_PAUSE_SR_TYPES:
+        return None, ('SM does not hold the VDI lock across attach and detach on %s SRs, so its inert backend node '
+                      'cannot be removed safely' % sr_type)
+    if hv.unmapped:
+        return None, ('tapdisk pid %s here %s, so it is not established that no tapdisk serves this one'
+                      % (hv.unmapped[0]['pid'], unmapped_why(hv.unmapped[0])))
+    if hv.tapinfo is None:
+        return None, ('the tapdisk processes on %s were not read, so a tapdisk tap-ctl list does not show would not '
+                      'be seen' % hv.name)
+    if hv.ident_rows(vdi):
+        return None, 'a tapdisk serves it under another minor'
+    return {'rdev': list(node.get('was_rdev') or [0, 0]), 'ino': node['ino'], 'path_sr': sr_type in PATH_SR_TYPES,
+            'remove': True, 'inert_file': True}, None
+
+
+INERT_LASTS = ('SM does not hold the VDI lock across attach and detach', 'a tapdisk serves it under another minor')
+
+
+def inert_refusal_lasts(why):
+    return _text(why).startswith(INERT_LASTS) or ' serves it under another minor' in _text(why)
+
+
+def victim_of_row(hv, row):
+    info = (hv.tapinfo or {}).get(str(row['pid'])) or {}
+    return [row['pid'], row['minor'], row.get('path'), sorted(hv.row_ident.get((row['pid'], row['minor'])) or ()),
+            info.get('start_ticks')]
+
+
+def node_step_text(hv, vref, inert):
+    if not inert.get('remove'):
+        return ('made inert (not removed: the disk has CBT and is in use nowhere else, and SM\'s own deactivate then '
+                'marks its CBT log consistent and removes the file)')
+    m = hv.audit.model
+    elsewhere = live_elsewhere(m, vref, hv.href) if vref in m.vdis else []
+    if elsewhere:
+        return ('removed, with its .attach_info and NBD link (not made inert: the disk is in use elsewhere, %s, and '
+                'SM\'s pause of it, which goes to every host its sm-config names, must not fail halfway on an inert '
+                'node here, nor SM\'s deactivate here mark its CBT log consistent while it is written elsewhere)'
+                % '; '.join(elsewhere[:3]))
+    return ('removed, with its .attach_info and NBD link (not made inert, so that nothing on this host that is handed '
+            'this datapath\'s attach info, such as an export, opens a file in its place)')
+
+
+def live_elsewhere(m, vref, href):
+    out = []
+    for r, vbd in vdi_vbds(m, vref):
+        vm = m.vms.get(vbd['VM']) or {}
+        where = vm.get('resident_on')
+        if vbd.get('currently_attached') and where in m.hosts and where != href:
+            out.append('%s on %s' % ('dom0' if vm.get('is_control_domain') else 'VM "%s"' % vm.get('name_label'),
+                                     m.name_host(where)))
+    for k in sorted(m.vdis[vref].get('sm_config') or {}):
+        if k.startswith('host_') and k[len('host_'):] != href:
+            out.append('sm-config %s' % k)
+    return out
 
 
 def task_time(t):
@@ -16018,13 +16230,21 @@ def eval_vbd(a, opts, vbd, vm, vdi):
                     unknowns.append(why)
                 elif state == 'other':
                     evidence.append('its tapdisk is gone and tap minor %d now belongs to %s: SM\'s own deactivate '
-                                    'would shut that tapdisk down, so the backend node is made inert first'
-                                    % (n, hv.row_label(at)))
+                                    'would shut that tapdisk down, so the backend node is %s first'
+                                    % (n, hv.row_label(at), node_step_text(hv, vbd['VDI'], inert)))
                 else:
                     ring = ((hv.blktap or {}).get('blktap') or {}).get(str(n))
-                    evidence.append('its tapdisk is gone and no tapdisk runs on tap minor %d%s: the backend node is '
-                                    'made inert first, so SM\'s deactivate cannot reach whatever tapdisk takes that '
-                                    'minor next' % (n, ' (blktap%d is a leftover file)' % n if ring else ''))
+                    evidence.append('its tapdisk is gone and no tapdisk runs on tap minor %d%s: the backend node is %s '
+                                    'first, so SM\'s deactivate cannot reach whatever tapdisk takes that minor next'
+                                    % (n, ' (blktap%d is a leftover file)' % n if ring else '',
+                                       node_step_text(hv, vbd['VDI'], inert)))
+        elif state == 'inert' and not mine:
+            inert, why = plan_inert_file(hv, sr_uuid, vdi['uuid'], sr_type, node_)
+            if why:
+                unknowns.append(why)
+            elif inert is not None:
+                evidence.append('its backend node is the inert file an earlier run of this tool left; it is %s first'
+                                % node_step_text(hv, vbd['VDI'], inert))
         elif state != 'own' and mine:
             problems.append('tapdisk pid %s serves it, but its backend node is %s, so SM would not close it'
                             % (mine[0]['pid'], 'missing' if state == 'none' else state))
@@ -16044,7 +16264,7 @@ def eval_vbd(a, opts, vbd, vm, vdi):
             reason += later_text(hname, later)
     item = {'cls': cls, 'phase': 'V', 'action': 'release-vbd', 'host': hv.uuid, 'vbd': vbd['uuid'],
             'vdi': vdi['uuid'], 'sr': sr_uuid, 'attached': vbd['currently_attached'], 'inert': inert,
-            'victim': [at['pid'], at['minor'], at.get('path')] if inert and state == 'other' else None}
+            'victim': victim_of_row(hv, at) if inert and state == 'other' else None}
     if shared:
         item['shared'] = shared
     if steps:
@@ -18796,6 +19016,24 @@ def sr_journals(a, hv, sr):
                   for n, attr in names if JOURNAL_LV.match(n))
 
 
+def start_hazard(hv, sr, vdi):
+    if hv.entries is None:
+        return (', and whether xapi still holds a datapath of it on %s was not read (storage.db: %s), so a VM with '
+                'this disk started on or migrated to %s may be handed that tapdisk\'s disk'
+                % (hv.name, hv.why('storage_db') or 'not read', hv.name))
+    held = [e for s2, v2, e in hv.entries if (s2, v2) == (sr, vdi) and e.get('dps')]
+    if not held:
+        return ''
+    leaked = sorted(set(held[0].get('leaked') or []) & set(held[0]['dps']))
+    if leaked and set(held[0]['dps']) <= set(leaked):
+        return (', and a VM with this disk that is started on or migrated to %s makes xapi tear %s down through SM '
+                'first (it retries a leaked datapath before every attach), which shuts that tapdisk down'
+                % (hv.name, ', '.join(leaked)))
+    return (', and a VM with this disk that is started on or migrated to %s is handed that tapdisk\'s disk instead of '
+            'its own: xapi gives the new VBD the attach info of datapath %s, which it still holds for this VDI and which '
+            'names this node, without asking SM' % (hv.name, ', '.join(sorted(held[0]['dps']))))
+
+
 def eval_hazards(a, opts):
     out = []
     m = a.model
@@ -18814,14 +19052,26 @@ def eval_hazards(a, opts):
                     vm = m.vms.get(vbd['VM'])
                     if vm and vbd['currently_attached'] and vm['resident_on'] == href:
                         users.append('dom0' if vm['is_control_domain'] else 'VM "%s"' % vm['name_label'])
+            if vref is None:
+                reach = 'the VDI is not in xapi, so SM does not pause it'
+            elif ('host_' + href) in m.vdis[vref]['sm_config']:
+                reach = ('its sm-config names this host (host_%s), so SM\'s pause of it here (a snapshot, a GC '
+                         'coalesce) pauses that tapdisk instead and freezes that disk until the unpause, which on a '
+                         'LINSTOR SR, and on LVM when its LV name changed, reopens that tapdisk on this VDI\'s image'
+                         % href)
+            else:
+                reach = ('its sm-config names no host_ key for this host, so SM\'s pause and unpause of it (snapshots, '
+                         'the GC) do not reach this node')
             out.append(ev(('C20', hv.uuid, sr, vdi), 'C20', REPORT, hv.uuid,
                           'C20 backend node of VDI %s on %s points at another disk\'s tapdisk'
                           % (m.name_vdi(vref) if vref else vdi, hv.name),
                           'it is attached here by %s. Its own tapdisk is gone and tap minor %d now belongs to %s. '
-                          'Anything that deactivates, pauses or unpauses this VDI on %s - unplugging its VBD, shutting '
-                          'down its VM, a snapshot, the GC coalescing it - acts on that tapdisk instead and takes that '
-                          'disk away from its user. Touch nothing that uses this VDI until its node is made inert' %
-                          (', '.join(users) or 'nothing in xapi', node['rdev'][1], hv.row_label(at), hv.name),
+                          'SM\'s teardown of this VDI on %s (an unplug of a VBD of it there, its VM stopping there, xe '
+                          'host-sm-dp-destroy of its datapath there) shuts that tapdisk down instead and takes that '
+                          'disk away from its user%s; %s. Touch nothing that tears this VDI down on %s, and start or '
+                          'migrate no VM with this disk onto %s, until this node is gone' %
+                          (', '.join(users) or 'nothing in xapi', node['rdev'][1], hv.row_label(at), hv.name,
+                           start_hazard(hv, sr, vdi) if vref is not None else '', reach, hv.name, hv.name),
                           ['attached here by: %s' % (', '.join(users) or 'nothing in xapi'),
                            '/dev/sm/backend/%s/%s is block %d:%d' % (sr, vdi, node['rdev'][0], node['rdev'][1])]))
     return out
@@ -20682,8 +20932,18 @@ def dependencies(final, audits):
             if it and x['verdict'] == FIX and it['action'] == 'release-vbd' and it.get('inert') and \
                     [it['host'], it['sr'], it['vdi']] == e['key'][1:]:
                 e['verdict'] = INFO
-                e['reason'] = 'handled by the planned release of dom0 VBD %s: its node is made inert first. ' % \
-                    it['vbd'] + base[1]
+                e['reason'] = 'handled by the planned release of dom0 VBD %s: its node is %s first. ' % (
+                    it['vbd'], 'removed' if it['inert'].get('remove') else 'made inert') + base[1]
+        dps = sorted(x['item']['dp'] for x in final if x.get('item') and x['verdict'] == FIX and
+                     x['item']['action'] == 'dp-destroy' and x['item'].get('inert') and
+                     [x['item']['host'], x['item']['sr'], x['item']['vdi']] == e['key'][1:])
+        if dps and e['verdict'] != INFO:
+            e['verdict'] = INFO
+            e['reason'] = ('handled by the planned teardown of datapath %s: its node is %s first. '
+                           % (', '.join(dps), 'removed' if any(
+                               (x['item'].get('inert') or {}).get('remove') for x in final if x.get('item') and
+                               x['item'].get('dp') in dps and x['item']['action'] == 'dp-destroy' and
+                               x['item']['vdi'] == e['key'][3]) else 'made inert')) + base[1]
     chains = [x for x in final if x['verdict'] == FIX and x.get('item') and
               (x['item']['action'] in ('tap-end', 'sm-teardown') or x['item']['action'] == 'dp-destroy' and
                (len(x['item'].get('steps') or []) > 1 or x['item'].get('tap')) or
@@ -21849,6 +22109,18 @@ def disk_owners(model, vdi_uuid):
     return sorted(out)
 
 
+def node_step_desc(it):
+    inert = it.get('inert') or {}
+    node = u'/dev/sm/backend/%s/%s' % (it['sr'], it['vdi'])
+    if inert.get('inert_file'):
+        return (u', after removing %s, the inert file an earlier run of this tool left there, with its .attach_info '
+                u'and NBD link' % node)
+    if inert.get('remove'):
+        return (u', after removing its stale backend node %s (tap minor %d) with its .attach_info and NBD link'
+                % (node, inert['rdev'][1]))
+    return u', after making its stale backend node %s (tap minor %d) inert' % (node, inert['rdev'][1])
+
+
 def describe_item(model, it):
     hn = model.name_host(model.host_by_uuid.get(it.get('host'))) if it.get('host') else None
     a = it['action']
@@ -21887,8 +22159,7 @@ def describe_item(model, it):
                                                     it['vbd'], hn, vdi_text(model, it['vdi']),
                                                     (u', the disk of %s' % u'; '.join(owners)) if owners else u'')
         if it.get('inert'):
-            txt += u', after making its stale backend node /dev/sm/backend/%s/%s (tap minor %d) inert' % (
-                it['sr'], it['vdi'], it['inert']['rdev'][1])
+            txt += node_step_desc(it)
         if 'unkey' in (it.get('steps') or []):
             txt += (u', after removing the VDI\'s stale sm-config paused (which SM\'s deactivate refuses) under SM\'s '
                     u'VDI lock on every host that has its SR')
@@ -21919,7 +22190,9 @@ def describe_item(model, it):
         txt = u'xe host-sm-dp-destroy %s of VDI %s on %s%s%s%s%s%s' % (
             it['dp'], vdi_text(model, it['vdi']), hn, dps, (u' (once dom0 VBD(s) %s are released)'
                                                             % ', '.join(it['needs'])) if it.get('needs') else u'',
-            after, (u', after making its stale backend node (tap minor %d) inert' % it['inert']['rdev'][1])
+            after, (node_step_desc(it) + ((u': that minor now belongs to tapdisk pid %s, which SM\'s teardown then '
+                                           u'cannot reach, and which is checked to be as it was afterwards'
+                                           % it['victim'][0]) if it.get('victim') else u''))
             if it.get('inert') else u'', forget)
         steps = it.get('steps') or ['destroy']
         tp, lv = it.get('tap') or {}, it.get('lv') or {}
@@ -22459,6 +22732,10 @@ class Engine(object):
         self.kick_tried = set()
         self.fixed_c10_srs = set()
         self.inert_made = set()
+        self.victims = {}
+        self.victim_checked = set()
+        self.victim_notes = {}
+        self.cid_before = {}
         self.chains = {}
         self.busy_hosts = {}
         self.gc_aborted_srs = set()
@@ -25145,6 +25422,7 @@ class Engine(object):
                     why = self.shared_still(h, it, m.vbds[vbref], risky)
                     if why:
                         return self.result(it, 'skipped', 'not unplugged: %s%s' % (why, self.inert_note(h, it)))
+                self.cid_before[it['seq']] = self.content_id_of(fresh, it['vdi'])
                 self.act_on(it)
                 since = self.host_now(fresh, h)
                 ok, err, settled = self.unplug(vbref)
@@ -25202,11 +25480,22 @@ class Engine(object):
         if still:
             return self.fail_item(it, 'the VBD is still there after destroy')
         left = self.leftovers(h, it)
-        lost = self.victim_lost(h, it)
+        self.victim_checked.add(it['seq'])
+        try:
+            lost = self.victim_lost(h, it)
+        except (Failed, CallError, KeyError, TypeError, EnvironmentError) as exc:
+            v = self.victim_of(it)
+            return self.fail_item(it, 'unplugged and destroyed, but whether tapdisk pid %s on minor %s, which held its '
+                                      'reused tap minor, still runs is not established (%s): look at the disk that '
+                                      'tapdisk served, and at the VM using it, before anything else'
+                                  % (v[0], v[1], _text(exc)))
         if lost:
             return self.fail_item(it, 'unplugged and destroyed, but %s' % lost)
+        cid = self.content_id_put_back(it)
         self.result(it, 'fixed', ('%s; then ' % unkeyed if unkeyed else '') + 'unplugged and destroyed' +
-                    ('; ' + left if left else ''))
+                    ('; ' + left if left else '') +
+                    ('; %s' % self.victim_notes[it['seq']] if self.victim_notes.get(it['seq']) else '') +
+                    ('; %s' % cid if cid else ''))
 
     def inert_note(self, h, it):
         if not it.get('inert') or it['seq'] not in self.inert_made:
@@ -25218,6 +25507,16 @@ class Engine(object):
             why = None if recs is not None else val['backend'].get('error')
         except (CallError, KeyError, TypeError) as exc:
             recs, why = None, _text(exc)
+        if it['inert'].get('remove'):
+            if recs is None:
+                return ('; its stale backend node %s was removed earlier in this run, with its .attach_info and NBD link; '
+                        'whether a node is there again was not read (%s): %s' % (node, why, REMOVED_EFFECT))
+            now = [r for r in recs if r['sr'] == it['sr'] and r['vdi'] == it['vdi'] and r.get('kind') != 'attach_info']
+            if now:
+                return ('; its stale backend node %s was removed earlier in this run, and there is a %s there again, '
+                        'made since' % (node, now[0].get('kind')))
+            return ('; its stale backend node %s was removed earlier in this run, with its .attach_info and NBD link: %s'
+                    % (node, REMOVED_EFFECT))
         if recs is None:
             return ('; its stale backend node %s was replaced by the inert file earlier in this run; whether that file '
                     'is still there was not read (%s): if it is, SM cannot activate that VDI on %s again until it is '
@@ -25252,31 +25551,42 @@ class Engine(object):
 
     def before_sm(self, h, it):
         if it.get('inert'):
+            remove = bool(it['inert'].get('remove'))
             args = {'sr': it['sr'], 'vdi': it['vdi'], 'expect': {'rdev': it['inert']['rdev'],
-                                                                 'ino': it['inert']['ino']},
-                    'path_sr': it['inert']['path_sr'], 'run_id': self.run_id}
+                                                                 'ino': it['inert']['ino'],
+                                                                 'inert_file': bool(it['inert'].get('inert_file'))},
+                    'path_sr': it['inert']['path_sr'], 'run_id': self.run_id, 'remove': remove}
+            done_text = 'removed' if remove else 'made inert'
             self.act_on(it)
             try:
                 res = self.ctx.transport.call(h, 'inert-node', args, timeout=180)
             except CallError as exc:
-                self.fail_item(it, call_outcome(exc, 'makes /dev/sm/backend/%s/%s on %s inert'
-                                                % (it['sr'], it['vdi'], h.name)))
+                self.fail_item(it, call_outcome(exc, '%s /dev/sm/backend/%s/%s on %s' % (
+                    'removes' if remove else 'makes inert', it['sr'], it['vdi'], h.name)))
             self.j.rec('inert', host=h.uuid, seq=it['seq'], result=res)
             if res.get('was') and not res.get('done'):
-                self.fail_item(it, 'its backend node was replaced, but does not read back as the inert file: %s'
+                self.fail_item(it, ('its backend node was removed, but not everything it took went: %s' if remove else
+                                    'its backend node was replaced, but does not read back as the inert file: %s')
                                % '; '.join(res.get('problems') or ['no detail']))
             if res.get('problems'):
-                return ('its stale backend node was not made inert, so it was not touched: %s'
-                        % '; '.join(res['problems'][:6]))
+                return ('its stale backend node was not %s, so it was not touched: %s'
+                        % (done_text, '; '.join(res['problems'][:6])))
             if not res.get('done') and not res.get('already'):
-                self.fail_item(it, 'the backend node did not read back as inert')
+                self.fail_item(it, 'the backend node did not read back as %s' % ('gone' if remove else 'inert'))
             if res.get('gone'):
-                step('  /dev/sm/backend/%s/%s on %s is already gone: there was nothing to make inert'
-                     % (it['sr'], it['vdi'], h.name))
+                self.victims[it['seq']] = None
+                step('  /dev/sm/backend/%s/%s on %s is already gone: there was nothing to %s'
+                     % (it['sr'], it['vdi'], h.name, 'remove' if remove else 'make inert'))
                 return None
             self.inert_made.add(it['seq'])
-            step('  /dev/sm/backend/%s/%s on %s is inert%s' % (
-                it['sr'], it['vdi'], h.name, (' (it pointed at tap minor %d, which serves %s)' % (
+            if res.get('done') and 'minor_serves' in res:
+                self.victims[it['seq']] = res['minor_serves']
+            step('  /dev/sm/backend/%s/%s on %s is %s%s%s' % (
+                it['sr'], it['vdi'], h.name, 'removed' if remove else 'inert',
+                (', with %s' % ', '.join(os.path.basename(p) if p.endswith('.attach_info') else 'its NBD link'
+                                          for p in (res.get('removed') or [])[1:])) if remove and res.get('removed')
+                and len(res['removed']) > 1 else '',
+                (' (it pointed at tap minor %d, which serves %s)' % (
                     it['inert']['rdev'][1], (res.get('minor_serves') or {}).get('path')))
                 if res.get('minor_serves') else ''))
             return None
@@ -25288,20 +25598,70 @@ class Engine(object):
                         % (lsof_text(self.ctx.caps, h, 'this deactivate'), '; '.join(res['problems'][:4])))
         return None
 
+    def victim_of(self, it):
+        planned = it.get('victim')
+        if it['seq'] in self.victims:
+            s = self.victims[it['seq']]
+            if not s:
+                return None
+            if planned and planned[0] == s['pid'] and planned[1] == s['minor']:
+                return [s['pid'], s['minor'], s.get('path')] + list(planned[3:5])
+            return [s['pid'], s['minor'], s.get('path'), sorted(set(re.findall(UUID_PAT, s.get('path') or ''))), None]
+        return planned
+
     def victim_lost(self, h, it):
-        v = it.get('victim')
+        lost, note = self.victim_check(h, it)
+        if note:
+            self.victim_notes[it['seq']] = note
+        return lost
+
+    def victim_check(self, h, it):
+        v = self.victim_of(it)
         if not v:
-            return None
+            return None, None
         a = self.audit(hosts=[h.uuid], smlog=False)
-        hv = a.view(a.model.host_by_uuid[h.uuid])
+        m = a.model
+        hv = a.view(m.host_by_uuid[h.uuid])
+        vdis = set(u for u in (v[3] if len(v) > 3 and v[3] else ()) if u in m.vdi_by_uuid)
         if hv.taps is None:
-            return 'whether tapdisk pid %s on minor %s still runs is not established: %s' % (v[0], v[1], hv.why('tapdisks'))
+            return ('whether tapdisk pid %s on minor %s still runs is not established: %s'
+                    % (v[0], v[1], hv.why('tapdisks')), None)
         rows = [r for r in hv.taps if r['pid'] == v[0] and r['minor'] == v[1]]
+        start = len(v) > 4 and v[4]
+        now_start = ((hv.tapinfo or {}).get(str(v[0])) or {}).get('start_ticks')
+        if rows and start and now_start is not None and now_start != start:
+            rows = []
+        users = [vm['name_label'] for u in sorted(vdis) for r, vbd in vdi_vbds(m, m.vdi_by_uuid.get(u))
+                 for vm in [m.vms.get(vbd['VM']) or {}] if vbd['currently_attached'] and vm.get('resident_on') == hv.href
+                 and not vm.get('is_control_domain')] if all(m.vdi_by_uuid.get(u) for u in vdis) else None
+        dom0 = [vbd['uuid'] for u in sorted(vdis) for r, vbd in vdi_vbds(m, m.vdi_by_uuid.get(u))
+                if vbd['currently_attached'] and (m.vms.get(vbd['VM']) or {}).get('is_control_domain') and
+                (m.vms.get(vbd['VM']) or {}).get('resident_on') == hv.href] if users is not None else None
+        own_now = [r for r in hv.live_taps() if vdis and vdis & set(hv.row_ident.get((r['pid'], r['minor'])) or ())
+                   and not (r['pid'] == v[0] and r['minor'] == v[1])]
         if not rows:
-            return 'tapdisk pid %s on minor %s (%s), which held the reused minor, is gone' % (v[0], v[1], v[2])
+            if vdis and own_now:
+                return None, ('tapdisk pid %s on minor %s, which held the reused minor, has ended since, and its disk is '
+                              'served by tapdisk pid %s on minor %s now (its own restart, not this teardown)'
+                              % (v[0], v[1], own_now[0]['pid'], own_now[0]['minor']))
+            if vdis and users == [] and dom0 == []:
+                return None, ('tapdisk pid %s on minor %s, which held the reused minor, has ended since, together with '
+                              'every attachment of its disk on %s (its own teardown, not this one)' % (v[0], v[1], h.name))
+            return ('tapdisk pid %s on minor %s (%s), which held the reused minor, is gone%s'
+                    % (v[0], v[1], v[2], (' while its disk is still attached here (%s)' % ', '.join(
+                        ['VM "%s"' % n for n in users or []] + ['dom0 VBD %s' % b for b in dom0 or []]))
+                       if users or dom0 else ''), None)
         if rows[0].get('path') != v[2]:
-            return 'tapdisk pid %s on minor %s now serves %s, not %s' % (v[0], v[1], rows[0].get('path'), v[2])
-        return None
+            named = set(u for u in re.findall(UUID_PAT, rows[0].get('path') or '') if u in m.vdi_by_uuid) | \
+                set(hv.row_ident.get((rows[0]['pid'], rows[0]['minor'])) or ())
+            nodes = set(x['vdi'] for x in hv.back_minor.get(rows[0]['minor'], []) if x.get('vdi') != it['vdi'])
+            if vdis and vdis & (named if named else nodes):
+                return None, ('tapdisk pid %s on minor %s serves %s now, another name of the same disk (%s)'
+                              % (v[0], v[1], rows[0].get('path'), v[2]))
+            return 'tapdisk pid %s on minor %s now serves %s, not %s' % (v[0], v[1], rows[0].get('path'), v[2]), None
+        state = rows[0].get('state')
+        return None, ('tapdisk pid %s on minor %s still serves %s%s' % (
+            v[0], v[1], v[2], (' (state %s now)' % tap_state_text(state)) if state else ''))
 
     def leftovers(self, h, it):
         deadline = _now() + VERIFY_DELAY
@@ -25330,11 +25690,32 @@ class Engine(object):
             pause(5, False)
 
     def fail_item(self, it, why):
-        if it.get('inert') and it['seq'] in self.inert_made and 'the inert file' not in why:
+        why = _text(why)
+        if it.get('inert') and it['seq'] in self.inert_made and 'the inert file' not in why and \
+                'removed earlier in this run' not in why:
             try:
-                why = _text(why) + self.inert_note(self.host(it['host']), it)
+                why = why + self.inert_note(self.host(it['host']), it)
             except Failed:
                 pass
+        check = it.get('action') in ('dp-destroy', 'release-vbd') and it['seq'] in self.inert_made and \
+            it['seq'] not in self.victim_checked
+        if check:
+            self.result(it, 'failed', why, show=False)
+            self.victim_checked.add(it['seq'])
+            try:
+                lost = self.victim_lost(self.host(it['host']), it) if self.victim_of(it) else None
+            except (Failed, CallError, KeyError, TypeError, EnvironmentError) as exc:
+                lost = 'whether the tapdisk that held its tap minor still runs is not established (%s)' % _text(exc)
+            if lost:
+                why = why + ('; and %s: look at the disk that tapdisk served, and at the VM using it, before anything '
+                             'else' % lost)
+            elif self.victim_notes.get(it['seq']):
+                why = why + '; %s' % self.victim_notes[it['seq']]
+        if it['seq'] in self.cid_before:
+            self.result(it, 'failed', why, show=False)
+            cid = self.content_id_put_back(it)
+            if cid:
+                why = why + '; %s' % cid
         self.result(it, 'failed', why)
         raise Failed('%s %d failed: %s' % (it['cls'], it['seq'], why))
 
@@ -26472,7 +26853,18 @@ class Engine(object):
         if moved:
             return self.chain_stop(it, h, done, 'something changed since it was re-checked (%s); run the tool again'
                                    % moved)
-        why = self.still_gone(it) if it.get('forgotten') else self.before_sm(h, it)
+        hvf = fresh.view(fresh.model.host_by_uuid[h.uuid])
+        ops = teardown_ops((sdb_entry(hvf, it['sr'], it['vdi']) or {}).get('dps'), it['dp'])[0]
+        if it.get('forgotten'):
+            why = self.still_gone(it)
+        elif ops or not it.get('inert'):
+            why = self.before_sm(h, it)
+        else:
+            why = None
+            self.victims[it['seq']] = None
+            step('  %d. %s: xapi asks SM for nothing when it removes %s (another datapath of the VDI keeps it attached '
+                 'on %s), so its backend node is left for the teardown of the last of them'
+                 % (it['seq'], it['cls'], it['dp'], h.name))
         if why:
             return self.chain_stop(it, h, done, why)
         moved = self.changed(fresh, h, vdis=[it['vdi']], srs=[it['sr']])
@@ -26482,8 +26874,7 @@ class Engine(object):
         if it.get('forgotten'):
             return self.forget_dp(it, h, fresh, done)
         allow = [it['lv']['refcount'][0], 0] if 'deactivate' in (it.get('steps') or []) else None
-        hvf = fresh.view(fresh.model.host_by_uuid[h.uuid])
-        ops = teardown_ops((sdb_entry(hvf, it['sr'], it['vdi']) or {}).get('dps'), it['dp'])[0]
+        self.cid_before[it['seq']] = self.content_id_of(fresh, it['vdi'])
         vmholds, why, risky = self.hold_starts(it, it['vdi'])
         if why:
             return self.chain_stop(it, h, done, '%s%s' % (why, self.inert_note(h, it)))
@@ -26536,6 +26927,20 @@ class Engine(object):
                                    'under it, so look at that disk before anything else' % (h.name, '; '.join(late[:4])))
         finally:
             self.free_starts(it, vmholds, unsettled)
+        if self.victim_of(it):
+            self.victim_checked.add(it['seq'])
+            v = self.victim_of(it)
+            try:
+                lost = self.victim_lost(h, it)
+            except (Failed, CallError, KeyError, TypeError, EnvironmentError) as exc:
+                lost = None
+                self.fail_item(it, 'xapi tore the datapath down, but whether tapdisk pid %s on minor %s, which held its '
+                                   'reused tap minor, still runs is not established (%s): look at the disk that tapdisk '
+                                   'served, and at the VM using it, before anything else' % (v[0], v[1], _text(exc)))
+            if lost:
+                self.fail_item(it, 'xapi tore the datapath down, but %s: look at the disk that tapdisk served, and at '
+                                   'the VM using it, before anything else' % lost)
+        cid = self.content_id_put_back(it)
         check = self.audit(hosts=[h.uuid], smlog=False)
         cv = check.view(check.model.host_by_uuid[h.uuid])
         if cv.claim is None:
@@ -26563,8 +26968,57 @@ class Engine(object):
             text = forgot + '; ' + text
         if notes:
             text += ' (%s)' % '; '.join(notes)
+        if it['seq'] in self.inert_made and (it.get('inert') or {}).get('remove'):
+            text += '; its stale backend node had been removed first, with its .attach_info and NBD link'
+        elif it['seq'] in self.inert_made:
+            text += '; its stale backend node had been made inert first'
+        if self.victim_notes.get(it['seq']):
+            text += '; %s' % self.victim_notes[it['seq']]
+        if cid:
+            text += '; %s' % cid
         out = r.out.strip()
         return text + ('; xe printed: %s' % out[:300] if out else '')
+
+    def content_id_of(self, fresh, vdi):
+        vref = fresh.model.vdi_by_uuid.get(vdi)
+        if vref is None or not isinstance(fresh.model.vdis[vref].get('other_config'), dict):
+            return None
+        return 'content_id' in fresh.model.vdis[vref]['other_config']
+
+    def content_id_put_back(self, it):
+        before = self.cid_before.pop(it['seq'], None)
+        if before is not False:
+            return None
+        x = self.ctx.api.x
+        try:
+            vref = x.VDI.get_by_uuid(it['vdi'])
+            oc = x.VDI.get_other_config(vref)
+        except Exception as exc:
+            return 'whether xapi\'s teardown gave it an other-config content_id was not read back (%s)' % _text(exc)
+        if 'content_id' not in oc:
+            return None
+        try:
+            a = self.audit(hosts=[it['host']], smlog=False)
+        except (Failed, CallError, KeyError, TypeError, EnvironmentError) as exc:
+            return ('xapi\'s teardown gave it an other-config content_id, and whether a VBD writes it on another host '
+                    'was not established (%s), so it was left: if the disk runs on another host, remove it with xe '
+                    'vdi-param-remove uuid=%s param-name=other-config param-key=content_id' % (_text(exc), it['vdi']))
+        m = a.model
+        ref = m.vdi_by_uuid.get(it['vdi'])
+        here = m.host_by_uuid.get(it['host'])
+        rw = [vbd for r, vbd in vdi_vbds(m, ref) if vbd['currently_attached'] and vbd.get('mode') != 'RO' and
+              (m.vms.get(vbd['VM']) or {}).get('resident_on') not in (None, NULL_REF, here)] if ref else []
+        if not rw:
+            return None
+        try:
+            x.VDI.remove_from_other_config(vref, 'content_id')
+        except Exception as exc:
+            return ('xapi\'s teardown here gave it an other-config content_id while it is written on another host, and '
+                    'removing it again failed (%s): remove it with xe vdi-param-remove uuid=%s param-name=other-config '
+                    'param-key=content_id' % (_text(exc), it['vdi']))
+        return ('xapi\'s teardown here gave it an other-config content_id (it does that on every deactivate), which '
+                'says its contents are not changing, while VBD %s writes it on another host: removed again, as that '
+                'host\'s own activation had left it' % rw[0]['uuid'])
 
     def release_dp0(self, it):
         h = self.host(it['host'])
@@ -28171,6 +28625,9 @@ CLOSING_HEADS = ('seen in one audit only, so it is read again: ', 'seen in one a
 def closing_classify(eng, a, opts):
     pre = [x for x in eng.audits or [] if x is not None]
     final, plan, per = classify_per(pre + [a], opts)
+    for e in final:
+        if e['cls'] == 'C20' and e.get('base'):
+            e['verdict'], e['reason'] = e['base']
     for e in final:
         head = [h for h in CLOSING_HEADS if e['reason'].startswith(h)][:1]
         if not head or not pre:
