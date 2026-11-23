@@ -29,7 +29,7 @@ import time
 import xml.parsers.expat
 import zlib
 
-VERSION = '2.16'
+VERSION = '2.17'
 PYTHON = sys.version.split()[0]
 PROG = 'storage-state-fixer'
 STORAGE_DB = '/var/run/nonpersistent/xapi/storage.db'
@@ -2207,6 +2207,84 @@ def f_lvnames(vgs):
     return out
 
 
+def f_dminfo():
+    r = run([DMSETUP, 'info', '-c', '--noheadings', '--separator', '|', '-o', 'name,uuid,open'], 30)
+    if not r.ok:
+        raise Failed('dmsetup info %s' % r.why())
+    out = {}
+    for line in r.out.splitlines():
+        if not line.strip() or line.strip() == 'No devices found':
+            continue
+        p = line.split('|')
+        if len(p) != 3 or not p[0] or not p[2].strip().isdigit():
+            raise Failed('dmsetup info printed %s' % canon(line[:200]))
+        out[p[0]] = [p[1].strip(), int(p[2].strip())]
+    return out
+
+
+def lvids_rows(text, names):
+    seen = {}
+    for line in text.splitlines():
+        p = [x.strip() for x in line.split('|')]
+        if len(p) != 4 or p[0] not in names or not p[1] or not p[2] or not p[3]:
+            continue
+        rec = seen.setdefault(p[0], {'vg_uuid': p[1].replace('-', ''), 'lvs': {}})
+        rec['lvs'][p[3].replace('-', '')] = p[2]
+    return seen
+
+
+def dm_read():
+    try:
+        return f_dminfo(), None
+    except Failed as exc:
+        return None, _text(exc)
+
+
+def dm_bracket(out, names, before, after, why):
+    for vg in names:
+        rec = out.get(vg) or {}
+        if not rec.get('ok'):
+            continue
+        if before is None or after is None:
+            rec['value']['dm_error'] = why
+            continue
+        pre = vg.replace('-', '--') + '-'
+        same, changed = {}, {}
+        for n in sorted(after):
+            if not n.startswith(pre):
+                continue
+            if n in before and before[n][0] == after[n][0]:
+                same[n] = after[n]
+            else:
+                changed[n] = after[n]
+        rec['value']['dm'] = same
+        rec['value']['dm_changed'] = changed
+
+
+def f_lvids(vgs):
+    names = [vg for vg in vgs or [] if re.match(r'^VG_XenStorage-' + UUID_PAT + '$', vg)]
+    out = {}
+    if not names:
+        return out
+    before, bwhy = dm_read()
+    argv = [LVS, '--noheadings', '--separator', '|', '-o', 'vg_name,vg_uuid,lv_name,lv_uuid']
+    r = run(argv + names, 60)
+    if r.ok:
+        seen = lvids_rows(r.out, names)
+        for vg in names:
+            out[vg] = {'ok': True, 'value': seen[vg]} if vg in seen else \
+                {'ok': False, 'error': 'lvs listed no volumes of it'}
+    else:
+        for vg in names:
+            r = run(argv + [vg], 60)
+            seen = lvids_rows(r.out, [vg]) if r.ok else {}
+            out[vg] = {'ok': True, 'value': seen[vg]} if vg in seen else \
+                {'ok': False, 'error': 'lvs %s' % r.why() if not r.ok else 'lvs listed no volumes of it'}
+    after, awhy = dm_read()
+    dm_bracket(out, names, before, after, 'dmsetup info around the LV listing failed: %s' % (bwhy or awhy))
+    return out
+
+
 def f_srdir(srs):
     out = {}
     for sr in srs or []:
@@ -2283,10 +2361,61 @@ def is_image_path(p):
     return p.startswith('/dev/VG_XenStorage-') or p.startswith('/var/run/sr-mount/') or p.startswith('/run/sr-mount/')
 
 
-def vhd_check_one(p, parents=True):
+VHD_KILL_BYTE = b'\xc7'
+
+
+def footer_killed(p):
+    try:
+        fd = os.open(p, os.O_RDONLY)
+        try:
+            size = os.lseek(fd, 0, os.SEEK_END)
+        finally:
+            os.close(fd)
+    except OSError:
+        return False
+    if size < 1024 or size % 512:
+        return False
+    r = run([DD, 'if=' + p, 'iflag=direct', 'bs=512', 'skip=%d' % (size // 512 - 1), 'count=1', 'status=none'], 60,
+            raw=True)
+    return r.ok and len(r.out) == 512 and r.out == VHD_KILL_BYTE * 512
+
+
+def vhd_check_one(p, parents=True, open_rw=False):
     why = mount_stuck(p)
     if why:
         return {'ok': False, 'detail': why, 'timed_out': True, 'parent_error': why}
+    if open_rw:
+        rec = vhd_check_one(p, parents=False)
+        if not rec.get('ok') and footer_killed(p):
+            r = run([VHD_UTIL, 'check', '--debug', '-i', '-n', p], 120)
+            rec['ok'] = r.ok
+            rec.pop('timed_out', None)
+            if r.timed_out:
+                rec['timed_out'] = True
+            rec['detail'] = ('its primary footer is overwritten (512 bytes of 0xc7), as tapdisk does to a VHD it holds '
+                             'open read-write once it has resumed it (after a snapshot or a GC step paused it), and '
+                             'restores at the next pause or close; the disk is open read-write on another host; with '
+                             'that ignored (-i): %s'
+                             % ('; '.join(l.strip() for l in (r.out + u'\n' + r.err).splitlines()
+                                          if l.strip())[-200:] or r.why()))[:400]
+            rec['footer_killed'] = True
+        if rec.get('ok') and parents and 'parent' not in rec:
+            rec['ok'] = False
+            rec['detail'] = 'its parent cannot be named, so the chain is not checked (%s)' % rec.get('parent_error')
+        if rec.get('ok') and parents and rec.get('parent'):
+            q = run([VHD_UTIL, 'query', '--debug', '-n', p, '-p'], 60)
+            pp = (q.out.strip().splitlines() or [''])[-1].strip() if q.ok else ''
+            if not is_image_path(pp):
+                rec['ok'] = False
+                rec['detail'] = 'the path of its parent cannot be read (%s)' % (
+                    q.why() if not q.ok else canon(pp)[:200])
+            else:
+                r = run([VHD_UTIL, 'check', '--debug', '-p', '-n', pp], 120)
+                if not r.ok:
+                    rec['ok'] = False
+                    rec['detail'] = 'its parent %s fails vhd-util check -p: %s' % (pp, '; '.join(
+                        l.strip() for l in (r.out + u'\n' + r.err).splitlines() if l.strip())[-200:] or r.why())
+        return rec
     r = run([VHD_UTIL, 'check', '--debug'] + (['-p'] if parents else []) + ['-n', p], 120)
     lines = [l.strip() for l in (r.out + u'\n' + r.err).splitlines() if l.strip()]
     bad = [l for l in lines if VHD_CHECK_BAD.search(l)]
@@ -2312,13 +2441,14 @@ def vhd_check_one(p, parents=True):
     return rec
 
 
-def f_vhdcheck(paths):
+def f_vhdcheck(paths, open_paths=()):
     out = {}
     for p in paths or []:
         if not is_image_path(p):
             out[p] = {'ok': False, 'detail': 'not an SR image path'}
             continue
-        out[p] = qcow2_check_one(p, True) if image_kind(p) == 'qcow2' else vhd_check_one(p)
+        out[p] = qcow2_check_one(p, True) if image_kind(p) == 'qcow2' else \
+            vhd_check_one(p, open_rw=p in (open_paths or ()))
     return out
 
 
@@ -3238,7 +3368,11 @@ def merge_linstor(a, targets):
             got = (f.get('value') or {}).get(rec['sr']) if f.get('ok') else {
                 'ok': False, 'error': 'the LINSTOR key-value store was not read on %s: %s' % (h.name, f.get('error'))}
             got = got or {'ok': False, 'error': 'the agent on %s did not answer for this SR' % h.name}
-            if got.get('ok') and not (a.linstor_kv.get(rec['sr']) or {}).get('ok'):
+            sref = a.model.sr_by_uuid.get(rec['sr'])
+            master = sref is not None and a.model.sr_master(sref) == h.ref
+            if got.get('ok'):
+                got = {'ok': True, 'value': dict(got['value'], host=h.uuid)}
+            if got.get('ok') and (master or not (a.linstor_kv.get(rec['sr']) or {}).get('ok')):
                 a.linstor_kv[rec['sr']] = got
             elif rec['sr'] not in a.linstor_kv:
                 a.linstor_kv[rec['sr']] = got
@@ -4305,7 +4439,7 @@ class SmlogFile(object):
             return False
         sub = doc.get('subjects') or {}
         old = dict((k, set(sub.get(k) or [])) for k in ('relink', 'pause', 'phy', 'activate'))
-        if s.relink != old['relink'] or not s.pause <= old['pause'] or not s.activate <= old['activate'] or \
+        if not s.relink <= old['relink'] or not s.pause <= old['pause'] or not s.activate <= old['activate'] or \
                 bool(s.activate) != bool(old['activate']) or not s.phy <= old['phy'] or \
                 (doc.get('phy_fall') and s.phy != old['phy']):
             return False
@@ -4367,11 +4501,9 @@ class SmlogFile(object):
         m = RE_SET_RELINK.search(msg) if 'Set relinking = True for ' in msg else None
         if m and m.group(1) in s.relink:
             self.events['relink:' + m.group(1)].append([t, 'set', pid])
-            return
         m = RE_DEL_RELINK.search(msg) if 'Removed relinking from ' in msg else None
         if m and m.group(1) in s.relink:
             self.events['relink:' + m.group(1)].append([t, 'removed', pid])
-            return
         m = RE_IPC.search(msg) if 'IPCFlag: ' in msg else None
         if m and m.group(3) == 'abort':
             self.events['abort:' + m.group(2)].append([t, m.group(1), pid])
@@ -5616,6 +5748,7 @@ def f_linstor_names(srs):
             out[sr or '?'] = {'ok': False, 'error': 'its PBD here names no group-name'}
             continue
         name = 'xcp-sr-' + group.replace('/', '_')
+        t0 = time.time()
         try:
             raw = bounded(_linstor_read, LINSTOR_KV_TIMEOUT, name, uri)
         except (Failed, EnvironmentError) as exc:
@@ -5623,6 +5756,7 @@ def f_linstor_names(srs):
                                              % (name, uri, _text(exc))}
             continue
         out[sr] = {'ok': True, 'value': kv_summary(name, addr, raw)}
+        out[sr]['value']['read_start'], out[sr]['value']['read_at'] = t0, time.time()
     return out
 
 
@@ -6214,6 +6348,7 @@ def facts_doc(args):
         doc['domvms'] = fact(bounded, f_domvms, 30)
         doc['room'] = fact(f_room)
         doc['blockmap'] = fact(f_blockmap)
+        doc['dminfo'] = fact(f_dminfo)
         parts = [doc['backend'], doc['phy'], doc['blktap'], doc['blockmap']]
         if all(p['ok'] for p in parts):
             bm = doc['blockmap']['value']
@@ -6242,6 +6377,8 @@ def facts_doc(args):
         doc['identity_after'] = fact(f_identity)
     if 'backend' in want and 'core' not in want:
         doc['backend'] = fact(f_backend)
+    if 'dminfo' in want and 'core' not in want:
+        doc['dminfo'] = fact(f_dminfo)
     if 'procs' in want and 'core' not in want:
         doc['procs'] = fact(bounded, f_procs, 30)
     if 'ha' in want and 'core' not in want:
@@ -6283,9 +6420,10 @@ def facts_doc(args):
     if 'extra' in want:
         doc['statfiles'] = fact(f_statfiles, args.get('statfiles') or [])
         doc['lvnames'] = fact(f_lvnames, args.get('vgs') or [])
+        doc['lvids'] = fact(f_lvids, args.get('lvids') or [])
         doc['srdir'] = fact(f_srdir, args.get('srdirs') or [])
         doc['xsread'] = fact(f_xsread, args.get('xsread') or [])
-        doc['vhdcheck'] = fact(f_vhdcheck, args.get('vhdcheck') or [])
+        doc['vhdcheck'] = fact(f_vhdcheck, args.get('vhdcheck') or [], args.get('vhdcheck_open') or [])
         doc['headcheck'] = fact(f_headcheck, args.get('headcheck') or [])
         doc['dmcheck'] = fact(f_dmcheck, args.get('dmcheck') or [])
     if 'xlog' in want:
@@ -9397,7 +9535,7 @@ def teardown_locked(args, sr, vdi):
             problems.extend(tap_end_proofs(pid, minor, path, tapmaj, None, fds))
     else:
         exp = args.get('node') or {}
-        mn = (exp.get('rdev') or exp.get('was_rdev') or [None, None])[1] if exp else None
+        mn = (exp.get('rdev') or exp.get('was_rdev') or [None, None])[1] if exp and not exp.get('leave') else None
         try:
             xs = xs_backend()
         except Failed as exc:
@@ -9450,7 +9588,7 @@ def teardown_locked(args, sr, vdi):
             did.append('tapdisk pid %d exited' % pid)
     for p, exp, what in [(path + '.attach_info', args.get('attach_info'), 'attach_info file'),
                          (path, args.get('node'), 'backend node')] + places[1:]:
-        if exp is None:
+        if exp is None or (what == 'backend node' and exp.get('leave')):
             continue
         why = node_problem(p, exp, args.get('ended')) if what == 'backend node' else link_problem(p, exp, what)
         if why:
@@ -9487,7 +9625,8 @@ def lock_holder(fd):
 
 def try_sm_lock(ns, name, until):
     import fcntl
-    if not UUID_RE.match(ns or '') or name not in ('vdi', 'sr', 'gc_active'):
+    if not ((UUID_RE.match(ns or '') and name in ('vdi', 'sr', 'gc_active')) or
+            ((ns or '').startswith('lvm-') and UUID_RE.match(ns[4:]) and UUID_RE.match(name or ''))):
         raise Failed('not an SM lock: %s/%s' % (ns, name))
     d = os.path.join(SM_LOCK_DIR, ns)
     try:
@@ -9512,11 +9651,15 @@ def try_sm_lock(ns, name, until):
         time.sleep(FENCE_POLL)
 
 
+LVREF_RE = re.compile('^(' + UUID_PAT + ')/(' + UUID_PAT + ')$')
+
+
 def fence_locks(locks):
     out = []
     for lk in locks or []:
-        if not (isinstance(lk, list) and len(lk) == 2 and lk[0] in ('vdi', 'gc', 'sr', 'toolstack') and
-                UUID_RE.match(lk[1] or '')):
+        if not (isinstance(lk, list) and len(lk) == 2 and (
+                (lk[0] in ('vdi', 'gc', 'sr', 'toolstack') and UUID_RE.match(lk[1] or '')) or
+                (lk[0] == 'lvref' and LVREF_RE.match(lk[1] or '')))):
             raise Failed('not a lock this tool takes: %s' % canon(lk))
         if lk[0] == 'gc' and ('sr', lk[1]) in out:
             raise Failed('the GC lock of SR %s comes after its SR lock, whose release it would drop' % lk[1])
@@ -9679,6 +9822,14 @@ def take_fence(locks, until, aborted=None, release=None, unpaused=False):
                     return held, 'SM holds the lock of SR %s (%s): an SM operation on the SR runs' % (uuid, who)
                 held.append(fd)
                 continue
+            if kind == 'lvref':
+                sr_, vdi_ = uuid.split('/')
+                fd, who = try_sm_lock('lvm-' + sr_, vdi_, until)
+                if fd is None:
+                    return held, ('SM holds the activation lock of the LV of VDI %s (%s): SM activates or deactivates '
+                                  'it now' % (vdi_, who))
+                held.append(fd)
+                continue
             backed = False
             while True:
                 srfd, who = try_sm_lock(uuid, 'sr', until)
@@ -9755,6 +9906,7 @@ def fence_acquire(locks):
 
 def fence_paths(locks):
     return [toolstack_lockfile() if kind == 'toolstack' else
+            os.path.join(SM_LOCK_DIR, 'lvm-' + uuid.split('/')[0], uuid.split('/')[1]) if kind == 'lvref' else
             os.path.join(SM_LOCK_DIR, uuid, {'vdi': 'vdi', 'sr': 'sr'}.get(kind, 'gc_active')) for kind, uuid in locks]
 
 
@@ -11232,6 +11384,7 @@ class Audit(object):
         self.vbd2 = None
         self.pidinfo = {}
         self.lvnames = {}
+        self.lvids = {}
         self.statfiles = {}
         self.srdirs = {}
         self.xsread = {}
@@ -11391,6 +11544,7 @@ class HostView(object):
         self.domains = f('domains')
         self.room = f('room')
         self.blockmap = f('blockmap')
+        self.dminfo = f('dminfo')
         self.sdb = f('storage_db')
         self.identity = f('identity')
         self.caps = audit.caps.get(self.uuid) if self.doc is not None else None
@@ -14058,8 +14212,9 @@ REMOVED_EFFECT = ('SM\'s teardown of the datapath, when it runs, reaches no tapd
                   'this disk onto that host fails while the datapath is not marked leaked (xapi hands the new VBD the '
                   'datapath\'s attach info, which names the node that is gone; a leaked one is torn down through SM '
                   'first and the start goes ahead), and SM\'s pause of the disk passes over that host')
-C03_STEPS = ('end', 'teardown', 'refresh', 'unkey', 'destroy', 'deactivate', 'free')
+C03_STEPS = ('end', 'teardown', 'relink', 'refresh', 'unkey', 'destroy', 'deactivate', 'free')
 STEP_TEXT = {'end': 'end its wedged tapdisk', 'teardown': 'remove what SM left of the VDI in dom0',
+             'relink': 'replace a device-mapper device of its LV that carries another name through SM',
              'refresh': 'refresh its LV through SM',
              'unkey': 'remove its stale sm-config paused', 'destroy': 'xe host-sm-dp-destroy',
              'deactivate': 'put back the stale LV activation count through SM', 'free': 'release its tap minor'}
@@ -14083,6 +14238,142 @@ def lv_active(hv, sr, vdi):
     return any(n in (hv.blockmap.get('dm') or {}) for n in lv_dm_names(sr, vdi))
 
 
+def classify_devs(dminfo, vg, ids):
+    pre = vg.replace('-', '--') + '-'
+    out = {}
+    src = ids['dm'] if ids is not None and ids.get('dm') is not None else dminfo
+    for name, (uuid, opn) in sorted(src.items()):
+        if not name.startswith(pre):
+            continue
+        lv = name[len(pre):].replace('--', '-')
+        owner, state = None, 'unknown'
+        if ids is not None and len(uuid) == 68 and uuid.startswith('LVM-' + ids['vg_uuid']):
+            owner = ids['lvs'].get(uuid[36:])
+            state = 'ok' if owner == lv else 'misnamed' if owner else 'orphan'
+        out[lv] = {'dm': name, 'uuid': uuid, 'open': opn, 'owner': owner, 'state': state}
+    for name, (uuid, opn) in sorted(((ids or {}).get('dm_changed') or {}).items()):
+        if not name.startswith(pre):
+            continue
+        lv = name[len(pre):].replace('--', '-')
+        owner = ids['lvs'].get(uuid[36:]) if len(uuid) == 68 and uuid.startswith('LVM-' + ids['vg_uuid']) else None
+        out[lv] = {'dm': name, 'uuid': uuid, 'open': opn, 'owner': owner, 'state': 'ok' if owner == lv else 'unknown'}
+        if owner != lv:
+            out[lv]['why'] = ('it appeared or changed while the LVs were listed (dmsetup info read before and after), '
+                              'so what it maps is not established')
+    return out
+
+
+def lvm_devices(a, hv, sr):
+    if hv.dminfo is None:
+        return None, 'the device-mapper devices on %s were not read: %s' % (hv.name, hv.why('dminfo'))
+    vg = 'VG_XenStorage-' + sr
+    ids = a.lvids.get((hv.uuid, vg))
+    out = classify_devs(hv.dminfo, vg, ids)
+    if ids is None and out:
+        return out, 'the LVs of %s were not listed with their uuids on %s' % (vg, hv.name)
+    if ids is not None and ids.get('dm_error'):
+        return out, 'the device-mapper devices on %s were not read around the listing of the LVs of %s: %s' % (
+            hv.name, vg, ids['dm_error'])
+    return out, None
+
+
+def lv_vdi_of(name):
+    for p in LV_PREFIXES:
+        if name.startswith(p) and UUID_RE.match(name[len(p):]):
+            return name[len(p):]
+    if name.endswith('.cbtlog') and UUID_RE.match(name[:-len('.cbtlog')]):
+        return name[:-len('.cbtlog')]
+    return None
+
+
+def dev_text(lv, r):
+    if r['state'] == 'unknown':
+        return 'device-mapper device %s (%s)' % (lv, dev_unknown_text(r))
+    return ('device-mapper device %s, which %s' % (lv, 'holds no LV of the volume group any more (the LV it mapped is '
+                                                     'gone)' if r['state'] == 'orphan' else
+                                                     'holds LV %s (the LV was renamed on the SR master after this host '
+                                                     'activated it)' % r['owner']))
+
+
+def dev_unknown_text(r):
+    return r.get('why') or 'its uuid %s does not read as an LV of the volume group' % canon(r['uuid'])[:80]
+
+
+def lock_owner(name):
+    return lv_vdi_of(name) if name and not name.endswith('.cbtlog') else None
+
+
+def relink_plan(a, hv, sr, names, refresh=()):
+    devs, why = lvm_devices(a, hv, sr)
+    if devs is None or why:
+        return None, [why], []
+    plan, unknowns, problems = [], [], []
+    for lv in names:
+        own = devs.get(lv)
+        if own is not None and own['state'] == 'unknown':
+            unknowns.append('device-mapper device %s on %s: %s' % (lv, hv.name, dev_unknown_text(own)))
+            continue
+        squat = own is not None and own['state'] != 'ok'
+        acted = lv in refresh or squat
+        shaky = [n for n, r in sorted(devs.items()) if r['state'] == 'unknown' and r['owner'] == lv and n != lv]
+        if acted and shaky:
+            unknowns.append('device-mapper device %s on %s, which holds LV %s: %s'
+                            % (shaky[0], hv.name, lv, dev_unknown_text(devs[shaky[0]])))
+            continue
+        holders = [n for n, r in sorted(devs.items()) if r['owner'] == lv and n != lv] if acted else []
+        if not squat and not holders:
+            continue
+        rm = holders + ([lv] if squat else [])
+        for n in rm:
+            r = devs[n]
+            if r['open']:
+                problems.append('%s on %s is open (open count %d), so it is not replaced' % (dev_text(n, r), hv.name,
+                                                                                          r['open']))
+            elif r['owner'] and r['owner'] != lv and lv_vdi_of(r['owner']) is None:
+                problems.append('%s on %s; removing it would deactivate LV %s, which is no disk\'s LV'
+                                % (dev_text(n, r), hv.name, r['owner']))
+            elif r['owner'] and r['owner'] != lv:
+                ov = lv_vdi_of(r['owner'])
+                rc, rwhy = refcount_of(hv, sr, ov)
+                if rc is None:
+                    unknowns.append(rwhy)
+                elif sum(rc) or (ov and in_use_here(a, hv, ov)):
+                    problems.append('%s on %s; removing it would deactivate that LV there, and SM counts or uses it '
+                                    'there' % (dev_text(n, r), hv.name))
+        plan.append({'lv': lv, 'remove': [{'name': n, 'dm': devs[n]['dm'], 'uuid': devs[n]['uuid'],
+                                           'owner': devs[n]['owner']} for n in rm]})
+    return plan, unknowns, problems
+
+
+def relink_devs_text(plan):
+    out = []
+    for p in plan:
+        for r in p['remove']:
+            out.append(u'%s (%s)' % (r['name'], u'it holds LV %s under an old name' % r['owner'] if r['owner'] else
+                                     u'the LV it mapped is gone'))
+    return u', '.join(out)
+
+
+def relink_text(hv, plan):
+    return ('device-mapper device(s) %s on %s are stale: SM\'s GC renamed or removed the LV on the SR master and '
+            'tells only the hosts that hold a host_ key for the VDI (_updateSlavesOnRename: deactivate the old name, '
+            'then refresh the new one), and %s was not told. SM\'s own activation does not mend them: LVM leaves a '
+            'device that holds the LV under another name as it is when its read-only flag already matches, and '
+            'cannot create the LV\'s device while another device carries its name. So they are removed first through '
+            'SM (on-slave deactivateNoRefcount of the LV: LVM removes the device that holds it by its uuid, with its '
+            '/dev/mapper node and /dev link, and refuses if it is open; SM then removes a device left under that '
+            'name), with SM\'s activation lock of each LV they hold held, and nothing on %s has them open'
+            % (relink_devs_text(plan), hv.name, hv.name, hv.name))
+
+
+def relink_owners(it):
+    out = set()
+    for p in (it.get('lv') or {}).get('relink') or []:
+        out.add(lock_owner(p['lv']))
+        out.update(lock_owner(r['owner']) for r in p['remove'] if r.get('owner'))
+    return sorted(x for x in out if x)
+
+
 def lv_listed(a, hv, sr, vdi):
     names = a.lvnames.get((hv.uuid, 'VG_XenStorage-' + sr))
     if names is None:
@@ -14091,7 +14382,7 @@ def lv_listed(a, hv, sr, vdi):
     return hit[0] if len(hit) == 1 else False
 
 
-def chain_refresh(a, hv, sr, vref, sm_reads=False):
+def chain_refresh(a, hv, sr, vref, sm_reads=False, devs=None):
     m = a.model
     out, unknowns, problems = [], [], []
     seen = set([m.vdis[vref]['uuid']])
@@ -14109,6 +14400,9 @@ def chain_refresh(a, hv, sr, vref, sm_reads=False):
             break
         rc, why = refcount_of(hv, sr, p)
         act = lv_active(hv, sr, p)
+        if act and devs is not None and any(devs[n]['state'] != 'ok' for n in [x + p for x in LV_PREFIXES]
+                                            if n in devs):
+            act = False
         if rc is None:
             unknowns.append(why)
         elif act is None:
@@ -14672,11 +14966,11 @@ def driver_left(a, hv, sr, vdi, sr_type):
     return problems, unknowns, evidence
 
 
-def forgotten(a, hv, sr, vdi, edit=False):
+def forgotten(a, hv, sr, vdi, edit=False, node_fix=False):
     cache = getattr(a, '_forgotten', None)
     if cache is None:
         cache = a._forgotten = {}
-    key = (hv.uuid, sr, vdi, edit)
+    key = (hv.uuid, sr, vdi, edit, node_fix)
     if key in cache:
         return cache[key]
     m = a.model
@@ -14693,11 +14987,16 @@ def forgotten(a, hv, sr, vdi, edit=False):
     if hv.taps is None or hv.tapinfo is None or hv.backend is None or hv.phy_list is None or hv.nbdlinks is None:
         unknowns.append('what SM left of it on %s is not established (%s)'
                         % (hv.name, hv.why('tapdisks', 'tapinfo', 'backend', 'phy', 'nbdlinks')))
-    rows, why = hv.serving(sr_type, vdi, sr) if hv.taps is not None else (None, 'tap-ctl list did not answer')
+    state, node, at = hv.node_state(sr, vdi)
+    other = state == 'other' and node_fix
+    if other:
+        left = [x for x in left if x != 'its backend node is still there' and
+                not (at is not None and x == 'tapdisk pid %s still serves it' % at.get('pid'))]
+    rows, why = hv.serving(sr_type, vdi, sr, exclude=at if other else None) if hv.taps is not None \
+        else (None, 'tap-ctl list did not answer')
     if rows is None:
         tap_why(why, unknowns, waits)
         rows = []
-    state, node, at = hv.node_state(sr, vdi)
     if rows:
         tp, tu, tw, te, tap = c03_tap(a, None, hv, None, sr, vdi, sr_type, None, rows, state, at, gone_vdi=True)
         problems.extend(tp)
@@ -14753,6 +15052,12 @@ def forgotten(a, hv, sr, vdi, edit=False):
             mn = (node.get('was_rdev') or [None, None])[1]
             if mn is not None and any(r['minor'] == mn for r in hv.empty_minors):
                 minor = mn
+        elif other:
+            plan['node'] = {'kind': 'block', 'rdev': list(node['rdev']), 'ino': node.get('ino'), 'leave': True}
+            evidence.append('its backend node points at tap minor %d, which now belongs to %s: this teardown leaves '
+                            'the node alone, and the datapath\'s fix removes it before xapi is asked to forget the '
+                            'datapath, so nothing reaches that tapdisk through it'
+                            % (node['rdev'][1], hv.row_label(at)))
         elif state == 'other':
             problems.append('its backend node points at tap minor %d, which now belongs to %s (C20)'
                             % (node['rdev'][1], hv.row_label(at)))
@@ -14803,7 +15108,8 @@ def forgotten(a, hv, sr, vdi, edit=False):
         unknowns.append('the xenstore backends on %s were not read' % hv.name)
     else:
         devs = set()
-        for mn in set([minor] + ([node['rdev'][1]] if node is not None and node['kind'] == 'block' else [])):
+        for mn in set([minor] + ([node['rdev'][1]] if node is not None and node['kind'] == 'block' and
+                                 not other else [])):
             if mn is not None and hv.tap_major is not None:
                 devs.add('%x:%x' % (hv.tap_major, mn))
         names = path_variants('%s/%s/%s' % (SM_BACKEND, sr, vdi)) | path_variants('%s/%s/%s' % (SM_PHY, sr, vdi))
@@ -15023,8 +15329,13 @@ def eval_guest_dp(a, opts, hv, dp, cl, sr, vdi, st):
     entry_dps = dict((sdb_entry(hv, sr, vdi) or {}).get('dps') or {})
     no_sm = sxm and vref is not None and len(entry_dps) > 1 and teardown_ops(entry_dps, dp) == ([], None)
     if vref is None:
-        fg = forgotten(a, hv, sr, vdi)
-        if not fg['left']:
+        fg = forgotten(a, hv, sr, vdi, node_fix=True)
+        if not fg['left'] and (fg['plan'].get('node') or {}).get('leave'):
+            unknowns.extend(fg['fu'])
+            evidence.append('%s; nothing else of it is left on %s: its backend node, which now points at another '
+                            'disk\'s tapdisk, is removed first, then xapi is told to forget the datapath '
+                            '(allow-leak=true)' % (GONE_VDI_TEXT, hv.name))
+        elif not fg['left']:
             unknowns.extend(fg['fu'])
             evidence.append('%s; nothing of it is left on %s, so xapi is told to forget the datapath straight away '
                             '(allow-leak=true)' % (GONE_VDI_TEXT, hv.name))
@@ -15108,9 +15419,6 @@ def eval_guest_dp(a, opts, hv, dp, cl, sr, vdi, st):
     state, node, at = hv.node_state(sr, vdi)
     if state == 'unknown':
         unknowns.append(at)
-    elif state == 'other' and vref is None:
-        problems.append('its backend node points at tap minor %d, which now belongs to %s (C20)'
-                        % (node['rdev'][1], hv.row_label(at)))
     elif state == 'other':
         inert, why_inert = plan_inert(hv, sr, vdi, sr_type, node)
         if inert is None:
@@ -15127,9 +15435,15 @@ def eval_guest_dp(a, opts, hv, dp, cl, sr, vdi, st):
                              'node is made harmless only while that tapdisk runs (if it was paused through this stale '
                              'node, its unpause needs the node)'
                              % (at['pid'], node['rdev'][1], tap_state_text(at['state'])))
-            evidence.append('its tapdisk is gone and tap minor %d now belongs to %s: SM\'s own deactivate would shut '
-                            'that tapdisk down, so the backend node is %s first, and that tapdisk is checked after the '
-                            'teardown' % (node['rdev'][1], hv.row_label(at), node_step_text(hv, vref, inert)))
+            evidence.append('its tapdisk is gone and tap minor %d now belongs to %s: %s, so the backend node is %s '
+                            'first, and that tapdisk is checked after the teardown'
+                            % (node['rdev'][1], hv.row_label(at),
+                               'SM\'s own deactivate would shut that tapdisk down' if vref is not None else
+                               'xapi calls no SM for a VDI it no longer has (its VDI.deactivate fails with No_VDI '
+                               'first, measured on XCP-ng 8.3), but anything that opens this node reaches that '
+                               'tapdisk, and so does SM\'s deactivate once an SR scan brings the VDI back (an SR with '
+                               'auto-scan is scanned every 30 s, measured, and a scan brings back a VDI whose image is '
+                               'still there)', node_step_text(hv, vref, inert)))
     elif state == 'free' and vref is not None:
         inert, why_inert = plan_inert(hv, sr, vdi, sr_type, node)
         if inert is None:
@@ -15294,12 +15608,20 @@ def eval_guest_dp(a, opts, hv, dp, cl, sr, vdi, st):
     if sr_type in LVM_SR_TYPES and vref is not None:
         rc, rwhy = refcount_of(hv, sr, vdi)
         act = lv_active(hv, sr, vdi)
+        devs, dwhy = lvm_devices(a, hv, sr)
         if rc is None:
             unknowns.append(rwhy)
         elif act is None:
             unknowns.append('the device-mapper devices on %s were not read: %s' % (hv.name, hv.why('blockmap')))
+        elif devs is None or dwhy:
+            unknowns.append('whether a device-mapper device on %s maps its LV under another name is not established: '
+                            '%s' % (hv.name, dwhy))
         else:
-            lv = {'vg': 'VG_XenStorage-' + sr, 'refcount': rc, 'active': act, 'lv': None, 'refresh': []}
+            named = [p + vdi for p in LV_PREFIXES if p + vdi in devs]
+            wrong = [n for n in named if devs[n]['state'] != 'ok']
+            act = act and not wrong
+            lv = {'vg': 'VG_XenStorage-' + sr, 'refcount': rc, 'active': act, 'lv': None, 'refresh': [], 'relink': [],
+                  'open_rw': bool(rw_open_elsewhere(a, vref, hv.href))}
             for dm, pre in zip(lv_dm_names(sr, vdi), ('VHD-', 'LV-', 'QCOW2-')) if act else ():
                 if dm not in ((hv.blockmap or {}).get('dm') or {}):
                     continue
@@ -15316,10 +15638,10 @@ def eval_guest_dp(a, opts, hv, dp, cl, sr, vdi, st):
                                     'a stale mapping; refresh it through SM first (on-slave refresh)'
                                     % (hv.name, canon(dmc['value'].get('dm'))[:200],
                                        canon(dmc['value'].get('lvm'))[:200]))
-            anc, au, ap = chain_refresh(a, hv, sr, vref, sm_reads=True) if rc[1] >= 1 else ([], [], [])
+            anc, au, ap = chain_refresh(a, hv, sr, vref, sm_reads=True, devs=devs) if rc[1] >= 1 else ([], [], [])
             unknowns.extend(au)
             problems.extend(ap)
-            stale = (sum(rc) >= 1 and not act) or rc[0] >= 1 or bool(anc)
+            stale = (sum(rc) >= 1 and not act) or rc[0] >= 1 or bool(anc) or bool(wrong)
             if stale and needs:
                 unknowns.append('SM counts %d %d activation(s) of its LV on %s, which is read again once the dom0 '
                                 'VBD(s) are released: run this again then' % (rc[0], rc[1], hv.name))
@@ -15342,6 +15664,13 @@ def eval_guest_dp(a, opts, hv, dp, cl, sr, vdi, st):
                     elif sum(rc) >= 1 and not act:
                         lv['refresh'].append(listed[0])
                     lv['refresh'].extend(anc)
+                    rl, ru, rp = relink_plan(a, hv, sr, sorted(set([listed[0]] + lv['refresh'])), lv['refresh'])
+                    unknowns.extend(ru)
+                    problems.extend(rp)
+                    if rl:
+                        lv['relink'] = rl
+                        steps.append('relink')
+                        evidence.append(relink_text(hv, rl))
                     if lv['refresh']:
                         steps.append('refresh')
                         evidence.append('SM counts an activation of %s on %s, but %s not active there, so SM\'s own '
@@ -15722,6 +16051,20 @@ def node_step_text(hv, vref, inert):
                 % '; '.join(elsewhere[:3]))
     return ('removed, with its .attach_info and NBD link (not made inert, so that nothing on this host that is handed '
             'this datapath\'s attach info, such as an export, opens a file in its place)')
+
+
+def rw_open_elsewhere(a, vref, href):
+    m = a.model
+    vdi = m.vdis[vref]['uuid']
+    hosts = set()
+    for r, vbd in vdi_vbds(m, vref):
+        where = (m.vms.get(vbd['VM']) or {}).get('resident_on')
+        if vbd.get('currently_attached') and vbd.get('mode') == 'RW' and where in m.hosts and where != href:
+            hosts.add(where)
+    for k, val in (m.vdis[vref].get('sm_config') or {}).items():
+        if k.startswith('host_') and k[len('host_'):] != href and val == 'RW' and k[len('host_'):] in m.hosts:
+            hosts.add(k[len('host_'):])
+    return sorted(h for h in hosts if (a.view(h).tap_vdis or {}).get(vdi))
 
 
 def live_elsewhere(m, vref, href):
@@ -16651,9 +16994,20 @@ def relink_override(a, opts, v, sr):
 RELINK_FLIGHT = 600
 
 
-def leaf_try_live(a, hv, vdi8):
+def leaf_try_live(a, hv, vdi8, at=None):
     s = (((hv.smlog or {}).get('leaf') or {}).get(vdi8)) or {}
+    lo, hi = at if isinstance(at, tuple) else (at, at)
     for x in reversed(s.get('attempts') or []):
+        if at is not None:
+            if x['start'] > hi + 1 or (x.get('out') != 'running' and (x.get('end') is None or x['end'] < lo - 1)):
+                continue
+            pi = next((p for p in hv.procs or [] if p.get('pid') == x['pid']), None)
+            if pi and pi.get('sm') and pi.get('start', 0) <= x['start'] + 1:
+                return x
+            pi = a.pidinfo.get((hv.uuid, x['pid']))
+            if pi and pi.get('alive') and pi.get('sm') and pi.get('start', 0) <= x['start'] + 1:
+                return x
+            continue
         if x.get('out') != 'running':
             continue
         pi = a.pidinfo.get((hv.uuid, x['pid']))
@@ -17971,9 +18325,52 @@ def in_use_here(a, hv, vdi):
     return why
 
 
+def lv_name_devs(a, hv, sr, vdi, lvname=None):
+    problems, unknowns, evidence, owners = [], [], [], []
+    devs, dwhy = lvm_devices(a, hv, sr)
+    if devs is None or dwhy:
+        return [], [dwhy], [], []
+    names = [lvname] if lvname else [p + vdi for p in LV_PREFIXES]
+    for n, r in sorted(devs.items()):
+        under = n in names
+        if r['state'] == 'ok' or not (under or (r['owner'] in names and n != r['owner'])):
+            continue
+        if r['state'] == 'unknown':
+            unknowns.append('device-mapper device %s on %s: %s' % (n, hv.name, dev_unknown_text(r)))
+            continue
+        if r['open']:
+            problems.append('%s on %s is open (open count %d), and SM\'s deactivate of this LV removes it'
+                            % (dev_text(n, r), hv.name, r['open']))
+            continue
+        ov = lock_owner(r['owner']) if under and r['owner'] and r['owner'] not in names else None
+        if under and r['owner'] and r['owner'] not in names and (ov is None or ov == vdi):
+            problems.append('%s on %s carries this LV\'s name, and SM\'s deactivate of this LV would remove it by name '
+                            'and with it LV %s, which this tool does not take SM\'s activation lock of'
+                            % (dev_text(n, r), hv.name, r['owner']))
+            continue
+        if ov:
+            rc, why = refcount_of(hv, sr, ov)
+            if rc is None:
+                unknowns.append(why)
+                continue
+            if sum(rc) or in_use_here(a, hv, ov):
+                problems.append('%s on %s carries this LV\'s name, and SM\'s deactivate of this LV removes it by '
+                                'name, which would take that LV away there while SM counts or uses VDI %s'
+                                % (dev_text(n, r), hv.name, ov))
+                continue
+            owners.append(ov)
+        evidence.append('%s on %s, open count 0: SM\'s deactivate of this LV removes it (%s)' % (
+            dev_text(n, r), hv.name, 'by its name, which is this LV\'s' if under else
+            'LVM removes the device that holds the LV, whatever its name'))
+    return problems, unknowns, evidence, owners
+
+
 def lv_put_proof(a, hv, sr, vdi, want):
     m = a.model
     problems, waits = [], []
+    lst = lv_listed(a, hv, sr, vdi)
+    dp_, du, de, do = lv_name_devs(a, hv, sr, vdi, lst[0] if lst else None)
+    problems.extend(dp_ + du)
     rc, why = refcount_of(hv, sr, vdi)
     if rc is None:
         problems.append(why)
@@ -18024,9 +18421,11 @@ def lv_put_proof(a, hv, sr, vdi, want):
     return problems, waits
 
 
-def lv_forget_proof(a, hv, sr, vdi, want, held=False):
+def lv_forget_proof(a, hv, sr, vdi, want, held=False, plan=None):
     m = a.model
     problems, unknowns, waits, evidence = [], [], [], []
+    plan = plan if plan is not None else {}
+    plan['drop'], plan['after_refresh'], plan['owners'] = [], [], []
     rc, why = refcount_of(hv, sr, vdi)
     if rc is None:
         unknowns.append(why)
@@ -18036,6 +18435,26 @@ def lv_forget_proof(a, hv, sr, vdi, want, held=False):
     if m.vdi_by_uuid.get(vdi) is not None:
         problems.append('the VDI is in xapi')
     kids = sorted(v['uuid'] for v in m.vdis.values() if v['sm_config'].get('vhd-parent') == vdi)
+    dead = []
+    for k in kids:
+        kv = m.vdis[m.vdi_by_uuid[k]]
+        if kv['type'] == 'cbt_metadata' and kv.get('is_a_snapshot'):
+            dead.append(k)
+    if dead:
+        names = a.lvnames.get((hv.uuid, 'VG_XenStorage-' + sr))
+        if names is None:
+            unknowns.append('the LVs of its SR were not listed on %s, so whether CBT snapshot(s) %s still have an '
+                            'image is not established' % (hv.name, ', '.join(dead[:3])))
+        else:
+            imaged = [k for k in dead if any(n in [p + k for p in LV_PREFIXES] for n, attr in names)]
+            if imaged:
+                problems.append('VDI %s names it as its parent and still has an image LV, although xapi records it as '
+                                'CBT metadata only' % ', '.join(imaged[:3]))
+            else:
+                evidence.append('VDI %s names it as its parent, but %s a CBT snapshot whose data was destroyed (type '
+                                'CBT metadata, no image LV, only its .cbtlog): nothing reads that chain'
+                                % (', '.join(dead[:3]), 'it is' if len(dead) == 1 else 'they are'))
+    kids = [k for k in kids if k not in dead]
     if kids:
         problems.append('VDI %s names it as its parent' % ', '.join(kids[:3]))
     unread = use_unread(hv)
@@ -18067,8 +18486,46 @@ def lv_forget_proof(a, hv, sr, vdi, want, held=False):
     if act is None:
         unknowns.append('the device-mapper devices on %s were not read: %s' % (hv.name, hv.why('blockmap')))
     elif act:
-        problems.append('a device-mapper node of it is still on %s with no LV behind it, which this tool does not '
-                        'remove (SM\'s own clean-up of one falls back to dmsetup remove --force)' % hv.name)
+        devs, dwhy = lvm_devices(a, hv, sr)
+        if devs is None or dwhy:
+            unknowns.append('a device-mapper node of it is still on %s, and what it maps is not established: %s'
+                            % (hv.name, dwhy))
+        for n in [p + vdi for p in LV_PREFIXES if devs is not None and not dwhy and p + vdi in devs]:
+            r = devs[n]
+            if r['state'] in ('unknown', 'ok'):
+                problems.append('a device-mapper node of it is still on %s (%s): %s' % (
+                    hv.name, n, dev_unknown_text(r) if r['state'] == 'unknown' else
+                    'its uuid is that of an LV of that name, which the listing missed'))
+            elif r['open']:
+                problems.append('%s on %s is open (open count %d)' % (dev_text(n, r), hv.name, r['open']))
+            elif r['state'] == 'orphan':
+                plan['drop'].append(n)
+                evidence.append('%s on %s, open count 0: it is removed through SM first (on-slave '
+                                'deactivateNoRefcount, which finds no LV of that name and removes the device with its '
+                                '/dev/mapper node and /dev link, SM\'s _lvmBugCleanup)' % (dev_text(n, r), hv.name))
+            else:
+                ov = lv_vdi_of(r['owner'])
+                orc, owhy = refcount_of(hv, sr, ov) if ov else ([0, 0], None)
+                dps = sorted(dp for dp, cl in (hv.claim or {}).items() if GUEST_DP_RE.match(dp) and
+                             any(c[0] == sr and c[1] == ov for c in cl)) if ov else []
+                if orc is None:
+                    unknowns.append(owhy)
+                elif ov and (sum(orc) or in_use_here(a, hv, ov)) and dps and not held:
+                    plan['after_refresh'].append([ov, dps, n])
+                    evidence.append('%s on %s: SM there counts or uses VDI %s, so this device is first removed by '
+                                    'the C03 fix of its datapath %s (the relink before its refresh), in this run, and '
+                                    'its count is dropped after that' % (dev_text(n, r), hv.name, ov, ', '.join(dps)))
+                elif ov and (sum(orc) or in_use_here(a, hv, ov)):
+                    problems.append('%s on %s, and SM counts or uses VDI %s there, so this tool does not remove the '
+                                    'device' % (dev_text(n, r), hv.name, ov))
+                else:
+                    plan['drop'].append(n)
+                    if lock_owner(r['owner']):
+                        plan['owners'].append(lock_owner(r['owner']))
+                    evidence.append('%s on %s, open count 0, and nothing on %s counts or uses %s: the device is '
+                                    'removed through SM first (on-slave deactivateNoRefcount, which finds no LV named '
+                                    '%s and removes the device with its /dev/mapper node and /dev link)'
+                                    % (dev_text(n, r), hv.name, hv.name, r['owner'], n))
     if hv.locks is None:
         unknowns.append('the SM locks on %s were not read' % hv.name)
     else:
@@ -18168,19 +18625,28 @@ def eval_lvrefs(a, opts):
                                 'or a disk on top of it attached: no datapath, tapdisk, backend node, phy link or VBD'
                                 % (rc[0], rc[1], hv.name))
                 if vref is None and sref is not None and m.srs[sref]['type'] in LVM_SR_TYPES:
-                    fp, fu, fw, fe = lv_forget_proof(a, hv, sr, vdi, rc)
+                    fplan = {}
+                    fp, fu, fw, fe = lv_forget_proof(a, hv, sr, vdi, rc, plan=fplan)
                     evidence.extend(fe)
                     verdict, reason = verdict_of(fp, fu, fw)
                     if verdict == FIX:
                         reason = ('xapi no longer has the VDI and no LV of it is left, but SM on %s still counts an '
-                                  'activation of it: the count and its lock file are dropped through SM (on-slave '
+                                  'activation of it: %sthe count and its lock file are dropped through SM (on-slave '
                                   'cleanupLockAndRefcount), the call SM\'s GC makes on every host when it deletes an LV'
-                                  % hv.name)
+                                  % (hv.name, 'its stale device-mapper device %s is removed through SM first, then '
+                                     % ', '.join(fplan['drop']) if fplan['drop'] else
+                                     'once the C03 fix of the datapath of VDI %s has removed its stale device-mapper '
+                                     'device %s (the relink before that disk\'s refresh), '
+                                     % (fplan['after_refresh'][0][0], fplan['after_refresh'][0][2])
+                                     if fplan['after_refresh'] else ''))
                     else:
                         reason = 'the VDI is not in xapi; %s' % reason
                     item = {'cls': 'C16', 'phase': 'L', 'action': 'lv-forget', 'host': hv.uuid, 'sr': sr, 'vdi': vdi,
-                            'lv': {'vg': 'VG_XenStorage-' + sr, 'lv': None, 'refcount': rc}}
-                    out.append(ev(k, 'C16', verdict, hv.uuid, title, reason, evidence, sig=[rc],
+                            'lv': {'vg': 'VG_XenStorage-' + sr, 'lv': None, 'refcount': rc, 'drop': fplan['drop'],
+                                   'owners': sorted(set(fplan['owners']))}}
+                    if fplan['after_refresh']:
+                        item['after_refresh'] = fplan['after_refresh']
+                    out.append(ev(k, 'C16', verdict, hv.uuid, title, reason, evidence, sig=[rc, fplan['drop']],
                                   item=item if verdict == FIX else None))
                     continue
                 if sref is None or m.srs[sref]['type'] not in LVM_SR_TYPES:
@@ -18199,6 +18665,10 @@ def eval_lvrefs(a, opts):
                     problems.append('the volume group on %s does not list exactly one LV for it' % hv.name)
                 elif len(listed[1]) > 5 and listed[1][5] == 'o':
                     problems.append('its LV %s is open on %s (attributes %s)' % (listed[0], hv.name, listed[1]))
+                dp_, du, de, do = lv_name_devs(a, hv, sr, vdi, listed[0] if listed else None)
+                problems.extend(dp_)
+                unknowns.extend(du)
+                evidence.extend(de)
                 if sref is not None:
                     gstate, greasons = gc_state(a, sref)
                     if gstate == 'running':
@@ -18228,6 +18698,140 @@ def eval_lvrefs(a, opts):
                 item = {'cls': 'C16', 'phase': 'L', 'action': 'lv-deactivate', 'host': hv.uuid, 'sr': sr, 'vdi': vdi,
                         'lv': {'vg': 'VG_XenStorage-' + sr, 'lv': listed[0] if listed else None, 'refcount': rc}}
                 out.append(ev(k, 'C16', verdict, hv.uuid, title, reason, evidence, sig=[rc],
+                              item=item if verdict == FIX else None))
+    return out
+
+
+def lvdev_covered(a, hv, sr, n, r):
+    unread = [x for x, v in (('SM\'s LV activation counts', hv.smrefs), ('storage.db', hv.claim)) if v is None]
+    if unread:
+        return 'unknown', ('whether C16 or C03 judge it is not established: %s on %s %s not read'
+                           % (' and '.join(unread), hv.name, 'was' if len(unread) == 1 else 'were'))
+    vu = lv_vdi_of(n)
+    if vu and not n.endswith('.cbtlog') and vu in (hv.smrefs.get('lvm-' + sr) or {}):
+        return 'covered', 'its name is that of an LV whose activation SM on %s counts (C16 or C03 judges it)' % hv.name
+    xv = lv_vdi_of(r['owner']) if r.get('owner') else None
+    if xv and not r['owner'].endswith('.cbtlog') and any(
+            GUEST_DP_RE.match(dp) and any(c[0] == sr and c[1] == xv for c in cl) for dp, cl in hv.claim.items()):
+        return 'covered', 'it holds the LV of VDI %s, whose datapath on %s C03 judges' % (xv, hv.name)
+    return None, None
+
+
+def lvdev_proof(a, hv, sr, n, r, held=False):
+    m = a.model
+    problems, unknowns, waits, evidence = [], [], [], []
+    ids = a.lvids.get((hv.uuid, 'VG_XenStorage-' + sr)) or {'lvs': {}}
+    devs, dwhy = lvm_devices(a, hv, sr)
+    if devs is None or dwhy:
+        return [], [dwhy], [], []
+    unread = use_unread(hv)
+    if unread:
+        unknowns.append('%s on %s were not read, so what uses the LVs it maps there is not established'
+                        % (', '.join(unread), hv.name))
+    if r['open']:
+        problems.append('it is open on %s (open count %d)' % (hv.name, r['open']))
+    if r['state'] == 'misnamed':
+        xv = lv_vdi_of(r['owner'])
+        rc, why = refcount_of(hv, sr, xv) if xv else ([0, 0], None)
+        if rc is None:
+            unknowns.append(why)
+        elif xv and (sum(rc) or in_use_here(a, hv, xv)):
+            problems.append('SM on %s counts or uses VDI %s, whose LV %s it holds, so removing it would take that LV '
+                            'away there' % (hv.name, xv, r['owner']))
+        else:
+            evidence.append('nothing on %s counts or uses %s, the LV it holds, so removing it only deactivates that LV '
+                            'there, under a name nothing uses' % (hv.name, r['owner']))
+    if n in ids['lvs'].values():
+        own = [d for d2, d in devs.items() if d['owner'] == n]
+        if own:
+            problems.append('LV %s, whose name it carries, is active on %s as device %s, and SM\'s clean-up acts on '
+                            'the LV of that name first' % (n, hv.name, own[0]['dm']))
+        else:
+            evidence.append('LV %s, whose name it carries, is not active on %s under any name, so SM\'s lvchange -an '
+                            'of that name changes nothing and its clean-up then removes this device by name'
+                            % (n, hv.name))
+    else:
+        evidence.append('no LV of the volume group is named %s, so SM finds none and removes the device by name '
+                        '(_lvmBugCleanup), with its /dev/mapper node and /dev link' % n)
+    vu = lv_vdi_of(n)
+    if hv.locks is None:
+        unknowns.append('the SM locks on %s were not read' % hv.name)
+    elif vu:
+        for l in hv.locks:
+            if l['path'] == '%s/lvm-%s/%s' % (SM_LOCK_DIR, sr, vu) or \
+                    (l['path'] == '%s/%s/vdi' % (SM_LOCK_DIR, vu) and not held):
+                waits.append('its SM lock %s is held by pid %d' % (l['path'], l['pid']))
+    sref = m.sr_by_uuid.get(sr)
+    gstate, greasons = gc_state(a, sref) if not held else ('held', [])
+    if gstate == 'running':
+        note, wait = gc_running_text(a, sref, greasons, 'the clean-up')
+        if wait:
+            waits.append(wait)
+        else:
+            evidence.append(note)
+    elif gstate not in ('idle', 'held') and master_gc(a, sref) is None:
+        unknowns.append('whether the GC of its SR runs is not established (%s)' % '; '.join(greasons[:2]))
+    if vu:
+        busy = lv_put_busy(a, hv, sr, vu)
+        if busy is None:
+            unknowns.append('the processes on %s were not read' % hv.name)
+        else:
+            waits.extend(busy)
+    return problems, unknowns, waits, evidence
+
+
+def eval_lvdevs(a, opts):
+    out = []
+    m = a.model
+    for href in sorted(m.hosts):
+        hv = a.view(href)
+        if not hv.live or hv.doc is None:
+            continue
+        for sref, s in sorted(m.srs.items(), key=lambda kv: kv[1]['uuid']):
+            if s['type'] not in LVM_SR_TYPES:
+                continue
+            sr = s['uuid']
+            devs, dwhy = lvm_devices(a, hv, sr)
+            if devs is None:
+                out.append(ev(('C16', 'lvdevs', hv.uuid), 'C16', UNKNOWN, hv.uuid,
+                              'C16 device-mapper devices on %s not judged' % hv.name, dwhy))
+                break
+            if dwhy:
+                out.append(ev(('C16', 'lvdevs', hv.uuid, sr), 'C16', UNKNOWN, hv.uuid,
+                              'C16 device-mapper devices of SR %s on %s not judged' % (sr, hv.name), dwhy))
+                continue
+            for n, r in sorted(devs.items()):
+                if r['state'] == 'ok':
+                    continue
+                k = ('C16', 'lvdev', hv.uuid, sr, n)
+                title = 'C16 stale device-mapper device %s on %s' % (n, hv.name)
+                if r['state'] == 'unknown':
+                    out.append(ev(k, 'C16', UNKNOWN, hv.uuid, 'C16 device-mapper device %s on %s not judged'
+                                  % (n, hv.name), dev_unknown_text(r)))
+                    continue
+                cov, ctext = lvdev_covered(a, hv, sr, n, r)
+                if cov == 'unknown':
+                    out.append(ev(k, 'C16', UNKNOWN, hv.uuid, title, ctext))
+                    continue
+                if cov:
+                    continue
+                problems, unknowns, waits, evidence = lvdev_proof(a, hv, sr, n, r)
+                verdict, reason = verdict_of(problems, unknowns, waits)
+                what = ('it maps the extents of an LV that is gone: they are free or belong to another LV now'
+                        if r['state'] == 'orphan' else
+                        'it maps LV %s under an old name: SM\'s GC renamed that LV on the SR master and tells only the '
+                        'hosts that hold a host_ key for its VDI' % r['owner'])
+                evidence.insert(0, '%s; /dev/VG_XenStorage-%s/%s on %s leads to it, so anything there that opens that '
+                                   'path reads and writes those extents instead of the LV of that name' % (what, sr, n,
+                                                                                                         hv.name))
+                if verdict == FIX:
+                    reason = ('%s; nothing has it open: it is removed through SM (on-slave deactivateNoRefcount), with '
+                              'the GC of its SR held off' % what)
+                named = n in ((a.lvids.get((hv.uuid, 'VG_XenStorage-' + sr)) or {}).get('lvs') or {}).values()
+                item = {'cls': 'C16', 'phase': 'L', 'action': 'lv-device', 'host': hv.uuid, 'sr': sr,
+                        'vdi': lv_vdi_of(n), 'dev': {'vg': 'VG_XenStorage-' + sr, 'name': n, 'dm': r['dm'],
+                                                     'uuid': r['uuid'], 'owner': r['owner'], 'named_lv': named}}
+                out.append(ev(k, 'C16', verdict, hv.uuid, title, reason, evidence, sig=[r['uuid'], r['owner']],
                               item=item if verdict == FIX else None))
     return out
 
@@ -18724,11 +19328,29 @@ def c12_refresh_plan(a, hv, sr, vdi, vref):
     if not listed[0].startswith(COW_LV_PREFIX.get(fmt, '?')):
         return ['it is %s, and this tool activates only %s LVs through SM, each under the name of the disk\'s own '
                 'format (this disk\'s is %s)' % (listed[0], COW_TEXT, fmt or 'not recorded')], [], None
-    anc, au, ap = chain_refresh(a, hv, sr, vref)
+    devs, dwhy = lvm_devices(a, hv, sr)
+    if devs is None or dwhy:
+        return [], ['whether a device-mapper device on %s carries its LV\'s name with another uuid is not established: '
+                    '%s' % (hv.name, dwhy)], None
+    anc, au, ap = chain_refresh(a, hv, sr, vref, devs=devs)
+    shaky = [n for n, r in sorted(devs.items()) if r['state'] == 'unknown' and
+             (n in [listed[0]] + anc or r['owner'] in [listed[0]] + anc)]
+    if shaky:
+        au = au + ['device-mapper device %s on %s: %s' % (shaky[0], hv.name, dev_unknown_text(devs[shaky[0]]))]
+    squat = [n for n in [listed[0]] + anc if n in devs and devs[n]['state'] not in ('ok', 'unknown')]
+    held = [n for n, r in sorted(devs.items()) if r['owner'] in [listed[0]] + anc and n != r['owner'] and
+            r['state'] != 'unknown']
+    if squat:
+        ap = ap + ['%s on %s carries the name of an LV its refresh activates (see C16), and SM\'s activation of that '
+                   'name would clash with it' % (dev_text(squat[0], devs[squat[0]]), hv.name)]
+    elif held:
+        ap = ap + ['%s on %s, an LV its refresh activates (see C16 and C03), and SM\'s activation leaves such a '
+                   'device as it is when its read-only flag already matches' % (dev_text(held[0], devs[held[0]]),
+                                                                                 hv.name)]
     if au or ap:
         return ap, au, None
     return [], [], {'vg': 'VG_XenStorage-' + sr, 'lv': listed[0], 'refresh': [listed[0]] + anc, 'refcount': rc,
-                    'active': False}
+                    'active': False, 'open_rw': bool(rw_open_elsewhere(a, vref, hv.href))}
 
 
 def eval_gc(a, opts):
@@ -20504,25 +21126,81 @@ def eval_linstor(a, opts):
         title = 'the LINSTOR journal of SR %s has %d entr%s' % (
             m.name_sr(m.sr_by_uuid[sru]) if sru in m.sr_by_uuid else sru, len(jr), 'y' if len(jr) == 1 else 'ies')
         evidence = ['%s = %s' % (_text(k), canon(x)[:120]) for k, x in sorted(jr.items())[:8]]
-        own = journal_in_try(a, sru, jr)
+        smref = m.sr_master(m.sr_by_uuid[sru]) if sru in m.sr_by_uuid else None
+        val = rec.get('value') or {}
+        mine = smref in m.hosts and val.get('host') == m.hosts[smref]['uuid'] and val.get('read_at') is not None
+        own = journal_in_try(a, sru, jr, read_at=(val.get('read_start', val['read_at']), val['read_at'])
+                             if mine else None)
+        keys = sorted(_text(k) for k in jr)
+        gc_keys = [k for k in keys if RE_GC_JOURNAL.match(k)]
+        gc_only = len(gc_keys) == len(keys)
+        sref = m.sr_by_uuid.get(sru)
+        gstate = gc_state(a, sref)[0] if gc_only and sref is not None else None
+        blocks = gc_journal_blocks(m, sref, gc_keys)
         if own:
-            e = ev(('ENV', 'linstor-journal', sru), 'C18', INFO, None, title, own, evidence,
-                   sig=sorted(_text(k) for k in jr))
+            e = ev(('ENV', 'linstor-journal', sru), 'C18', INFO, None, title, own, evidence, sig=keys)
+        elif gc_only and gstate == 'running':
+            e = ev(('ENV', 'linstor-journal', sru), 'C18', INFO, None, title,
+                   'the GC\'s own markers (%s): a GC task or process for the SR runs now, and %s; SM refuses to attach '
+                   'VDI(s) %s until they are gone%s'
+                   % (', '.join(keys[:4]), gc_journal_text(gc_keys), ', '.join(named[:4]) or 'none named',
+                      ''.join('; but ' + b for b in blocks)), evidence, sig=keys)
+        elif gc_only:
+            e = ev(('ENV', 'linstor-journal', sru), 'C18', REPORT, None, title,
+                   'the GC\'s own markers (%s), left when a GC stopped mid-step, and no GC runs for the SR now: %s. SM '
+                   'refuses to attach VDI(s) %s until they are gone. xe sr-scan uuid=%s on the pool master starts a GC '
+                   '(the scan itself replays only clone and inflate entries)%s'
+                   % (', '.join(keys[:4]), gc_journal_text(gc_keys), ', '.join(named[:4]) or 'none named', sru,
+                      ''.join('; ' + b for b in blocks)), evidence, sig=keys)
         else:
             e = ev(('ENV', 'linstor-journal', sru), 'C18', REPORT, None, title,
-                   'an SM or GC transaction on LINSTOR was interrupted (%s), and SM refuses to attach the VDI(s) it names '
-                   '(%s) until a scan of the SR on its master replays it: xe sr-scan uuid=%s on the pool master'
-                   % (', '.join(sorted(_text(k) for k in jr)[:4]), ', '.join(named[:4]) or 'none named', sru),
-                   evidence, sig=sorted(_text(k) for k in jr))
+                   'an SM transaction on LINSTOR was interrupted (%s), and SM refuses to attach the VDI(s) it names '
+                   '(%s) until its entries are gone: a scan of the SR on its master replays clone and inflate entries '
+                   '(xe sr-scan uuid=%s on the pool master)%s'
+                   % (', '.join(keys[:4]), ', '.join(named[:4]) or 'none named', sru,
+                      '; of the GC\'s own markers among them, %s' % gc_journal_text(gc_keys) if gc_keys else ''),
+                   evidence, sig=keys)
         e['subjects'] = named
         out.append(e)
     return out
 
 
-RE_GC_JOURNAL = re.compile(r'^(?:relink|coalesce)/(' + UUID_PAT + r')$')
+RE_GC_JOURNAL = re.compile(r'^(relink|coalesce|leaf|zero)/(' + UUID_PAT + r')$')
+GC_JOURNAL_TEXT = (
+    ('coalesce', 'a coalesce marker is removed by a GC run that finds work (garbage, or a coalesce or leaf-coalesce '
+                 'candidate) at the start of its loop; a GC with nothing to do exits before that'),
+    ('relink', 'a relink entry is finished when the GC next coalesces its VDI, which it does only while the SR\'s '
+               'coalescing is on (other-config coalesce is not false) and the VDI is in its tree, and is dropped for a '
+               'VDI that is gone only after the GC has collected garbage'),
+    ('leaf', 'a leaf-coalesce marker is cleared by every GC run when it scans the SR'),
+    ('zero', 'a zeroing entry is finished when the GC next processes its VDI, and is dropped for a VDI that is gone '
+             'only after the GC has collected garbage'))
 
 
-def journal_in_try(a, sru, jr):
+def gc_journal_text(keys):
+    kinds = set(RE_GC_JOURNAL.match(k).group(1) for k in keys if RE_GC_JOURNAL.match(k))
+    return '; '.join(t for k, t in GC_JOURNAL_TEXT if k in kinds)
+
+
+def gc_journal_blocks(m, sref, keys):
+    out = []
+    kinds = dict((RE_GC_JOURNAL.match(k).group(2), RE_GC_JOURNAL.match(k).group(1)) for k in keys
+                 if RE_GC_JOURNAL.match(k))
+    if sref is not None and _text((m.srs[sref].get('other_config') or {}).get('gc')) == 'false' and \
+            set(kinds.values()) - set(['leaf']):
+        out.append('the SR\'s other-config has gc=false, so a GC run stops before it removes coalesce markers or '
+                   'finishes or drops relink and zeroing entries (a scan still clears leaf-coalesce markers)')
+    if sref is not None and _text((m.srs[sref].get('other_config') or {}).get('coalesce')).lower() == 'false' and \
+            'relink' in kinds.values():
+        out.append('the SR\'s other-config has coalesce=false, so no GC finishes its relink entries')
+    gone = sorted(u for u, k in kinds.items() if k in ('relink', 'zero') and u not in m.vdi_by_uuid)
+    if gone:
+        out.append('VDI(s) %s, which an entry names, are not in xapi, so their entries are dropped only once a GC '
+                   'run collects garbage' % ', '.join(gone[:3]))
+    return out
+
+
+def journal_in_try(a, sru, jr, read_at=None):
     m = a.model
     sref = m.sr_by_uuid.get(sru)
     smref = m.sr_master(sref) if sref else None
@@ -20531,17 +21209,20 @@ def journal_in_try(a, sru, jr):
     hv = a.view(smref)
     now = host_time(hv, a)
     tries = []
+    t1 = read_at if read_at is not None else (hv.identity or {}).get('time') if hv.procs is not None else None
+    hi = t1[1] if isinstance(t1, tuple) else t1
     for v8 in sorted(((hv.smlog or {}).get('leaf') or {})):
-        x = leaf_try_live(a, hv, v8)
-        if x and x.get('round') and now - x['round'][1] <= RELINK_FLIGHT:
+        x = leaf_try_live(a, hv, v8, at=t1)
+        if x and x.get('round') and (hi if hi is not None else now) - x['round'][1] <= RELINK_FLIGHT:
             tries.append((v8, x))
     hit = None
     for k in sorted(_text(k) for k in jr):
         mm = RE_GC_JOURNAL.match(k)
-        t = next((t for t in tries if mm and t[1]['round'][0] == mm.group(1)[:8]), None)
+        t = next((t for t in tries if mm and mm.group(1) in ('relink', 'coalesce') and
+                  t[1]['round'][0] == mm.group(2)[:8]), None)
         if t is None:
             return None
-        hit = hit or (t, mm.group(1))
+        hit = hit or (t, mm.group(2))
     (v8, x), snap = hit
     refs = [r for r, v in m.vdis.items() if v['SR'] == sref and v['uuid'].startswith(v8)]
     return ('%s, and %s is the snapshot that round is merging (its "Coalescing parent" line %s ago): each round writes '
@@ -20564,7 +21245,8 @@ def ha_starts(m):
 
 
 EVALUATORS = (eval_hosts, eval_ha, eval_dps, eval_vbds, eval_vdis, eval_aborts, eval_taps, eval_hazards, eval_gc,
-              eval_lvrefs, eval_held_vms, eval_diverged, eval_chain, eval_ops, eval_nbd, eval_clients, eval_linstor,
+              eval_lvrefs, eval_lvdevs, eval_held_vms, eval_diverged, eval_chain, eval_ops, eval_nbd, eval_clients,
+              eval_linstor,
               eval_thin_maps, eval_orphans, eval_stuck_deletes, eval_satellites, eval_receiving)
 REPORT_ONLY_EVALUATORS = (eval_clients, eval_linstor, eval_thin_maps)
 
@@ -20922,6 +21604,25 @@ def dependencies(final, audits):
                                       'not judged'))
                     moved = True
                     break
+    for e in final:
+        it = e.get('item')
+        if not (it and it.get('after_refresh')):
+            continue
+        for ov, dps, n in it['after_refresh']:
+            c03s = [by.get(('C03', it['host'], it['sr'], ov, dp)) for dp in dps]
+            if any(x is not None and x['verdict'] == FIX and x.get('item') and
+                   'relink' in (x['item'].get('steps') or []) and
+                   any(r['name'] == n for p in ((x['item'].get('lv') or {}).get('relink') or []) for r in p['remove'])
+                   for x in c03s):
+                continue
+            first = ([x for x in c03s if x is not None] or [None])[0]
+            e['verdict'] = first['verdict'] if first is not None and first['verdict'] in (WAIT, UNKNOWN) else REPORT
+            e['item'] = None
+            e['reason'] = ('device-mapper device %s of it on its host holds the LV of VDI %s under this old name, and '
+                           'the C03 fix of that disk\'s datapath %s, whose relink removes it, does not run in this '
+                           'run (%s)' % (n, ov, ', '.join(dps), ('%s: %s' % (first['verdict'], first['reason']))
+                                         if first is not None else 'not judged'))
+            break
     for e in final:
         if e['cls'] != 'C20':
             continue
@@ -21427,7 +22128,7 @@ def batch_touch(it):
 def item_key(it):
     keep = dict((k, v) for k, v in it.items() if k not in ('seq', 'after', 'later', 'later_own', 'later_taps',
                                                            'later_keys', 'dps_write', 'after_resync', 'strip_risk',
-                                                           'before_restart', 'pre'))
+                                                           'before_restart', 'pre', 'after_refresh'))
     return canon(keep)
 
 
@@ -21497,10 +22198,16 @@ def candidates_round2(a, opts):
                                          'statfiles': set(), 'vgs': set(), 'srdirs': set(),
                                          'xsread': set(), 'vhdcheck': set(), 'drbdres': set(), 'dmcheck': set(),
                                          'taplog': {}, 'chain': {'vgs': set(), 'srdirs': set(), 'vhd': []},
-                                         'drbdall': False, 'thinvgs': set(), 'detail': set(), 'xenops': set()})
+                                         'drbdall': False, 'thinvgs': set(), 'detail': set(), 'xenops': set(),
+                                         'lvids': set()})
     for sref, sr in m.srs.items():
         if sr['type'] in LVM_SR_TYPES and sr.get('PBDs'):
             journal_query(q, m.sr_master(sref), sr)
+        if sr['type'] in LVM_SR_TYPES:
+            pre = ('VG_XenStorage-' + sr['uuid']).replace('-', '--') + '-'
+            for href in m.hosts:
+                if any(n.startswith(pre) for n in ((a.view(href).blockmap or {}).get('dm') or {})):
+                    q[href]['lvids'].add('VG_XenStorage-' + sr['uuid'])
     for vref, v in m.vdis.items():
         smc = v['sm_config']
         mref = m.sr_master(v['SR'])
@@ -21541,8 +22248,7 @@ def candidates_round2(a, opts):
             elif p.startswith('/var/run/sr-mount/') or p.startswith('/run/sr-mount/'):
                 q[href]['statfiles'].add(p)
         for ns, objs in sorted((hv.smrefs or {}).items()):
-            if ns.startswith('lvm-') and m.sr_by_uuid.get(ns[4:]) is not None and \
-                    any(o not in m.vdi_by_uuid for o in objs):
+            if ns.startswith('lvm-') and m.sr_by_uuid.get(ns[4:]) is not None and objs:
                 q[href]['vgs'].add('VG_XenStorage-' + ns[4:])
         for row in hv.taps or []:
             if row['state'] is not None and row['state'] & PAUSED:
@@ -21929,7 +22635,7 @@ def collect_audit(ctx, n, first=False, only_hosts=None, probes=True, smlog=True,
                           'phy': sorted(qq['smlog']['phy']), 'drbd': qq['smlog']['drbd'], 'cache': ctx.session},
                 'statfiles': sorted(qq['statfiles']), 'vgs': sorted(qq['vgs']), 'srdirs': sorted(qq['srdirs']),
                 'xsread': sorted(qq['xsread']), 'vhdcheck': sorted(qq['vhdcheck']), 'drbd': sorted(qq['drbdres']),
-                'dmcheck': sorted([list(x) for x in qq['dmcheck']])}
+                'dmcheck': sorted([list(x) for x in qq['dmcheck']]), 'lvids': sorted(qq['lvids'])}
         t2 = _now()
         ctx.cache_hosts.add(h.uuid)
         try:
@@ -21973,7 +22679,7 @@ def collect_audit(ctx, n, first=False, only_hosts=None, probes=True, smlog=True,
             if f is not None:
                 store[h.uuid] = f.get('value') if f.get('ok') else {'error': f.get('error')}
         for key, store in (('statfiles', a.statfiles), ('lvnames', a.lvnames), ('srdir', a.srdirs),
-                           ('xsread', a.xsread)):
+                           ('xsread', a.xsread), ('lvids', a.lvids)):
             f = val.get(key) or {}
             if not f.get('ok'):
                 continue
@@ -22205,13 +22911,18 @@ def describe_item(model, it):
             elif s == 'teardown':
                 td = it.get('teardown') or {}
                 what = [n for n, k in ((u'attach_info file', 'attach_info'), (u'backend node', 'node'),
-                                       (u'NBD link', 'nbd'), (u'phy link', 'phy')) if td.get(k)]
+                                       (u'NBD link', 'nbd'), (u'phy link', 'phy'))
+                        if td.get(k) and not (k == 'node' and td[k].get('leave'))]
                 parts.append(u'remove what SM left of VDI %s on %s, the way SM\'s own teardown does, under the VDI\'s '
                              u'SM lock: %s%s' % (
                                  it['vdi'], hn, (u'close and detach its tapdisk pid %s (minor %s) with tap-ctl, then '
                                                  % (td['tap']['pid'], td['tap']['minor'])) if td.get('tap') else u'',
                                  u'remove its %s, each only as it was read' % u', '.join(what) if what else
                                  u'nothing else'))
+            elif s == 'relink':
+                parts.append(u'remove stale device-mapper device(s) %s on %s through SM (on-slave '
+                             u'deactivateNoRefcount), the update SM\'s GC never sent %s'
+                             % (relink_devs_text(lv.get('relink') or []), hn, hn))
             elif s == 'refresh':
                 names = lv.get('refresh') or [lv.get('lv')]
                 parts.append(u'activate %s %s on %s through SM (on-slave refresh) and check %s device-mapper table'
@@ -22237,7 +22948,8 @@ def describe_item(model, it):
     if a == 'sm-teardown':
         td = it.get('teardown') or {}
         what = [n for n, k in ((u'attach_info file', 'attach_info'), (u'backend node', 'node'), (u'NBD link', 'nbd'),
-                               (u'phy link', 'phy')) if td.get(k)]
+                               (u'phy link', 'phy'))
+                if td.get(k) and not (k == 'node' and td[k].get('leave'))]
         return (u'remove what SM left of VDI %s on %s (no datapath names it, and it is not in xapi), the way SM\'s own '
                 u'teardown does, under the VDI\'s SM lock: %s%s%s' % (
                     it['vdi'], hn, (u'close and detach its tapdisk pid %s (minor %s) with tap-ctl, then '
@@ -22264,10 +22976,20 @@ def describe_item(model, it):
         return u'put back %d stale activation count(s) of the LV of VDI %s on %s through SM (on-slave deactivate)' % (
             (it['lv'].get('refcount') or [0])[0], vdi_text(model, it['vdi']), hn)
     if a == 'lv-forget':
-        return (u'drop SM\'s activation count (%s) and lock file of VDI %s on %s, which xapi no longer has and of '
+        return (u'%sdrop SM\'s activation count (%s) and lock file of VDI %s on %s, which xapi no longer has and of '
                 u'which no LV is left, through SM (on-slave cleanupLockAndRefcount), with SM\'s VDI lock held there '
-                u'and the GC of its SR held off' % (' '.join(str(x) for x in it['lv'].get('refcount') or []),
-                                                   it['vdi'], hn))
+                u'and the GC of its SR held off%s' % (
+                    u'remove its stale device-mapper device %s through SM (on-slave deactivateNoRefcount), then '
+                    % u', '.join(it['lv'].get('drop')) if it['lv'].get('drop') else u'',
+                    ' '.join(str(x) for x in it['lv'].get('refcount') or []), it['vdi'], hn,
+                    u', once the C03 fix of VDI %s has removed its device-mapper device %s'
+                    % (it['after_refresh'][0][0], it['after_refresh'][0][2]) if it.get('after_refresh') else u''))
+    if a == 'lv-device':
+        d = it['dev']
+        return (u'remove stale device-mapper device %s on %s (%s) through SM (on-slave deactivateNoRefcount), with '
+                u'its /dev/mapper node and /dev link, the GC of its SR held off%s' % (
+                    d['name'], hn, u'it holds LV %s under an old name' % d['owner'] if d.get('owner') else
+                    u'the LV it mapped is gone', u' and SM\'s VDI lock held' if it.get('vdi') else u''))
     if a == 'reset-marker' and it.get('direct'):
         return (u'remove sm-config %s from VDI %s with VDI.remove_from_sm_config (SM\'s is_open cannot answer for its '
                 u'SR type, so SM\'s reset cannot), with SM\'s VDI lock held on every host that has its SR plugged and '
@@ -22726,6 +23448,7 @@ class Engine(object):
         self.acts = {}
         self.act_ended = set()
         self.end_inert = set()
+        self.gate_notes = {}
         self.flag_gone = set()
         self.attempts = collections.Counter()
         self.kicked = {}
@@ -22951,14 +23674,16 @@ class Engine(object):
             if hu not in a.facts:
                 continue
             try:
-                val = self.ctx.transport.call(self.host(hu), 'facts', {'want': ['extra'], 'vgs': names}, timeout=120)
+                val = self.ctx.transport.call(self.host(hu), 'facts', {'want': ['extra'], 'vgs': names, 'lvids': names},
+                                              timeout=120)
             except CallError as exc:
                 self.j.rec('lvnames', host=hu, error=_text(exc))
                 continue
-            f = val.get('lvnames') or {}
-            for vg, res in ((f.get('value') or {}).items() if f.get('ok') else ()):
-                if res.get('ok'):
-                    a.lvnames[(hu, vg)] = res['value']
+            for key, store in (('lvnames', a.lvnames), ('lvids', a.lvids)):
+                f = val.get(key) or {}
+                for vg, res in ((f.get('value') or {}).items() if f.get('ok') else ()):
+                    if res.get('ok'):
+                        store[(hu, vg)] = res['value']
         return a
 
     def event_token(self):
@@ -23200,7 +23925,7 @@ class Engine(object):
                                            timeout=fence_acquire(hs[1]['locks']) + 60)
         first = [s for s in specs if any(lk[0] in ('sr', 'gc') for lk in s[1]['locks'])]
         rest = [s for s in specs if not any(s is f for f in first)]
-        if first and rest and any(lk[0] == 'vdi' for h, sp in rest for lk in sp['locks']):
+        if first and rest and any(lk[0] in ('vdi', 'lvref') for h, sp in rest for lk in sp['locks']):
             res = parallel(start, first)
             if all(st == 'ok' and ((val or {}).get('status') or {}).get('state') == 'held' for x, (st, val) in res):
                 res += parallel(start, rest)
@@ -23617,6 +24342,8 @@ class Engine(object):
             return k == ['C15', it['host'], 'wedged', it['pid'], it['minor']]
         if it['action'] in ('lv-deactivate', 'lv-forget'):
             return k == ['C16', 'lvref', it['host'], it['sr'], it['vdi']]
+        if it['action'] == 'lv-device':
+            return k == ['C16', 'lvdev', it['host'], it['sr'], it['dev']['name']]
         if it['action'] == 'nbd-end':
             return k == ['C25', it['host']]
         if it['action'] == 'ha-release':
@@ -25941,6 +26668,8 @@ class Engine(object):
                 self.lv_put_item(it)
             elif it['action'] == 'lv-forget':
                 self.lv_forget_item(it)
+            elif it['action'] == 'lv-device':
+                self.lv_device_item(it)
             elif it['action'] == 'sm-teardown':
                 self.lone_teardown(it)
             elif it['action'] == 'ctl-clean':
@@ -26254,6 +26983,10 @@ class Engine(object):
             return None, 'the tapdisk that serves it changed'
         if canon((it.get('lv') or {}).get('refcount')) != canon((e['item'].get('lv') or {}).get('refcount')):
             return None, 'the activation count of its LV changed'
+        if 'relink' in it['steps'] and 'relink' not in done and \
+                canon((it.get('lv') or {}).get('relink')) != canon((e['item'].get('lv') or {}).get('relink')):
+            return None, 'the devices its relink would replace are now %s, where %s were planned' % (
+                canon((e['item'].get('lv') or {}).get('relink')), canon((it.get('lv') or {}).get('relink')))
         if 'refresh' in it['steps'] and 'refresh' not in done and \
                 canon((it.get('lv') or {}).get('refresh')) != canon((e['item'].get('lv') or {}).get('refresh')):
             return None, 'the LVs its refresh would activate are now %s, where %s were planned' % (
@@ -26422,6 +27155,123 @@ class Engine(object):
         lv = it['lv']
         return list(lv.get('refresh') or [lv['lv']])
 
+    def relink_read(self, h, vg, paths=()):
+        try:
+            val = self.ctx.transport.call(h, 'facts', {'want': ['dminfo', 'extra'], 'lvids': [vg],
+                                                       'statfiles': sorted(paths)}, timeout=AGENT_TIMEOUT)
+        except CallError as exc:
+            return None, None, 'the device-mapper devices on %s could not be read: %s' % (h.name, _text(exc))
+        di = val.get('dminfo') or {}
+        li = ((val.get('lvids') or {}).get('value') or {}).get(vg) or {}
+        if not di.get('ok') or not li.get('ok') or li['value'].get('dm_error'):
+            return None, None, ('the device-mapper devices or the LV uuids on %s could not be read: %s'
+                                % (h.name, di.get('error') or li.get('error') or li.get('value', {}).get('dm_error')
+                                   or 'not answered'))
+        st = dict(((val.get('statfiles') or {}).get('value') or {}).items())
+        return classify_devs(di['value'], vg, li['value']), st, None
+
+    def relink_moved(self, h, it):
+        devs, st, why = self.relink_read(h, it['lv']['vg'])
+        if why:
+            return why
+        for p in it['lv']['relink']:
+            for r in p['remove']:
+                d = devs.get(r['name'])
+                if d is None:
+                    return 'device-mapper device %s on %s is gone already' % (r['name'], h.name)
+                if d['uuid'] != r['uuid']:
+                    return 'device-mapper device %s on %s carries another uuid now (%s)' % (r['name'], h.name,
+                                                                                          d['uuid'])
+                if d['open']:
+                    return 'device-mapper device %s on %s is open now (open count %d)' % (r['name'], h.name,
+                                                                                         d['open'])
+            planned = set(r['name'] for r in p['remove'])
+            extra = sorted(n for n, d in devs.items() if d['owner'] == p['lv'] and n != p['lv'] and n not in planned)
+            if extra:
+                return ('device-mapper device %s on %s holds LV %s now, and was not planned (SM\'s deactivate of '
+                        'the LV would remove it)' % (extra[0], h.name, p['lv']))
+        others = sorted(set(lv_vdi_of(r['owner']) for p in it['lv']['relink'] for r in p['remove']
+                            if r['owner'] and r['owner'] != p['lv']) - set([None]))
+        if not others:
+            return None
+        a = self.audit(hosts=[h.uuid], smlog=False)
+        hv = a.view(a.model.host_by_uuid[h.uuid])
+        unread = use_unread(hv)
+        if unread:
+            return '%s on %s were not read again' % (', '.join(unread), h.name)
+        for ov in others:
+            rc, rwhy = refcount_of(hv, it['sr'], ov)
+            use = in_use_here(a, hv, ov) if rc is not None else []
+            if rc is None or sum(rc) or use:
+                return ('VDI %s, whose LV a device to be removed holds, reads %s on %s under its activation lock'
+                        % (ov, rwhy if rc is None else 'counted %s' % canon(rc) if sum(rc) else 'in use (%s)'
+                           % ', '.join(use), h.name))
+        return None
+
+    def relink_left(self, h, it):
+        vg = it['lv']['vg']
+        paths = set()
+        for p in it['lv']['relink']:
+            for r in p['remove']:
+                if r['name'] != p['lv'] or p['lv'] not in (it['lv'].get('refresh') or []):
+                    paths.add('/dev/mapper/' + r['dm'])
+                    paths.add('/dev/%s/%s' % (vg, r['name']))
+        devs, st, why = self.relink_read(h, vg, paths)
+        if why:
+            return why
+        left = []
+        for p in it['lv']['relink']:
+            for r in p['remove']:
+                if r['name'] in devs and devs[r['name']]['uuid'] == r['uuid']:
+                    left.append('device %s is still there' % r['name'])
+            for n, d in sorted(devs.items()):
+                if d['owner'] == p['lv'] and n != p['lv']:
+                    left.append('device %s still holds LV %s' % (n, p['lv']))
+        for path in sorted(paths):
+            rec = st.get(path) or {}
+            if not rec.get('ok'):
+                left.append('whether %s is gone is not established (%s)' % (path, rec.get('error') or 'not read'))
+            elif rec['value'].get('exists'):
+                left.append('%s is still there' % path)
+        return '; '.join(left)
+
+    def step_relink(self, it, h, fresh, done):
+        lv = it['lv']
+        moved = self.changed(fresh, h, vdis=[it['vdi']], srs=[it['sr']])
+        if moved:
+            return self.chain_stop(it, h, done, 'something changed since it was re-checked (%s); run the tool again'
+                                   % moved)
+        marked = self.marked_here(it, h)
+        if marked:
+            return self.chain_stop(it, h, done, marked)
+        acts = [{'action': 'deactivateNoRefcount', 'lvName': p['lv']} for p in lv['relink']]
+        what = ', '.join('device %s' % r['name'] for p in lv['relink'] for r in p['remove'])
+        plan, why = self.lv_fence_plan(it, h, owners=relink_owners(it))
+        fences, why = self.fence_up(it, plan, hold=LV_FENCE_HOLD, paused_ok=bool(it.get('paused_orphan'))) \
+            if plan else ([], why)
+        ok, r, lost = False, None, None
+        try:
+            why = why or self.fence_check(fences, FENCE_MARGIN) or self.count_moved(h, it, lv['refcount']) or \
+                self.relink_moved(h, it) or self.marked_here(it, h) or self.fence_check(fences, FENCE_MARGIN)
+            if why:
+                return self.chain_stop(it, h, done, '%s not replaced: %s' % (what, why))
+            self.act_on(it)
+            ok, r = self.on_slave(h, lv['vg'], acts)
+            lost = self.fence_check(fences, 0)
+        finally:
+            self.fence_down(fences)
+        left = self.relink_left(h, it)
+        if not ok or left:
+            self.fail_item(it, 'the on-slave deactivateNoRefcount of %s on %s answered %s (%s); %s'
+                           % (', '.join(x['lvName'] for x in acts), h.name, canon(r.out.strip()[:80]),
+                              r.why() if not r.ok else 'ok', left or 'nothing of them is left'))
+        if lost:
+            self.fail_item(it, '%s removed on %s, but SM\'s locks were not held for the whole step (%s), so that no '
+                               'SM operation ran meanwhile is not established' % (what, h.name, lost))
+        return ('removed %s on %s through SM (on-slave deactivateNoRefcount, the update SM\'s GC sends a host when it '
+                'renames an LV that host has active, which this host missed); none is left, nor its /dev/mapper node '
+                'or /dev/%s link' % (what, h.name, lv['vg']))
+
     def step_refresh(self, it, h, fresh, done):
         lv = it['lv']
         names = self.refresh_lvs(it)
@@ -26458,9 +27308,10 @@ class Engine(object):
             self.fail_item(it, '%s %s activated on %s through SM, but %s; %s'
                            % (', '.join(names), 'was' if len(names) == 1 else 'were', h.name, '; '.join(bad), rb))
         key, what, hn = self.gate_check(it)
+        note = self.gate_notes.get(it['seq'])
         return ('activated %s on %s through SM (on-slave refresh); the device-mapper table of each matches the LVM '
-                'metadata, %s passes, and its header names the parent xapi records'
-                % (', '.join(names), h.name, what % lv['lv']))
+                'metadata, %s passes%s, and its header names the parent xapi records'
+                % (', '.join(names), h.name, what % lv['lv'], ' (%s)' % note if note else ''))
 
     def gate_check(self, it):
         if not it['lv']['lv'].startswith('QCOW2-'):
@@ -26478,7 +27329,9 @@ class Engine(object):
         try:
             val = self.ctx.transport.call(h, 'facts', {'want': ['core', 'extra'],
                                                        'dmcheck': [[lv['vg'], n] for n in names],
-                                                       key: paths, 'vgs': [lv['vg']]}, timeout=AGENT_TIMEOUT)
+                                                       key: paths, 'vgs': [lv['vg']],
+                                                       'vhdcheck_open': [path] if key == 'vhdcheck' and
+                                                       lv.get('open_rw') else []}, timeout=AGENT_TIMEOUT)
         except CallError as exc:
             return ['its state could not be read back: %s' % _text(exc)]
         self.j.rec('gate_h', seq=it['seq'], host=h.uuid, dmcheck=val.get('dmcheck'), vhdcheck=val.get(key),
@@ -26494,6 +27347,12 @@ class Engine(object):
                            % (n, canon(dmc['value'].get('dm'))[:200], canon(dmc['value'].get('lvm'))[:200]))
         got = ((val.get(key) or {}).get('value') or {})
         chk = got.get(path) or {}
+        if chk.get('footer_killed'):
+            self.gate_notes[it['seq']] = ('its primary footer reads as tapdisk overwrites it on a disk it holds open '
+                                          'read-write once it has resumed it after a pause (512 bytes of 0xc7), and a '
+                                          'tapdisk on another host has it open read-write, so vhd-util check ran with '
+                                          '-i (missing primary footer ignored; its backup footer, header and block '
+                                          'table still checked) and its parents were checked strictly')
         for p in paths:
             c = got.get(p) or {}
             if not c.get('ok'):
@@ -26537,7 +27396,7 @@ class Engine(object):
             return 'the SR has %s in progress' % ', '.join(ops)
         return None
 
-    def lv_fence_plan(self, it, h):
+    def lv_fence_plan(self, it, h, owners=()):
         try:
             m = Model(pool_snapshot(self.ctx.api))
         except Exception as exc:
@@ -26547,9 +27406,11 @@ class Engine(object):
         if mref not in m.hosts:
             return None, 'the SR has no master here, so its GC cannot be held off'
         mu = m.hosts[mref]['uuid']
+        here = ([['vdi', it['vdi']]] if it.get('vdi') else []) + \
+            [['lvref', '%s/%s' % (it['sr'], ou)] for ou in sorted(set(owners))]
         if mu == h.uuid:
-            return [(h, [['gc', it['sr']], ['vdi', it['vdi']]])], None
-        return [(self.host(mu), [['gc', it['sr']]]), (h, [['vdi', it['vdi']]])], None
+            return [(h, [['gc', it['sr']]] + here)], None
+        return [(self.host(mu), [['gc', it['sr']]])] + ([(h, here)] if here else []), None
 
     def marked_here(self, it, h):
         if not it.get('paused_orphan'):
@@ -26571,7 +27432,7 @@ class Engine(object):
         lv = it['lv']
         names = self.refresh_lvs(it)
         left = '%s left as %s' % (', '.join(names), 'it is' if len(names) == 1 else 'they are')
-        plan, why = self.lv_fence_plan(it, h)
+        plan, why = self.lv_fence_plan(it, h, owners=[x for x in (lv_vdi_of(n) for n in names) if x])
         fences, why = self.fence_up(it, plan, hold=LV_FENCE_HOLD, paused_ok=bool(it.get('paused_orphan'))) \
             if plan else ([], why)
         try:
@@ -26687,10 +27548,12 @@ class Engine(object):
             self.result(it, 'partial', 'done: %s; its LV activation count was not put back: something changed (%s)'
                         % (', '.join(STEP_TEXT[s] for s in done), moved))
             return None
-        plan, why = self.lv_fence_plan(it, h)
+        nd = lv_name_devs(a, hv, it['sr'], it['vdi'], lv['lv'])
+        plan, why = self.lv_fence_plan(it, h, owners=nd[3])
         fences, why = self.fence_up(it, plan) if plan else ([], why)
         try:
             why = why or self.fence_check(fences, FENCE_MARGIN) or self.count_moved(h, it, want) or \
+                (self.lv_devs_moved(h, it, lv['vg'], lv['lv']) if nd[2] else None) or \
                 self.fence_check(fences, FENCE_MARGIN)
             if why:
                 if standalone:
@@ -26703,11 +27566,12 @@ class Engine(object):
             ok, r = self.on_slave(h, lv['vg'], [{'action': 'deactivate', 'ns': 'lvm-' + it['sr'], 'uuid': it['vdi'],
                                                  'lvName': lv['lv']}] * want[0])
             lost = self.fence_check(fences, 0)
-            left = self.lv_left(h, it['sr'], it['vdi'])
+            left = self.lv_left(h, it['sr'], it['vdi']) or \
+                (self.lv_devs_left(h, it, lv['vg'], lv['lv']) if ok and lv.get('lv') else '')
         finally:
             self.fence_down(fences)
         if ok and not left and lost:
-            self.fail_item(it, 'its stale activation count(s) were put back on %s, but SM\'s VDI lock was not held for '
+            self.fail_item(it, 'its stale activation count(s) were put back on %s, but SM\'s locks were not held for '
                                'the whole step (%s), so that no SM operation ran meanwhile is not established'
                            % (h.name, lost))
         if not ok or left:
@@ -26716,6 +27580,23 @@ class Engine(object):
                               left or 'nothing of it is left'))
         return 'put back %d stale activation count(s) of its LV on %s through SM; the LV is deactivated' % (
             want[0], h.name)
+
+    def lv_devs_moved(self, h, it, vg, lvname):
+        a = self.audit(hosts=[h.uuid], smlog=False, vgs={h.uuid: [vg]})
+        hv = a.view(a.model.host_by_uuid[h.uuid])
+        p, u, e, o = lv_name_devs(a, hv, it['sr'], it['vdi'], lvname)
+        if p or u:
+            return 'read again under SM\'s locks: %s' % '; '.join((p + u)[:3])
+        return None
+
+    def lv_devs_left(self, h, it, vg, lvname):
+        a = self.audit(hosts=[h.uuid], smlog=False, vgs={h.uuid: [vg]})
+        hv = a.view(a.model.host_by_uuid[h.uuid])
+        devs, why = lvm_devices(a, hv, it['sr'])
+        if devs is None or why:
+            return 'what is left of its devices is not established (%s)' % why
+        return '; '.join('device %s %s' % (n, 'still carries its name' if n == lvname else 'still holds it')
+                         for n, r in sorted(devs.items()) if n == lvname or r['owner'] == lvname)
 
     def lv_left(self, h, sr, vdi):
         a = self.audit(hosts=[h.uuid], smlog=False)
@@ -26746,35 +27627,114 @@ class Engine(object):
         if e is None:
             return self.result(it, 'skipped', why)
         lv = it['lv']
-        plan, why = self.lv_fence_plan(it, h)
+        plan, why = self.lv_fence_plan(it, h, owners=lv.get('owners') or [])
         fences, why = self.fence_up(it, plan) if plan else ([], why)
+        fplan = {}
         try:
             why = why or self.fence_check(fences, FENCE_MARGIN)
             if not why:
                 a = self.audit(hosts=self.sr_hosts(it['sr'], h), smlog=False,
                                vgs=dict((u, [lv['vg']]) for u in self.sr_hosts(it['sr'], h)))
                 hv = a.view(a.model.host_by_uuid[h.uuid])
-                p2, u2, w2, e2 = lv_forget_proof(a, hv, it['sr'], it['vdi'], lv['refcount'], held=True)
+                p2, u2, w2, e2 = lv_forget_proof(a, hv, it['sr'], it['vdi'], lv['refcount'], held=True, plan=fplan)
                 why = '; '.join((p2 + u2 + w2)[:6]) or self.fence_check(fences, FENCE_MARGIN)
+            if not why and sorted(fplan['drop']) != sorted(lv.get('drop') or []) and \
+                    not (it.get('after_refresh') and not fplan['drop']):
+                why = 'the stale device-mapper devices of it are now %s, where %s were planned' % (
+                    canon(fplan['drop']), canon(lv.get('drop') or []))
             if why:
                 return self.result(it, 'skipped', 'not dropped (read again under SM\'s locks): %s' % why)
             self.act_on(it)
-            ok, r = self.on_slave(h, lv['vg'], [{'action': 'cleanupLockAndRefcount', 'ns': 'lvm-' + it['sr'],
-                                                 'uuid': it['vdi']}])
+            acts = [{'action': 'deactivateNoRefcount', 'lvName': n} for n in fplan['drop']]
+            ok, r = self.on_slave(h, lv['vg'], acts + [{'action': 'cleanupLockAndRefcount', 'ns': 'lvm-' + it['sr'],
+                                                        'uuid': it['vdi']}])
             lost = self.fence_check(fences, 0)
             left = self.lv_left(h, it['sr'], it['vdi'])
+            olds = sorted(set(fplan['drop'] + [x[2] for x in it.get('after_refresh') or []]))
+            if not left and olds:
+                vgdm = lv['vg'].replace('-', '--')
+                gone = self.relink_read(h, lv['vg'], ['/dev/mapper/%s-%s' % (vgdm, n.replace('-', '--'))
+                                                      for n in olds] +
+                                        ['/dev/%s/%s' % (lv['vg'], n) for n in olds])
+                if gone[2]:
+                    left = gone[2]
+                else:
+                    left = '; '.join('%s is still there' % p for p, rec in sorted(gone[1].items())
+                                     if not rec.get('ok') or rec['value'].get('exists'))
         finally:
             self.fence_down(fences)
         if not ok or left:
-            self.fail_item(it, 'the on-slave cleanupLockAndRefcount of %s on %s answered %s (%s); %s'
-                           % (it['vdi'], h.name, canon(r.out.strip()[:80]), r.why() if not r.ok else 'ok',
+            self.fail_item(it, 'the on-slave %s of %s on %s answered %s (%s); %s'
+                           % ('deactivateNoRefcount and cleanupLockAndRefcount' if fplan['drop'] else
+                              'cleanupLockAndRefcount', it['vdi'], h.name, canon(r.out.strip()[:80]),
+                              r.why() if not r.ok else 'ok', left or 'nothing of it is left'))
+        if lost:
+            self.fail_item(it, 'its count was dropped on %s, but SM\'s locks were not held for the whole step (%s), '
+                               'so that no SM operation ran meanwhile is not established' % (h.name, lost))
+        self.result(it, 'fixed', '%sdropped SM\'s stale activation count (%s) and lock file of VDI %s on %s through SM '
+                    '(on-slave cleanupLockAndRefcount), with its VDI lock held and the GC of its SR held off; no LV of '
+                    'it was left in the volume group' % (
+                        'removed its stale device-mapper device %s through SM (on-slave deactivateNoRefcount, with its '
+                        '/dev/mapper node and /dev link), then ' % ', '.join(fplan['drop']) if fplan['drop'] else '',
+                        ' '.join(str(x) for x in lv['refcount']), it['vdi'], h.name))
+
+    def lv_device_item(self, it):
+        h = self.host(it['host'])
+        fresh, e, why = self.fresh_check(h, it)
+        if e is None:
+            return self.result(it, 'skipped', why)
+        d = it['dev']
+        plan, why = self.lv_fence_plan(it, h, owners=[x for x in [lock_owner(d.get('owner')),
+                                                                   lock_owner(d['name']) if d.get('named_lv') else None]
+                                                       if x])
+        fences, why = self.fence_up(it, plan) if plan else ([], why)
+        ok, r, lost, left = False, None, None, ''
+        try:
+            why = why or self.fence_check(fences, FENCE_MARGIN)
+            if not why:
+                a = self.audit(hosts=[h.uuid], smlog=False, vgs={h.uuid: [d['vg']]})
+                hv = a.view(a.model.host_by_uuid[h.uuid])
+                devs, dwhy = lvm_devices(a, hv, it['sr'])
+                now = (devs or {}).get(d['name'])
+                if devs is None or dwhy:
+                    why = dwhy
+                elif now is None:
+                    return self.result(it, 'already-fixed', 'device-mapper device %s on %s is gone' % (d['name'],
+                                                                                                     h.name))
+                elif now['uuid'] != d['uuid'] or now['owner'] != d.get('owner') or now['state'] == 'ok':
+                    why = 'device-mapper device %s on %s now reads %s, where %s was planned' % (
+                        d['name'], h.name, canon([now['uuid'], now['owner'], now['state']]),
+                        canon([d['uuid'], d.get('owner')]))
+                else:
+                    p2, u2, w2, e2 = lvdev_proof(a, hv, it['sr'], d['name'], now, held=True)
+                    why = '; '.join((p2 + u2 + w2)[:6]) or lvdev_covered(a, hv, it['sr'], d['name'], now)[1] or \
+                        self.fence_check(fences, FENCE_MARGIN)
+            if why:
+                return self.result(it, 'skipped', 'not removed (read again under SM\'s locks): %s' % why)
+            self.act_on(it)
+            ok, r = self.on_slave(h, d['vg'], [{'action': 'deactivateNoRefcount', 'lvName': d['name']}])
+            lost = self.fence_check(fences, 0)
+            paths = ['/dev/mapper/' + d['dm'], '/dev/%s/%s' % (d['vg'], d['name'])]
+            devs2, st, why2 = self.relink_read(h, d['vg'], paths)
+            if why2:
+                left = why2
+            else:
+                gone = [p for p in paths if not (st.get(p) or {}).get('ok') or (st[p].get('value') or {}).get('exists')]
+                left = '; '.join((['device %s is still there' % d['name']] if d['name'] in devs2 else []) +
+                                 ['%s is still there or unread' % p for p in gone])
+        finally:
+            self.fence_down(fences)
+        if not ok or left:
+            self.fail_item(it, 'the on-slave deactivateNoRefcount of %s on %s answered %s (%s); %s'
+                           % (d['name'], h.name, canon(r.out.strip()[:80]), r.why() if not r.ok else 'ok',
                               left or 'nothing of it is left'))
         if lost:
-            self.fail_item(it, 'its count was dropped on %s, but SM\'s VDI lock was not held for the whole step (%s), '
-                               'so that no SM operation ran meanwhile is not established' % (h.name, lost))
-        self.result(it, 'fixed', 'dropped SM\'s stale activation count (%s) and lock file of VDI %s on %s through SM '
-                    '(on-slave cleanupLockAndRefcount), with its VDI lock held and the GC of its SR held off; no LV of '
-                    'it was left in the volume group' % (' '.join(str(x) for x in lv['refcount']), it['vdi'], h.name))
+            self.fail_item(it, 'device %s was removed on %s, but SM\'s locks were not held for the whole step (%s), so '
+                               'that no SM operation ran meanwhile is not established' % (d['name'], h.name, lost))
+        self.result(it, 'fixed', 'removed stale device-mapper device %s on %s (%s) through SM (on-slave '
+                    'deactivateNoRefcount) with the GC of its SR held off; the device, its /dev/mapper node and its '
+                    '/dev link are gone' % (d['name'], h.name, 'it held LV %s under an old name' % d['owner']
+                                       if d.get('owner') else 'the LV it mapped was gone'))
 
     def step_free(self, it, h, fresh, done):
         return self.minor_free(it, h, it['minor'], done)
@@ -26857,6 +27817,8 @@ class Engine(object):
         ops = teardown_ops((sdb_entry(hvf, it['sr'], it['vdi']) or {}).get('dps'), it['dp'])[0]
         if it.get('forgotten'):
             why = self.still_gone(it)
+            if not why and it.get('inert'):
+                why = self.before_sm(h, it)
         elif ops or not it.get('inert'):
             why = self.before_sm(h, it)
         else:
@@ -27158,9 +28120,10 @@ class Engine(object):
         note = ''
         if cv.dps_files is not None and it['dp'].replace('/', '-') in cv.dps_files:
             note = '; xapi\'s storage-dps record of it is still there'
-        return ('xapi forgot it (allow-leak=true; its VDI is not in xapi, so SM was not called)%s%s'
-                % ('; datapath(s) %s still hold the VDI on %s, and their own fixes forget them' % (', '.join(held), h.name)
-                   if held else ', and nothing of the VDI is left on %s' % h.name, note))
+        rest = ('; datapath(s) %s still hold the VDI on %s, and their own fixes forget them' % (', '.join(held), h.name)
+                if held else ', and nothing of the VDI is left on %s' % h.name)
+        return ('xapi forgot it (allow-leak=true; its VDI is not in xapi, so SM was not called, and xapi records that '
+                'failed deactivate, No_VDI, among the past storage errors of %s)%s%s' % (h.name, rest, note))
 
     def holder_busy(self, vbd_uuid):
         x = self.ctx.api.x
@@ -28266,6 +29229,9 @@ def destroy_hint(exc):
     return ''
 
 
+ROUND2_STORES = ('statfiles', 'lvnames', 'srdirs', 'xsread', 'lvids', 'vhdchecks', 'dmchecks')
+
+
 def save_audits(d, audits):
     for a in audits:
         try:
@@ -28276,7 +29242,10 @@ def save_audits(d, audits):
                           'probes': dict(('%s@%s' % k, v) for k, v in a.probes.items()),
                           'drbd': a.drbd, 'drbd_all': a.drbd_all, 'drbd_detail': a.drbd_detail,
                           'satellite': a.satellite, 'sm_needles': a.sm_needles, 'xenops': a.xenops,
-                          'gc_held': sorted(a.gc_held), 'took': getattr(a, 'took', None)})
+                          'gc_held': sorted(a.gc_held), 'took': getattr(a, 'took', None),
+                          'round2': dict((name, dict(('%s|%s' % k, v)
+                                                     for k, v in (getattr(a, name, None) or {}).items()))
+                                         for name in ROUND2_STORES)})
         except Exception as exc:
             warn('the audit record could not be saved: %s' % _text(exc))
 
@@ -28628,6 +29597,11 @@ def closing_classify(eng, a, opts):
     for e in final:
         if e['cls'] == 'C20' and e.get('base'):
             e['verdict'], e['reason'] = e['base']
+        if list(e['key'][:2]) == ['ENV', 'linstor-journal'] and \
+                e['key'][2] in (getattr(eng, 'gc_aborted_srs', None) or ()) \
+                and e['reason'].startswith('the GC\'s own markers'):
+            e['reason'] = ('this run held the SR\'s GC off by aborting it, and a GC stopped mid-merge leaves such '
+                           'markers: %s' % e['reason'])
     for e in final:
         head = [h for h in CLOSING_HEADS if e['reason'].startswith(h)][:1]
         if not head or not pre:
