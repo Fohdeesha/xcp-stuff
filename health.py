@@ -28,6 +28,7 @@ from urllib.parse import urlsplit
 import atexit
 import base64
 import calendar
+import fnmatch
 import getopt
 import ipaddress
 import json
@@ -48,7 +49,7 @@ import unicodedata
 # ======================================================================================
 # --- config ----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "3.26"
+SCRIPT_VERSION = "3.27"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
@@ -88,10 +89,38 @@ RO_FS_NATIVE_RO = ["iso9660", "udf", "squashfs", "cramfs", "erofs"]  # read-only
 # stay under 24 to be able to say anything at all.
 TASK_PENDING_MAX_HOURS = 16
 
-# Failed Systemd Units: units left out, by name prefix. SMGC@<sr>.service is one GC run of an
-# SR; a failed one stays 'failed' until that SR's next GC run, and GC health is judged from
-# SMlog by storage-state-fixer (C19), not from a unit state.
-FAILED_UNITS_IGNORE = ["SMGC@"]
+# Leaf-Coalesce Disabled: a VDI with other-config:leaf-coalesce=false is never leaf-coalesced
+# by SM's GC ("Leaf-coalesce disabled for <vdi>"). SM itself writes it (VDI.py
+# disable_leaf_on_secondary) when a storage migration starts mirroring the disk, and writes
+# it again when the mirror is stopped; a migration that completes takes the source disk away
+# with it, one that fails or is cancelled leaves the flag behind for good. Nothing in xapi or
+# XO sets it (xen-api and xen-orchestra master, 2026-11). A disk whose VM or VDI is in one of
+# these operations right now is in the middle of that, and is not counted.
+LEAF_COALESCE_BUSY_VM_OPS = ["migrate_send", "pool_migrate", "export", "import"]
+LEAF_COALESCE_BUSY_VDI_OPS = ["mirror", "copy"]
+LEAF_COALESCE_MAX_LINES = 40
+
+# Windows VMs Not Optimized: the platform keys every 8.3 Windows template sets (read off the
+# 8.3 templates on the lab, 2026-11-24) and "Other install media" sets none of. xapi passes
+# them through to xenguest as they are; a VM made from an older Windows template carries
+# viridian alone.
+WINDOWS_PLATFORM_KEYS = ["viridian", "viridian_time_ref_count", "viridian_reference_tsc",
+                         "viridian_apic_assist", "viridian_crash_ctl", "viridian_stimer"]
+WINDOWS_MAX_LINES = 40
+
+# Failed Systemd Units: units left out, as fnmatch patterns on the unescaped name (the one
+# the report prints, 'SMGC@a112-...' rather than 'SMGC@a112\x2d...').
+#   SMGC@*   one GC run of an SR; a failed one stays 'failed' until that SR's next GC run,
+#            and GC health is judged from SMlog by storage-state-fixer (C19), not from a unit
+#   *xcp-persistent-database.service   the units drbd-utils and drbd-reactor's promoter run
+#            for XOSTOR's LINSTOR-database resource (drbd@..., drbd-promote@...), expected to
+#            sit failed on the hosts that do not hold it; the controller's own health is
+#            the XOSTOR lines' business
+#   mcelog.service   fails at every boot on an AMD host by design: "mcelog: ERROR: AMD
+#            Processor family 25: mcelog does not support this processor.  Please use the
+#            edac_mce_amd module instead." (seen in the field, 2026-11). Left out on every
+#            CPU, the maintainer's call - on Intel that hides a dead machine-check logger.
+FAILED_UNITS_IGNORE = ["SMGC@*", "*xcp-persistent-database.service", "mcelog.service"]
 # attach-static-vdis is left out only when no static-VDI entry existed when it failed: its
 # script, before xen-api ae4d3ec4, fails on an empty directory (a host booted with HA off)
 STATIC_VDIS_UNIT = "attach-static-vdis.service"
@@ -104,10 +133,14 @@ DMESG_ISSUE_WORDS = ["panic", "crash", "rip", "kill"]  # whole-word, case-insens
 DMESG_ISSUE_PHRASES = ["call trace", "timed out"]      # substring, case-insensitive
 OOM_PHRASE = "out of memory"
 
-# A dmesg line that matched a word/phrase above is dropped only if it contains ALL of a
+# A dmesg line is dropped from Dmesg Content AND from MTU Issues if it contains ALL of a
 # rule's substrings (case-insensitive, whitespace collapsed). One list entry = one rule.
 DMESG_IGNORE_RULES = [
     ["megaraid", "firmware crash dump"],   # megaraid driver load prints "... : no"
+    # the PCI core reading a NIC's Vital Product Data at probe time, e.g.
+    # "ixgbe 0000:82:00.0: invalid large VPD tag 7f at offset 25091" - a firmware quirk
+    # of the card's EEPROM, nothing to do with MTUs or large frames
+    ["invalid large vpd tag"],
 ]
 
 # --- "Log Errors" check ---------------------------------------------------------------
@@ -126,6 +159,15 @@ LOG_ERROR_FILES = [
     "/var/log/xensource.log",
 ]
 LOG_ERROR_CONTEXT = 3            # lines of context shown either side of a match
+# A matched line is not a hit if it contains ALL of a rule's substrings (case-insensitive).
+# Applied in the collector, while the last hit per phrase is picked: dropping the line
+# afterwards would leave an earlier, real hit of the same phrase unreported.
+LOG_ERROR_IGNORE_RULES = [
+    # every xapi start: check_network_reset reads /var/tmp/network-reset, which exists only
+    # after xe-reset-networking, and logs the ENOENT at error level (xen-api xapi.ml,
+    # "Raises exception if the file is not there and no reset is required")
+    ["check_network_reset", "/var/tmp/network-reset", "enoent"],
+]
 
 # --- multipath checks -----------------------------------------------------------------
 # `Multipathing` reports the xapi SETTING. These describe the paths themselves, which is a
@@ -349,6 +391,7 @@ POOL_RUN = {
     "silly_mtus": True,
     "dns_gw_non_mgmt_pifs": True,
     "overlapping_subnets": True,
+    "duplicate_ips": True,
     "log_errors": True,
     "lun_assignments": True,
     "smapi_hidden_leaves": False,
@@ -553,7 +596,9 @@ def wrap(payload, key):
 # xe labelled output
 # --------------------------------------------------------------------------------------
 
-_PARAM_RE = re.compile(r"^\s*([A-Za-z0-9_.:-]+)\s*\(\s*[A-Z]{2}\s*\)\s*:\s?(.*)$")
+# The access tag is two letters for a plain field ('( RO)', '( RW)') and three for a map or
+# set ('(MRW)', '(MRO)', '(SRO)'); matching only two silently dropped every map field.
+_PARAM_RE = re.compile(r"^\s*([A-Za-z0-9_.:-]+)\s*\(\s*[A-Z]{2,3}\s*\)\s*:\s?(.*)$")
 
 
 def parse_xe_records(text, start_key="uuid"):
@@ -800,6 +845,13 @@ def parse_pending_tasks(text, now, max_age):
 def unit_display(name):
     """systemd's \\xHH escaping undone for display: 'SMGC@a112\\x2d8923' -> 'SMGC@a112-8923'."""
     return re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), name)
+
+
+def unit_ignored(name, patterns):
+    """Does a unit match one of the fnmatch patterns? Matched on the unescaped name, which
+    is the one the report prints, so a pattern reads the way the line it removes did."""
+    shown = unit_display(name)
+    return any(fnmatch.fnmatchcase(shown, p) for p in patterns)
 
 
 def static_vdis_failure_moot(value, boot_epoch):
@@ -1214,6 +1266,162 @@ def has_overlapping_subnets(entries):
     return False
 
 
+def parse_ip_addrs(text):
+    """[(ifname, address)] from 'ip -o addr show', both families, for telling duplicates.
+
+    Left out: loopback, and link-local in either family (169.254/16, fe80::/10). Those mean
+    something only on their own link and dom0 repeats them legitimately: every bridge over
+    one NIC carries that NIC's fe80 address, and the host-internal management network has
+    the same 169.254/16 address on every host that has it. Addresses come back canonical,
+    so two spellings of one IPv6 address are one address. A 'name@parent' interface is
+    named without '@'.
+    """
+    out = []
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        name = parts[1].rstrip(":").split("@")[0]
+        if name in ("lo", "lo0"):
+            continue
+        for i, token in enumerate(parts):
+            if token not in ("inet", "inet6") or i + 1 >= len(parts):
+                continue
+            addr = ip_literal(parts[i + 1].split("/")[0])
+            if addr is None:
+                break
+            ip = ipaddress.ip_address(addr)
+            if not (ip.is_loopback or ip.is_link_local or ip.is_unspecified):
+                out.append((name, addr))
+            break
+    return out
+
+
+def duplicate_addresses(entries):
+    """[(address, [ifname, ...])] for every address on more than one interface, sorted.
+
+    The same address twice on ONE interface (a /24 and a /32, say) is not counted: it is
+    one place, and the question is two places answering for one address."""
+    places = {}
+    for name, addr in entries:
+        names = places.setdefault(addr, [])
+        if name not in names:
+            names.append(name)
+    return sorted((addr, names) for addr, names in places.items() if len(names) > 1)
+
+
+# --------------------------------------------------------------------------------------
+# VMs and VDIs (xe labelled records)
+# --------------------------------------------------------------------------------------
+
+def xe_ops(text):
+    """The operation names in an xe current-operations field, lower case.
+
+    Read as words, whatever the field prints around them (a set of names, or a map of task
+    ref to name), so 'export' is found and 'metadata_export' is not taken for it."""
+    return set(re.findall(r"[a-z_]+", (text or "").lower()))
+
+
+def _xe_map(text):
+    """An xe map field as a dict; '<not in database>' and an absent field are both {}."""
+    if not text or text.strip() == "<not in database>":
+        return {}
+    return parse_other_config(text)
+
+
+def leaf_coalesce_vdis(vdi_text, vbd_text, vm_text, busy_vm_ops, busy_vdi_ops):
+    """(disks, busy) for the VDIs whose other-config says leaf-coalesce: false.
+
+    vdi_text is 'xe vdi-list other-config:leaf-coalesce=false', and each record is checked
+    again here, so a filter xe ever ignored would show up as disks that do not qualify
+    rather than as every disk in the pool. vbd_text is every VBD (None when it was not read,
+    which leaves each disk's VMs unnamed), vm_text the VM list with current-operations (None
+    when not read: the disk's own operations are still judged, its VMs' are not).
+
+    disks: [{"uuid", "name", "sr", "snapshot", "vms": [(uuid, name)]}], ordered by first VM
+    name and then disk name; busy: how many were left out because their VM or the disk
+    itself is in one of the busy operations, which is when the flag belongs there.
+    """
+    vm_ops = {}
+    for rec in parse_xe_records(vm_text or ""):
+        vm_ops[rec.get("uuid", "")] = xe_ops(rec.get("current-operations"))
+    by_vdi = {}
+    for rec in parse_xe_records(vbd_text or ""):
+        vdi = rec.get("vdi-uuid", "")
+        if vdi and vdi != "<not in database>":
+            by_vdi.setdefault(vdi, []).append((rec.get("vm-uuid", ""),
+                                               rec.get("vm-name-label", "")))
+    disks, busy = [], 0
+    for rec in parse_xe_records(vdi_text or ""):
+        if _xe_map(rec.get("other-config")).get("leaf-coalesce", "").lower() != "false":
+            continue
+        vms = sorted(by_vdi.get(rec.get("uuid", ""), []), key=lambda v: (v[1].lower(), v[0]))
+        if (xe_ops(rec.get("current-operations")) & set(busy_vdi_ops) or
+                any(vm_ops.get(u, set()) & set(busy_vm_ops) for u, _n in vms)):
+            busy += 1
+            continue
+        disks.append({"uuid": rec.get("uuid", ""), "name": rec.get("name-label", ""),
+                      "sr": rec.get("sr-name-label", ""),
+                      "snapshot": rec.get("is-a-snapshot", "") == "true", "vms": vms})
+    disks.sort(key=lambda d: ((d["vms"][0][1].lower() if d["vms"] else "￿"),
+                              d["name"].lower(), d["uuid"]))
+    return disks, busy
+
+
+def leaf_coalesce_srs(sr_text):
+    """[(uuid, name)] of the SRs whose own other-config says leaf-coalesce: false - GC then
+    leaf-coalesces nothing on that SR ("Leaf-coalesce disabled for this SR")."""
+    out = []
+    for rec in parse_xe_records(sr_text or ""):
+        if _xe_map(rec.get("other-config")).get("leaf-coalesce", "").lower() == "false":
+            out.append((rec.get("uuid", ""), rec.get("name-label", "")))
+    return sorted(out, key=lambda s: (s[1].lower(), s[0]))
+
+
+def windows_vm_findings(vm_text, keys):
+    """(windows, findings) over 'xe vm-list' labelled records.
+
+    A VM is a Windows VM when its guest agent says so (os-version distro 'windows', or a
+    name starting 'Microsoft Windows') or when it was made from a Windows template
+    (reference-label 'windows-...', or other-config base_template_name 'Windows ...'). A
+    VM with no agent made from a non-Windows template cannot be told apart, and is not seen.
+    XO replicas (other-config xo:backup:vm) are left out: each carries its source's
+    platform, so it would repeat the source's finding.
+
+    findings: [(name, uuid, [problem, ...])] for the ones that fall short:
+      - the guest is Windows but the VM was made from a template that is not ('Other
+        install media'); a VM whose origin is not recorded is not judged on this
+      - a platform key of `keys` not set to true
+    """
+    windows, findings = 0, []
+    for rec in parse_xe_records(vm_text or ""):
+        if rec.get("is-control-domain") == "true":
+            continue
+        other = _xe_map(rec.get("other-config"))
+        if "xo:backup:vm" in other:
+            continue
+        guest = _xe_map(rec.get("os-version"))
+        guest_win = (guest.get("distro", "").lower() == "windows" or
+                     guest.get("name", "").lower().startswith("microsoft windows"))
+        ref = (rec.get("reference-label") or "").strip()
+        base = other.get("base_template_name", "").strip()
+        template_win = ref.lower().startswith("windows") or base.lower().startswith("windows")
+        if not (guest_win or template_win):
+            continue
+        windows += 1
+        problems = []
+        if guest_win and not template_win and (ref or base):
+            problems.append("made from the '%s' template, not a Windows one" % (base or ref))
+        platform = _xe_map(rec.get("platform"))
+        short = [k for k in keys if platform.get(k, "").lower() != "true"]
+        if short:
+            problems.append("platform %s not set to true" % ", ".join(short))
+        if problems:
+            findings.append((rec.get("name-label", ""), rec.get("uuid", ""), problems))
+    findings.sort(key=lambda f: (f[0].lower(), f[1]))
+    return windows, findings
+
+
 # --------------------------------------------------------------------------------------
 # multipath
 # --------------------------------------------------------------------------------------
@@ -1425,16 +1633,33 @@ def _word_re(word):
                       re.IGNORECASE)
 
 
-def find_mtu_keywords(text, keywords):
-    """Whole-word, case-insensitive, on the raw text - and every match is collected.
+def _ignore_rules(ignore_rules):
+    """Each rule as its normalised substrings; an empty rule would match every line."""
+    rules = []
+    for rule in ignore_rules or ():
+        subs = [_normalise(s).strip() for s in rule if s and s.strip()]
+        if subs:
+            rules.append(subs)
+    return rules
 
-    Returning on the first hit meant the line could not say WHICH keyword tripped it.
+
+def find_mtu_keywords(text, keywords, ignore_rules=()):
+    """Whole-word, case-insensitive - and every match is collected, in keyword order.
+
+    Returning on the first hit meant the line could not say WHICH keyword tripped it. A
+    line containing ALL substrings of one ignore rule is skipped, as in dmesg_issue_lines:
+    "invalid large VPD tag" is a NIC's EEPROM, not a large frame.
     """
-    found = []
-    for kw in keywords:
-        if _word_re(kw).search(text):
-            found.append(kw)
-    return found
+    rules = _ignore_rules(ignore_rules)
+    word_res = [(kw, _word_re(kw)) for kw in keywords]
+    found = set()
+    for line in (text or "").splitlines():
+        if rules and any(all(sub in _normalise(line) for sub in rule) for rule in rules):
+            continue
+        for kw, r in word_res:
+            if kw not in found and r.search(line):
+                found.add(kw)
+    return [kw for kw in keywords if kw in found]
 
 
 def dmesg_issue_lines(text, words, phrases, ignore_rules):
@@ -1446,11 +1671,7 @@ def dmesg_issue_lines(text, words, phrases, ignore_rules):
     """
     lowered_words = [w.lower() for w in words if w]
     lowered_phrases = [p.lower().strip() for p in phrases if p and p.strip()]
-    rules = []
-    for rule in ignore_rules:
-        subs = [_normalise(s).strip() for s in rule if s and s.strip()]
-        if subs:
-            rules.append(subs)
+    rules = _ignore_rules(ignore_rules)
     word_res = [_word_re(w) for w in lowered_words]
 
     hits = []
@@ -3011,9 +3232,10 @@ def collect_iplink():
 
 
 def collect_ipaddr():
-    r = run(["ip", "-o", "-4", "addr", "show"], timeout=20)
+    """Both families: Overlapping Subnets reads the inet lines, Duplicate IPs all of them."""
+    r = run(["ip", "-o", "addr", "show"], timeout=20)
     if not r.ok:
-        return err("ip -4 addr show failed (%s)" % r.why())
+        return err("ip addr show failed (%s)" % r.why())
     return fact(r.out)
 
 
@@ -3780,13 +4002,22 @@ def collect_patch_facts():
 # log scanning
 # --------------------------------------------------------------------------------------
 
-def grep_scan(path, phrases, timeout=180):
+def grep_scan(path, phrases, timeout=180, ignore=None):
     """Line numbers of the LAST hit of each phrase in one file.
 
     One grep pass for all phrases together (these files run to 30 MB+), then attribution
     over just the matched lines. Streamed, so a phrase that matches constantly cannot
     blow memory. Returns {phrase_index: lineno} or None if the file could not be read.
+
+    ignore is a list of rules, each a list of substrings: a matched line containing ALL of
+    one rule's is no hit at all. It has to be decided here, while the last hit is picked -
+    dropped afterwards, it would hide an earlier, real hit of the same phrase.
     """
+    rules = []
+    for rule in ignore or []:
+        subs = [s.lower() for s in rule if s]
+        if subs:
+            rules.append(subs)
     if not phrases:
         return {}
     try:
@@ -3835,6 +4066,8 @@ def grep_scan(path, phrases, timeout=180):
             if not num.isdigit():
                 continue
             body = line[sep + 1:].lower()
+            if rules and any(all(s in body for s in r) for r in rules):
+                continue
             for i, needle in enumerate(lowered):
                 if needle and needle in body:
                     last[i] = int(num)
@@ -3867,20 +4100,20 @@ def context_lines(path, lineno, ctx):
     return r.out.splitlines()
 
 
-def collect_log_scan(files, phrases, ctx):
+def collect_log_scan(files, phrases, ctx, ignore=None):
     """For every (file, phrase) pair, the most recent hit with context.
 
     Each base log is tried first and its rotated .1 only for phrases the live file
     lacks: these rotate daily around 04:00, so right after a rotation the live file is
     nearly empty - but reporting a stale .1 hit beside a current one would be worse.
     One block per phrase, so a phrase that matches constantly ('except') can never
-    crowd out a rare, serious one.
+    crowd out a rare, serious one. ignore: see grep_scan.
     """
     if not files or not phrases:
         return fact([])
     blocks = []
     for base in files:
-        live = grep_scan(base, phrases)
+        live = grep_scan(base, phrases, ignore=ignore)
         rotated = None
         rotated_scanned = False
         for i, phrase in enumerate(phrases):
@@ -3889,7 +4122,7 @@ def collect_log_scan(files, phrases, ctx):
             if hit is None:
                 if not rotated_scanned:
                     rotated_scanned = True
-                    rotated = grep_scan(base + ".1", phrases)
+                    rotated = grep_scan(base + ".1", phrases, ignore=ignore)
                 path = base + ".1"
                 hit = rotated.get(i) if rotated is not None else None
             if hit is None:
@@ -4191,6 +4424,42 @@ def collect_pool(spec, self_uuid):
     out["tasks"] = fact({"text": r.out, "now": time.time()}) if r.ok else \
         err("xe task-list failed (%s)" % r.why())
 
+    # Windows VMs Not Optimized, and what Leaf-Coalesce Disabled judges busy-ness by: every
+    # VM in one labelled call. vm-list leaves templates and snapshots out by itself.
+    # reference-label is not known to exist on 8.2 (no 8.2 host left to look), and the list
+    # form answers a field that is not there with nothing, quietly (measured on 8.3 with a
+    # made-up name: 0 exceptions)
+    r = xe(["vm-list", "is-control-domain=false",
+            "params=uuid,name-label,power-state,current-operations,platform,"
+            "reference-label,other-config,os-version"])
+    out["vms"] = fact(r.out) if r.ok else err("xe vm-list failed (%s)" % r.why())
+
+    # Leaf-Coalesce Disabled: xe filters on the map key itself (measured: 0 of 127 VDIs back
+    # on a pool with none set, 0 exceptions), and the parser checks every record again. The
+    # VBDs are only worth a call when there is a disk to name the VMs of.
+    lc = {}
+    r = xe(["vdi-list", "other-config:leaf-coalesce=false",
+            "params=uuid,name-label,sr-name-label,is-a-snapshot,current-operations,other-config"])
+    if not r.ok:
+        out["leaf_coalesce"] = err("xe vdi-list failed (%s)" % r.why())
+    else:
+        lc["vdis"] = r.out
+        lc["vbds"] = ""
+        if r.out.strip():
+            r = xe(["vbd-list", "params=uuid,vdi-uuid,vm-uuid,vm-name-label"])
+            if r.ok:
+                lc["vbds"] = r.out
+            else:
+                lc["vbds"] = None
+                lc["vbd_error"] = "xe vbd-list failed (%s)" % r.why()
+        r = xe(["sr-list", "other-config:leaf-coalesce=false", "params=uuid,name-label,other-config"])
+        if r.ok:
+            lc["srs"] = r.out
+        else:
+            lc["srs"] = None
+            lc["sr_error"] = "xe sr-list failed (%s)" % r.why()
+        out["leaf_coalesce"] = fact(lc)
+
     r = xe(["sr-list", "type=linstor", "--minimal"])
     if not r.ok:
         out["xostor_srs"] = err("xe sr-list type=linstor failed (%s)" % r.why())
@@ -4327,7 +4596,8 @@ def collect(spec):
         scan = spec.get("log_scan") or {}
         out["log_scan"] = collect_log_scan(scan.get("files") or [],
                                            scan.get("phrases") or [],
-                                           scan.get("context") or 3)
+                                           scan.get("context") or 3,
+                                           scan.get("ignore") or [])
         lun = spec.get("lun_scan") or {}
         out["lun_scan"] = collect_log_scan(lun.get("files") or [],
                                            lun.get("phrases") or [],
@@ -6063,7 +6333,8 @@ def mtu_issues(host):
     f = host.fact("dmesg")
     if not f.ok:
         return unknown("MTU Issues", "Unknown (could not read dmesg)")
-    found = parsers.find_mtu_keywords(f.value, config.MTU_DMESG_KEYWORDS)
+    found = parsers.find_mtu_keywords(f.value, config.MTU_DMESG_KEYWORDS,
+                                      config.DMESG_IGNORE_RULES)
     if not found:
         return ok("MTU Issues", "None")
     # every matching keyword is named, so the line says which one tripped it
@@ -6166,10 +6437,12 @@ def coredumps(host):
 def failed_units(host):
     """A systemd unit in the failed state: a service that did not start, or died since.
 
-    systemctl's own answer, with the prefixes in FAILED_UNITS_IGNORE left out - SM's GC
+    systemctl's own answer, with the units FAILED_UNITS_IGNORE matches left out - SM's GC
     runs, whose health is judged from SMlog rather than from the state of the last run's
-    unit. A unit stays failed until it is started again, reset or the host reboots, so the
-    finding can be days old: the detail says what systemd says, and that is all it claims.
+    unit, and the units expected to sit failed (XOSTOR's database resource on the hosts
+    that do not hold it, mcelog on AMD). A unit stays failed until it is started again,
+    reset or the host reboots, so the finding can be days old: the detail says what
+    systemd says, and that is all it claims.
 
     attach-static-vdis is left out only when its failure was about nothing: no static-VDI
     entry existed when it failed (a host booted with HA off, which its script fails on
@@ -6179,7 +6452,7 @@ def failed_units(host):
     if not f.ok:
         return unknown("Failed Systemd Units", "Unknown (%s)" % f.error)
     units = [(u, d) for u, d in parsers.parse_failed_units(f.value)
-             if not any(u.startswith(p) for p in config.FAILED_UNITS_IGNORE)]
+             if not parsers.unit_ignored(u, config.FAILED_UNITS_IGNORE)]
     notes = []
     if any(u == config.STATIC_VDIS_UNIT for u, _d in units):
         sv, boot = host.fact("static_vdis"), host.fact("boot_epoch")
@@ -6545,6 +6818,79 @@ def overlapping_subnets(host):
     if parsers.has_overlapping_subnets(parsers.parse_ipv4_addrs(f.value)):
         return flag("Overlapping Subnets", "Yes")
     return ok("Overlapping Subnets", "No")
+
+
+def duplicate_ips(host):
+    """One address on two interfaces of this host - two NICs, or a NIC and a bridge, both
+    answering for it. Overlapping Subnets trips on that too, but cannot say which address
+    or where; this names both. Both families; loopback and link-local are left out (see
+    parsers.parse_ip_addrs)."""
+    f = host.fact("ipaddr")
+    if not f.ok:
+        return unknown("Duplicate IPs", "Unknown (%s)" % f.error)
+    dups = parsers.duplicate_addresses(parsers.parse_ip_addrs(f.value))
+    if not dups:
+        return ok("Duplicate IPs", "None")
+    return flag("Duplicate IPs", "Yes", " - " + "; ".join(
+        "%s on %s" % (addr, ", ".join(names)) for addr, names in dups))
+
+
+def duplicate_ips_across_hosts(hosts, xoa_addrs=None):
+    """One address on two machines: two pool hosts, or a host and the XOA.
+
+    hosts is every host in scope, reachable or not; an unreachable one is named as not
+    compared (Unreachable Hosts flags it already), while a reachable host whose addresses
+    could not be read leaves a clean answer Unknown - it is one of the machines the
+    comparison is about. xoa_addrs is the appliance's own 'ip -o addr show' as a Fact, or
+    None in a host run, which has no XOA. Each machine counts once per address: one address
+    twice on one machine is the host line's finding, not this one's.
+    """
+    machines, unread, unreachable = [], [], []
+    for h in hosts:
+        if not h.reachable:
+            unreachable.append(h.address)
+            continue
+        f = h.fact("ipaddr")
+        if f.ok:
+            machines.append((h.label, parsers.parse_ip_addrs(f.value)))
+        else:
+            unread.append("%s (%s)" % (h.label, f.error))
+    host_count = len(machines)
+    if xoa_addrs is not None:
+        if xoa_addrs.ok:
+            machines.append(("this XOA", parsers.parse_ip_addrs(xoa_addrs.value)))
+        else:
+            unread.append("this XOA (%s)" % xoa_addrs.error)
+
+    owners = {}
+    for label, entries in machines:
+        for ifname, addr in entries:
+            names = owners.setdefault(addr, {}).setdefault(label, [])
+            if ifname not in names:
+                names.append(ifname)
+    clashes = sorted((addr, o) for addr, o in owners.items() if len(o) > 1)
+
+    scope = _plural(host_count, "host") + (" + this XOA" if len(machines) > host_count else "")
+    tail = ""
+    if unreachable:
+        tail = ", %s not compared (unreachable)" % " ".join(unreachable)
+    if clashes:
+        lines = []
+        for addr, o in clashes:
+            lines.append("  %s" % addr)
+            for label in sorted(o):
+                lines.append("    %s  (%s)" % (label, ", ".join(o[label])))
+        if unread:
+            lines.append("  not read: " + "; ".join(unread))
+        return flag("Duplicate IPs Across Hosts", "Yes", " - " + ", ".join(addr for addr, _o in clashes)).with_detail(
+            "Duplicate IPs Across Hosts", "\n".join(lines))
+    if unread:
+        return unknown("Duplicate IPs Across Hosts", "Unknown - none among %s, but not read: %s"
+                       % (scope, "; ".join(unread)))
+    if len(machines) < 2:
+        return ok("Duplicate IPs Across Hosts", "N/A - Nothing to compare" + tail)
+    return ok("Duplicate IPs Across Hosts", "None (%s, %d address%s)%s"
+              % (scope, len(owners), "" if len(owners) == 1 else "es", tail))
 
 
 def _render_scan_blocks(blocks):
@@ -7039,6 +7385,98 @@ def long_running_tasks(pool):
                                                 ", ".join(t[0] for t in old[:3]) +
                                                 (", ..." if len(old) > 3 else ""))).with_detail(
         "Long-Running Tasks", "\n".join(lines))
+
+
+def leaf_coalesce_disabled(pool):
+    """Disks SM's GC will never leaf-coalesce, and SRs where it will leaf-coalesce nothing.
+
+    other-config:leaf-coalesce=false on a VDI is written by SM when a storage migration
+    starts mirroring that disk (see config.LEAF_COALESCE_BUSY_VM_OPS for the trace), and a
+    migration that fails or is cancelled leaves it there: the disk's snapshot chain then
+    only ever grows. A disk whose VM or VDI is mid-migration, -export or -import right now
+    is where the flag belongs, so it is counted aside. On an SR's other-config the same key
+    turns leaf-coalesce off for every disk on it, and only a person sets that.
+
+    The VM list is what busy-ness is judged by; without it every flagged disk is reported
+    and the detail says why. The VBD list only names the VMs, so without it the disks are
+    still reported, unnamed.
+    """
+    f = pool.fact("leaf_coalesce")
+    if not f.ok:
+        return unknown("Leaf-Coalesce Disabled", "Unknown (%s)" % f.error)
+    v = f.value if isinstance(f.value, dict) else {}
+    vms = pool.fact("vms")
+    disks, busy = parsers.leaf_coalesce_vdis(
+        v.get("vdis") or "", v.get("vbds"), vms.value if vms.ok else None,
+        config.LEAF_COALESCE_BUSY_VM_OPS, config.LEAF_COALESCE_BUSY_VDI_OPS)
+    srs = parsers.leaf_coalesce_srs(v.get("srs") or "")
+    aside = (" (%s mid-migration/export/import, as expected)" % _plural(busy, "disk")
+             if busy else "")
+    if not disks and not srs:
+        if v.get("srs") is None:
+            return unknown("Leaf-Coalesce Disabled", "Unknown - no disk has it%s, but the SRs were not read (%s)"
+                           % (aside, v.get("sr_error") or "not collected"))
+        return ok("Leaf-Coalesce Disabled", "None" + aside)
+
+    lines = []
+    for uuid, name in srs:
+        lines.append("  SR %s (%s): leaf-coalesce disabled for every disk on it" % (name, uuid))
+    rows = []
+    for d in disks:
+        where = ", ".join("%s (%s)" % (n or "?", u) for u, n in d["vms"]) or "no VM"
+        rows.append("  %s: %s (%s) on %s%s" % (where, d["name"], d["uuid"], d["sr"] or "?",
+                                               "  [snapshot]" if d["snapshot"] else ""))
+    lines.extend(parsers.cap_lines(rows, config.LEAF_COALESCE_MAX_LINES, "disk(s)"))
+    if busy:
+        lines.append("  %s left out: mid-migration/export/import right now"
+                     % _plural(busy, "flagged disk"))
+    if v.get("vbds") is None and disks:
+        lines.append("  the VBD list was not read (%s), so the disks' VMs are not named"
+                     % (v.get("vbd_error") or "not collected"))
+    if not vms.ok and disks:
+        lines.append("  whether any of these is mid-migration was not established (%s), so "
+                     "all are listed" % vms.error)
+    if v.get("srs") is None:
+        lines.append("  the SRs were not read (%s)" % (v.get("sr_error") or "not collected"))
+    lines.append("Left behind by a storage migration that did not finish: GC skips the disk "
+                 "until the key goes - xe vdi-param-remove uuid=<vdi> param-name=other-config "
+                 "param-key=leaf-coalesce (xe sr-param-remove for an SR).")
+    vm_count = len(set(u for d in disks for u, _n in d["vms"]))
+    parts = []
+    if disks:
+        parts.append(_plural(len(disks), "disk") +
+                     (" on %s" % _plural(vm_count, "VM") if vm_count else ""))
+    if srs:
+        parts.append(_plural(len(srs), "SR"))
+    return flag("Leaf-Coalesce Disabled", "Yes", " - %s, see below" % ", ".join(parts)).with_detail(
+        "Leaf-Coalesce Disabled", "\n".join(lines))
+
+
+def windows_vms_not_optimized(pool):
+    """Windows VMs made from the wrong template, or missing the viridian enlightenments.
+
+    The 8.3 Windows templates set every key in config.WINDOWS_PLATFORM_KEYS; 'Other install
+    media' sets none, and a VM made from an older Windows template carries viridian alone.
+    Without them Windows runs on emulated timers and interrupt paths. Halted VMs are judged
+    too, since the platform is read at the next boot; XO replicas are not (see
+    parsers.windows_vm_findings, which also says which VMs it cannot recognise).
+    """
+    f = pool.fact("vms")
+    if not f.ok:
+        return unknown("Windows VMs Not Optimized", "Unknown (%s)" % f.error)
+    windows, findings = parsers.windows_vm_findings(f.value or "", config.WINDOWS_PLATFORM_KEYS)
+    if not windows:
+        return ok("Windows VMs Not Optimized", "N/A - No Windows VMs found")
+    if not findings:
+        return ok("Windows VMs Not Optimized", "None (%s checked)" % _plural(windows, "Windows VM"))
+    rows = ["  %s (%s): %s" % (name or "?", uuid, "; ".join(problems))
+            for name, uuid, problems in findings]
+    lines = parsers.cap_lines(rows, config.WINDOWS_MAX_LINES, "VM(s)")
+    lines.append("Platform keys take effect at the VM's next boot: xe vm-param-set uuid=<vm> "
+                 + " ".join("platform:%s=true" % k for k in config.WINDOWS_PLATFORM_KEYS))
+    return flag("Windows VMs Not Optimized", "Yes", " - %d of %s, see below"
+                % (len(findings), _plural(windows, "Windows VM"))).with_detail(
+        "Windows VMs Not Optimized", "\n".join(lines))
 
 
 def migration_compression(pool):
@@ -7945,6 +8383,17 @@ def _dmesg():
     return out if rc == 0 else None
 
 
+def ip_addrs():
+    """The appliance's own 'ip -o addr show', as a Fact, for Duplicate IPs Across Hosts:
+    the same command the collector runs on a host, so both sides parse one way."""
+    rc, out, err = transport.run_local_cmd(["ip", "-o", "addr", "show"],
+                                           timeout=config.LOCAL_CMD_TIMEOUT)
+    if rc != 0:
+        return Fact(False, error="ip addr show failed (%s)" % (
+            "timed out" if rc == 124 else (err.strip() or "exit %d" % rc)))
+    return Fact(True, value=out)
+
+
 def _plugins_line(data):
     """Is anything installed here that Vates did not ship?
 
@@ -8589,7 +9038,8 @@ def _host_spec(with_smapi):
         "smapi": bool(with_smapi),
         "log_scan": {"files": config.LOG_ERROR_FILES,
                      "phrases": config.LOG_ERROR_PHRASES,
-                     "context": config.LOG_ERROR_CONTEXT},
+                     "context": config.LOG_ERROR_CONTEXT,
+                     "ignore": config.LOG_ERROR_IGNORE_RULES},
         "lun_scan": {"files": config.LUN_CHANGE_FILES,
                      "phrases": config.LUN_CHANGE_PHRASES,
                      "context": config.LOG_ERROR_CONTEXT},
@@ -9343,10 +9793,16 @@ def pool_status_section(run, rep):
         # like the two above, a comparison ACROSS hosts, so it belongs to the pool rather
         # than to any one host and has nothing to say when only one host was looked at
         rep.check("Multipath Path Counts", checks.multipath_path_counts, reachable)
+        # the XOA counts as one of the machines: an appliance holding a host's address
+        # is the same fault as two hosts holding one
+        rep.check("Duplicate IPs Across Hosts", checks.duplicate_ips_across_hosts, run.hosts,
+                  xoa.ip_addrs() if run.run_env == "xoa" else None)
 
     rep.check("HA Enabled", checks.ha_enabled, run.pool)
     rep.check("SR Attachment", checks.sr_attachment, run.pool)
     rep.check("Long-Running Tasks", checks.long_running_tasks, run.pool)
+    rep.check("Leaf-Coalesce Disabled", checks.leaf_coalesce_disabled, run.pool)
+    rep.check("Windows VMs Not Optimized", checks.windows_vms_not_optimized, run.pool)
     rep.check("Migration Compression", checks.migration_compression, run.pool)
     rep.check("Missing Patches", checks.missing_patches, run.pool)
     if not run.host_solo():
@@ -9503,6 +9959,7 @@ def per_host_checks():
         ("silly_mtus", "Silly MTUs", checks.silly_mtus),
         ("dns_gw_non_mgmt_pifs", "DNS/GW on Non-Mgmt PIFs", checks.dns_gw_non_mgmt_pifs),
         ("overlapping_subnets", "Overlapping Subnets", checks.overlapping_subnets),
+        ("duplicate_ips", "Duplicate IPs", checks.duplicate_ips),
         ("log_errors", "Log Errors", checks.log_errors),
         ("lun_assignments", "LUN Assignments", checks.lun_assignments),
         ("smapi_hidden_leaves", "SMAPI Hidden Leaves", checks.smapi_hidden_leaves),
@@ -9823,17 +10280,17 @@ def _module(name, exported):
     return module
 
 
-config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DMESG_MAX_LINES', 'DMESG_ROLLUP_MIN', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'FAILED_UNITS_IGNORE', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MOUNT_PROBE_RESERVE', 'MOUNT_PROBE_TIMEOUT', 'MOUNT_STALL_FILES', 'MOUNT_STALL_PHRASES', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'NETWORK_FS_TYPES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'PROGRESS_INTERVAL', 'REMOTE_CMD_TIMEOUT', 'RO_FS_DMESG', 'RO_FS_EXTRA', 'RO_FS_NATIVE_RO', 'RO_FS_SR_DIRS', 'RUN_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'STATIC_VDIS_UNIT', 'STUCK_MAX_LINES', 'STUCK_MIN_AGE', 'STUCK_RECHECK_DELAY', 'STUCK_SAMPLES', 'TASK_PENDING_MAX_HOURS', 'TIME_SYNC_ALLOWANCE_SECS', 'UPDATE_MIRROR_BUDGET', 'UPDATE_MIRROR_MAX_PROBES', 'UPDATE_MIRROR_REDIRECTOR', 'UPDATE_MIRROR_TIMEOUT', 'XOA_CHECK_TIMEOUT', 'XOA_STOCK_PLUGINS', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_PACKAGES', 'XOSTOR_QCOW2_MAX_LINES', 'XOSTOR_VG', 'XO_DNS_TIMEOUT', 'XO_PLUGIN_LOOKUP_PATHS', 'XO_PLUGIN_PREFIX', 'XO_PLUGIN_SCOPE_DIR', 'XO_PLUGIN_SCOPE_PREFIX', 'XO_REDIS_TIMEOUT'])
+config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DMESG_MAX_LINES', 'DMESG_ROLLUP_MIN', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'FAILED_UNITS_IGNORE', 'LEAF_COALESCE_BUSY_VDI_OPS', 'LEAF_COALESCE_BUSY_VM_OPS', 'LEAF_COALESCE_MAX_LINES', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_IGNORE_RULES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MOUNT_PROBE_RESERVE', 'MOUNT_PROBE_TIMEOUT', 'MOUNT_STALL_FILES', 'MOUNT_STALL_PHRASES', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'NETWORK_FS_TYPES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'PROGRESS_INTERVAL', 'REMOTE_CMD_TIMEOUT', 'RO_FS_DMESG', 'RO_FS_EXTRA', 'RO_FS_NATIVE_RO', 'RO_FS_SR_DIRS', 'RUN_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'STATIC_VDIS_UNIT', 'STUCK_MAX_LINES', 'STUCK_MIN_AGE', 'STUCK_RECHECK_DELAY', 'STUCK_SAMPLES', 'TASK_PENDING_MAX_HOURS', 'TIME_SYNC_ALLOWANCE_SECS', 'UPDATE_MIRROR_BUDGET', 'UPDATE_MIRROR_MAX_PROBES', 'UPDATE_MIRROR_REDIRECTOR', 'UPDATE_MIRROR_TIMEOUT', 'WINDOWS_MAX_LINES', 'WINDOWS_PLATFORM_KEYS', 'XOA_CHECK_TIMEOUT', 'XOA_STOCK_PLUGINS', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_PACKAGES', 'XOSTOR_QCOW2_MAX_LINES', 'XOSTOR_VG', 'XO_DNS_TIMEOUT', 'XO_PLUGIN_LOOKUP_PATHS', 'XO_PLUGIN_PREFIX', 'XO_PLUGIN_SCOPE_DIR', 'XO_PLUGIN_SCOPE_PREFIX', 'XO_REDIS_TIMEOUT'])
 colors = _module('colors', ['CYAN', 'GREEN', 'RESET', 'YELLOW', 'cyan', 'green', 'init', 'strip_ansi', 'yellow'])
 result = _module('result', ['FLAG', 'Fact', 'INFO', 'Line', 'MISSING', 'OK', 'UNKNOWN', 'flag', 'guard', 'info', 'ok', 'pinned', 'raw', 'unknown', 'wrap'])
-parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', 'SR_ATTACH_SKIP_TYPES', '_DIFF_KINDS', '_LINK_RE', '_LOOSE_URL_RE', '_MANIFEST_PKG_RE', '_MOUNT_FIELD_ESCAPES', '_MTU_RE', '_PARAM_RE', '_PREMIUM_SUFFIX', '_SCHEME_RE', '_TS_RE', '_XO_URL_RE', '_cidr_range', '_ids_among', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', 'backup_runners', 'cap_lines', 'classify_multipath_path', 'classify_xo_plugins', 'context_block', 'dmesg_issue_lines', 'find_mtu_keywords', 'find_phrase_lines', 'format_age', 'has_overlapping_subnets', 'has_url_scheme', 'host_records_from_state_db', 'http_proxy_address', 'ip_literal', 'job_field', 'job_touches_pool', 'leading_version', 'manifest_diff', 'manifest_diff_summary', 'manifest_packages', 'manifest_plugin_names', 'manifest_versions', 'mount_field', 'mount_table', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_failed_units', 'parse_host_list', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_lvm_backup_pvs', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pending_tasks', 'parse_pool_conf', 'parse_pvs', 'parse_sr_attachment', 'parse_timedatectl', 'parse_xe_records', 'plugin_block', 'pool_member_addresses', 'pv_missing', 'read_only_mounts', 'rollup_repeats', 'round_1dp', 'split_host_port', 'split_timestamp', 'static_vdis_failure_moot', 'truncate_block', 'unit_display', 'xapi_utc', 'xo_pattern_match', 'xo_server_address', 'xo_simple_ids'])
+parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', 'SR_ATTACH_SKIP_TYPES', '_DIFF_KINDS', '_LINK_RE', '_LOOSE_URL_RE', '_MANIFEST_PKG_RE', '_MOUNT_FIELD_ESCAPES', '_MTU_RE', '_PARAM_RE', '_PREMIUM_SUFFIX', '_SCHEME_RE', '_TS_RE', '_XO_URL_RE', '_cidr_range', '_ids_among', '_ignore_rules', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', '_xe_map', 'backup_runners', 'cap_lines', 'classify_multipath_path', 'classify_xo_plugins', 'context_block', 'dmesg_issue_lines', 'duplicate_addresses', 'find_mtu_keywords', 'find_phrase_lines', 'format_age', 'has_overlapping_subnets', 'has_url_scheme', 'host_records_from_state_db', 'http_proxy_address', 'ip_literal', 'job_field', 'job_touches_pool', 'leading_version', 'leaf_coalesce_srs', 'leaf_coalesce_vdis', 'manifest_diff', 'manifest_diff_summary', 'manifest_packages', 'manifest_plugin_names', 'manifest_versions', 'mount_field', 'mount_table', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_failed_units', 'parse_host_list', 'parse_ip_addrs', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_lvm_backup_pvs', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pending_tasks', 'parse_pool_conf', 'parse_pvs', 'parse_sr_attachment', 'parse_timedatectl', 'parse_xe_records', 'plugin_block', 'pool_member_addresses', 'pv_missing', 'read_only_mounts', 'rollup_repeats', 'round_1dp', 'split_host_port', 'split_timestamp', 'static_vdis_failure_moot', 'truncate_block', 'unit_display', 'unit_ignored', 'windows_vm_findings', 'xapi_utc', 'xe_ops', 'xo_pattern_match', 'xo_server_address', 'xo_simple_ids'])
 model = _module('model', ['Host', 'Pool', 'ntp_match', 'ram_match'])
 collectorsrc = _module('collectorsrc', ['EMBEDDED', 'collector_source'])
 transport = _module('transport', ['ASKPASS_ENV', 'ASKPASS_SCRIPT', 'AUTH_ASKPASS', 'AUTH_SSHPASS', 'BEGIN_MARKER', 'CollectError', 'END_MARKER', 'Transport', '_DEBUG_LOCK', '_LIVE', '_LIVE_LOCK', '_REMOTE_LAUNCH', '_REMOTE_LAUNCH_PINNED', '_kill_tree', '_remote_launch', 'cleanup_work_dir', 'debug', 'ensure_sshpass', 'have', 'kill_all_children', 'make_work_dir', 'run_local_cmd', 'which', 'write_askpass'])
 xoredis = _module('xoredis', ['DEFAULT_ADDR', 'ENCRYPTION_PREFIX', 'IDS_KEY', 'PLUGIN_IDS_KEY', 'PLUGIN_RECORD_PREFIX', 'RECORD_PREFIX', 'RedisError', '_config_dirs', '_config_files', '_encode', '_fetch', '_fetch_autoload', '_fetch_collection', '_flatten', '_mentions_redis', '_read_reply', 'read_plugin_autoload', 'read_records', 'read_server_records'])
 xodb = _module('xodb', ['QUOTES', 'SELECT_NONE', 'SELECT_NO_MATCH', 'SELECT_OK', 'SELECT_QUIT', 'SELECT_UNREADABLE', 'Server', '_ALL_SERVERS', '_COLLECTIONS', '_ESCAPE_RE', '_KEY_RE', '_READ_ERROR', '_RESOLVED', '_SIMPLE_ESCAPES', '_describe_failure', '_ls', '_read_servers', '_resolve', '_same_address', '_sort_key', 'all_servers', 'backup_routes', 'clean', 'collection', 'db_address', 'enabled_server_for', 'enabled_servers', 'have_xo_server_db', 'match_record', 'password_for', 'pool_name_for_host', 'read_error', 'record_password', 'reset_cache', 'scan_records', 'select_pool', 'server_for_host', 'unescape'])
-checks = _module('checks', ['_backup_moved_elsewhere', '_dmesg_phrase_blocks', '_drbd_stale', '_first_line', '_ha_statefile_sr_text', '_linstor_column', '_linstor_has_rows', '_linstor_line', '_linstor_node_addresses', '_linstor_node_offline', '_linstor_table', '_linstor_unknown', '_maps', '_mount_detail', '_multipath_detail', '_multipath_read', '_network_line', '_plural', '_pool_conf_target', '_pool_roles_detail', '_pool_rollup', '_render_scan_blocks', '_ro_detail', '_ro_name', '_stuck_detail', '_url_host_of', '_xostor_signature', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_block', 'dmesg_content', 'dmesg_content_of', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'failed_units', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'log_errors', 'long_running_tasks', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mount_stalls', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'network_mounts', 'ntp', 'oom_events', 'overlapping_subnets', 'pending_reboot_pool', 'pool_host_list', 'pool_roles', 'read_only_filesystems', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'sr_attachment', 'stuck_processes', 'tap_status', 'task_timeout_override', 'update_mirror_access', 'update_mirror_access_pool', 'vlan0', 'xapi_status', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_missing_devices', 'xostor_missing_devices_pool', 'xostor_nodes', 'xostor_pref_nic', 'xostor_qcow2', 'xostor_ram', 'xostor_version_consistency', 'xostor_versions', 'yum_patch_level'])
-xoa = _module('xoa', ['_dmesg', '_first_token', '_max_old_space', '_meminfo', '_os_version', '_plugin_autoload', '_plugin_scan_targets', '_plugin_version', '_plugins_line', '_service_state', '_updater', 'collect_xoa', 'debian_version_ok', 'lines', 'ping_silent', 'running_as_root', 'scan_plugins'])
+checks = _module('checks', ['_backup_moved_elsewhere', '_dmesg_phrase_blocks', '_drbd_stale', '_first_line', '_ha_statefile_sr_text', '_linstor_column', '_linstor_has_rows', '_linstor_line', '_linstor_node_addresses', '_linstor_node_offline', '_linstor_table', '_linstor_unknown', '_maps', '_mount_detail', '_multipath_detail', '_multipath_read', '_network_line', '_plural', '_pool_conf_target', '_pool_roles_detail', '_pool_rollup', '_render_scan_blocks', '_ro_detail', '_ro_name', '_stuck_detail', '_url_host_of', '_xostor_signature', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_block', 'dmesg_content', 'dmesg_content_of', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'duplicate_ips', 'duplicate_ips_across_hosts', 'failed_units', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'leaf_coalesce_disabled', 'log_errors', 'long_running_tasks', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mount_stalls', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'network_mounts', 'ntp', 'oom_events', 'overlapping_subnets', 'pending_reboot_pool', 'pool_host_list', 'pool_roles', 'read_only_filesystems', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'sr_attachment', 'stuck_processes', 'tap_status', 'task_timeout_override', 'update_mirror_access', 'update_mirror_access_pool', 'vlan0', 'windows_vms_not_optimized', 'xapi_status', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_missing_devices', 'xostor_missing_devices_pool', 'xostor_nodes', 'xostor_pref_nic', 'xostor_qcow2', 'xostor_ram', 'xostor_version_consistency', 'xostor_versions', 'yum_patch_level'])
+xoa = _module('xoa', ['_dmesg', '_first_token', '_max_old_space', '_meminfo', '_os_version', '_plugin_autoload', '_plugin_scan_targets', '_plugin_version', '_plugins_line', '_service_state', '_updater', 'collect_xoa', 'debian_version_ok', 'ip_addrs', 'lines', 'ping_silent', 'running_as_root', 'scan_plugins'])
 report = _module('report', ['Report', '_as_entry'])
 runcmd = _module('runcmd', ['TRANSPORT_FAILED', '_run_one', 'execute'])
 

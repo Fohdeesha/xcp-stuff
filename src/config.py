@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Every threshold, list and toggle, in one place. Same names and values as health.sh."""
 
-SCRIPT_VERSION = "3.26"
+SCRIPT_VERSION = "3.27"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
@@ -41,10 +41,38 @@ RO_FS_NATIVE_RO = ["iso9660", "udf", "squashfs", "cramfs", "erofs"]  # read-only
 # stay under 24 to be able to say anything at all.
 TASK_PENDING_MAX_HOURS = 16
 
-# Failed Systemd Units: units left out, by name prefix. SMGC@<sr>.service is one GC run of an
-# SR; a failed one stays 'failed' until that SR's next GC run, and GC health is judged from
-# SMlog by storage-state-fixer (C19), not from a unit state.
-FAILED_UNITS_IGNORE = ["SMGC@"]
+# Leaf-Coalesce Disabled: a VDI with other-config:leaf-coalesce=false is never leaf-coalesced
+# by SM's GC ("Leaf-coalesce disabled for <vdi>"). SM itself writes it (VDI.py
+# disable_leaf_on_secondary) when a storage migration starts mirroring the disk, and writes
+# it again when the mirror is stopped; a migration that completes takes the source disk away
+# with it, one that fails or is cancelled leaves the flag behind for good. Nothing in xapi or
+# XO sets it (xen-api and xen-orchestra master, 2026-11). A disk whose VM or VDI is in one of
+# these operations right now is in the middle of that, and is not counted.
+LEAF_COALESCE_BUSY_VM_OPS = ["migrate_send", "pool_migrate", "export", "import"]
+LEAF_COALESCE_BUSY_VDI_OPS = ["mirror", "copy"]
+LEAF_COALESCE_MAX_LINES = 40
+
+# Windows VMs Not Optimized: the platform keys every 8.3 Windows template sets (read off the
+# 8.3 templates on the lab, 2026-11-24) and "Other install media" sets none of. xapi passes
+# them through to xenguest as they are; a VM made from an older Windows template carries
+# viridian alone.
+WINDOWS_PLATFORM_KEYS = ["viridian", "viridian_time_ref_count", "viridian_reference_tsc",
+                         "viridian_apic_assist", "viridian_crash_ctl", "viridian_stimer"]
+WINDOWS_MAX_LINES = 40
+
+# Failed Systemd Units: units left out, as fnmatch patterns on the unescaped name (the one
+# the report prints, 'SMGC@a112-...' rather than 'SMGC@a112\x2d...').
+#   SMGC@*   one GC run of an SR; a failed one stays 'failed' until that SR's next GC run,
+#            and GC health is judged from SMlog by storage-state-fixer (C19), not from a unit
+#   *xcp-persistent-database.service   the units drbd-utils and drbd-reactor's promoter run
+#            for XOSTOR's LINSTOR-database resource (drbd@..., drbd-promote@...), expected to
+#            sit failed on the hosts that do not hold it; the controller's own health is
+#            the XOSTOR lines' business
+#   mcelog.service   fails at every boot on an AMD host by design: "mcelog: ERROR: AMD
+#            Processor family 25: mcelog does not support this processor.  Please use the
+#            edac_mce_amd module instead." (seen in the field, 2026-11). Left out on every
+#            CPU, the maintainer's call - on Intel that hides a dead machine-check logger.
+FAILED_UNITS_IGNORE = ["SMGC@*", "*xcp-persistent-database.service", "mcelog.service"]
 # attach-static-vdis is left out only when no static-VDI entry existed when it failed: its
 # script, before xen-api ae4d3ec4, fails on an empty directory (a host booted with HA off)
 STATIC_VDIS_UNIT = "attach-static-vdis.service"
@@ -57,10 +85,14 @@ DMESG_ISSUE_WORDS = ["panic", "crash", "rip", "kill"]  # whole-word, case-insens
 DMESG_ISSUE_PHRASES = ["call trace", "timed out"]      # substring, case-insensitive
 OOM_PHRASE = "out of memory"
 
-# A dmesg line that matched a word/phrase above is dropped only if it contains ALL of a
+# A dmesg line is dropped from Dmesg Content AND from MTU Issues if it contains ALL of a
 # rule's substrings (case-insensitive, whitespace collapsed). One list entry = one rule.
 DMESG_IGNORE_RULES = [
     ["megaraid", "firmware crash dump"],   # megaraid driver load prints "... : no"
+    # the PCI core reading a NIC's Vital Product Data at probe time, e.g.
+    # "ixgbe 0000:82:00.0: invalid large VPD tag 7f at offset 25091" - a firmware quirk
+    # of the card's EEPROM, nothing to do with MTUs or large frames
+    ["invalid large vpd tag"],
 ]
 
 # --- "Log Errors" check ---------------------------------------------------------------
@@ -79,6 +111,15 @@ LOG_ERROR_FILES = [
     "/var/log/xensource.log",
 ]
 LOG_ERROR_CONTEXT = 3            # lines of context shown either side of a match
+# A matched line is not a hit if it contains ALL of a rule's substrings (case-insensitive).
+# Applied in the collector, while the last hit per phrase is picked: dropping the line
+# afterwards would leave an earlier, real hit of the same phrase unreported.
+LOG_ERROR_IGNORE_RULES = [
+    # every xapi start: check_network_reset reads /var/tmp/network-reset, which exists only
+    # after xe-reset-networking, and logs the ENOENT at error level (xen-api xapi.ml,
+    # "Raises exception if the file is not there and no reset is required")
+    ["check_network_reset", "/var/tmp/network-reset", "enoent"],
+]
 
 # --- multipath checks -----------------------------------------------------------------
 # `Multipathing` reports the xapi SETTING. These describe the paths themselves, which is a
@@ -302,6 +343,7 @@ POOL_RUN = {
     "silly_mtus": True,
     "dns_gw_non_mgmt_pifs": True,
     "overlapping_subnets": True,
+    "duplicate_ips": True,
     "log_errors": True,
     "lun_assignments": True,
     "smapi_hidden_leaves": False,

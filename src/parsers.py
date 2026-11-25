@@ -8,6 +8,7 @@ generations, the record splitting that merged two SRs' VDIs into one.
 """
 
 import calendar
+import fnmatch
 import ipaddress
 import json
 import re
@@ -18,7 +19,9 @@ from urllib.parse import urlsplit
 # xe labelled output
 # --------------------------------------------------------------------------------------
 
-_PARAM_RE = re.compile(r"^\s*([A-Za-z0-9_.:-]+)\s*\(\s*[A-Z]{2}\s*\)\s*:\s?(.*)$")
+# The access tag is two letters for a plain field ('( RO)', '( RW)') and three for a map or
+# set ('(MRW)', '(MRO)', '(SRO)'); matching only two silently dropped every map field.
+_PARAM_RE = re.compile(r"^\s*([A-Za-z0-9_.:-]+)\s*\(\s*[A-Z]{2,3}\s*\)\s*:\s?(.*)$")
 
 
 def parse_xe_records(text, start_key="uuid"):
@@ -265,6 +268,13 @@ def parse_pending_tasks(text, now, max_age):
 def unit_display(name):
     """systemd's \\xHH escaping undone for display: 'SMGC@a112\\x2d8923' -> 'SMGC@a112-8923'."""
     return re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), name)
+
+
+def unit_ignored(name, patterns):
+    """Does a unit match one of the fnmatch patterns? Matched on the unescaped name, which
+    is the one the report prints, so a pattern reads the way the line it removes did."""
+    shown = unit_display(name)
+    return any(fnmatch.fnmatchcase(shown, p) for p in patterns)
 
 
 def static_vdis_failure_moot(value, boot_epoch):
@@ -679,6 +689,162 @@ def has_overlapping_subnets(entries):
     return False
 
 
+def parse_ip_addrs(text):
+    """[(ifname, address)] from 'ip -o addr show', both families, for telling duplicates.
+
+    Left out: loopback, and link-local in either family (169.254/16, fe80::/10). Those mean
+    something only on their own link and dom0 repeats them legitimately: every bridge over
+    one NIC carries that NIC's fe80 address, and the host-internal management network has
+    the same 169.254/16 address on every host that has it. Addresses come back canonical,
+    so two spellings of one IPv6 address are one address. A 'name@parent' interface is
+    named without '@'.
+    """
+    out = []
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        name = parts[1].rstrip(":").split("@")[0]
+        if name in ("lo", "lo0"):
+            continue
+        for i, token in enumerate(parts):
+            if token not in ("inet", "inet6") or i + 1 >= len(parts):
+                continue
+            addr = ip_literal(parts[i + 1].split("/")[0])
+            if addr is None:
+                break
+            ip = ipaddress.ip_address(addr)
+            if not (ip.is_loopback or ip.is_link_local or ip.is_unspecified):
+                out.append((name, addr))
+            break
+    return out
+
+
+def duplicate_addresses(entries):
+    """[(address, [ifname, ...])] for every address on more than one interface, sorted.
+
+    The same address twice on ONE interface (a /24 and a /32, say) is not counted: it is
+    one place, and the question is two places answering for one address."""
+    places = {}
+    for name, addr in entries:
+        names = places.setdefault(addr, [])
+        if name not in names:
+            names.append(name)
+    return sorted((addr, names) for addr, names in places.items() if len(names) > 1)
+
+
+# --------------------------------------------------------------------------------------
+# VMs and VDIs (xe labelled records)
+# --------------------------------------------------------------------------------------
+
+def xe_ops(text):
+    """The operation names in an xe current-operations field, lower case.
+
+    Read as words, whatever the field prints around them (a set of names, or a map of task
+    ref to name), so 'export' is found and 'metadata_export' is not taken for it."""
+    return set(re.findall(r"[a-z_]+", (text or "").lower()))
+
+
+def _xe_map(text):
+    """An xe map field as a dict; '<not in database>' and an absent field are both {}."""
+    if not text or text.strip() == "<not in database>":
+        return {}
+    return parse_other_config(text)
+
+
+def leaf_coalesce_vdis(vdi_text, vbd_text, vm_text, busy_vm_ops, busy_vdi_ops):
+    """(disks, busy) for the VDIs whose other-config says leaf-coalesce: false.
+
+    vdi_text is 'xe vdi-list other-config:leaf-coalesce=false', and each record is checked
+    again here, so a filter xe ever ignored would show up as disks that do not qualify
+    rather than as every disk in the pool. vbd_text is every VBD (None when it was not read,
+    which leaves each disk's VMs unnamed), vm_text the VM list with current-operations (None
+    when not read: the disk's own operations are still judged, its VMs' are not).
+
+    disks: [{"uuid", "name", "sr", "snapshot", "vms": [(uuid, name)]}], ordered by first VM
+    name and then disk name; busy: how many were left out because their VM or the disk
+    itself is in one of the busy operations, which is when the flag belongs there.
+    """
+    vm_ops = {}
+    for rec in parse_xe_records(vm_text or ""):
+        vm_ops[rec.get("uuid", "")] = xe_ops(rec.get("current-operations"))
+    by_vdi = {}
+    for rec in parse_xe_records(vbd_text or ""):
+        vdi = rec.get("vdi-uuid", "")
+        if vdi and vdi != "<not in database>":
+            by_vdi.setdefault(vdi, []).append((rec.get("vm-uuid", ""),
+                                               rec.get("vm-name-label", "")))
+    disks, busy = [], 0
+    for rec in parse_xe_records(vdi_text or ""):
+        if _xe_map(rec.get("other-config")).get("leaf-coalesce", "").lower() != "false":
+            continue
+        vms = sorted(by_vdi.get(rec.get("uuid", ""), []), key=lambda v: (v[1].lower(), v[0]))
+        if (xe_ops(rec.get("current-operations")) & set(busy_vdi_ops) or
+                any(vm_ops.get(u, set()) & set(busy_vm_ops) for u, _n in vms)):
+            busy += 1
+            continue
+        disks.append({"uuid": rec.get("uuid", ""), "name": rec.get("name-label", ""),
+                      "sr": rec.get("sr-name-label", ""),
+                      "snapshot": rec.get("is-a-snapshot", "") == "true", "vms": vms})
+    disks.sort(key=lambda d: ((d["vms"][0][1].lower() if d["vms"] else "￿"),
+                              d["name"].lower(), d["uuid"]))
+    return disks, busy
+
+
+def leaf_coalesce_srs(sr_text):
+    """[(uuid, name)] of the SRs whose own other-config says leaf-coalesce: false - GC then
+    leaf-coalesces nothing on that SR ("Leaf-coalesce disabled for this SR")."""
+    out = []
+    for rec in parse_xe_records(sr_text or ""):
+        if _xe_map(rec.get("other-config")).get("leaf-coalesce", "").lower() == "false":
+            out.append((rec.get("uuid", ""), rec.get("name-label", "")))
+    return sorted(out, key=lambda s: (s[1].lower(), s[0]))
+
+
+def windows_vm_findings(vm_text, keys):
+    """(windows, findings) over 'xe vm-list' labelled records.
+
+    A VM is a Windows VM when its guest agent says so (os-version distro 'windows', or a
+    name starting 'Microsoft Windows') or when it was made from a Windows template
+    (reference-label 'windows-...', or other-config base_template_name 'Windows ...'). A
+    VM with no agent made from a non-Windows template cannot be told apart, and is not seen.
+    XO replicas (other-config xo:backup:vm) are left out: each carries its source's
+    platform, so it would repeat the source's finding.
+
+    findings: [(name, uuid, [problem, ...])] for the ones that fall short:
+      - the guest is Windows but the VM was made from a template that is not ('Other
+        install media'); a VM whose origin is not recorded is not judged on this
+      - a platform key of `keys` not set to true
+    """
+    windows, findings = 0, []
+    for rec in parse_xe_records(vm_text or ""):
+        if rec.get("is-control-domain") == "true":
+            continue
+        other = _xe_map(rec.get("other-config"))
+        if "xo:backup:vm" in other:
+            continue
+        guest = _xe_map(rec.get("os-version"))
+        guest_win = (guest.get("distro", "").lower() == "windows" or
+                     guest.get("name", "").lower().startswith("microsoft windows"))
+        ref = (rec.get("reference-label") or "").strip()
+        base = other.get("base_template_name", "").strip()
+        template_win = ref.lower().startswith("windows") or base.lower().startswith("windows")
+        if not (guest_win or template_win):
+            continue
+        windows += 1
+        problems = []
+        if guest_win and not template_win and (ref or base):
+            problems.append("made from the '%s' template, not a Windows one" % (base or ref))
+        platform = _xe_map(rec.get("platform"))
+        short = [k for k in keys if platform.get(k, "").lower() != "true"]
+        if short:
+            problems.append("platform %s not set to true" % ", ".join(short))
+        if problems:
+            findings.append((rec.get("name-label", ""), rec.get("uuid", ""), problems))
+    findings.sort(key=lambda f: (f[0].lower(), f[1]))
+    return windows, findings
+
+
 # --------------------------------------------------------------------------------------
 # multipath
 # --------------------------------------------------------------------------------------
@@ -890,16 +1056,33 @@ def _word_re(word):
                       re.IGNORECASE)
 
 
-def find_mtu_keywords(text, keywords):
-    """Whole-word, case-insensitive, on the raw text - and every match is collected.
+def _ignore_rules(ignore_rules):
+    """Each rule as its normalised substrings; an empty rule would match every line."""
+    rules = []
+    for rule in ignore_rules or ():
+        subs = [_normalise(s).strip() for s in rule if s and s.strip()]
+        if subs:
+            rules.append(subs)
+    return rules
 
-    Returning on the first hit meant the line could not say WHICH keyword tripped it.
+
+def find_mtu_keywords(text, keywords, ignore_rules=()):
+    """Whole-word, case-insensitive - and every match is collected, in keyword order.
+
+    Returning on the first hit meant the line could not say WHICH keyword tripped it. A
+    line containing ALL substrings of one ignore rule is skipped, as in dmesg_issue_lines:
+    "invalid large VPD tag" is a NIC's EEPROM, not a large frame.
     """
-    found = []
-    for kw in keywords:
-        if _word_re(kw).search(text):
-            found.append(kw)
-    return found
+    rules = _ignore_rules(ignore_rules)
+    word_res = [(kw, _word_re(kw)) for kw in keywords]
+    found = set()
+    for line in (text or "").splitlines():
+        if rules and any(all(sub in _normalise(line) for sub in rule) for rule in rules):
+            continue
+        for kw, r in word_res:
+            if kw not in found and r.search(line):
+                found.add(kw)
+    return [kw for kw in keywords if kw in found]
 
 
 def dmesg_issue_lines(text, words, phrases, ignore_rules):
@@ -911,11 +1094,7 @@ def dmesg_issue_lines(text, words, phrases, ignore_rules):
     """
     lowered_words = [w.lower() for w in words if w]
     lowered_phrases = [p.lower().strip() for p in phrases if p and p.strip()]
-    rules = []
-    for rule in ignore_rules:
-        subs = [_normalise(s).strip() for s in rule if s and s.strip()]
-        if subs:
-            rules.append(subs)
+    rules = _ignore_rules(ignore_rules)
     word_res = [_word_re(w) for w in lowered_words]
 
     hits = []

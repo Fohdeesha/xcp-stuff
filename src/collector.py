@@ -890,9 +890,10 @@ def collect_iplink():
 
 
 def collect_ipaddr():
-    r = run(["ip", "-o", "-4", "addr", "show"], timeout=20)
+    """Both families: Overlapping Subnets reads the inet lines, Duplicate IPs all of them."""
+    r = run(["ip", "-o", "addr", "show"], timeout=20)
     if not r.ok:
-        return err("ip -4 addr show failed (%s)" % r.why())
+        return err("ip addr show failed (%s)" % r.why())
     return fact(r.out)
 
 
@@ -1659,13 +1660,22 @@ def collect_patch_facts():
 # log scanning
 # --------------------------------------------------------------------------------------
 
-def grep_scan(path, phrases, timeout=180):
+def grep_scan(path, phrases, timeout=180, ignore=None):
     """Line numbers of the LAST hit of each phrase in one file.
 
     One grep pass for all phrases together (these files run to 30 MB+), then attribution
     over just the matched lines. Streamed, so a phrase that matches constantly cannot
     blow memory. Returns {phrase_index: lineno} or None if the file could not be read.
+
+    ignore is a list of rules, each a list of substrings: a matched line containing ALL of
+    one rule's is no hit at all. It has to be decided here, while the last hit is picked -
+    dropped afterwards, it would hide an earlier, real hit of the same phrase.
     """
+    rules = []
+    for rule in ignore or []:
+        subs = [s.lower() for s in rule if s]
+        if subs:
+            rules.append(subs)
     if not phrases:
         return {}
     try:
@@ -1714,6 +1724,8 @@ def grep_scan(path, phrases, timeout=180):
             if not num.isdigit():
                 continue
             body = line[sep + 1:].lower()
+            if rules and any(all(s in body for s in r) for r in rules):
+                continue
             for i, needle in enumerate(lowered):
                 if needle and needle in body:
                     last[i] = int(num)
@@ -1746,20 +1758,20 @@ def context_lines(path, lineno, ctx):
     return r.out.splitlines()
 
 
-def collect_log_scan(files, phrases, ctx):
+def collect_log_scan(files, phrases, ctx, ignore=None):
     """For every (file, phrase) pair, the most recent hit with context.
 
     Each base log is tried first and its rotated .1 only for phrases the live file
     lacks: these rotate daily around 04:00, so right after a rotation the live file is
     nearly empty - but reporting a stale .1 hit beside a current one would be worse.
     One block per phrase, so a phrase that matches constantly ('except') can never
-    crowd out a rare, serious one.
+    crowd out a rare, serious one. ignore: see grep_scan.
     """
     if not files or not phrases:
         return fact([])
     blocks = []
     for base in files:
-        live = grep_scan(base, phrases)
+        live = grep_scan(base, phrases, ignore=ignore)
         rotated = None
         rotated_scanned = False
         for i, phrase in enumerate(phrases):
@@ -1768,7 +1780,7 @@ def collect_log_scan(files, phrases, ctx):
             if hit is None:
                 if not rotated_scanned:
                     rotated_scanned = True
-                    rotated = grep_scan(base + ".1", phrases)
+                    rotated = grep_scan(base + ".1", phrases, ignore=ignore)
                 path = base + ".1"
                 hit = rotated.get(i) if rotated is not None else None
             if hit is None:
@@ -2070,6 +2082,42 @@ def collect_pool(spec, self_uuid):
     out["tasks"] = fact({"text": r.out, "now": time.time()}) if r.ok else \
         err("xe task-list failed (%s)" % r.why())
 
+    # Windows VMs Not Optimized, and what Leaf-Coalesce Disabled judges busy-ness by: every
+    # VM in one labelled call. vm-list leaves templates and snapshots out by itself.
+    # reference-label is not known to exist on 8.2 (no 8.2 host left to look), and the list
+    # form answers a field that is not there with nothing, quietly (measured on 8.3 with a
+    # made-up name: 0 exceptions)
+    r = xe(["vm-list", "is-control-domain=false",
+            "params=uuid,name-label,power-state,current-operations,platform,"
+            "reference-label,other-config,os-version"])
+    out["vms"] = fact(r.out) if r.ok else err("xe vm-list failed (%s)" % r.why())
+
+    # Leaf-Coalesce Disabled: xe filters on the map key itself (measured: 0 of 127 VDIs back
+    # on a pool with none set, 0 exceptions), and the parser checks every record again. The
+    # VBDs are only worth a call when there is a disk to name the VMs of.
+    lc = {}
+    r = xe(["vdi-list", "other-config:leaf-coalesce=false",
+            "params=uuid,name-label,sr-name-label,is-a-snapshot,current-operations,other-config"])
+    if not r.ok:
+        out["leaf_coalesce"] = err("xe vdi-list failed (%s)" % r.why())
+    else:
+        lc["vdis"] = r.out
+        lc["vbds"] = ""
+        if r.out.strip():
+            r = xe(["vbd-list", "params=uuid,vdi-uuid,vm-uuid,vm-name-label"])
+            if r.ok:
+                lc["vbds"] = r.out
+            else:
+                lc["vbds"] = None
+                lc["vbd_error"] = "xe vbd-list failed (%s)" % r.why()
+        r = xe(["sr-list", "other-config:leaf-coalesce=false", "params=uuid,name-label,other-config"])
+        if r.ok:
+            lc["srs"] = r.out
+        else:
+            lc["srs"] = None
+            lc["sr_error"] = "xe sr-list failed (%s)" % r.why()
+        out["leaf_coalesce"] = fact(lc)
+
     r = xe(["sr-list", "type=linstor", "--minimal"])
     if not r.ok:
         out["xostor_srs"] = err("xe sr-list type=linstor failed (%s)" % r.why())
@@ -2206,7 +2254,8 @@ def collect(spec):
         scan = spec.get("log_scan") or {}
         out["log_scan"] = collect_log_scan(scan.get("files") or [],
                                            scan.get("phrases") or [],
-                                           scan.get("context") or 3)
+                                           scan.get("context") or 3,
+                                           scan.get("ignore") or [])
         lun = spec.get("lun_scan") or {}
         out["lun_scan"] = collect_log_scan(lun.get("files") or [],
                                            lun.get("phrases") or [],

@@ -162,7 +162,8 @@ def _host_spec(with_smapi):
         "smapi": bool(with_smapi),
         "log_scan": {"files": config.LOG_ERROR_FILES,
                      "phrases": config.LOG_ERROR_PHRASES,
-                     "context": config.LOG_ERROR_CONTEXT},
+                     "context": config.LOG_ERROR_CONTEXT,
+                     "ignore": config.LOG_ERROR_IGNORE_RULES},
         "lun_scan": {"files": config.LUN_CHANGE_FILES,
                      "phrases": config.LUN_CHANGE_PHRASES,
                      "context": config.LOG_ERROR_CONTEXT},
@@ -916,10 +917,16 @@ def pool_status_section(run, rep):
         # like the two above, a comparison ACROSS hosts, so it belongs to the pool rather
         # than to any one host and has nothing to say when only one host was looked at
         rep.check("Multipath Path Counts", checks.multipath_path_counts, reachable)
+        # the XOA counts as one of the machines: an appliance holding a host's address
+        # is the same fault as two hosts holding one
+        rep.check("Duplicate IPs Across Hosts", checks.duplicate_ips_across_hosts, run.hosts,
+                  xoa.ip_addrs() if run.run_env == "xoa" else None)
 
     rep.check("HA Enabled", checks.ha_enabled, run.pool)
     rep.check("SR Attachment", checks.sr_attachment, run.pool)
     rep.check("Long-Running Tasks", checks.long_running_tasks, run.pool)
+    rep.check("Leaf-Coalesce Disabled", checks.leaf_coalesce_disabled, run.pool)
+    rep.check("Windows VMs Not Optimized", checks.windows_vms_not_optimized, run.pool)
     rep.check("Migration Compression", checks.migration_compression, run.pool)
     rep.check("Missing Patches", checks.missing_patches, run.pool)
     if not run.host_solo():
@@ -1076,6 +1083,7 @@ def per_host_checks():
         ("silly_mtus", "Silly MTUs", checks.silly_mtus),
         ("dns_gw_non_mgmt_pifs", "DNS/GW on Non-Mgmt PIFs", checks.dns_gw_non_mgmt_pifs),
         ("overlapping_subnets", "Overlapping Subnets", checks.overlapping_subnets),
+        ("duplicate_ips", "Duplicate IPs", checks.duplicate_ips),
         ("log_errors", "Log Errors", checks.log_errors),
         ("lun_assignments", "LUN Assignments", checks.lun_assignments),
         ("smapi_hidden_leaves", "SMAPI Hidden Leaves", checks.smapi_hidden_leaves),

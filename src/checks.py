@@ -237,7 +237,8 @@ def mtu_issues(host):
     f = host.fact("dmesg")
     if not f.ok:
         return unknown("MTU Issues", "Unknown (could not read dmesg)")
-    found = parsers.find_mtu_keywords(f.value, config.MTU_DMESG_KEYWORDS)
+    found = parsers.find_mtu_keywords(f.value, config.MTU_DMESG_KEYWORDS,
+                                      config.DMESG_IGNORE_RULES)
     if not found:
         return ok("MTU Issues", "None")
     # every matching keyword is named, so the line says which one tripped it
@@ -340,10 +341,12 @@ def coredumps(host):
 def failed_units(host):
     """A systemd unit in the failed state: a service that did not start, or died since.
 
-    systemctl's own answer, with the prefixes in FAILED_UNITS_IGNORE left out - SM's GC
+    systemctl's own answer, with the units FAILED_UNITS_IGNORE matches left out - SM's GC
     runs, whose health is judged from SMlog rather than from the state of the last run's
-    unit. A unit stays failed until it is started again, reset or the host reboots, so the
-    finding can be days old: the detail says what systemd says, and that is all it claims.
+    unit, and the units expected to sit failed (XOSTOR's database resource on the hosts
+    that do not hold it, mcelog on AMD). A unit stays failed until it is started again,
+    reset or the host reboots, so the finding can be days old: the detail says what
+    systemd says, and that is all it claims.
 
     attach-static-vdis is left out only when its failure was about nothing: no static-VDI
     entry existed when it failed (a host booted with HA off, which its script fails on
@@ -353,7 +356,7 @@ def failed_units(host):
     if not f.ok:
         return unknown("Failed Systemd Units", "Unknown (%s)" % f.error)
     units = [(u, d) for u, d in parsers.parse_failed_units(f.value)
-             if not any(u.startswith(p) for p in config.FAILED_UNITS_IGNORE)]
+             if not parsers.unit_ignored(u, config.FAILED_UNITS_IGNORE)]
     notes = []
     if any(u == config.STATIC_VDIS_UNIT for u, _d in units):
         sv, boot = host.fact("static_vdis"), host.fact("boot_epoch")
@@ -719,6 +722,79 @@ def overlapping_subnets(host):
     if parsers.has_overlapping_subnets(parsers.parse_ipv4_addrs(f.value)):
         return flag("Overlapping Subnets", "Yes")
     return ok("Overlapping Subnets", "No")
+
+
+def duplicate_ips(host):
+    """One address on two interfaces of this host - two NICs, or a NIC and a bridge, both
+    answering for it. Overlapping Subnets trips on that too, but cannot say which address
+    or where; this names both. Both families; loopback and link-local are left out (see
+    parsers.parse_ip_addrs)."""
+    f = host.fact("ipaddr")
+    if not f.ok:
+        return unknown("Duplicate IPs", "Unknown (%s)" % f.error)
+    dups = parsers.duplicate_addresses(parsers.parse_ip_addrs(f.value))
+    if not dups:
+        return ok("Duplicate IPs", "None")
+    return flag("Duplicate IPs", "Yes", " - " + "; ".join(
+        "%s on %s" % (addr, ", ".join(names)) for addr, names in dups))
+
+
+def duplicate_ips_across_hosts(hosts, xoa_addrs=None):
+    """One address on two machines: two pool hosts, or a host and the XOA.
+
+    hosts is every host in scope, reachable or not; an unreachable one is named as not
+    compared (Unreachable Hosts flags it already), while a reachable host whose addresses
+    could not be read leaves a clean answer Unknown - it is one of the machines the
+    comparison is about. xoa_addrs is the appliance's own 'ip -o addr show' as a Fact, or
+    None in a host run, which has no XOA. Each machine counts once per address: one address
+    twice on one machine is the host line's finding, not this one's.
+    """
+    machines, unread, unreachable = [], [], []
+    for h in hosts:
+        if not h.reachable:
+            unreachable.append(h.address)
+            continue
+        f = h.fact("ipaddr")
+        if f.ok:
+            machines.append((h.label, parsers.parse_ip_addrs(f.value)))
+        else:
+            unread.append("%s (%s)" % (h.label, f.error))
+    host_count = len(machines)
+    if xoa_addrs is not None:
+        if xoa_addrs.ok:
+            machines.append(("this XOA", parsers.parse_ip_addrs(xoa_addrs.value)))
+        else:
+            unread.append("this XOA (%s)" % xoa_addrs.error)
+
+    owners = {}
+    for label, entries in machines:
+        for ifname, addr in entries:
+            names = owners.setdefault(addr, {}).setdefault(label, [])
+            if ifname not in names:
+                names.append(ifname)
+    clashes = sorted((addr, o) for addr, o in owners.items() if len(o) > 1)
+
+    scope = _plural(host_count, "host") + (" + this XOA" if len(machines) > host_count else "")
+    tail = ""
+    if unreachable:
+        tail = ", %s not compared (unreachable)" % " ".join(unreachable)
+    if clashes:
+        lines = []
+        for addr, o in clashes:
+            lines.append("  %s" % addr)
+            for label in sorted(o):
+                lines.append("    %s  (%s)" % (label, ", ".join(o[label])))
+        if unread:
+            lines.append("  not read: " + "; ".join(unread))
+        return flag("Duplicate IPs Across Hosts", "Yes", " - " + ", ".join(addr for addr, _o in clashes)).with_detail(
+            "Duplicate IPs Across Hosts", "\n".join(lines))
+    if unread:
+        return unknown("Duplicate IPs Across Hosts", "Unknown - none among %s, but not read: %s"
+                       % (scope, "; ".join(unread)))
+    if len(machines) < 2:
+        return ok("Duplicate IPs Across Hosts", "N/A - Nothing to compare" + tail)
+    return ok("Duplicate IPs Across Hosts", "None (%s, %d address%s)%s"
+              % (scope, len(owners), "" if len(owners) == 1 else "es", tail))
 
 
 def _render_scan_blocks(blocks):
@@ -1213,6 +1289,98 @@ def long_running_tasks(pool):
                                                 ", ".join(t[0] for t in old[:3]) +
                                                 (", ..." if len(old) > 3 else ""))).with_detail(
         "Long-Running Tasks", "\n".join(lines))
+
+
+def leaf_coalesce_disabled(pool):
+    """Disks SM's GC will never leaf-coalesce, and SRs where it will leaf-coalesce nothing.
+
+    other-config:leaf-coalesce=false on a VDI is written by SM when a storage migration
+    starts mirroring that disk (see config.LEAF_COALESCE_BUSY_VM_OPS for the trace), and a
+    migration that fails or is cancelled leaves it there: the disk's snapshot chain then
+    only ever grows. A disk whose VM or VDI is mid-migration, -export or -import right now
+    is where the flag belongs, so it is counted aside. On an SR's other-config the same key
+    turns leaf-coalesce off for every disk on it, and only a person sets that.
+
+    The VM list is what busy-ness is judged by; without it every flagged disk is reported
+    and the detail says why. The VBD list only names the VMs, so without it the disks are
+    still reported, unnamed.
+    """
+    f = pool.fact("leaf_coalesce")
+    if not f.ok:
+        return unknown("Leaf-Coalesce Disabled", "Unknown (%s)" % f.error)
+    v = f.value if isinstance(f.value, dict) else {}
+    vms = pool.fact("vms")
+    disks, busy = parsers.leaf_coalesce_vdis(
+        v.get("vdis") or "", v.get("vbds"), vms.value if vms.ok else None,
+        config.LEAF_COALESCE_BUSY_VM_OPS, config.LEAF_COALESCE_BUSY_VDI_OPS)
+    srs = parsers.leaf_coalesce_srs(v.get("srs") or "")
+    aside = (" (%s mid-migration/export/import, as expected)" % _plural(busy, "disk")
+             if busy else "")
+    if not disks and not srs:
+        if v.get("srs") is None:
+            return unknown("Leaf-Coalesce Disabled", "Unknown - no disk has it%s, but the SRs were not read (%s)"
+                           % (aside, v.get("sr_error") or "not collected"))
+        return ok("Leaf-Coalesce Disabled", "None" + aside)
+
+    lines = []
+    for uuid, name in srs:
+        lines.append("  SR %s (%s): leaf-coalesce disabled for every disk on it" % (name, uuid))
+    rows = []
+    for d in disks:
+        where = ", ".join("%s (%s)" % (n or "?", u) for u, n in d["vms"]) or "no VM"
+        rows.append("  %s: %s (%s) on %s%s" % (where, d["name"], d["uuid"], d["sr"] or "?",
+                                               "  [snapshot]" if d["snapshot"] else ""))
+    lines.extend(parsers.cap_lines(rows, config.LEAF_COALESCE_MAX_LINES, "disk(s)"))
+    if busy:
+        lines.append("  %s left out: mid-migration/export/import right now"
+                     % _plural(busy, "flagged disk"))
+    if v.get("vbds") is None and disks:
+        lines.append("  the VBD list was not read (%s), so the disks' VMs are not named"
+                     % (v.get("vbd_error") or "not collected"))
+    if not vms.ok and disks:
+        lines.append("  whether any of these is mid-migration was not established (%s), so "
+                     "all are listed" % vms.error)
+    if v.get("srs") is None:
+        lines.append("  the SRs were not read (%s)" % (v.get("sr_error") or "not collected"))
+    lines.append("Left behind by a storage migration that did not finish: GC skips the disk "
+                 "until the key goes - xe vdi-param-remove uuid=<vdi> param-name=other-config "
+                 "param-key=leaf-coalesce (xe sr-param-remove for an SR).")
+    vm_count = len(set(u for d in disks for u, _n in d["vms"]))
+    parts = []
+    if disks:
+        parts.append(_plural(len(disks), "disk") +
+                     (" on %s" % _plural(vm_count, "VM") if vm_count else ""))
+    if srs:
+        parts.append(_plural(len(srs), "SR"))
+    return flag("Leaf-Coalesce Disabled", "Yes", " - %s, see below" % ", ".join(parts)).with_detail(
+        "Leaf-Coalesce Disabled", "\n".join(lines))
+
+
+def windows_vms_not_optimized(pool):
+    """Windows VMs made from the wrong template, or missing the viridian enlightenments.
+
+    The 8.3 Windows templates set every key in config.WINDOWS_PLATFORM_KEYS; 'Other install
+    media' sets none, and a VM made from an older Windows template carries viridian alone.
+    Without them Windows runs on emulated timers and interrupt paths. Halted VMs are judged
+    too, since the platform is read at the next boot; XO replicas are not (see
+    parsers.windows_vm_findings, which also says which VMs it cannot recognise).
+    """
+    f = pool.fact("vms")
+    if not f.ok:
+        return unknown("Windows VMs Not Optimized", "Unknown (%s)" % f.error)
+    windows, findings = parsers.windows_vm_findings(f.value or "", config.WINDOWS_PLATFORM_KEYS)
+    if not windows:
+        return ok("Windows VMs Not Optimized", "N/A - No Windows VMs found")
+    if not findings:
+        return ok("Windows VMs Not Optimized", "None (%s checked)" % _plural(windows, "Windows VM"))
+    rows = ["  %s (%s): %s" % (name or "?", uuid, "; ".join(problems))
+            for name, uuid, problems in findings]
+    lines = parsers.cap_lines(rows, config.WINDOWS_MAX_LINES, "VM(s)")
+    lines.append("Platform keys take effect at the VM's next boot: xe vm-param-set uuid=<vm> "
+                 + " ".join("platform:%s=true" % k for k in config.WINDOWS_PLATFORM_KEYS))
+    return flag("Windows VMs Not Optimized", "Yes", " - %d of %s, see below"
+                % (len(findings), _plural(windows, "Windows VM"))).with_detail(
+        "Windows VMs Not Optimized", "\n".join(lines))
 
 
 def migration_compression(pool):

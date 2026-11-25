@@ -67,6 +67,7 @@ UNCOLLECTED = [
     ("Silly MTUs", checks.silly_mtus),
     ("DNS/GW on Non-Mgmt PIFs", checks.dns_gw_non_mgmt_pifs),
     ("Overlapping Subnets", checks.overlapping_subnets),
+    ("Duplicate IPs", checks.duplicate_ips),
     ("Log Errors", checks.log_errors),
     ("LUN Assignments", checks.lun_assignments),
     ("SMAPI Hidden Leaves", checks.smapi_hidden_leaves),
@@ -790,6 +791,22 @@ def test_crash_logs_names_the_newest_dump():
     assert line.status == OK
 
 
+VPD_LINE = "[Wed Nov  4 22:18:54 2026] ixgbe 0000:82:00.0: invalid large VPD tag 7f at offset 25091\n"
+
+
+def test_mtu_issues_leaves_a_nic_vpd_quirk_alone():
+    assert checks.mtu_issues(host(dmesg=fact(VPD_LINE))).status == OK
+    # the rule drops that line only: 'large' anywhere else still counts
+    line = checks.mtu_issues(host(dmesg=fact(
+        VPD_LINE + "[Wed Nov  4 22:19:00 2026] xenbr1: dropped large frame (size 9014)\n")))
+    assert line.status == FLAG and "'large'" in line.text
+
+
+def test_mtu_keywords_are_named_in_keyword_order_across_lines():
+    text = "a fragment here\nmtu changed\n"
+    assert parsers.find_mtu_keywords(text, ["mtu", "large", "fragment"]) == ["mtu", "fragment"]
+
+
 def test_silly_mtus_names_the_offenders():
     links = "2: eth0: <UP> mtu 9000 qdisc mq state UP mode DEFAULT\\    link\n"
     line = checks.silly_mtus(host(iplink=fact(links)))
@@ -932,7 +949,7 @@ def test_xostor_missing_devices_pool_never_green_with_a_host_unread():
 # Update Mirror Access
 # --------------------------------------------------------------------------------------
 
-def mirror_fact(mirrors=None, redirector_error="", selected="mirror.b.org"):
+def mirror_fact(mirrors=None, redirector_error="", selected="mirror-b.example.org"):
     return fact({"url": "https://mirrors.xcp-ng.org/8/8.3/base/x86_64/repodata/repomd.xml",
                  "proxy": False, "public_ip": "203.0.113.7", "asn": "Example (ASN64500)",
                  "selected": selected, "redirector_error": redirector_error,
@@ -946,15 +963,15 @@ def mrow(name, ok_=True, share=50, error=""):
 
 def test_update_mirror_access_ok_when_every_mirror_answers():
     line = checks.update_mirror_access(host(update_mirror=mirror_fact(
-        [mrow("mirror.a.org"), mrow("mirror.b.org")])))
-    assert line.status == OK and "2 mirrors" in line.text and "mirror.b.org" in line.text
+        [mrow("mirror-a.example.org"), mrow("mirror-b.example.org")])))
+    assert line.status == OK and "2 mirrors" in line.text and "mirror-b.example.org" in line.text
 
 
 def test_update_mirror_access_flags_one_bad_mirror_and_marks_the_pick():
     line = checks.update_mirror_access(host(update_mirror=mirror_fact(
-        [mrow("mirror.a.org"), mrow("mirror.b.org", False, error="timed out")])))
+        [mrow("mirror-a.example.org"), mrow("mirror-b.example.org", False, error="timed out")])))
     assert line.status == FLAG and "1 of 2 mirrors" in line.text
-    assert "mirror.b.org *" in line.detail_text and "timed out" in line.detail_text
+    assert "mirror-b.example.org *" in line.detail_text and "timed out" in line.detail_text
     assert "203.0.113.7" in line.detail_text
 
 

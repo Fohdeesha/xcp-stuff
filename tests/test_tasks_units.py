@@ -210,3 +210,21 @@ def test_check_still_reports_other_units_next_to_a_moot_static_vdis_failure():
     line = checks.failed_units(host(failed_units={"ok": True, "value": STATIC + other},
                                     static_vdis=sv(), boot_epoch={"ok": True, "value": BOOT}))
     assert line.text.endswith(" - xapi-nbd.service")
+
+
+def test_units_expected_to_sit_failed_are_left_out():
+    for name in ("drbd@xcp\\x2dpersistent\\x2ddatabase.service",
+                 "drbd-promote@xcp\\x2dpersistent\\x2ddatabase.service",
+                 "xcp-persistent-database.service", "mcelog.service"):
+        text = "%s loaded failed failed something\n" % name
+        assert checks.failed_units(host(failed_units={"ok": True, "value": text})).status == OK, name
+
+
+def test_the_ignore_patterns_match_the_unescaped_name_and_nothing_wider():
+    assert parsers.unit_ignored("SMGC@bbbb\\x2d0001.service", config.FAILED_UNITS_IGNORE)
+    # what the pattern is matched against: the name with systemd's escaping undone
+    assert parsers.unit_display("drbd@xcp\\x2dpersistent\\x2ddatabase.service").split("@") == \
+        ["drbd", "xcp-persistent-database.service"]
+    assert not parsers.unit_ignored("xcp-persistent-database.mount", config.FAILED_UNITS_IGNORE)
+    assert not parsers.unit_ignored("mcelog-extra.service", config.FAILED_UNITS_IGNORE)
+    assert not parsers.unit_ignored("linstor-controller.service", config.FAILED_UNITS_IGNORE)

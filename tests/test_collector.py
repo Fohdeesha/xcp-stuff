@@ -603,26 +603,26 @@ MIRRORLIST = """<h3>Client</h3>
 <div>You are connecting with IP address <i>203.0.113.7</i>, which belongs to autonomous system <i>Example Net (ASN64500)</i>.<br />
 <h3>Mirrors</h3>
 <table><tr>
-<td style="text-align: right;">1.</td><td>mirror.a.org</td><td style="text-align: right;"><a href="https://mirror.a.org/xcp-ng/8/8.3/base/x86_64/repodata/repomd.xml">https://mirror.a.org/xcp-ng/</a></td><td style="text-align: center;">US</td><td style="text-align: center;">NA</td><td style="text-align: right;">1265 Km</td><td style="text-align: center;">60%</td>
+<td style="text-align: right;">1.</td><td>mirror-a.example.org</td><td style="text-align: right;"><a href="https://mirror-a.example.org/xcp-ng/8/8.3/base/x86_64/repodata/repomd.xml">https://mirror-a.example.org/xcp-ng/</a></td><td style="text-align: center;">US</td><td style="text-align: center;">NA</td><td style="text-align: right;">1265 Km</td><td style="text-align: center;">60%</td>
 </tr><tr>
-<td style="text-align: right;">2.</td><td>mirror.b.org</td><td style="text-align: right;"><a href="https://mirror.b.org/8/8.3/base/x86_64/repodata/repomd.xml">https://mirror.b.org/</a></td><td style="text-align: center;">US</td><td style="text-align: center;">NA</td><td style="text-align: right;">1300 Km</td><td style="text-align: center;">40%</td>
+<td style="text-align: right;">2.</td><td>mirror-b.example.org</td><td style="text-align: right;"><a href="https://mirror-b.example.org/8/8.3/base/x86_64/repodata/repomd.xml">https://mirror-b.example.org/</a></td><td style="text-align: center;">US</td><td style="text-align: center;">NA</td><td style="text-align: right;">1300 Km</td><td style="text-align: center;">40%</td>
 </tr><tr>
-<td style="text-align: right;">3.</td><td>mirror.far.eu</td><td style="text-align: right;"><a href="https://mirror.far.eu/8/8.3/base/x86_64/repodata/repomd.xml">https://mirror.far.eu/</a></td><td style="text-align: center;">FR</td><td style="text-align: center;">EU</td><td style="text-align: right;">7795 Km</td><td style="text-align: center;">n/a</td>
+<td style="text-align: right;">3.</td><td>mirror-far.example.org</td><td style="text-align: right;"><a href="https://mirror-far.example.org/8/8.3/base/x86_64/repodata/repomd.xml">https://mirror-far.example.org/</a></td><td style="text-align: center;">FR</td><td style="text-align: center;">EU</td><td style="text-align: right;">7795 Km</td><td style="text-align: center;">n/a</td>
 </tr></table>
 <h3>Excluded Mirrors</h3>
 <table><tr>
-<td>mirror.dead.org<td style="text-align: right;"><a href="https://mirror.dead.org/xcp-ng/">https://mirror.dead.org/xcp-ng/</a></td><td>Unreachable</td>
+<td>mirror-dead.example.org<td style="text-align: right;"><a href="https://mirror-dead.example.org/xcp-ng/">https://mirror-dead.example.org/xcp-ng/</a></td><td>Unreachable</td>
 </tr></table>
 """
 
-REPOMD = '<?xml version="1.0"?>\n<repomd xmlns="http://linux.duke.edu/metadata/repo"></repomd>'
+REPOMD = '<?xml version="1.0"?>\n<repomd></repomd>'
 
 
 def test_parse_mirrorlist_reads_ip_and_only_the_mirrors_table():
     ip, asn, mirrors = collector.parse_mirrorlist(MIRRORLIST)
     assert ip == "203.0.113.7" and asn == "Example Net (ASN64500)"
     assert [(h, s) for h, _u, s in mirrors] == [
-        ("mirror.a.org", 60), ("mirror.b.org", 40), ("mirror.far.eu", None)]
+        ("mirror-a.example.org", 60), ("mirror-b.example.org", 40), ("mirror-far.example.org", None)]
     assert collector.parse_mirrorlist("") == ("", "", [])
 
 
@@ -664,18 +664,18 @@ OPTS = {"redirector": "mirrors.xcp-ng.org", "timeout": 10, "budget": 60}
 def test_update_mirror_probes_every_mirror_with_a_share(tmp_path, monkeypatch):
     calls = _mirror_env(tmp_path, monkeypatch, BASE_REPO, [
         (RL + "?mirrorlist", collector.Ran(0, MIRRORLIST, "", False)),
-        (RL, collector.Ran(0, "302 https://mirror.b.org/8/8.3/base/x86_64/repodata/"
+        (RL, collector.Ran(0, "302 https://mirror-b.example.org/8/8.3/base/x86_64/repodata/"
                               "repomd.xml", "", False)),
-        ("https://mirror.a.org/", collector.Ran(0, REPOMD + "\n200", "", False)),
+        ("https://mirror-a.example.org/", collector.Ran(0, REPOMD + "\n200", "", False)),
     ])
     f = collector.collect_update_mirror(OPTS)
     v = f["value"]
-    assert f["ok"] and v["public_ip"] == "203.0.113.7" and v["selected"] == "mirror.b.org"
+    assert f["ok"] and v["public_ip"] == "203.0.113.7" and v["selected"] == "mirror-b.example.org"
     assert v["url"] == RL
     rows = dict((m["host"], m) for m in v["mirrors"])
-    assert set(rows) == {"mirror.a.org", "mirror.b.org"}      # n/a fallback not tried
-    assert rows["mirror.a.org"]["ok"]
-    assert "Could not resolve host" in rows["mirror.b.org"]["error"]
+    assert set(rows) == {"mirror-a.example.org", "mirror-b.example.org"}      # n/a fallback not tried
+    assert rows["mirror-a.example.org"]["ok"]
+    assert "Could not resolve host" in rows["mirror-b.example.org"]["error"]
     assert not any(c[1]["https_proxy"] for c in calls)
 
 
@@ -689,7 +689,7 @@ def test_update_mirror_says_why_the_redirector_failed(tmp_path, monkeypatch):
 def test_update_mirror_rejects_a_200_that_is_not_repo_metadata(tmp_path, monkeypatch):
     _mirror_env(tmp_path, monkeypatch, BASE_REPO, [
         (RL + "?mirrorlist", collector.Ran(0, MIRRORLIST, "", False)),
-        ("https://mirror.", collector.Ran(0, "<html>login</html>\n200", "", False)),
+        ("https://mirror-", collector.Ran(0, "<html>login</html>\n200", "", False)),
     ])
     v = collector.collect_update_mirror(OPTS)["value"]
     assert v["mirrors"] and all("not repo metadata" in m["error"] for m in v["mirrors"])
@@ -741,3 +741,55 @@ def test_ha_statefile_srs_follows_vdi_to_sr_by_uuid_only(monkeypatch):
     f = collector.collect_ha_statefile_srs("pool-uuid")
     assert f["value"] == [{"vdi": VDI, "sr": "", "name": ""}]
     assert not any(a[0] == "sr-list" for a in asked)
+
+
+# --------------------------------------------------------------------------------------
+# Log Errors ignore rules, decided while the last hit is picked
+# --------------------------------------------------------------------------------------
+
+NET_RESET = (b'40:Nov  4 22:19:53 xcp-a01 xapi: [error||0 |Checking emergency network reset '
+             b'D:a0bc277f299b|xapi] Xapi.check_network_reset: exception: '
+             b'Unix.Unix_error(Unix.ENOENT, "open", "/var/tmp/network-reset") (Raised by '
+             b'primitive operation at Xapi_stdext_unix__Unixext.with_file)\n')
+REAL = b'12:Nov  4 21:00:01 xcp-a01 SM: [4242] ***** sr_scan: EXCEPTION <class SMException>\n'
+
+
+class _FakeGrep(object):
+    def __init__(self, out):
+        import io
+        self.stdout = io.BytesIO(out)
+
+    def wait(self):
+        return 0
+
+
+def _grep_returning(monkeypatch, out):
+    import io
+    monkeypatch.setattr(collector, "_popen", lambda argv: (_FakeGrep(out), io.BytesIO()))
+
+
+def test_an_ignored_line_is_no_hit_and_an_earlier_real_one_is_still_found(tmp_path, monkeypatch):
+    log = tmp_path / "xensource.log"
+    log.write_text("x\n")
+    _grep_returning(monkeypatch, REAL + NET_RESET)
+    rules = [["check_network_reset", "/var/tmp/network-reset", "enoent"]]
+    assert collector.grep_scan(str(log), ["except"], ignore=rules) == {0: 12}
+    # without the rule the startup line is the last hit, and the real one is never shown
+    _grep_returning(monkeypatch, REAL + NET_RESET)
+    assert collector.grep_scan(str(log), ["except"]) == {0: 40}
+
+
+def test_a_rule_needs_all_of_its_substrings(tmp_path, monkeypatch):
+    log = tmp_path / "xensource.log"
+    log.write_text("x\n")
+    other_enoent = (b'41:Nov  4 22:20:00 xcp-a01 xapi: [error||1 |x|xapi] exception: '
+                    b'Unix.Unix_error(Unix.ENOENT, "open", "/var/tmp/something-else")\n')
+    _grep_returning(monkeypatch, REAL + NET_RESET + other_enoent)
+    rules = [["check_network_reset", "/var/tmp/network-reset", "enoent"]]
+    assert collector.grep_scan(str(log), ["except"], ignore=rules) == {0: 41}
+
+
+def test_the_shipped_rule_matches_the_line_xapi_writes():
+    import config
+    body = NET_RESET.decode("ascii").split(":", 1)[1].lower()
+    assert any(all(s in body for s in rule) for rule in config.LOG_ERROR_IGNORE_RULES)

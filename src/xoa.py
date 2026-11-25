@@ -22,7 +22,7 @@ import config
 import parsers
 import transport
 import xoredis
-from result import FLAG, INFO, OK, Line, flag, ok, unknown
+from result import FLAG, INFO, OK, Fact, Line, flag, ok, unknown
 
 
 def _updater(*args):
@@ -232,6 +232,17 @@ def _max_old_space():
 def _dmesg():
     rc, out, _err = transport.run_local_cmd(["dmesg", "-T"], timeout=60)
     return out if rc == 0 else None
+
+
+def ip_addrs():
+    """The appliance's own 'ip -o addr show', as a Fact, for Duplicate IPs Across Hosts:
+    the same command the collector runs on a host, so both sides parse one way."""
+    rc, out, err = transport.run_local_cmd(["ip", "-o", "addr", "show"],
+                                           timeout=config.LOCAL_CMD_TIMEOUT)
+    if rc != 0:
+        return Fact(False, error="ip addr show failed (%s)" % (
+            "timed out" if rc == 124 else (err.strip() or "exit %d" % rc)))
+    return Fact(True, value=out)
 
 
 def _plugins_line(data):
