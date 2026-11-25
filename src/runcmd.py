@@ -34,10 +34,11 @@ def _run_one(run, host):
         return (TRANSPORT_FAILED, "", str(exc))
 
 
-# Not an exit code any command can return: 0-255 are all reachable over ssh, and 255 in
-# particular is ssh's own 'the connection failed', which is a different thing from 'the
-# transport never started'. Printed as a reason, never as a number.
-TRANSPORT_FAILED = -1
+# Not an exit code any process can produce: 0-255 are all reachable over ssh (255 is ssh's
+# own 'the connection failed', a different thing from 'the transport never started'), and
+# Popen reports a death by signal N as -N - so -1 was an ssh killed by SIGHUP. None is
+# nothing a process returns. Printed as a reason, never as a number.
+TRANSPORT_FAILED = None
 
 
 def execute(run, workers):
@@ -63,7 +64,13 @@ def execute(run, workers):
             try:
                 results = [f.result() for f in futures]
             except BaseException:
-                # the workers are blocked in communicate() and never see the ctrl-C
+                # the workers are blocked in communicate() and never see the ctrl-C. The
+                # hosts still QUEUED go first: shutdown(wait=True) runs pending work rather
+                # than discarding it (cancel_futures is 3.9; the floor is 3.6), so without
+                # this a ctrl-C meant to stop the wrong command ran it on every host the
+                # pool had not reached yet. main's collection does the same.
+                for future in futures:
+                    future.cancel()
                 transport.kill_all_children()
                 raise
         finally:
@@ -79,16 +86,21 @@ def execute(run, workers):
         if out:
             sys.stdout.write(out if out.endswith("\n") else out + "\n")
         if rc != 0:
-            if rc == TRANSPORT_FAILED:
+            if rc is TRANSPORT_FAILED:
                 sys.stdout.write(colors.yellow("Could not run the command") + "\n")
-            elif rc == 124:
+            elif transport.is_timeout(rc):
+                # the transport's own timeout - a command that itself EXITED 124 (GNU
+                # timeout inside the command) is reported as the exit code it is
                 sys.stdout.write(colors.yellow(
                     "Command timed out after %ds" % config.RUN_CMD_TIMEOUT) + "\n")
+            elif rc < 0:
+                sys.stdout.write(colors.yellow("Command killed by signal %d" % -rc) + "\n")
             else:
                 sys.stdout.write(colors.yellow("Command failed (exit code %d)" % rc) + "\n")
-            # the reason goes to stderr, where every other transport failure goes, so it
-            # cannot contaminate output being piped somewhere
-            if err.strip():
-                sys.stderr.write(err if err.endswith("\n") else err + "\n")
+        # stderr whatever the exit code - "print what each said", and a tool that warns and
+        # exits 0 said something too. To stderr, where every other transport message goes,
+        # so it cannot contaminate output being piped somewhere
+        if err.strip():
+            sys.stderr.write(err if err.endswith("\n") else err + "\n")
         sys.stdout.write("\n")
     return 0

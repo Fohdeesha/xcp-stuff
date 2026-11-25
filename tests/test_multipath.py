@@ -276,10 +276,18 @@ def test_a_host_with_no_multipath_at_all_is_green_and_says_why():
     assert line.status == OK and line.text.endswith("N/A - No multipath maps")
 
 
-def test_no_maps_is_still_answerable_when_dmsetup_could_not_be_run():
-    # multipathd is alive and says there is nothing; dmsetup was only corroboration
+def test_no_maps_is_not_green_when_dmsetup_could_not_be_run():
+    # multipathd alive and empty is exactly what a daemon that never adopted the kernel's
+    # maps looks like: without the kernel's side it cannot be told from no multipath
+    # (v3.28; green needs both, as the docstring and the ledger always said)
     line = checks.multipath_health(host(multipath=mp(dm=err(), maps="", paths="")))
-    assert line.status == OK
+    assert line.status == UNKNOWN and line.flags
+    assert "dmsetup ls --target multipath was not read" in line.text
+
+
+def test_healthy_maps_with_dmsetup_unread_say_what_was_not_looked_for():
+    line = checks.multipath_health(host(multipath=mp(dm=err())))
+    assert line.status == OK and "not looked for (dmsetup not read)" in line.text
 
 
 def test_maps_in_the_kernel_that_multipathd_does_not_manage_flag():

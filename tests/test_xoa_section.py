@@ -54,7 +54,7 @@ def drive(monkeypatch, tmp_path, argv, lines_fn=xoa_lines, addresses=("10.0.0.1"
     monkeypatch.setattr(xoa, "lines", lines_fn)
     monkeypatch.setattr(transport, "make_work_dir", lambda: str(tmp_path))
     monkeypatch.setattr(transport, "cleanup_work_dir", lambda path: None)
-    monkeypatch.setattr(transport, "ensure_sshpass", lambda run_env_: True)
+    monkeypatch.setattr(transport, "sshpass_present", lambda run_env_: True)
 
     def fake_resolve(run, args):
         run.seed = addresses[0]

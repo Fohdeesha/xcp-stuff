@@ -115,12 +115,12 @@ def scan_plugins():
         for entry in entries:
             if not entry.startswith(prefix) or entry == prefix:
                 continue
+            full = os.path.join(directory, entry)
             name = entry[len(prefix):]
             if name in seen:
                 continue          # xo-server keeps the first path that has the name
             seen.add(name)
-            full = os.path.join(directory, entry)
-            plugins.append({
+            plugin = {
                 "name": name,
                 "package": entry,
                 "path": full,
@@ -128,7 +128,18 @@ def scan_plugins():
                 # an npm-linked or hand-symlinked plugin is worth naming outright: the
                 # directory says nothing about where its code actually came from
                 "link": os.path.realpath(full) if os.path.islink(full) else "",
-            })
+            }
+            if not os.path.isdir(full):
+                # xo-server takes every ENTRY, not only directories (findPluginsInPath),
+                # and loads it through require.resolve, which finds a plain file -
+                # xo-server-x, or xo-server-x.js - and imports it. So a file here is
+                # loaded as a plugin, and shadows a directory of the same name further
+                # down the lookup paths (isdir follows a link, so a linked plugin is a
+                # directory)
+                plugin["why"] = ("a file, not a package directory - XO tries to load it"
+                                 if os.path.exists(full)
+                                 else "a link to nothing - XO tries to load it and fails")
+            plugins.append(plugin)
     return plugins, errors
 
 
@@ -163,6 +174,10 @@ def collect_xoa():
     data["updater_timeout"] = (rc == 124)
     if rc == 124:
         return data
+    # every call's own result is kept: one that failed is that line's Unknown with the
+    # reason, never error text read as an answer (a failed getXoaPlan used to print a green
+    # plan made of its first word, and a failed isRegistered an 'Unregistered' finding)
+    data["status_error"] = "" if rc == 0 else _call_failure("xoa-updater", rc, out)
 
     channel = ""
     for line in out.splitlines():
@@ -172,36 +187,70 @@ def collect_xoa():
     data["channel"] = channel
     data["up_to_date"] = "All up to date" in out
 
-    _, reg = _updater("raw-api-call", "isRegistered")
-    m = re.search(r"email:\s*'([^']*)'", reg)
-    data["registration"] = m.group(1) if m else ""
+    rc, reg = _updater("raw-api-call", "isRegistered")
+    if rc != 0:
+        data["registration_error"] = _call_failure("isRegistered", rc, reg)
+    else:
+        # util.inspect quotes with ', or " when the value holds a ' (o'brien@...), or `
+        m = re.search(r"email:\s*(['\"`])(.*?)\1", reg)
+        registered = re.search(r"registered:\s*(true|false)", reg)
+        data["registration"] = m.group(2) if m else ""
+        data["registered"] = (registered.group(1) == "true") if registered else None
 
-    _, manifest = _updater("raw-api-call", "getLocalManifest")
+    rc, manifest = _updater("raw-api-call", "getLocalManifest")
     version = ""
-    for line in manifest.splitlines():
-        parts = line.split("'")
-        if len(parts) >= 4 and parts[1] == "xen-orchestra":
-            version = parts[3]
-            break
+    if rc == 0:
+        for line in manifest.splitlines():
+            parts = line.split("'")
+            if len(parts) >= 4 and parts[1] == "xen-orchestra":
+                version = parts[3]
+                break
+        # the same call already paid for, read twice: it also lists every npm package
+        # Vates offers this appliance, which is the golden list the plugin scan is judged
+        # against
+        data["manifest_plugins"] = parsers.manifest_plugin_names(manifest)
+    else:
+        data["version_error"] = _call_failure("getLocalManifest", rc, manifest)
     data["version"] = version
-    # the same call already paid for, read twice: it also lists every npm package Vates
-    # offers this appliance, which is the golden list the plugin scan is judged against
-    data["manifest_plugins"] = parsers.manifest_plugin_names(manifest)
 
-    _, plan = _updater("raw-api-call", "getXoaPlan")
-    data["plan"] = _first_token(plan)
-    _, lic = _updater("raw-api-call", "getSelfLicenses")
-    data["licenses"] = _first_token(lic)
+    rc, plan = _updater("raw-api-call", "getXoaPlan")
+    data["plan"] = _first_token(plan) if rc == 0 else ""
+    if rc != 0:
+        data["plan_error"] = _call_failure("getXoaPlan", rc, plan)
+    rc, lic = _updater("raw-api-call", "getSelfLicenses")
+    if rc != 0:
+        data["licenses"] = ""
+        data["plan_error"] = data.get("plan_error") or _call_failure("getSelfLicenses", rc, lic)
+    else:
+        # util.inspect of an array: '[]' is none bound, '[ {' or '[\n' is some - anything
+        # else is not an answer this can read. The updater prints its 'ℹ' glyph in front
+        # (measured on 6.9.2: "\nℹ [\n  {"), so non-ASCII goes first, as in _first_token
+        text = "".join(c for c in lic if ord(c) < 128).strip()
+        data["licenses"] = ("[]" if text == "[]" else
+                            "bound" if text.startswith("[") else "")
 
     # 'xoa check' does real network probes, so it gets its own longer timeout - and a
     # timed-out check produces no stderr, which used to read as a clean pass
     rc, _out, err = transport.run_local_cmd(["xoa", "check"], timeout=config.XOA_CHECK_TIMEOUT)
     data["check_timeout"] = (rc == 124)
+    data["check_missing"] = (rc == 127)
     data["check_output"] = err.strip()
     return data
 
 
+def _call_failure(what, rc, out):
+    """One phrase for an updater call that did not answer: its exit status and the first
+    line it printed."""
+    first = next((line.strip() for line in (out or "").splitlines() if line.strip()), "")
+    return "%s exited %d%s" % (what, rc, (": " + first[:120]) if first else "")
+
+
 def _os_version():
+    """os-release's PRETTY_NAME, which every systemd distribution carries; lsb_release
+    is a separate package a minimal Debian does not have."""
+    fields = _os_release()
+    if fields and fields.get("PRETTY_NAME"):
+        return fields["PRETTY_NAME"]
     rc, out, _err = transport.run_local_cmd(["lsb_release", "-a"],
                                             timeout=config.LOCAL_CMD_TIMEOUT)
     if rc == 0:
@@ -219,14 +268,72 @@ def _meminfo():
         return None
 
 
-def _max_old_space():
-    """The XO-Server heap cap, read out of the unit file."""
+_HEAP_PROBE = "process.stdout.write(String(require('v8').getHeapStatistics().heap_size_limit))"
+
+
+def _xo_server_heap():
+    """(limit_mb, source, error): the heap limit the RUNNING xo-server has.
+
+    Read off the process rather than the unit file, which only says what the next start
+    will do and misses a drop-in, NODE_OPTIONS, and a unit edited without a restart. On
+    the command line (which node applies after NODE_OPTIONS, so it wins), else in
+    NODE_OPTIONS, else node's own default - which is what xo-server gets when nobody sets
+    one, and is measured by asking the same node binary with no options. V8 sizes the heap
+    when the process starts, so nothing set later from inside it can change the number.
+
+    The default is measured in this run's cgroup, not the service's; a MemoryMax on
+    xo-server.service would make its real default smaller still (node sizes it from the
+    constrained memory), never larger.
+    """
+    rc, out, err = transport.run_local_cmd(
+        ["systemctl", "show", "-p", "MainPID", "--value", "xo-server"],
+        timeout=config.LOCAL_CMD_TIMEOUT)
+    pid = out.strip()
+    if rc != 0 or not pid.isdigit():
+        return None, None, "could not ask systemd for xo-server's process (%s)" % (
+            "timed out" if rc == 124 else (err.strip() or "exit %d" % rc))
+    if pid == "0":
+        return None, None, "xo-server is not running"
     try:
-        with open("/etc/systemd/system/xo-server.service", "r") as fh:
-            m = re.search(r"--max-old-space-size=(\d+)", fh.read())
-    except (IOError, OSError):
-        return None
-    return int(m.group(1)) if m else None
+        with open("/proc/%s/cmdline" % pid, "rb") as fh:
+            argv = fh.read().decode("utf-8", "replace").split("\0")
+        with open("/proc/%s/environ" % pid, "rb") as fh:
+            environ = fh.read().decode("utf-8", "replace").split("\0")
+    except (IOError, OSError) as exc:
+        return None, None, "could not read xo-server's process %s (%s)" % (pid, exc)
+    limit = parsers.node_heap_flag(argv)
+    if limit is not None:
+        return limit, "set on its command line", None
+    node_options = next((e[len("NODE_OPTIONS="):] for e in environ
+                         if e.startswith("NODE_OPTIONS=")), "")
+    limit = parsers.node_heap_flag(node_options.split())
+    if limit is not None:
+        return limit, "set in NODE_OPTIONS", None
+    try:
+        node = os.readlink("/proc/%s/exe" % pid)
+    except OSError:
+        node = "node"
+    env = dict(os.environ)
+    env.pop("NODE_OPTIONS", None)
+    rc, out, err = transport.run_local_cmd([node, "-e", _HEAP_PROBE],
+                                           timeout=config.LOCAL_CMD_TIMEOUT, env=env)
+    if rc != 0 or not out.strip().isdigit():
+        return None, None, "could not read node's default heap limit (%s)" % (
+            "timed out" if rc == 124 else (err.strip().splitlines() or ["exit %d" % rc])[0])
+    return int(out.strip()) // (1024 * 1024), "node's default, nothing sets it", None
+
+
+def heap_limit_line(total_mb, limit_mb, source, error):
+    """XO-Server Memory Limit, judged against Vates' 70%-of-RAM rule (config)."""
+    if error:
+        return unknown("XO-Server Memory Limit", "Unknown (%s)" % error)
+    target = max(config.XO_HEAP_MIN_MB, int(total_mb * config.XO_HEAP_TARGET_PCT / 100))
+    pct = 100.0 * limit_mb / total_mb if total_mb else 0.0
+    text = "%d MB, %s (%.0f%% of %d MB RAM" % (limit_mb, source, pct, total_mb)
+    if limit_mb < target:
+        return flag("XO-Server Memory Limit",
+                    text + "; XO's rule is %d%%, %d MB)" % (config.XO_HEAP_TARGET_PCT, target))
+    return ok("XO-Server Memory Limit", text + ")")
 
 
 def _dmesg():
@@ -265,7 +372,17 @@ def _plugins_line(data):
                        "Unknown (could not read %s)" % "; ".join(data["plugin_errors"]))
     found = data.get("plugins") or []
     vates_names = set(config.XOA_STOCK_PLUGINS) | set(data.get("manifest_plugins") or ())
-    _stock, third_party = parsers.classify_xo_plugins(found, vates_names)
+    stock, third_party = parsers.classify_xo_plugins(found, vates_names)
+    # a stock NAME outside the directory xoa-updater installs into is not Vates' copy: it
+    # is the one XO loads (an earlier lookup path wins), and a hand-replaced stock plugin
+    # is the stealthiest case this line exists for
+    home = os.path.join(config.XO_PLUGIN_STOCK_DIR, "")
+    for plugin in stock:
+        if not plugin.get("why") and not plugin["path"].startswith(home):
+            plugin["why"] = ("a stock plugin's name outside %s - XO loads this copy"
+                             % config.XO_PLUGIN_STOCK_DIR)
+        if plugin.get("why"):
+            third_party.append(plugin)
     if not third_party:
         return ok("XOA Plugins", "%d installed, all shipped with XOA" % len(found))
     return flag("XOA Plugins",
@@ -293,13 +410,25 @@ def lines():
                            "Timeout issues, unable to determine XOA status"))
     else:
         reg = data.get("registration")
-        out.append(ok("Registration", reg) if reg else flag("Registration", "Unregistered"))
+        if data.get("registration_error"):
+            out.append(unknown("Registration", "Unknown (%s)" % data["registration_error"]))
+        elif data.get("registered") is False:
+            out.append(flag("Registration", "Unregistered"))
+        elif reg:
+            out.append(ok("Registration", reg))
+        elif data.get("registered") is True:
+            out.append(ok("Registration", "Registered"))
+        else:
+            out.append(unknown("Registration", "Unknown (isRegistered's answer could not "
+                                               "be read)"))
 
         channel = data.get("channel")
         out.append(ok("XOA Channel", channel) if channel else unknown("XOA Channel", "(Unknown)"))
 
         version = data.get("version")
-        out.append(ok("XOA Version", version) if version else unknown("XOA Version", "Unknown"))
+        out.append(ok("XOA Version", version) if version else
+                   unknown("XOA Version", "Unknown (%s)" % data["version_error"]
+                           if data.get("version_error") else "Unknown"))
 
         # plan and licence binding share one printed line, so -f weighs them together:
         # deciding per half would drop a flagged licence along with a healthy plan
@@ -317,15 +446,21 @@ def lines():
         else:
             lic_txt = colors.green("Bound")
         combined = "%s (%s)" % (plan_txt, lic_txt)
+        if data.get("plan_error"):
+            combined += " - %s" % data["plan_error"]
         out.append(Line("XOA Plan", combined, FLAG if flagged else OK))
 
-        if data.get("up_to_date"):
+        if data.get("status_error"):
+            out.append(unknown("XOA Status", "Unknown (%s)" % data["status_error"]))
+        elif data.get("up_to_date"):
             out.append(ok("XOA Status", "Up to date"))
         else:
             out.append(flag("XOA Status", "Updates available"))
 
         if data.get("check_timeout"):
             out.append(unknown("XOA Check", "Timed out after %ds" % config.XOA_CHECK_TIMEOUT))
+        elif data.get("check_missing"):
+            out.append(unknown("XOA Check", "Unknown (the xoa command was not found)"))
         elif not data.get("check_output"):
             out.append(ok("XOA Check", "All OK"))
         else:
@@ -342,6 +477,8 @@ def lines():
         # skipping the memory lines silently would hide that the XO-Server heap cap never
         # got checked at all
         out.append(unknown("Memory Usage", "Unknown (could not read /proc/meminfo)"))
+        out.append(unknown("XO-Server Memory Limit",
+                           "Unknown (no RAM total to judge it against)"))
     else:
         total_mb, avail_mb = mem
         total_gb = total_mb / 1024.0
@@ -356,16 +493,7 @@ def lines():
                                                         colors.green("%.1f" % pct)),
                         INFO))
 
-        cap = _max_old_space()
-        if cap is None:
-            out.append(flag("XO-Server Memory Limit", "Not Set"))
-        else:
-            # total minus 500MB, in MB, is the sizing the appliance docs ask for
-            adjusted = int(round(total_mb - 500))
-            if cap < adjusted:
-                out.append(flag("XO-Server Memory Limit", str(cap)))
-            else:
-                out.append(ok("XO-Server Memory Limit", str(cap)))
+        out.append(heap_limit_line(total_mb, *_xo_server_heap()))
 
     dmesg_text = _dmesg()
     if dmesg_text is None:
@@ -384,8 +512,11 @@ def ping_silent(ips):
     unreachable backup network cost 2s per pool host (measured: 8 silent IPs, 16s serial
     versus 2.0s here). The result list is rebuilt in the original order so the report
     stays stable between runs.
+
+    A probe still running when the wait ends answered nothing, so it counts as silent: a
+    False default read it as an answer it never gave.
     """
-    results = [False] * len(ips)
+    results = [None] * len(ips)
 
     def probe(index, address):
         rc, _out, _err = transport.run_local_cmd(
@@ -400,23 +531,42 @@ def ping_silent(ips):
         threads.append(t)
     for t in threads:
         t.join(config.LOCAL_CMD_TIMEOUT + 5)
-    return [ips[i] for i in range(len(ips)) if results[i]]
+    return [ips[i] for i in range(len(ips)) if results[i] is not False]
 
 
-def debian_version_ok():
-    """XOA mode still has to be a Debian 11+ appliance."""
+def _os_release():
+    """/etc/os-release as a dict, or None when it cannot be read."""
     try:
         with open("/etc/os-release", "r") as fh:
             text = fh.read()
     except (IOError, OSError):
+        return None
+    fields = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key.strip() and not key.lstrip().startswith("#"):
+            fields[key.strip()] = value.strip().strip("\"'")
+    return fields
+
+
+def debian_version_ok():
+    """XOA mode still has to be a Debian 11+ appliance - Debian, or a distribution that
+    names Debian in ID_LIKE. VERSION_ID alone let any OS numbered 11 or more through (a
+    Fedora 40 passed), and the run then failed somewhere far less clear."""
+    fields = _os_release()
+    if fields is None:
         return (False, "unknown")
-    m = re.search(r"^VERSION_ID=\"?([^\"\n]+)", text, re.M)
-    if not m:
+    version = fields.get("VERSION_ID", "")
+    debian = (fields.get("ID") == "debian"
+              or "debian" in fields.get("ID_LIKE", "").split())
+    if not version:
         return (False, "unknown")
-    major = m.group(1).split(".")[0]
+    if not debian:
+        return (False, "%s %s" % (fields.get("ID", "unknown"), version))
+    major = version.split(".")[0]
     if not major.isdigit():
-        return (False, m.group(1))
-    return (int(major) >= 11, m.group(1))
+        return (False, version)
+    return (int(major) >= 11, version)
 
 
 def running_as_root():

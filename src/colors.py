@@ -6,6 +6,7 @@ FORCE_COLOR on purpose: node tools (xoa-updater) honour that one, and they would
 colourise output this script parses.
 """
 
+import re
 import os
 import sys
 
@@ -51,17 +52,11 @@ def cyan(text):
 
 
 def strip_ansi(text):
-    """Defensive: some tools colourise even when told not to."""
-    out = []
-    i = 0
-    n = len(text)
-    while i < n:
-        if text[i] == "\033" and i + 1 < n and text[i + 1] == "[":
-            j = i + 2
-            while j < n and text[j] not in "ABCDEFGHJKSTfmnsulh":
-                j += 1
-            i = j + 1
-            continue
-        out.append(text[i])
-        i += 1
-    return "".join(out)
+    """Defensive: some tools colourise even when told not to.
+
+    An ECMA-48 control sequence is ESC [, parameter bytes 0x30-0x3F, intermediate bytes
+    0x20-0x2F, then exactly ONE final byte 0x40-0x7E. Scanning for a final byte from a
+    short list of letters instead ate real text after any other sequence - after ESC[2d
+    a whole line of xoa-updater output vanished up to the next listed letter. The
+    collector carries the same pattern (collector.ANSI_RE)."""
+    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)

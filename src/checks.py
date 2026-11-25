@@ -109,23 +109,98 @@ def xapi_status(host):
 
 
 def ntp(host):
-    """One line, two facts. An explicit 'no' is a real finding; 'Unknown' (address not in
-    the xe maps) stays informational."""
+    """One line, two facts. An explicit 'no' is a real finding, and so is a half that was
+    not established: timedatectl unread or unparseable is a fact we failed to establish,
+    which flags the exit code like any other (v3.28 - it used to be an exit-neutral
+    yellow, on a reason left over from the bash script's xe-map source). systemd's 'n/a'
+    (no NTP service known) arrives here as 'no'."""
     from colors import green, yellow
     state = host.ntp_state()
     enabled, synced = state["ntp"], state["sync"]
     text = "Enabled - %s Synced - %s" % (
         (green if enabled == "yes" else yellow)(enabled),
         (green if synced == "yes" else yellow)(synced))
+    if state.get("error"):
+        text += " (%s)" % state["error"]
     line = result.Line("NTP", text, result.OK)
     if enabled == "no" or synced == "no":
         line.status = result.FLAG
     elif enabled != "yes" or synced != "yes":
-        # neither half was established, which -f must not hide: the yellow in the text is
-        # the same warning info(..., "yellow") carries, so it keeps its line the same way
-        line.status = result.INFO
-        line.keep = True
+        line.status = result.UNKNOWN
     return line
+
+
+def dom0_ram_allocations(hosts):
+    """Every reachable host's dom0 MemTotal, compared.
+
+    Within RAM_MATCH_TOLERANCE_MB counts as the same: MemTotal is dom0_mem less kernel
+    reservations that differ with hardware by tens of MiB, and rounding to the nearest
+    GiB (what this did) split two hosts 20 MiB apart across an N.5 GiB boundary while
+    calling two 480 MiB apart equal. A host whose memory was not read is not a
+    difference - but it is not agreement either, so a match then says Unknown and names
+    it; and one reading compares nothing.
+    """
+    readings, unread = [], []
+    for host in hosts:
+        total = host.mem_total_mb()
+        if total is None:
+            unread.append(host.label)
+        else:
+            readings.append((host.label, total))
+    if not readings:
+        return unknown("Dom0 RAM Allocations", "Unknown (no host's memory could be read)")
+    low, high = min(t for _l, t in readings), max(t for _l, t in readings)
+    if high - low > config.RAM_MATCH_TOLERANCE_MB:
+        return flag("Dom0 RAM Allocations", "Mismatched").with_detail(
+            "Dom0 RAM Allocations", "\n".join("  %s  %.1fG" % (label, total / 1024.0)
+                                              for label, total in readings))
+    if unread:
+        return unknown("Dom0 RAM Allocations", "Unknown - matched on %d of %d hosts, not "
+                       "read: %s" % (len(readings), len(readings) + len(unread),
+                                     ", ".join(unread)))
+    if len(readings) < 2:
+        return ok("Dom0 RAM Allocations", "N/A - Nothing to compare")
+    return ok("Dom0 RAM Allocations", "Matched")
+
+
+def pool_time_sync(hosts):
+    """Every reachable host has NTP on, says it is synchronised, and agrees with this
+    machine's clock inside TIME_SYNC_ALLOWANCE_SECS.
+
+    "Mismatched" only for what was established - an explicit no, or a drift measured over
+    the allowance - naming the host and why. A host whose state or clock was not read is
+    Unknown with its reason: it was claimed as a mismatch before, which it was not known to
+    be. With no host read at all there is nothing to call matched.
+    """
+    bad, unread = [], []
+    for host in hosts:
+        state = host.ntp_state()
+        if state.get("error") or "Unknown" in (state["ntp"], state["sync"]):
+            unread.append("%s (%s)" % (host.label, state.get("error") or
+                                       "NTP state not in timedatectl's output"))
+            continue
+        if state["ntp"] != "yes" or state["sync"] != "yes":
+            bad.append("%s: NTP enabled %s, synchronised %s"
+                       % (host.label, state["ntp"], state["sync"]))
+            continue
+        drift = host.clock_drift()
+        if drift is None:
+            unread.append("%s (its clock was not read)" % host.label)
+        elif drift > config.TIME_SYNC_ALLOWANCE_SECS:
+            bad.append("%s: %ds from this machine's clock (allowed %ds)"
+                       % (host.label, int(drift), config.TIME_SYNC_ALLOWANCE_SECS))
+    if bad:
+        detail = list(bad)
+        if unread:
+            detail.append("not read: " + "; ".join(unread))
+        return flag("Pool Time Synchronization", "Mismatched").with_detail(
+            "Pool Time Synchronization", "\n".join("  " + d for d in detail))
+    if unread:
+        return unknown("Pool Time Synchronization", "Unknown - not read: %s"
+                       % "; ".join(unread))
+    if not hosts:
+        return unknown("Pool Time Synchronization", "Unknown (no host was read)")
+    return ok("Pool Time Synchronization", "Matched")
 
 
 # --------------------------------------------------------------------------------------
@@ -133,13 +208,21 @@ def ntp(host):
 # --------------------------------------------------------------------------------------
 
 def dom0_disk_usage(host):
+    """Local filesystems over DOM0_MAX_USED. The collector reads usage without df, from
+    /proc/mounts and statvfs, so a dead network mount can neither hang this line nor
+    leave a df behind; a local mount it could not read makes a clean answer Unknown."""
     f = host.fact("df")
     if not f.ok:
         return unknown("Dom0 Disk Usage", "Unknown (%s)" % f.error)
-    bad = parsers.parse_df(f.value, config.DOM0_MAX_USED)
-    if not bad:
-        return ok("Dom0 Disk Usage", "OK")
-    return flag("Dom0 Disk Usage", "Fail", " - " + ", ".join(bad))
+    v = f.value
+    text, failed = ((v.get("text") or "", v.get("failed") or []) if isinstance(v, dict)
+                    else (v or "", []))
+    bad = parsers.parse_df(text, config.DOM0_MAX_USED)
+    if bad:
+        return flag("Dom0 Disk Usage", "Fail", " - " + ", ".join(bad))
+    if failed:
+        return unknown("Dom0 Disk Usage", "Unknown - could not read %s" % ", ".join(failed))
+    return ok("Dom0 Disk Usage", "OK")
 
 
 def read_only_filesystems(host):
@@ -338,6 +421,16 @@ def coredumps(host):
         "Coredumps (%s)" % config.COREDUMP_DIR, "\n".join(shown))
 
 
+def host_collection(host):
+    """Printed only when the host's collector stopped part way - stuck on a command it
+    could not kill, or failed - and sent back what it had. A complete document prints
+    nothing here: None is "no line", and a host that answered whole needs none."""
+    why = (host.payload or {}).get("__incomplete__")
+    if not why:
+        return None
+    return flag("Host Collection", "Incomplete", " - " + why)
+
+
 def failed_units(host):
     """A systemd unit in the failed state: a service that did not start, or died since.
 
@@ -510,7 +603,12 @@ def _multipath_read(host):
         config.MULTIPATH_OK_DEV_STATES, config.MULTIPATH_STANDBY_CHK_STATES)
 
     known = set(entry["name"] for entry in summary["maps"])
-    unmanaged = [name for name in (dm_maps or []) if name not in known]
+    if dm_maps is None:
+        # the kernel's side was not read: unmanaged is None - "not looked for" - and never
+        # an empty list, which would read as "looked, there are none"
+        return (summary, None, bool(rechecked.ok and rechecked.value),
+                "dmsetup ls --target multipath was not read (%s)" % dm.error)
+    unmanaged = [name for name in dm_maps if name not in known]
     return summary, unmanaged, bool(rechecked.ok and rechecked.value), None
 
 
@@ -526,6 +624,8 @@ def multipath_health(host):
     summary, unmanaged, rechecked, reason = _multipath_read(host)
     if summary is None:
         return unknown("Multipath Path Health", "Unknown (%s)" % reason)
+    dm_unread = unmanaged is None
+    unmanaged = unmanaged or []
     detail = _multipath_detail(summary, unmanaged, rechecked)
 
     if not summary["maps"]:
@@ -533,8 +633,12 @@ def multipath_health(host):
             return flag("Multipath Path Health",
                         "%d device-mapper map(s) multipathd does not manage, See Below"
                         % len(unmanaged)).with_detail("Multipath Paths", detail)
-        # dm could not be read here only means the corroboration was missing: multipathd
-        # is alive and says there is nothing, which is itself an established answer
+        if dm_unread:
+            # an alive multipathd answering empty is exactly what a daemon that came up
+            # without adopting the kernel's maps looks like: without the kernel's side
+            # there is no telling it from a host with no multipath, so no green
+            return unknown("Multipath Path Health", "Unknown - multipathd lists no maps, "
+                                                    "but %s" % reason)
         return ok("Multipath Path Health", "N/A - No multipath maps")
 
     usable = summary["ok_paths"] + summary["standby_paths"]
@@ -562,6 +666,9 @@ def multipath_health(host):
         # normal on an active/passive array, and worth saying out loud so nobody reads
         # 4/4 and assumes four paths are carrying I/O
         text += " (%d standby)" % summary["standby_paths"]
+    if dm_unread:
+        # every path multipathd knows is fine; what it does not know was not looked for
+        text += " - maps multipathd does not manage not looked for (dmsetup not read)"
     return ok("Multipath Path Health", text)
 
 
@@ -671,16 +778,15 @@ def multipath_events(host):
     reloads: that would leave a permanent yellow behind a switch reboot last month. These
     two windows both close by themselves.
     """
-    scan = host.fact("multipath_scan")
+    blocks, failed = _scan_result(host.fact("multipath_scan"))
     dmesg = host.fact("dmesg")
 
-    blocks = list(scan.value) if (scan.ok and scan.value) else []
     if dmesg.ok:
         blocks = blocks + _dmesg_phrase_blocks(dmesg.value, config.MULTIPATH_EVENT_PHRASES,
                                                config.LOG_ERROR_CONTEXT)
     if blocks:
         # a finding is established whatever the other source did or did not manage to say
-        detail = _render_scan_blocks(blocks)
+        detail = _render_scan_blocks(blocks, failed)
         if len(blocks) > 1:
             detail += ("\n\n(the same event can appear under both sources - dmesg -T "
                        "recomputes its timestamps each run, so they sit a second or two "
@@ -688,8 +794,8 @@ def multipath_events(host):
         return flag("Multipath Path Events", "Yes, See Error Output").with_detail(
             "Multipath Path Events", detail)
     # nothing found, so every source has to have actually been read before this is a "None"
-    if not scan.ok:
-        return unknown("Multipath Path Events", "Unknown (%s)" % scan.error)
+    if failed:
+        return unknown("Multipath Path Events", "Unknown (%s)" % "; ".join(failed))
     if not dmesg.ok:
         return unknown("Multipath Path Events", "Unknown (could not read dmesg)")
     return ok("Multipath Path Events", "None")
@@ -797,37 +903,56 @@ def duplicate_ips_across_hosts(hosts, xoa_addrs=None):
               % (scope, len(owners), "" if len(owners) == 1 else "es", tail))
 
 
-def _render_scan_blocks(blocks):
-    """The scanner's blocks, laid out the way the report has always shown them."""
+def _scan_result(f):
+    """(blocks, failed) of a log-scan fact. `failed` names every scan that did not happen;
+    a fact that is itself an error is one failure with its reason. Nothing found plus
+    anything failed is not "nothing found". (An older collector's plain list of blocks
+    recorded no failures - it could not tell them apart.)"""
+    if not f.ok:
+        return [], [f.error]
+    v = f.value
+    if isinstance(v, dict):
+        return list(v.get("blocks") or []), list(v.get("failed") or [])
+    return list(v or []), []
+
+
+def _render_scan_blocks(blocks, failed=None):
+    """The scanner's blocks, laid out the way the report has always shown them, and the
+    scans that did not happen after them - a finding stands, but the reader is told what
+    was not looked at."""
     out = []
     for block in blocks:
         out.append("--- %s (%s) ---" % (block["phrase"], block["file"]))
+        if block.get("note"):
+            out.append("  (%s - the matching line alone)" % block["note"])
         for line in block["context"]:
             out.append("  " + line)
         out.append("")
+    if failed:
+        out.append("Not read: " + "; ".join(failed))
     # blocks are separated by a blank line, but the blob itself does not end with one:
     # the detail printer adds its own spacing
     return "\n".join(out).rstrip("\n")
 
 
 def log_errors(host):
-    f = host.fact("log_scan")
-    if not f.ok:
-        return unknown("Log Errors", "Unknown (%s)" % f.error)
-    if not f.value:
-        return ok("Log Errors", "None")
-    return flag("Log Errors", "Yes, See Error Output").with_detail(
-        "Log Errors", _render_scan_blocks(f.value))
+    blocks, failed = _scan_result(host.fact("log_scan"))
+    if blocks:
+        return flag("Log Errors", "Yes, See Error Output").with_detail(
+            "Log Errors", _render_scan_blocks(blocks, failed))
+    if failed:
+        return unknown("Log Errors", "Unknown (%s)" % "; ".join(failed))
+    return ok("Log Errors", "None")
 
 
 def lun_assignments(host):
-    f = host.fact("lun_scan")
-    if not f.ok:
-        return unknown("LUN Assignments", "Unknown (%s)" % f.error)
-    if not f.value:
-        return ok("LUN Assignments", "Unchanged")
-    return flag("LUN Assignments", "Changed - see below").with_detail(
-        "LUN Assignment Changes", _render_scan_blocks(f.value))
+    blocks, failed = _scan_result(host.fact("lun_scan"))
+    if blocks:
+        return flag("LUN Assignments", "Changed - see below").with_detail(
+            "LUN Assignment Changes", _render_scan_blocks(blocks, failed))
+    if failed:
+        return unknown("LUN Assignments", "Unknown (%s)" % "; ".join(failed))
+    return ok("LUN Assignments", "Unchanged")
 
 
 def smapi_hidden_leaves(host):
@@ -874,6 +999,12 @@ def yum_patch_level(host, is_master, master_manifest):
     re-fetching on mismatch meant two different snapshots, which produced a
     'Mismatch, See Below' over an empty difference block."""
     if is_master:
+        own = host.fact("rpm_manifest")
+        if not own.ok or not (own.value or "").strip():
+            # the green value claims a baseline exists, and every slave is Unknown "no
+            # baseline" for exactly this reason - the master's line has to say so too
+            return unknown("Yum Patch Level", "Unknown (the master's package list could not "
+                                              "be read, so no host was compared)")
         # guarded like the slaves' Match line: unguarded, -f showed the master's baseline
         # while hiding every slave's passing line, reading as though they were not checked
         return ok("Yum Patch Level", "Reference (Master)")
@@ -919,19 +1050,18 @@ def xostor_version_consistency(hosts, details_shown=True):
     the pool section. details_shown is False when those per-host lines are switched off
     for slaves, and then the line must not send the reader to look for them.
     """
-    key = "XOSTOR Version Consistency"
     sigs = [s for s in (_xostor_signature(h) for h in hosts) if s is not None]
     if not sigs:
-        return unknown(key, "Unknown (could not read versions from any host)")
+        return unknown("XOSTOR Version Consistency", "Unknown (could not read versions from any host)")
     stale = any(loaded and dict(tracked).get("kmod-drbd")
                 and _drbd_stale(loaded, dict(tracked)["kmod-drbd"])
                 for tracked, loaded in sigs)
     if stale or len(set(sigs)) > 1:
-        return flag(key, "Mismatched, See Host Results" if details_shown else "Mismatched")
+        return flag("XOSTOR Version Consistency", "Mismatched, See Host Results" if details_shown else "Mismatched")
     if len(sigs) < len(hosts):
-        return unknown(key, "Matched on %d of %d hosts (rest unreadable)"
+        return unknown("XOSTOR Version Consistency", "Matched on %d of %d hosts (rest unreadable)"
                        % (len(sigs), len(hosts)))
-    return ok(key, "Matched")
+    return ok("XOSTOR Version Consistency", "Matched")
 
 
 def xostor_versions(host, pool_uses_xostor):
@@ -949,10 +1079,15 @@ def xostor_versions(host, pool_uses_xostor):
     tracked = [(n, pkgs[n]) for n in config.XOSTOR_PACKAGES if n in pkgs]
     loaded = module.value if module.ok else ""
     if not pool_uses_xostor and not tracked and not loaded:
-        if manifest.ok and module.ok:
-            return None   # established: no XOSTOR here, so nothing to say
-        if not manifest.ok and not module.ok:
+        if module.ok:
+            # DRBD established as not loaded on a pool that does not use XOSTOR: nothing to
+            # say, whatever the manifest did (Yum Patch Level carries a failed one). The
+            # mixed case used to fall through and FLAG "DRBD Module: Not Loaded" about a
+            # feature this pool does not use
+            return None
+        if not manifest.ok:
             return None   # cannot tell whether XOSTOR applies; the pool line says if so
+        # module unreadable means /sys/module/drbd exists: DRBD is here, so say so
 
     lines = []
     if not manifest.ok or not manifest.value.strip():
@@ -963,24 +1098,23 @@ def xostor_versions(host, pool_uses_xostor):
         lines.append(info("XOSTOR Packages", ", ".join(
             "%s %s" % (n, " + ".join(v)) for n, v in tracked)))
 
-    key = "XOSTOR DRBD Module"
     if not module.ok:
-        lines.append(unknown(key, "Unknown (%s)" % module.error))
+        lines.append(unknown("XOSTOR DRBD Module", "Unknown (%s)" % module.error))
         return lines
     kmod = pkgs.get("kmod-drbd") or []
     if not loaded:
-        lines.append(flag(key, "Not Loaded"))
+        lines.append(flag("XOSTOR DRBD Module", "Not Loaded"))
         return lines
     if not manifest.ok:
-        lines.append(unknown(key, "Loaded %s (installed kmod-drbd unknown)" % loaded))
+        lines.append(unknown("XOSTOR DRBD Module", "Loaded %s (installed kmod-drbd unknown)" % loaded))
         return lines
     if not kmod:
-        lines.append(flag(key, "Loaded %s, but kmod-drbd is not installed" % loaded))
+        lines.append(flag("XOSTOR DRBD Module", "Loaded %s, but kmod-drbd is not installed" % loaded))
         return lines
     if not _drbd_stale(loaded, kmod):
-        lines.append(ok(key, "Loaded %s (matches kmod-drbd)" % loaded))
+        lines.append(ok("XOSTOR DRBD Module", "Loaded %s (matches kmod-drbd)" % loaded))
     else:
-        lines.append(flag(key, "Loaded %s, Installed kmod-drbd %s (reboot pending?)"
+        lines.append(flag("XOSTOR DRBD Module", "Loaded %s, Installed kmod-drbd %s (reboot pending?)"
                           % (loaded, " + ".join(kmod))))
     return lines
 
@@ -1103,6 +1237,10 @@ def pool_roles(hosts):
                         % (len(masters), ", ".join(h.name for h in masters)))
     for e in slaves:
         target = e["target"]
+        if not e["pointer"]:
+            # 'slave:' with nothing after it: xapi reads it as a slave of no address
+            problems.append("%s holds '%s', a slave of no address" % (e["host"].name, e["text"]))
+            continue
         if target is e["host"]:
             problems.append("%s points at itself" % e["host"].name)
             continue
@@ -1252,14 +1390,15 @@ def sr_attachment(pool):
 
 
 def long_running_tasks(pool):
-    """A xapi task still pending after TASK_PENDING_MAX_HOURS.
+    """A xapi task not finished after TASK_PENDING_MAX_HOURS - pending, or cancelling.
 
     It holds whatever it was working on - a VM, a VDI, an SR operation - and every later
     operation on that object waits behind it or fails with an 'operation in progress'
     that names nothing. One reading only, so the line says how long a task has been
-    pending, never that it is stuck: progress is shown, not judged. xapi destroys a
-    pending task itself at pending_task_timeout (24 h by default), so the window this can
-    see is the hours before that.
+    unfinished, never that it is stuck: progress is shown, not judged. xapi destroys one
+    older than pending_task_timeout (24 h by default) only if its progress has not moved
+    since its previous GC pass (see config.TASK_PENDING_MAX_HOURS), so a task that keeps
+    creeping can be seen here at any age.
     """
     f = pool.fact("tasks")
     if not f.ok:
@@ -1279,11 +1418,12 @@ def long_running_tasks(pool):
     if att.ok and isinstance(att.value, dict):
         for rec in parsers.parse_xe_records(att.value.get("hosts") or ""):
             names[rec.get("uuid")] = rec.get("name-label") or rec.get("uuid")
-    lines = ["  %s (%s): pending for %.1fh, progress %s, on %s" % (
-        name, uuid, age / 3600.0, progress, names.get(host, host))
-        for name, uuid, age, progress, host in old]
-    lines.append("A task xapi still calls pending holds what it works on; if it is not "
-                 "moving, xe task-cancel uuid=<uuid> asks it to stop.")
+    lines = ["  %s (%s): %s for %.1fh, progress %s, on %s" % (
+        name, uuid, status, age / 3600.0, progress, names.get(host, host))
+        for name, uuid, age, progress, host, status in old]
+    lines.append("A task xapi has not finished holds what it works on; if it is not "
+                 "moving, xe task-cancel uuid=<uuid> asks it to stop (a 'cancelling' one "
+                 "already was asked, and did not stop).")
     return flag("Long-Running Tasks", "Yes",
                 " - %d pending over %dh: %s" % (len(old), config.TASK_PENDING_MAX_HOURS,
                                                 ", ".join(t[0] for t in old[:3]) +
@@ -1292,14 +1432,16 @@ def long_running_tasks(pool):
 
 
 def leaf_coalesce_disabled(pool):
-    """Disks SM's GC will never leaf-coalesce, and SRs where it will leaf-coalesce nothing.
+    """Disks SM's GC is not leaf-coalescing, and SRs where it leaf-coalesces nothing.
 
     other-config:leaf-coalesce=false on a VDI is written by SM when a storage migration
-    starts mirroring that disk (see config.LEAF_COALESCE_BUSY_VM_OPS for the trace), and a
-    migration that fails or is cancelled leaves it there: the disk's snapshot chain then
-    only ever grows. A disk whose VM or VDI is mid-migration, -export or -import right now
-    is where the flag belongs, so it is counted aside. On an SR's other-config the same key
-    turns leaf-coalesce off for every disk on it, and only a person sets that.
+    starts mirroring that disk (see config.LEAF_COALESCE_BUSY_VM_OPS for the trace). A
+    migration that fails or is cancelled leaves it there until the disk's next snapshot -
+    SM's snapshot path removes the key before deciding whether to set it again - or until
+    someone removes it; until then GC skips the disk. A disk whose VM or VDI is
+    mid-migration, -export or -import right now is where the flag belongs, so it is
+    counted aside. On an SR, any of three other-config switches set to false stops it for
+    every disk there (parsers.GC_SR_SWITCHES), and only a person sets those.
 
     The VM list is what busy-ness is judged by; without it every flagged disk is reported
     and the detail says why. The VBD list only names the VMs, so without it the disks are
@@ -1323,8 +1465,12 @@ def leaf_coalesce_disabled(pool):
         return ok("Leaf-Coalesce Disabled", "None" + aside)
 
     lines = []
-    for uuid, name in srs:
-        lines.append("  SR %s (%s): leaf-coalesce disabled for every disk on it" % (name, uuid))
+    what = {"gc": "garbage collection disabled for it - nothing is coalesced or cleaned up",
+            "coalesce": "coalescing disabled for every disk on it",
+            "leaf-coalesce": "leaf-coalesce disabled for every disk on it"}
+    for uuid, name, off in srs:
+        lines.append("  SR %s (%s): %s (other-config %s)"
+                     % (name, uuid, what[off[0]], ", ".join("%s=false" % k for k in off)))
     rows = []
     for d in disks:
         where = ", ".join("%s (%s)" % (n or "?", u) for u, n in d["vms"]) or "no VM"
@@ -1342,9 +1488,14 @@ def leaf_coalesce_disabled(pool):
                      "all are listed" % vms.error)
     if v.get("srs") is None:
         lines.append("  the SRs were not read (%s)" % (v.get("sr_error") or "not collected"))
-    lines.append("Left behind by a storage migration that did not finish: GC skips the disk "
-                 "until the key goes - xe vdi-param-remove uuid=<vdi> param-name=other-config "
-                 "param-key=leaf-coalesce (xe sr-param-remove for an SR).")
+    if disks:
+        lines.append("Left behind by a storage migration that did not finish: GC skips the "
+                     "disk until its next snapshot, or until the key goes - xe "
+                     "vdi-param-remove uuid=<vdi> param-name=other-config "
+                     "param-key=leaf-coalesce.")
+    if srs:
+        lines.append("An SR switch stays until removed: xe sr-param-remove uuid=<sr> "
+                     "param-name=other-config param-key=<switch>.")
     vm_count = len(set(u for d in disks for u, _n in d["vms"]))
     parts = []
     if disks:
@@ -1424,32 +1575,49 @@ def update_mirror_access(host):
 
     A host whose repos point somewhere else (a local mirror) is said, not flagged.
     """
-    key = "Update Mirror Access"
     f = host.fact("update_mirror")
     if not f.ok:
-        return unknown(key, "Unknown (%s)" % f.error)
+        return unknown("Update Mirror Access", "Unknown (%s)" % f.error)
     v = f.value or {}
     if v.get("skipped"):
-        return info(key, "N/A (repos use %s)" % (", ".join(v.get("repo_hosts") or [])
+        return info("Update Mirror Access", "N/A (repos use %s)" % (", ".join(v.get("repo_hosts") or [])
                                                   or "no enabled repos"))
     redirector = _url_host_of(v.get("url", "")) or config.UPDATE_MIRROR_REDIRECTOR
     seen = "Public IP: %s%s" % (v.get("public_ip") or "unknown",
                                 " - %s" % v["asn"] if v.get("asn") else "")
-    head = ["Repo URL:  %s" % v.get("url", "?"), seen,
+    head = ["Repo URL:  %s" % (v.get("repo_url") or v.get("url", "?")), seen,
             "Via yum proxy: %s" % ("yes" if v.get("proxy") else "no")]
+    if v.get("repo_url") and v.get("repo_url") != v.get("url"):
+        head.insert(1, "Probed:    %s (the redirector sends http requests there)"
+                    % v.get("url", "?"))
     if v.get("redirector_error"):
-        return flag(key, "Cannot reach %s, See Below" % redirector).with_detail(
-            "---update mirror access---",
-            "\n".join(head + ["", "%s: %s" % (redirector, v["redirector_error"])]))
+        # yum falls back to the repo's other hosts; the line still flags (the mirror
+        # network is down for this host) and says whether the fallback answers
+        fallbacks = v.get("fallbacks") or []
+        answering = [x.get("host", "?") for x in fallbacks if x.get("ok")]
+        text = "Cannot reach %s" % redirector
+        if answering:
+            text += " (yum falls back to %s, which answers)" % ", ".join(answering)
+        elif fallbacks:
+            text += " (nor its fallback %s)" % ", ".join(x.get("host", "?") for x in fallbacks)
+        lines = head + ["", "%s: %s" % (redirector, v["redirector_error"])]
+        for x in fallbacks:
+            lines.append("fallback %s: %s" % (x.get("host", "?"),
+                                              "OK" if x.get("ok") else x.get("error")))
+        return flag("Update Mirror Access", text + ", See Below").with_detail(
+            "---update mirror access---", "\n".join(lines))
+    if v.get("page_error"):
+        # it answered: an unreadable mirror list establishes nothing about reachability
+        return unknown("Update Mirror Access", "Unknown (%s)" % v["page_error"])
 
     mirrors = v.get("mirrors") or []
-    bad = [m for m in mirrors if not m.get("ok")]
+    tried = [m for m in mirrors if m.get("tried", True)]
+    bad = [m for m in tried if not m.get("ok")]
+    untried = [m for m in mirrors if not m.get("tried", True)]
+    first_hop = v.get("first_hop_error") or ""
     selected = v.get("selected") or ""
-    if mirrors and not bad:
-        return ok(key, "Yes (%s, via %s)" % (_plural(len(mirrors), "mirror"),
-                                             selected or mirrors[0].get("host")))
     if not mirrors:
-        return unknown(key, "Unknown (no mirror was tried)")
+        return unknown("Update Mirror Access", "Unknown (no mirror was tried)")
     rows = ["%-40s %-6s %s" % ("Mirror", "Share", "Result")]
     for m in mirrors:
         share = "%d%%" % m["share"] if m.get("share") is not None else "-"
@@ -1457,10 +1625,30 @@ def update_mirror_access(host):
         rows.append("%-40s %-6s %s" % (name, share, "OK" if m.get("ok") else m.get("error")))
     if selected:
         rows.append("(* = the mirror %s picked for this host)" % redirector)
-    what = "All %s" % _plural(len(mirrors), "mirror") if len(bad) == len(mirrors) \
-        else "%d of %s" % (len(bad), _plural(len(mirrors), "mirror"))
-    return flag(key, "%s Unreachable, See Below" % what).with_detail(
-        "---update mirror access---", "\n".join(head + [""] + rows))
+    if v.get("not_probed"):
+        rows.append("(%d more with a share were not tried: at most %d are)"
+                    % (v["not_probed"], len(mirrors)))
+    if first_hop:
+        rows = ["%s (yum's own first request): %s" % (v.get("repo_url"), first_hop), ""] + rows
+    if bad or first_hop:
+        parts = []
+        if first_hop:
+            parts.append("Cannot reach %s" % re.sub(r"^(\w+://[^/]+).*$", r"\1",
+                                                    v.get("repo_url") or ""))
+        if bad:
+            parts.append(("All %s" % _plural(len(tried), "mirror") if len(bad) == len(tried)
+                          else "%d of %s" % (len(bad), _plural(len(mirrors), "mirror")))
+                         + " Unreachable")
+        return flag("Update Mirror Access", "; ".join(parts) + ", See Below").with_detail(
+            "---update mirror access---", "\n".join(head + [""] + rows))
+    if untried:
+        # a mirror the budget never let us try is not established either way
+        return unknown("Update Mirror Access", "Unknown - %d of %s not tried (out of time)"
+                       % (len(untried), _plural(len(mirrors), "mirror"))).with_detail(
+            "---update mirror access---", "\n".join(head + [""] + rows))
+    how_many = (("%d of %d mirrors" % (len(mirrors), len(mirrors) + v["not_probed"]))
+                if v.get("not_probed") else _plural(len(mirrors), "mirror"))
+    return ok("Update Mirror Access", "Yes (%s, via %s)" % (how_many, selected or mirrors[0].get("host")))
 
 
 def _url_host_of(url):
@@ -1496,11 +1684,10 @@ def xostor_missing_devices(host):
     layout. No PVs and an unreadable backup is Unknown - that pair cannot tell a diskless
     node from one that lost everything.
     """
-    key = "XOSTOR Missing Devices"
     vg = config.XOSTOR_VG
     f = host.fact("pvs")
     if not f.ok:
-        return unknown(key, "Unknown (%s)" % f.error)
+        return unknown("XOSTOR Missing Devices", "Unknown (%s)" % f.error)
     rows = [r for r in parsers.parse_pvs(f.value.get("rows")) if r[1] == vg]
     present = dict((r[3], r[0]) for r in rows if not parsers.pv_missing(r[0], r[2]))
     flagged = [r for r in rows if parsers.pv_missing(r[0], r[2])]
@@ -1524,22 +1711,29 @@ def xostor_missing_devices(host):
         total += len(extra)
     else:
         if not rows:
+            if b.ok and b.value is None:
+                # no backup file at all: the VG never lived here - a diskless node
+                return info("XOSTOR Missing Devices", "None (no %s PVs on this host)" % vg)
             if b.ok:
-                return info(key, "None (no %s PVs on this host)" % vg)
-            return unknown(key, "Unknown (no %s PVs, and %s)" % (vg, b.error))
+                # the backup file exists, so the VG did live here, and it names no PV that
+                # could be read: that pair cannot tell a diskless node from one that lost
+                # every disk at once - the very case the backup half is for
+                return unknown("XOSTOR Missing Devices", "Unknown (no %s PVs, and its LVM "
+                               "backup names none)" % vg)
+            return unknown("XOSTOR Missing Devices", "Unknown (no %s PVs, and %s)" % (vg, b.error))
         total, n_missing = len(rows), len(flagged)
         detail = ["%-40s %-16s %s" % (r[3] or "?", r[0], r[2]) for r in rows]
         if not b.ok:
             detail.append("(%s backup unreadable: %s)" % (vg, b.error))
 
     if not n_missing:
-        return ok(key, "None (%s present)" % _plural(total, "PV"))
+        return ok("XOSTOR Missing Devices", "None (%s present)" % _plural(total, "PV"))
     warnings = [w.strip() for w in (f.value.get("warnings") or "").splitlines() if w.strip()]
     if warnings:
         detail += [""] + warnings
     what = "All %s" % _plural(total, "PV") if n_missing == total and total > 1 else \
         "%d of %s" % (n_missing, _plural(total, "PV"))
-    return flag(key, "%s in %s Missing, See Below" % (what, vg)).with_detail(
+    return flag("XOSTOR Missing Devices", "%s in %s Missing, See Below" % (what, vg)).with_detail(
         "---xostor missing devices---", "\n".join(["%-40s %-16s %s" % (
             "PV UUID", "Device (hint)", "State")] + detail))
 
@@ -1557,20 +1751,26 @@ def xostor_missing_devices_pool(hosts, details_shown=True):
 
 
 def _pool_rollup(key, hosts, host_check, details_shown=True, flagged_as="Yes, on",
-                 clean="None"):
+                 clean="None", all_na=None):
     """One pool line built from each host's own line for the same check, so the two can
     never disagree: the hosts it flags, then the hosts it could not read, else clean.
     An INFO host line (not applicable there) counts as neither. 'See Host Results' only
     when every flagged host prints its line - the master always does, a slave only when
-    details_shown (its POOL_RUN toggle) says so.
+    details_shown (its POOL_RUN toggle) says so. With all_na given, a pool where EVERY
+    host's line was not-applicable says that (green info) rather than the clean value,
+    which would claim something no host was asked.
     """
-    flagged, unread = [], []
+    flagged, unread, na = [], [], 0
     for h in hosts:
         line = host_check(h)
         if line.status == result.FLAG:
             flagged.append(h)
         elif line.status == result.UNKNOWN:
             unread.append(h.name)
+        elif line.status == result.INFO:
+            na += 1
+    if all_na and hosts and na == len(hosts):
+        return info(key, all_na)
     if flagged:
         text = "%s: %s" % (flagged_as, ", ".join(h.name for h in flagged))
         if details_shown or all(h.is_master for h in flagged):
@@ -1595,7 +1795,8 @@ def update_mirror_access_pool(hosts, details_shown=True):
     """Hosts that cannot reach the XCP-ng update mirrors. Hosts on a local mirror are
     left out rather than counted as fine or failing."""
     return _pool_rollup("Update Mirror Access", hosts, update_mirror_access,
-                        details_shown, flagged_as="Failing on", clean="OK")
+                        details_shown, flagged_as="Failing on", clean="OK",
+                        all_na="N/A (no host uses the XCP-ng mirrors)")
 
 
 def xostor_in_use(pool):
@@ -1609,14 +1810,31 @@ def xostor_in_use(pool):
     return info("XOSTOR In Use", "Yes")
 
 
-def xostor_ram(pool, memory):
-    if memory is None:
-        return unknown("XOSTOR RAM", "Unknown (could not read dom0 memory)")
-    total_gb = memory[0] / 1024.0
-    if int(round_1dp(total_gb) + 0.00001) < config.XOSTOR_MIN_RAM_GB:
-        return flag("XOSTOR RAM", "Not Enough: %.1fG (Need >=%dG)"
-                    % (total_gb, config.XOSTOR_MIN_RAM_GB))
-    return ok("XOSTOR RAM", "%.1fG" % total_gb)
+def xostor_ram(hosts):
+    """Every XOSTOR node's dom0 RAM against XOSTOR_MIN_RAM_GB - every node runs DRBD and a
+    LINSTOR satellite. It judged only the host the pool questions were asked of, so a
+    slave short of RAM printed a green value that read as the pool's."""
+    short, unread, sizes = [], [], []
+    for host in hosts:
+        total = host.mem_total_mb()
+        if total is None:
+            unread.append(host.label)
+            continue
+        total_gb = total / 1024.0
+        sizes.append(total_gb)
+        if int(round_1dp(total_gb) + 0.00001) < config.XOSTOR_MIN_RAM_GB:
+            short.append("%s %.1fG" % (host.label, total_gb))
+    if short:
+        return flag("XOSTOR RAM", "Not Enough on: %s (Need >=%dG)"
+                    % (", ".join(short), config.XOSTOR_MIN_RAM_GB))
+    if unread:
+        return unknown("XOSTOR RAM", "Unknown (could not read dom0 memory on: %s)"
+                       % ", ".join(unread))
+    if not sizes:
+        return unknown("XOSTOR RAM", "Unknown (no host's dom0 memory was read)")
+    if len(sizes) == 1:
+        return ok("XOSTOR RAM", "%.1fG" % sizes[0])
+    return ok("XOSTOR RAM", "%.1fG or more on all %d hosts" % (min(sizes), len(sizes)))
 
 
 def _linstor_unknown(label, f):
@@ -1624,15 +1842,6 @@ def _linstor_unknown(label, f):
     if "not found" in (f.error or ""):
         return unknown(label, "Unknown (linstor CLI not found)")
     return unknown(label, "Unknown (%s)" % f.error)
-
-
-def _linstor_line(pool, key, label, predicate, detail_title):
-    f = pool.fact(key)
-    if not f.ok:
-        return _linstor_unknown(label, f)
-    if predicate(f.value):
-        return flag(label, "Yes, See Below").with_detail(detail_title, f.value)
-    return ok(label, "No")
 
 
 def _linstor_table(text):
@@ -1677,13 +1886,37 @@ def _linstor_has_rows(text):
 
 
 def xostor_faulty_resources(pool):
-    return _linstor_line(pool, "linstor_faulty", "XOSTOR Faulty Resources",
-                         _linstor_has_rows, "---xostor faulty resources---")
+    """Rows of 'linstor r l --faulty' are the finding. Its header prints whether or not
+    anything is faulty, so output with no header is not a table at all - a banner, an
+    error on rc 0, a client whose borders this does not read - and establishes nothing."""
+    f = pool.fact("linstor_faulty")
+    if not f.ok:
+        return _linstor_unknown("XOSTOR Faulty Resources", f)
+    header, rows = _linstor_table(f.value)
+    if not header:
+        return unknown("XOSTOR Faulty Resources",
+                       "Unknown (no table in 'linstor r l --faulty' output)")
+    if rows:
+        return flag("XOSTOR Faulty Resources", "Yes, See Below").with_detail(
+            "---xostor faulty resources---", f.value)
+    return ok("XOSTOR Faulty Resources", "No")
 
 
 def xostor_nodes(pool):
-    return _linstor_line(pool, "linstor_nodes", "XOSTOR Faulty Nodes",
-                         _linstor_node_offline, "---xostor node status---")
+    """Any node whose State is not Online. Green needs a State column and at least one
+    node: the line prints only on a pool that uses XOSTOR, so no nodes is never the right
+    answer - it is a table this could not read (the collector's twin says the same)."""
+    f = pool.fact("linstor_nodes")
+    if not f.ok:
+        return _linstor_unknown("XOSTOR Faulty Nodes", f)
+    header, rows = _linstor_table(f.value)
+    if "State" not in header or not rows:
+        return unknown("XOSTOR Faulty Nodes",
+                       "Unknown (no node rows with a State column in 'linstor n l' output)")
+    if _linstor_node_offline(f.value):
+        return flag("XOSTOR Faulty Nodes", "Yes, See Below").with_detail(
+            "---xostor node status---", f.value)
+    return ok("XOSTOR Faulty Nodes", "No")
 
 
 def _linstor_node_addresses(text):
@@ -1772,6 +2005,18 @@ def xostor_pref_nic(pool):
         return unknown("XOSTOR PrefNic",
                        "Unknown (could not read PrefNic on any of %d node(s))" % len(nodes))
     missing = sorted(name for name in nics if not nics[name])
+    values = set(nic for nic in nics.values() if nic)
+    if missing and not values:
+        # set on none of the nodes read: SM reads an absent PrefNic as 'default'
+        # (linstorvolumemanager.py), so this is the cluster consistently using LINSTOR's
+        # default interface - no dedicated storage NIC. Worth a look, not a finding (the
+        # maintainer's call). With nodes unread, a mix cannot be ruled out.
+        if unread:
+            return unknown("XOSTOR PrefNic", "Unknown (not set on the nodes read; could "
+                                             "not read: %s)" % ", ".join(unread)).with_detail(
+                "---xostor prefnic---", detail)
+        return info("XOSTOR PrefNic", "Default interface on all %d nodes (no PrefNic set)"
+                    % len(nodes), "yellow")
     if missing:
         return flag("XOSTOR PrefNic", "Not set on: %s" % ", ".join(missing)).with_detail(
             "---xostor prefnic---", detail)
@@ -1858,6 +2103,12 @@ def backup_network(pool, run_env, pinger, routes=None):
         return unknown("Backup Network", "Unknown (could not read backup network PIFs)")
     if not ips.value:
         return flag("Backup Network", "Configured but no usable IP was found on the network")
+    missing = net.get("pifs_without_ip") or 0
+    if missing:
+        # XO sends that host's exports (and a proxy's) to its backup-network PIF IP, taken
+        # verbatim: with none, there is nowhere to send them - whoever runs the job
+        return flag("Backup Network", "Configured but %d PIF(s) on it have no IP" % missing,
+                    " - those hosts' backups have no address on this network")
 
     silent = pinger(ips.value)
     if not silent:
@@ -1950,6 +2201,26 @@ def stuck_processes(host):
                                          facts.value.get("own_probes")))
 
 
+def _stuck_what(row):
+    """What a stuck row is: its command, or for one with none, what the kernel says it is.
+
+    The kernel's PF_KTHREAD flag decides (row["kernel"]) when the collector read it; an
+    older collector's row has no such key, and then an empty command line is read as a
+    kernel thread, as it always was. A userspace task can have an empty command line too
+    - one stuck in exit on a dead mount has already released its memory - and is named by
+    its comm instead."""
+    frame = row.get("frame") or ""
+    kernel = row.get("kernel")
+    cmd = row.get("cmd") or ""
+    if kernel is True or (kernel is None and not cmd):
+        return "[kernel thread] " + frame
+    if not cmd:
+        return "[%s] (command line not readable) %s" % (row.get("comm") or "?", frame)
+    if row.get("own"):
+        return "%s   <- left by an earlier health check" % cmd
+    return cmd
+
+
 def _stuck_detail(rows, total, user_count, watched, own_probes):
     if user_count is None:
         head = "%d process(es) in uninterruptible sleep." % total
@@ -1969,15 +2240,15 @@ def _stuck_detail(rows, total, user_count, watched, own_probes):
         # named rather than hidden, and counted rather than dropped: they are genuinely
         # stuck, and a reader who does not know where they came from would read a growing
         # count as the host getting worse on its own
-        lines.append("%d of them are this script's own mount probes, parked by earlier "
-                     "runs on a mount that stopped answering. Each one names the mount "
-                     "it was asking about." % own_probes)
+        lines.append("%d of them were left by this script's earlier runs - mount probes "
+                     "parked on a mount that stopped answering, or commands a run could "
+                     "not kill - marked below. Each one names what it was asking about."
+                     % own_probes)
     lines.append("")
     for row in rows:
         lines.append("  %-8s %-9s %-10s %s"
                      % (row.get("pid"), parsers.format_age(row.get("age") or 0),
-                        row.get("module") or "-",
-                        row.get("cmd") or "[kernel thread] " + (row.get("frame") or "")))
+                        row.get("module") or "-", _stuck_what(row)))
     if len(rows) < total:
         # never a silent cut: 25 rows under a heading saying 589 still reads as "here they
         # are" unless the block says outright that it is showing a slice
@@ -2002,18 +2273,17 @@ def mount_stalls(host):
     for the rest of the uptime. A host wedged for days can therefore be completely silent
     here while dozens of processes pile up, which is why the process scan leads.
     """
-    scan = host.fact("mount_stall_scan")
+    blocks, failed = _scan_result(host.fact("mount_stall_scan"))
     dmesg = host.fact("dmesg")
 
-    blocks = list(scan.value) if (scan.ok and scan.value) else []
     if dmesg.ok:
         blocks = blocks + _dmesg_phrase_blocks(dmesg.value, config.MOUNT_STALL_PHRASES,
                                                config.LOG_ERROR_CONTEXT)
     if blocks:
         return flag("Mount Stalls", "Yes, See Error Output").with_detail(
-            "Mount Stalls", _render_scan_blocks(blocks))
-    if not scan.ok:
-        return unknown("Mount Stalls", "Unknown (%s)" % scan.error)
+            "Mount Stalls", _render_scan_blocks(blocks, failed))
+    if failed:
+        return unknown("Mount Stalls", "Unknown (%s)" % "; ".join(failed))
     if not dmesg.ok:
         return unknown("Mount Stalls", "Unknown (could not read dmesg)")
     return ok("Mount Stalls", "None")
@@ -2048,8 +2318,9 @@ def network_mounts(host):
                     "%d of %d not responding" % (len(dead), len(rows))).with_detail(
             "Network Mounts", _mount_detail(rows))
     if unprobed:
-        # not probed is not "fine": it is a question that was deliberately not asked, and
-        # the reason it was not asked is itself already flagged by Stuck Processes
+        # not probed is not "fine": there was not enough of the run budget left to wait
+        # for an answer (MOUNT_PROBE_RESERVE) - the only reason since v3.12, never the
+        # state of the host
         return unknown("Network Mounts",
                        "Unknown - %d mount(s) not probed (%s)"
                        % (len(unprobed), unprobed[0].get("why") or "no reason given")

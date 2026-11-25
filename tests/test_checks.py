@@ -181,9 +181,65 @@ def test_ntp_states():
     assert checks.ntp(good).status == OK
     bad = host(timedatectl=fact("NTP enabled: no\nNTP synchronized: yes\n"))
     assert checks.ntp(bad).status == FLAG
-    unknown = host(timedatectl=err())
+    unknown = host(timedatectl=err("timedatectl failed (exit 1)"))
     line = checks.ntp(unknown)
-    assert line.status == INFO and line.always_print and not line.flags
+    # not established is a finding's weight (v3.28): it flags, and says why
+    assert line.status == UNKNOWN and line.flags and line.always_print
+    assert "timedatectl failed (exit 1)" in line.text
+    # systemd's n/a (no NTP service known) is an established no
+    na = host(timedatectl=fact("NTP enabled: n/a\nNTP synchronized: yes\n"))
+    assert checks.ntp(na).status == FLAG
+
+
+def _pool_host(address, meminfo=None, timedatectl=None, now=None, local_now=1000.0):
+    h = model.Host(address, "uuid-" + address, "h-" + address, "true", "false")
+    h.payload = {"hostname": fact("h-" + address)}
+    if meminfo is not None:
+        h.payload["meminfo"] = meminfo
+    if timedatectl is not None:
+        h.payload["timedatectl"] = timedatectl
+    if now is not None:
+        h.payload["now"] = fact(now)
+    h.local_now = local_now
+    return h
+
+
+def _mem(mb):
+    return fact("MemTotal:       %d kB\nMemAvailable:   1000 kB\n" % (mb * 1024))
+
+
+def test_dom0_ram_allocations_never_matches_over_nothing():
+    a, b = _pool_host("192.0.2.1", _mem(4096)), _pool_host("192.0.2.2", _mem(4100))
+    assert checks.dom0_ram_allocations([a, b]).text.endswith("Matched")
+    # 20 MiB apart across an N.5 GiB boundary is the same allocation now
+    c, d = _pool_host("192.0.2.3", _mem(4598)), _pool_host("192.0.2.4", _mem(4618))
+    assert checks.dom0_ram_allocations([c, d]).status == OK
+    # 480 MiB apart is not
+    e, f = _pool_host("192.0.2.5", _mem(4106)), _pool_host("192.0.2.6", _mem(4586))
+    line = checks.dom0_ram_allocations([e, f])
+    assert line.status == FLAG and "h-192.0.2.6 (192.0.2.6)  4.5G" in line.detail_text
+    # an unread host is not agreement
+    g = _pool_host("192.0.2.7", err("cat failed"))
+    line = checks.dom0_ram_allocations([a, g])
+    assert line.status == UNKNOWN and "h-192.0.2.7" in line.text
+    assert checks.dom0_ram_allocations([]).status == UNKNOWN
+    assert "Nothing to compare" in checks.dom0_ram_allocations([a]).text
+
+
+def test_pool_time_sync_says_mismatched_only_for_what_it_saw():
+    good = fact("NTP enabled: yes\nNTP synchronized: yes\n")
+    a = _pool_host("192.0.2.1", timedatectl=good, now=1000.0)
+    b = _pool_host("192.0.2.2", timedatectl=good, now=1010.0)
+    assert checks.pool_time_sync([a, b]).text.endswith("Matched")
+    # unread: Unknown, with the reason - not a mismatch it never saw
+    c = _pool_host("192.0.2.3", timedatectl=err("timedatectl failed (exit 1)"), now=1000.0)
+    line = checks.pool_time_sync([a, c])
+    assert line.status == UNKNOWN and "timedatectl failed (exit 1)" in line.text
+    # an established drift over the allowance names the host
+    d = _pool_host("192.0.2.4", timedatectl=good, now=1000.0 - 400)
+    line = checks.pool_time_sync([a, d])
+    assert line.status == FLAG and "h-192.0.2.4" in line.detail_text and "400s" in line.detail_text
+    assert checks.pool_time_sync([]).status == UNKNOWN
 
 
 # --------------------------------------------------------------------------------------
@@ -232,8 +288,16 @@ def test_rebooted_unknown_without_a_boot_time():
 # --------------------------------------------------------------------------------------
 
 def test_yum_patch_level_master_is_the_reference_and_is_suppressed_by_f():
-    line = checks.yum_patch_level(host(), True, "")
+    line = checks.yum_patch_level(host(rpm_manifest=fact("a 0:1\n")), True, "a 0:1\n")
     assert line.status == OK and not line.always_print
+
+
+def test_yum_patch_level_master_without_its_manifest_is_not_a_reference():
+    """Green 'Reference' claims a baseline; with the master's rpm -qa unread there is none,
+    which is exactly why every slave says 'no baseline'."""
+    for fact_ in (err("rpm -qa failed (exit 1)"), fact("")):
+        line = checks.yum_patch_level(host(rpm_manifest=fact_), True, "")
+        assert line.status == UNKNOWN and line.flags
 
 
 def test_yum_patch_level_without_a_baseline_is_unknown_not_a_mismatch():
@@ -417,9 +481,15 @@ def test_xostor_in_use_is_a_fact_not_a_finding():
 
 
 def test_xostor_ram():
-    assert checks.xostor_ram(pool(), None).status == UNKNOWN
-    assert checks.xostor_ram(pool(), (8 * 1024, 0)).status == FLAG
-    assert checks.xostor_ram(pool(), (16 * 1024, 0)).status == OK
+    big, small = _pool_host("192.0.2.1", _mem(16 * 1024)), _pool_host("192.0.2.2", _mem(8 * 1024))
+    unread = _pool_host("192.0.2.3", err("cat failed"))
+    assert checks.xostor_ram([]).status == UNKNOWN
+    assert checks.xostor_ram([big]).status == OK
+    # every node is judged, not just the one the pool questions were asked of
+    line = checks.xostor_ram([big, small])
+    assert line.status == FLAG and "h-192.0.2.2 (192.0.2.2) 8.0G" in line.text
+    assert checks.xostor_ram([big, unread]).status == UNKNOWN
+    assert checks.xostor_ram([big, big]).text.endswith("16.0G or more on all 2 hosts")
 
 
 def test_xostor_linstor_missing_is_unknown():
@@ -1047,3 +1117,74 @@ def test_update_mirror_access_pool_skips_local_mirror_hosts():
     assert checks.update_mirror_access_pool([good, local]).status == OK
     line = checks.update_mirror_access_pool([good, local, bad])
     assert line.status == FLAG and "Failing on: h3" in line.text and "h2" not in line.text
+
+
+# --------------------------------------------------------------------------------------
+# Update Mirror Access - the states added by the 2026-11-24 audit (A06/A07)
+# --------------------------------------------------------------------------------------
+
+def _mirror_v(**extra):
+    v = {"url": "https://mirrors.xcp-ng.org/8/8.3/base/x86_64/repodata/repomd.xml",
+         "repo_url": "http://mirrors.xcp-ng.org/8/8.3/base/x86_64/repodata/repomd.xml",
+         "proxy": False, "public_ip": "203.0.113.7", "asn": "", "selected": "",
+         "redirector_error": "", "first_hop_error": "", "page_error": "",
+         "fallbacks": [], "not_probed": 0, "mirrors": []}
+    v.update(extra)
+    return fact(v)
+
+
+def test_update_mirror_access_names_a_fallback_that_answers():
+    """yum falls back to the repo's next baseurl; the line still flags (this host cannot
+    use the mirror network) and says that updates still arrive (decision A07)."""
+    line = checks.update_mirror_access(host(update_mirror=_mirror_v(
+        redirector_error="(28) Connection timed out",
+        fallbacks=[{"host": "updates.xcp-ng.org", "ok": True, "error": ""}])))
+    assert line.status == FLAG
+    assert "yum falls back to updates.xcp-ng.org, which answers" in line.text
+    assert "fallback updates.xcp-ng.org: OK" in line.detail_text
+
+
+def test_update_mirror_access_says_when_the_fallback_fails_too():
+    line = checks.update_mirror_access(host(update_mirror=_mirror_v(
+        redirector_error="(28) Connection timed out",
+        fallbacks=[{"host": "updates.xcp-ng.org", "ok": False, "error": "HTTP 403"}])))
+    assert line.status == FLAG and "nor its fallback updates.xcp-ng.org" in line.text
+    assert "HTTP 403" in line.detail_text
+
+
+def test_update_mirror_access_an_unreadable_page_is_unknown_not_unreachable():
+    line = checks.update_mirror_access(host(update_mirror=_mirror_v(
+        page_error="mirrors.xcp-ng.org answered, but no mirror list could be read from it")))
+    assert line.status == UNKNOWN and "answered" in line.text
+
+
+def test_update_mirror_access_untried_mirrors_are_unknown_not_green():
+    line = checks.update_mirror_access(host(update_mirror=_mirror_v(mirrors=[
+        dict(mrow("mirror-a.example.org"), tried=True),
+        dict(mrow("mirror-b.example.org", False, error="not tried - out of time"),
+             tried=False)])))
+    assert line.status == UNKNOWN and "1 of 2 mirrors not tried" in line.text
+
+
+def test_update_mirror_access_untried_never_hides_a_real_failure():
+    line = checks.update_mirror_access(host(update_mirror=_mirror_v(mirrors=[
+        dict(mrow("mirror-a.example.org", False, error="timed out"), tried=True),
+        dict(mrow("mirror-b.example.org", False, error="not tried - out of time"),
+             tried=False)])))
+    assert line.status == FLAG
+
+
+def test_update_mirror_access_flags_a_failed_first_hop():
+    """yum's own first request is http://; a firewall that drops port 80 breaks yum even
+    with every https mirror answering."""
+    line = checks.update_mirror_access(host(update_mirror=_mirror_v(
+        first_hop_error="HTTP 407", mirrors=[mrow("mirror-a.example.org")])))
+    assert line.status == FLAG
+    assert line.text.startswith("Cannot reach http://mirrors.xcp-ng.org")
+    assert "HTTP 407" in line.detail_text
+
+
+def test_update_mirror_access_counts_what_was_capped():
+    line = checks.update_mirror_access(host(update_mirror=_mirror_v(
+        not_probed=3, mirrors=[mrow("a"), mrow("b")])))
+    assert line.status == OK and "2 of 5 mirrors" in line.text

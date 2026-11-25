@@ -218,10 +218,17 @@ def test_the_scripts_own_parked_probes_are_counted_as_its_own(monkeypatch):
     mount that has stopped answering, and a count that climbs on its own would read as the
     host degrading further when it is only this tool's own leavings."""
     probe_cmd = "stat -c %s %%i -- /run/sr-mount/e512c88e" % collector.MOUNT_PROBE_MARK
-    out, _clock = watch(monkeypatch, [{101: d_proc(3000), 102: d_proc(2000)}],
-                        cmdline={101: "df -hP", 102: probe_cmd})
-    assert out["value"]["total"] == 2
-    assert out["value"]["own_probes"] == 1
+    # an older run's df (a command its run could not kill) is this tool's leaving too; a
+    # coalesce is not, and neither is an admin's own sed that merely starts the same way
+    out, _clock = watch(monkeypatch, [{101: d_proc(3000), 102: d_proc(2000),
+                                       103: d_proc(1500), 104: d_proc(1200)}],
+                        cmdline={101: "df -hP", 102: probe_cmd,
+                                 103: "vhd-util coalesce --debug -n /dev/VG/x",
+                                 104: "sed -n 1,5p /root/notes.txt"})
+    assert out["value"]["total"] == 4
+    assert out["value"]["own_probes"] == 2
+    own = dict((row["pid"], row["own"]) for row in out["value"]["rows"])
+    assert own == {101: True, 102: True, 103: False, 104: False}
 
 
 def test_a_process_on_the_age_floor_is_not_dropped_for_being_caught_early(monkeypatch):
@@ -255,7 +262,7 @@ def probe(monkeypatch, mounts, budget=None, answer=None, spec=None):
         return collector.Ran(0, "12345", "", False)
 
     monkeypatch.setattr(collector, "DEADLINE", [None] if budget is None
-                        else [collector.time.time() + budget])
+                        else [collector._mono() + budget])
     monkeypatch.setattr(collector, "read_file", lambda path, limit=None: mounts)
     monkeypatch.setattr(collector, "run", fake_run)
     return collector.collect_network_mounts(spec or PROBE_SPEC), ran
@@ -363,7 +370,7 @@ def test_the_block_names_the_probes_this_script_left_behind():
     line = checks.stuck_processes(host(stuck_procs=fact({
         "total": 30, "userspace": 30, "watched": 10, "own_probes": 28,
         "rows": [stuck_row(1, 3000, "df -hP")]})))
-    assert "28 of them are this script's own mount probes" in line.detail_text
+    assert "28 of them were left by this script's earlier runs" in line.detail_text
 
 
 def test_a_collector_that_did_not_time_its_window_claims_no_window():
@@ -372,7 +379,7 @@ def test_a_collector_that_did_not_time_its_window_claims_no_window():
         "total": 1, "userspace": 1,
         "rows": [stuck_row(3552973, 3783, "df -hP")]})))
     assert "was watched" not in line.detail_text
-    assert "own mount probes" not in line.detail_text
+    assert "left by this script's earlier runs" not in line.detail_text
     assert "upper bound" in line.detail_text      # the caveat is not conditional
 
 

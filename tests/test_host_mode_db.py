@@ -105,7 +105,7 @@ def test_prepare_host_sweep_never_reads_the_db(monkeypatch, tripwires):
     It is where a password would be wanted, which makes it the likeliest place for someone
     to reach for a lookup that only exists on an appliance.
     """
-    monkeypatch.setattr(transport, "ensure_sshpass", lambda run_env: True)
+    monkeypatch.setattr(transport, "sshpass_present", lambda run_env: True)
     # the askpass helper runs one local command of its own - proving itself before it is
     # trusted - and the tripwire above cannot tell that from a db lookup, so it is stood
     # in for here. Establishing a way to authenticate is exactly what this step is for.

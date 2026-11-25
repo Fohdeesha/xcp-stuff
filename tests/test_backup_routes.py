@@ -53,8 +53,8 @@ def job(ident, vms=None, proxy=None, kind="backup", **fields):
 
 
 def touches(j, vm_uuids=frozenset([VM_HERE]), sr_uuids=frozenset([SR_HERE]),
-            pool_uuid=POOL_UUID):
-    return parsers.job_touches_pool(j, pool_uuid, vm_uuids, sr_uuids)
+            pool_uuid=POOL_UUID, schedule_ids=None):
+    return parsers.job_touches_pool(j, pool_uuid, vm_uuids, sr_uuids, schedule_ids)
 
 
 # --------------------------------------------------------------------------------------
@@ -112,7 +112,11 @@ def test_smart_mode_by_pool():
 
 
 def test_smart_mode_over_every_pool_counts():
-    assert touches(job("1", smart(tags={"__or": [["prod"]]}))) is True
+    # every VM of every pool: definitely this one
+    assert touches(job("1", json.dumps({"type": "VM"}))) is True
+    # narrowed by tags: this pool's VMs may all fall outside it - "may", never "yes"
+    # (v3.28: a proxied tag-only job used to take the XOA out of the answer)
+    assert touches(job("1", smart(tags={"__or": [["prod"]]}))) is None
 
 
 def test_vms_picked_by_hand_are_looked_up_in_the_pools_own_uuids():
@@ -132,7 +136,12 @@ def test_a_replication_into_this_pool_touches_it():
 def test_a_health_check_restoring_into_this_pool_touches_it():
     j = job("1", json.dumps({"id": VM_THERE}),
             settings={"": {"reportWhen": "always"}, "sched": {"healthCheckSr": SR_HERE}})
-    assert touches(j) is True
+    # XO reads settings[schedule.id]: definite only when that schedule runs
+    assert touches(j) is None
+    assert touches(j, schedule_ids={"sched"}) is True
+    assert touches(j, schedule_ids={"other"}) is None
+    j = job("1", json.dumps({"id": VM_THERE}), settings={"": {"healthCheckSr": SR_HERE}})
+    assert touches(j) is True                       # the job-wide entry
 
 
 def test_pool_metadata_backups():
@@ -165,7 +174,8 @@ def test_the_lab_jobs_read_as_written():
             "pools": '{"id":{"__or":["a2650ca4-5d0e-d2ad-f273-fb7fc9b3afe4",'
                      '"55d4887f-c4e2-54c7-ecae-3bcab5599abc",'
                      '"cab1ae78-be82-2e7c-3828-43c0a567881b"]}}'}
-    assert touches(full) is True
+    # this pool, but narrowed by tags: "may" (an XOA-run job keeps the XOA in either way)
+    assert touches(full) is None
     assert touches(full, pool_uuid=OTHER_POOL) is False
     assert touches(meta) is True
 
@@ -467,7 +477,7 @@ class FakeXe(object):
         self.answers = answers
         self.calls = []
 
-    def __call__(self, args, timeout=None):
+    def __call__(self, args, timeout=None, canary=True):
         self.calls.append(list(args))
         rc, out = self.answers.get(args[0], (0, ""))
         return collector.Ran(rc, out, "" if rc == 0 else "boom", False)
@@ -527,7 +537,7 @@ def _pool_answers(other_config):
 def test_the_scope_is_collected_only_when_asked_and_worth_it(monkeypatch, asked, other_config,
                                                              expected):
     monkeypatch.setattr(collector, "xe", FakeXe(_pool_answers(other_config)))
-    monkeypatch.setattr(collector, "_pif_ips", lambda uuid: collector.fact(["10.0.0.1"]))
+    monkeypatch.setattr(collector, "_pif_ips", lambda uuid: (collector.fact(["10.0.0.1"]), 0))
     out = collector.collect_pool({"backup_scope": asked}, "")
     assert ("backup_scope" in out) is expected
 
@@ -558,7 +568,12 @@ def test_an_encrypted_collection_is_declined(serve):
         xoredis._fetch_collection(server.addr, 5, "job")
 
 
-def test_a_record_deleted_between_the_two_calls_is_skipped(serve):
+def test_a_listed_record_with_no_string_value_declines(serve):
+    """MGET answers nil for a deleted key AND for one stored as a hash, which is how XO
+    wrote every record until Dec 2023: skipping it could drop an XOA-run job and read
+    Backup Network green, so the fast path declines and xo-server-db reads it (v3.28)."""
     server = serve([array([bulk("j1"), bulk("j2")]),
                     array([bulk(None), bulk(json.dumps({"type": "backup"}))])])
-    assert xoredis._fetch_collection(server.addr, 5, "job") == [{"type": "backup", "id": "j2"}]
+    with pytest.raises(xoredis.RedisError) as exc:
+        xoredis._fetch_collection(server.addr, 5, "job")
+    assert "as a hash" in str(exc.value)

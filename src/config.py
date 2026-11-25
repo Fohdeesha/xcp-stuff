@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Every threshold, list and toggle, in one place. Same names and values as health.sh."""
 
-SCRIPT_VERSION = "3.27"
+SCRIPT_VERSION = "3.28"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
@@ -25,6 +25,7 @@ DOM0_MAX_USED = 75               # dom0 disk use % allowed before flagging
 DOM0_MEM_USED_MAX_PCT = 65       # dom0 memory use % allowed before flagging
 XOSTOR_MIN_RAM_GB = 15           # minimum dom0 RAM (GB) when XOSTOR is in use
 TIME_SYNC_ALLOWANCE_SECS = 300   # max clock difference between a host and this machine
+RAM_MATCH_TOLERANCE_MB = 256     # dom0 MemTotal this close counts as the same allocation
 
 # Read-Only Filesystems judges the root filesystem, what fstab mounts without asking for ro,
 # and two kinds of mount that are only ever made writable: what SM mounts from a block device
@@ -36,18 +37,22 @@ RO_FS_SR_DIRS = ["/run/sr-mount/", "/var/run/sr-mount/"]
 RO_FS_EXTRA = ["/var/lib/linstor"]
 RO_FS_NATIVE_RO = ["iso9660", "udf", "squashfs", "cramfs", "erofs"]  # read-only by nature
 
-# Long-Running Tasks: a xapi task still pending after this many hours. xapi destroys a pending
-# task itself after pending_task_timeout (86400 s by default, /etc/xapi.conf), so this has to
-# stay under 24 to be able to say anything at all.
+# Long-Running Tasks: a xapi task not finished after this many hours. xapi destroys a task
+# older than pending_task_timeout (86400 s by default) only when its progress has not moved
+# since its previous GC pass (xen-api v26.1.19 db_gc_util.ml timeout_tasks) - a hung task
+# goes at about 24 h, one that keeps creeping can live on and is seen here at any age. A
+# pending_task_timeout override under this threshold destroys a hung task before it can be.
 TASK_PENDING_MAX_HOURS = 16
 
-# Leaf-Coalesce Disabled: a VDI with other-config:leaf-coalesce=false is never leaf-coalesced
+# Leaf-Coalesce Disabled: a VDI with other-config:leaf-coalesce=false is not leaf-coalesced
 # by SM's GC ("Leaf-coalesce disabled for <vdi>"). SM itself writes it (VDI.py
-# disable_leaf_on_secondary) when a storage migration starts mirroring the disk, and writes
-# it again when the mirror is stopped; a migration that completes takes the source disk away
-# with it, one that fails or is cancelled leaves the flag behind for good. Nothing in xapi or
-# XO sets it (xen-api and xen-orchestra master, 2026-11). A disk whose VM or VDI is in one of
-# these operations right now is in the middle of that, and is not counted.
+# disable_leaf_on_secondary) when a storage migration starts mirroring the disk, and again
+# when the mirror is stopped; a migration that completes takes the source disk away with
+# it, one that fails or is cancelled leaves the flag behind - until the disk's next
+# snapshot, whose path removes the key before deciding whether to set it again (SM
+# 1680f106 VDI.py:895-904), or until someone removes it. Nothing in xapi or XO sets it
+# (xen-api and xen-orchestra master, 2026-11). A disk whose VM or VDI is in one of these
+# operations right now is in the middle of that, and is not counted.
 LEAF_COALESCE_BUSY_VM_OPS = ["migrate_send", "pool_migrate", "export", "import"]
 LEAF_COALESCE_BUSY_VDI_OPS = ["mirror", "copy"]
 LEAF_COALESCE_MAX_LINES = 40
@@ -247,6 +252,16 @@ LUN_CHANGE_FILES = [
     "/var/log/kern.log",
 ]
 
+# --- "XO-Server Memory Limit" check ------------------------------------------------------
+# Vates' sizing rule since XO 6.8 (docs, getting-started/troubleshooting.md): the heap limit
+# is 70% of the VM's RAM, 1 GiB minimum. The docs say xo-server sets it itself; on the
+# test XOA (6.9.2, xo-server 5.211.4, 2026-11-25) nothing did - no flag in the unit, its
+# drop-in, the process' argv or NODE_OPTIONS, and no code in xo-server - so the process
+# ran on node's own default (~50% of RAM, at most ~4 GB). The line therefore judges the
+# limit the running process actually has, wherever it came from, against this rule.
+XO_HEAP_TARGET_PCT = 70
+XO_HEAP_MIN_MB = 1024
+
 # --- "XOA Plugins" check ---------------------------------------------------------------
 # Where xo-server looks for plugins, and what it accepts as one. Mirrors
 # packages/xo-server/config.toml's `plugins.lookupPaths` and registerPlugins() in
@@ -254,11 +269,15 @@ LUN_CHANGE_FILES = [
 # `server-` and each entry of `<path>` starting `xo-server-`, and the remainder of the
 # entry name IS the plugin's name. First path that has a name wins.
 #
-# Two of the three shipped lookup paths are relative to the process' cwd, which for a
-# systemd unit with no WorkingDirectory - and xo-server.service sets none - is "/". Hence
-# /node_modules and / here: neither holds a plugin on a stock appliance, and both are a
-# place somebody could put one. Listing "/" is one readdir.
-XO_PLUGIN_LOOKUP_PATHS = ["/usr/local/lib/node_modules", "/node_modules", "/"]
+# In XO's OWN order - xo-server keeps the first path that has a name, so the scan must walk
+# them as it does: config.toml's lookupPaths is ['./node_modules', '../',
+# '/usr/local/lib/node_modules'] (checked on the test XOA), and two of those are relative
+# to the process' cwd, which for a systemd unit with no WorkingDirectory - and
+# xo-server.service sets none - is "/". Hence /node_modules and / first: neither holds a
+# plugin on a stock appliance, and a copy there under a stock name is the one XO loads.
+XO_PLUGIN_LOOKUP_PATHS = ["/node_modules", "/", "/usr/local/lib/node_modules"]
+# where xoa-updater installs Vates' own plugins: a stock name anywhere else is not theirs
+XO_PLUGIN_STOCK_DIR = "/usr/local/lib/node_modules"
 XO_PLUGIN_PREFIX = "xo-server-"
 XO_PLUGIN_SCOPE_DIR = "@xen-orchestra"
 XO_PLUGIN_SCOPE_PREFIX = "server-"

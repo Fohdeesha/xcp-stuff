@@ -39,7 +39,10 @@ def plant(root, name, version="1.0.0", scope=None):
 
 
 def scan_in(monkeypatch, *paths):
+    """Scan these lookup paths, the LAST standing in for /usr/local/lib/node_modules -
+    the directory xoa-updater installs into, as it is last in XO's own order."""
     monkeypatch.setattr(config, "XO_PLUGIN_LOOKUP_PATHS", [str(p) for p in paths])
+    monkeypatch.setattr(config, "XO_PLUGIN_STOCK_DIR", str(paths[-1]))
     return xoa.scan_plugins()
 
 
@@ -185,8 +188,9 @@ def test_no_manifest_is_an_empty_set_not_a_crash():
 # the line
 # --------------------------------------------------------------------------------------
 
-def line_for(monkeypatch, tmp_path, manifest=(), autoload=None, autoload_known=False):
-    plugins, errors = scan_in(monkeypatch, tmp_path)
+def line_for(monkeypatch, tmp_path, manifest=(), autoload=None, autoload_known=False,
+             paths=None):
+    plugins, errors = scan_in(monkeypatch, *(paths or [tmp_path]))
     return xoa._plugins_line({"plugins": plugins,
                               "plugin_errors": errors,
                               "manifest_plugins": set(manifest),
@@ -273,3 +277,62 @@ def test_autoload_never_produces_a_finding_on_its_own(monkeypatch, tmp_path):
     line = line_for(monkeypatch, tmp_path,
                     autoload={"cloud": True, "tag-automation": True}, autoload_known=True)
     assert not line.flags
+
+
+# --------------------------------------------------------------------------------------
+# where a plugin lives, and what it is (audit F09/F20)
+# --------------------------------------------------------------------------------------
+
+def test_the_scan_walks_xo_s_own_order():
+    """xo-server keeps the FIRST lookup path holding a name, and its config lists
+    ./node_modules and ../ - relative to a cwd of / under systemd - before the directory
+    xoa-updater installs into."""
+    assert config.XO_PLUGIN_LOOKUP_PATHS[-1] == config.XO_PLUGIN_STOCK_DIR
+    assert config.XO_PLUGIN_LOOKUP_PATHS[:2] == ["/node_modules", "/"]
+
+
+def test_a_stock_name_outside_the_stock_dir_flags(monkeypatch, tmp_path):
+    """A copy under a stock name in an earlier lookup path is the one XO loads, and
+    Vates' copy beside xoa-updater's is shadowed: the stealthiest way to replace one."""
+    early, stock = tmp_path / "early", tmp_path / "stock"
+    plant(early, "xo-server-audit", version="6.6.6")
+    for name in STOCK:
+        plant(stock, name)
+    line = line_for(monkeypatch, tmp_path, paths=[early, stock])
+    assert line.flags
+    assert "1 of 3" in line.render()
+    assert "audit" in line.detail_text and "6.6.6" in line.detail_text
+    assert "XO loads this copy" in line.detail_text
+
+
+def test_a_plain_file_is_a_plugin_xo_tries_to_load(monkeypatch, tmp_path):
+    """findPluginsInPath takes every ENTRY, and require.resolve finds a plain file and
+    imports it - so a file is reported, even under a stock name, never skipped."""
+    for name in STOCK:
+        plant(tmp_path, name)
+    (tmp_path / "xo-server-backdoor.js").write_text("module.exports = {}")
+    line = line_for(monkeypatch, tmp_path)
+    assert line.flags
+    assert "backdoor.js" in line.detail_text
+    assert "a file, not a package directory" in line.detail_text
+
+
+def test_a_file_shadows_a_later_directory_of_the_same_name(monkeypatch, tmp_path):
+    early, stock = tmp_path / "early", tmp_path / "stock"
+    early.mkdir()
+    (early / "xo-server-audit").write_text("module.exports = {}")
+    plant(stock, "xo-server-audit")
+    plugins, _errors = scan_in(monkeypatch, early, stock)
+    assert len(plugins) == 1 and plugins[0]["path"].startswith(str(early))
+    line = line_for(monkeypatch, tmp_path, paths=[early, stock])
+    assert line.flags
+
+
+def test_a_dangling_link_is_reported_as_such(monkeypatch, tmp_path):
+    try:
+        os.symlink(str(tmp_path / "gone"), str(tmp_path / "xo-server-ghost"))
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not available to this user")
+    line = line_for(monkeypatch, tmp_path)
+    assert line.flags
+    assert "a link to nothing" in line.detail_text

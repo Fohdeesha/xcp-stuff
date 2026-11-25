@@ -30,10 +30,12 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 import collectorsrc
 import config
@@ -78,6 +80,30 @@ class CollectError(Exception):
     """Could not get a document out of a host. Never confused with 'the host is fine'."""
 
 
+def _mark_incomplete(payload, host):
+    """A document the collector sent back part way - stuck on a command it could not kill,
+    or failed - keeps every fact it did establish, with "__incomplete__" saying why the
+    rest is missing. Each missing fact then reads Unknown by construction, and the host
+    block carries one flagged line naming the cause: the evidence gathered on exactly the
+    host that is in trouble is not thrown away with it."""
+    if "__collector_stuck__" in payload:
+        # the host gave up on itself rather than being given up on: a command it could
+        # not kill, named. The old shape of this was the transport's own 300s timeout,
+        # which could say only that the host did not answer
+        debug("%s abandoned its run in: %s" % (host, payload["__collector_stuck__"]))
+        for elapsed, command in (payload.get("collector", {}).get("timings") or [])[:8]:
+            debug("%s   %6.2fs  %s" % (host, elapsed, command))
+        payload["__incomplete__"] = (
+            "gave up after %ds stuck in '%s' - that command cannot be killed, so the host's "
+            "storage or a driver is most likely wedged"
+            % (config.REMOTE_CMD_TIMEOUT - 60, payload["__collector_stuck__"]))
+    elif "__collector_error__" in payload:
+        trace = payload["__collector_error__"].strip().splitlines()
+        debug("collector failed on %s:\n%s" % (host, payload["__collector_error__"]))
+        payload["__incomplete__"] = "the collector failed part way: %s" % (
+            trace[-1] if trace else "no reason given")
+
+
 _DEBUG_LOCK = threading.Lock()
 
 
@@ -101,26 +127,35 @@ def debug(msg):
 # REMOTE_CMD_TIMEOUT waiting for the last collector to finish on its own.
 _LIVE = set()
 _LIVE_LOCK = threading.Lock()
+# Set once the run is stopping: a thread still working (the XOA section's daemon thread, a
+# collection worker between hosts) may not start a child after the kill that was meant to
+# take every child with it - nothing would ever kill that one.
+_STOPPING = [False]
+
+# A polite kill first: SIGTERM lets a collector take its own children down with it (they
+# are each in their own session, so nothing else reaches them); SIGKILL after this long.
+TERM_GRACE = 2.0
 
 
-def kill_all_children():
-    """Kill every child still running. For an interrupted run, not for normal shutdown."""
-    with _LIVE_LOCK:
-        procs = list(_LIVE)
-    for proc in procs:
-        _kill_tree(proc)
+class TimedOut(int):
+    """run_local_cmd's own timeout: it compares equal to 124, as it always has, so every
+    existing `rc == 124` keeps working - but a command that itself EXITED 124 (GNU timeout
+    inside -c) is a plain int, and the two can be told apart where it matters."""
 
 
-def _remote_launch(blob):
-    pinned = os.environ.get("HEALTH_REMOTE_PYTHON")
-    if pinned and re.match(r"^[A-Za-z0-9_./-]+$", pinned):
-        return (_REMOTE_LAUNCH_PINNED % pinned) % blob
-    return _REMOTE_LAUNCH % blob
+TIMED_OUT = TimedOut(124)
 
 
-def _kill_tree(proc):
+def is_timeout(rc):
+    return isinstance(rc, TimedOut)
+
+
+def _signal_group(proc, sig):
     try:
-        os.killpg(os.getpgid(proc.pid), 9)
+        if hasattr(os, "killpg"):
+            os.killpg(proc.pid, sig)          # start_new_session: pid is the group id
+        else:
+            proc.kill()
     except OSError:
         try:
             proc.kill()
@@ -128,8 +163,56 @@ def _kill_tree(proc):
             pass
 
 
+def kill_all_children():
+    """Stop every child still running, and any from starting. For an interrupted run, not
+    for normal shutdown. SIGTERM to all, a short grace, then SIGKILL the rest."""
+    with _LIVE_LOCK:
+        _STOPPING[0] = True
+        procs = list(_LIVE)
+    if not procs:
+        return
+    for proc in procs:
+        _signal_group(proc, getattr(signal, "SIGTERM", 15))
+    deadline = time.monotonic() + TERM_GRACE
+    for proc in procs:
+        try:
+            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            pass
+    for proc in procs:
+        if proc.poll() is None:
+            _signal_group(proc, 9)
+
+
+def _remote_launch(blob):
+    pinned = os.environ.get("HEALTH_REMOTE_PYTHON")
+    if pinned and re.match(r"^[A-Za-z0-9_./-]+$", pinned):
+        return (_REMOTE_LAUNCH_PINNED % pinned) % blob
+    if pinned:
+        # a regression run that believes it is forcing python2 must not quietly test
+        # python3 instead
+        sys.stderr.write("Warning: ignoring HEALTH_REMOTE_PYTHON=%r (expected an "
+                         "interpreter name or path).\n" % pinned)
+    return _REMOTE_LAUNCH % blob
+
+
+def _kill_tree(proc):
+    """SIGTERM the child's group, then SIGKILL it if it is still there after TERM_GRACE."""
+    _signal_group(proc, getattr(signal, "SIGTERM", 15))
+    try:
+        proc.wait(timeout=TERM_GRACE)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    _signal_group(proc, 9)
+
+
 def run_local_cmd(argv, timeout, env=None, stdin_text=None):
-    """Run a local command. Returns (rc, stdout_text, stderr_text); rc 124 = timed out."""
+    """Run a local command. Returns (rc, stdout_text, stderr_text); rc is TIMED_OUT (== 124)
+    when it ran out of time - see TimedOut."""
+    with _LIVE_LOCK:
+        if _STOPPING[0]:
+            return (130, "", "%s: not started - the run is stopping" % argv[0])
     try:
         proc = subprocess.Popen(
             argv,
@@ -144,6 +227,10 @@ def run_local_cmd(argv, timeout, env=None, stdin_text=None):
 
     with _LIVE_LOCK:
         _LIVE.add(proc)
+        stopping = _STOPPING[0]
+    if stopping:
+        # started in the instant the run was told to stop: it was never going to be killed
+        _kill_tree(proc)
     payload = stdin_text.encode("utf-8") if stdin_text is not None else None
     try:
         out, err = proc.communicate(input=payload, timeout=timeout)
@@ -154,7 +241,7 @@ def run_local_cmd(argv, timeout, env=None, stdin_text=None):
             out, err = proc.communicate(timeout=10)
         except subprocess.TimeoutExpired:
             out, err = b"", b""
-        rc = 124
+        rc = TIMED_OUT
     except KeyboardInterrupt:
         # only ever raised in the MAIN thread, so this is the serial path; the child is in
         # its own session and never saw the ctrl-C, so it has to be told
@@ -166,6 +253,55 @@ def run_local_cmd(argv, timeout, env=None, stdin_text=None):
     return (rc,
             out.decode("utf-8", "backslashreplace") if out else "",
             err.decode("utf-8", "backslashreplace") if err else "")
+
+
+# ssh binds its master at '<ControlPath>.<16 random characters>' and exits 255 when that
+# does not fit a unix socket's sun_path (108 bytes with its NUL: openssh mux.c
+# muxserver_listen, misc.c unix_listener - the same in 7.4 and 9.2)
+SOCKET_PATH_MAX = 107
+CONTROL_NAME = "cm-%C"            # %C: a 40-character hash of the connection (OpenSSH 6.7+)
+
+
+def control_options(work_dir):
+    """ssh's connection-sharing options for this run's work dir.
+
+    One master per host, its socket named by %C: a fixed length, where cm-%r@%h:%p grew
+    with the host name and a pool stored by a long FQDN could not be reached at all. The
+    work dir's own length still counts, though, and a long TMPDIR leaves no room for any
+    socket (measured: exit 255, 'ControlPath too long'). Then sharing is switched off and
+    every ssh makes its own connection - which costs one handshake, on the seed, since
+    each host is otherwise asked once."""
+    room = len(os.fsencode(work_dir)) + 1 + len(CONTROL_NAME) - 2 + 40 + 1 + 16
+    if room > SOCKET_PATH_MAX:
+        return ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
+    return ["-o", "ControlMaster=auto",
+            "-o", "ControlPath=%s" % os.path.join(work_dir, CONTROL_NAME),
+            "-o", "ControlPersist=60"]
+
+
+def close_masters(work_dir):
+    """Ask every ssh ControlMaster this run started to exit, so none outlives it.
+
+    With ControlPersist the first ssh to a host forks a master into its own session (out of
+    _LIVE's reach) that keeps the authenticated connection for 60 s after its last client;
+    and once the work dir is gone its socket is too, so nothing could ever ask it to go.
+    Measured: one per host, gone ~60 s after the run. `-O exit` over each socket ends them
+    now. No host is contacted - the master is local.
+    """
+    try:
+        names = os.listdir(work_dir)
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith("cm-"):
+            continue
+        # not run_local_cmd: this runs at exit, after kill_all_children has closed it
+        try:
+            subprocess.call(["ssh", "-S", os.path.join(work_dir, name), "-O", "exit",
+                             "health-master"], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
 
 class Transport(object):
@@ -207,25 +343,14 @@ class Transport(object):
             rc, out, err = self._run_ssh_collector(host, blob)
             what = "ssh to %s" % host
 
-        if rc == 124:
-            raise CollectError("%s timed out after %ds" % (what, config.REMOTE_CMD_TIMEOUT))
+        # the document first: one that arrived whole is the answer whatever the exit code
         payload = self._extract(out)
         if payload is None:
+            if is_timeout(rc):
+                raise CollectError("%s timed out after %ds" % (what, config.REMOTE_CMD_TIMEOUT))
             detail = (err.strip().splitlines() or [""])[-1][:300]
             raise CollectError("%s failed (exit %d)%s" % (what, rc, (": " + detail) if detail else ""))
-        if "__collector_error__" in payload:
-            raise CollectError("collector crashed on %s:\n%s" % (host, payload["__collector_error__"]))
-        if "__collector_stuck__" in payload:
-            # the host gave up on itself rather than being given up on: a command it could
-            # not kill, named. The old shape of this was the transport's own 300s timeout,
-            # which could say only that the host did not answer
-            debug("%s abandoned its run in: %s" % (host, payload["__collector_stuck__"]))
-            for elapsed, command in (payload.get("collector", {}).get("timings") or [])[:8]:
-                debug("%s   %6.2fs  %s" % (host, elapsed, command))
-            raise CollectError(
-                "gave up after %ds stuck in '%s' - that command cannot be killed, so the "
-                "host's storage or a driver is most likely wedged"
-                % (config.REMOTE_CMD_TIMEOUT - 60, payload["__collector_stuck__"]))
+        _mark_incomplete(payload, host)
         if err.strip():
             debug("stderr from %s:\n%s" % (host, err.strip()))
         info = payload.get("collector") or {}
@@ -244,15 +369,16 @@ class Transport(object):
         spec.setdefault("budget", config.REMOTE_CMD_TIMEOUT - 60)
         blob = base64.b64encode(json.dumps(spec).encode("utf-8")).decode("ascii")
         rc, out, err = self._run_local_collector(blob)
-        if rc == 124:
-            raise CollectError("local command timed out after %ds" % config.REMOTE_CMD_TIMEOUT)
         payload = self._extract(out)
         if payload is None:
+            if is_timeout(rc):
+                raise CollectError("local command timed out after %ds" % config.REMOTE_CMD_TIMEOUT)
             detail = (err.strip().splitlines() or [""])[-1][:300]
             raise CollectError("local command failed (exit %d)%s"
                                % (rc, (": " + detail) if detail else ""))
-        if "__collector_error__" in payload:
-            raise CollectError("collector crashed:\n%s" % payload["__collector_error__"])
+        # the same reading as collect(): this path used to ignore the stuck marker and use
+        # a partial document as if it were whole
+        _mark_incomplete(payload, "this host")
         return payload
 
     def _run_local_collector(self, blob):
@@ -278,9 +404,7 @@ class Transport(object):
             "-o", "LogLevel=ERROR",
             "-o", "ConnectTimeout=%d" % config.SSH_TIMEOUT,
             "-o", "NumberOfPasswordPrompts=1",
-            "-o", "ControlMaster=auto",
-            "-o", "ControlPath=%s" % os.path.join(self.work_dir, "cm-%r@%h:%p"),
-            "-o", "ControlPersist=60",
+        ] + control_options(self.work_dir) + [
             "-o", "BatchMode=no",
             "root@" + host,
             remote_command,
@@ -377,11 +501,11 @@ class Transport(object):
             debug("askpass helper unusable")
 
         if pinned != AUTH_ASKPASS:
-            if ensure_sshpass(run_env):
+            if sshpass_present(run_env):
                 self.auth = AUTH_SSHPASS
                 debug("password auth: sshpass")
                 return True
-            tried.append("sshpass is not installed and could not be installed")
+            tried.append("sshpass is not installed")
 
         # named individually: 'no way to authenticate' with no reason is the kind of
         # message that gets read as 'wrong password' and sends someone after the pool
@@ -467,51 +591,15 @@ def write_askpass(work_dir):
     return path
 
 
-def ensure_sshpass(run_env):
-    """Make sshpass available, or say why it is not.
+def sshpass_present(run_env):
+    """Is sshpass already installed? It is the fallback, reached only when the askpass
+    helper could not be run (a noexec work dir) - see enable_password_auth().
 
-    The fallback since v3.15, reached only when the askpass helper could not be run - see
-    enable_password_auth(). A run that gets here is on a machine where the work dir cannot
-    be executed from, so the install is the one way left to reach another host.
-
-    On a hypervisor it comes from 'extras', a stock XCP-ng repo that ships in
-    CentOS-Base.repo pointing at Vates' own mirror and is merely disabled by default.
-    --enablerepo is a one-shot, so the host's yum config is left exactly as it was, and
-    the package is 21KB with no dependencies. Note that plain 'yum list available sshpass'
-    finds nothing - it only searches ENABLED repos, which is what made an earlier look
-    conclude, wrongly, that it was not available.
+    Nothing is installed for it, on either side (the maintainer's call, 2026-11-25). The
+    install this replaces ran yum --enablerepo=extras on a dom0 and apt-get on an XOA: on
+    the offline appliances health.py is routinely pasted onto that was up to ten minutes
+    of timeouts before anything printed, and it left a package behind on a box the tool
+    is meant to leave as it found it. Without sshpass the run goes on to the XOA-only
+    report, or this host alone, saying why.
     """
-    if have("sshpass"):
-        return True
-    if run_env == "host":
-        sys.stderr.write("sshpass not found - installing it from the XCP-ng 'extras' repo "
-                         "to reach the other pool hosts...\n")
-        rc, out, err = run_local_cmd(
-            ["yum", "--enablerepo=extras", "install", "-y", "sshpass"], timeout=300)
-        if not have("sshpass"):
-            sys.stderr.write("ERROR: could not install sshpass (yum exit code %d).\n" % rc)
-            for line in (out + err).splitlines()[-5:]:
-                sys.stderr.write(line + "\n")
-            return False
-        sys.stderr.write("sshpass installed.\n")
-        return True
-
-    sys.stderr.write("sshpass not found. Installing via apt...\n")
-    env = dict(os.environ)
-    # stdin is /dev/null here, so anything that stops to ask (dpkg's conffile prompt,
-    # needrestart) would read EOF part way through an install nobody can see
-    env["DEBIAN_FRONTEND"] = "noninteractive"
-    rc, out, err = run_local_cmd(["apt-get", "update", "-y"], timeout=300, env=env)
-    if rc != 0:
-        # not fatal by itself: the package may well already be in the local index
-        sys.stderr.write("Warning: 'apt-get update' exited %d; trying the install anyway.\n" % rc)
-    rc, out, err = run_local_cmd(["apt-get", "install", "-y", "sshpass"], timeout=300, env=env)
-    if not have("sshpass"):
-        # the yum half has always said this much; the apt half said nothing at all, so a
-        # failure surfaced only as the caller's one-line 'sshpass is required'
-        sys.stderr.write("ERROR: could not install sshpass (apt-get exit code %d).\n" % rc)
-        for line in (out + err).splitlines()[-5:]:
-            sys.stderr.write(line + "\n")
-        return False
-    sys.stderr.write("sshpass installed.\n")
-    return True
+    return have("sshpass")

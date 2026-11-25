@@ -187,11 +187,27 @@ def test_partial_output_from_a_failing_command_is_kept(capsys):
 
 
 def test_a_timeout_is_named_as_a_timeout(capsys):
-    run = make_run(["10.0.0.1"], {"10.0.0.1": lambda a: (124, "", "")})
+    run = make_run(["10.0.0.1"], {"10.0.0.1": lambda a: (transport.TIMED_OUT, "", "")})
     runcmd.execute(run, len(run.hosts))
     out = capsys.readouterr().out
     assert "timed out after %ds" % config.RUN_CMD_TIMEOUT in out
     assert "exit code 124" not in out
+
+
+def test_a_command_that_exits_124_itself_is_not_a_timeout(capsys):
+    """GNU timeout inside the command exits 124: that is the command's answer, not ours."""
+    run = make_run(["10.0.0.1"], {"10.0.0.1": lambda a: (124, "", "")})
+    runcmd.execute(run, len(run.hosts))
+    out = capsys.readouterr().out
+    assert "Command failed (exit code 124)" in out
+    assert "timed out after" not in out
+
+
+def test_stderr_of_a_command_that_succeeded_is_still_shown(capsys):
+    run = make_run(["10.0.0.1"], {"10.0.0.1": lambda a: (0, "ok\n", "warning: x\n")})
+    runcmd.execute(run, len(run.hosts))
+    captured = capsys.readouterr()
+    assert "warning: x" in captured.err and "failed" not in captured.out
 
 
 def test_one_unreachable_host_does_not_lose_the_others(capsys):

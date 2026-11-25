@@ -123,7 +123,13 @@ class Report(object):
             section["name"] = host.name
             section["address"] = host.address
             section["master"] = bool(host.is_master)
-            section["reachable"] = True
+            # -s and a solo host run render their one host whether it answered or not -
+            # its checks are the report - so this must not simply say True
+            section["reachable"] = bool(host.reachable)
+            if not host.reachable and host.error:
+                section["error"] = host.error
+            if (host.payload or {}).get("__incomplete__"):
+                section["incomplete"] = host.payload["__incomplete__"]
         section["checks"] = []
         self._sections.append(section)
         self._section = section
@@ -178,11 +184,13 @@ class Report(object):
             # 'was this line in the output' identically, -f included
             if self.json_mode and self._section is not None:
                 self._section["checks"].append(_as_entry(line))
-        if line.detail_text:
-            if host_label is None:
-                self.add_pool_detail(line.detail_title, line.detail_text)
-            else:
-                self.add_host_detail(host_label, line.detail_title, line.detail_text)
+            # the detail too: under -f a line that was hidden must not leave its evidence
+            # printed at the end with nothing pointing at it
+            if line.detail_text:
+                if host_label is None:
+                    self.add_pool_detail(line.detail_title, line.detail_text)
+                else:
+                    self.add_host_detail(host_label, line.detail_title, line.detail_text)
 
     def add_all(self, lines, host_label=None):
         for line in lines:
@@ -199,7 +207,9 @@ class Report(object):
     def add_poolconf(self, host_label, text):
         first = (text or "").replace("\r", "").split("\n")[0]
         self._poolconf.append("%s\n%s\n\n" % (host_label, first))
-        if self.json_mode and self._section is not None:
+        # -f drops the block (no state of it is a finding), so it drops this too: "-f
+        # narrows the document identically"
+        if self.json_mode and self._section is not None and not self.filter_output:
             # in the document it belongs to the host it describes, rather than to a
             # separate block at the end that a consumer would have to re-attribute
             self._section["pool_conf"] = first

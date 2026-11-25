@@ -205,6 +205,13 @@ def test_pool_conf():
     assert parsers.parse_pool_conf("slave: 192.168.1.13 \n") == ("slave", "192.168.1.13")
     assert parsers.parse_pool_conf("") == (None, None)
     assert parsers.parse_pool_conf("garbage") == (None, None)
+    # read as xapi reads it: the whole file, case-sensitive - anything else xapi starts as
+    # broken, which (None, None) reports as "holds ..., which xapi reads as broken"
+    assert parsers.parse_pool_conf("Master\n") == (None, None)
+    assert parsers.parse_pool_conf("master\nslave:192.0.2.1\n") == (None, None)
+    assert parsers.parse_pool_conf("slave:") == ("slave", "")
+    # an IPv6 pointer survives the split on ':'
+    assert parsers.parse_pool_conf("slave:fd00::1\n") == ("slave", "fd00::1")
 
 
 # --------------------------------------------------------------------------------------

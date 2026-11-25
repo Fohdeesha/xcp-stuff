@@ -62,10 +62,20 @@ class Host(object):
         used_mb = total_mb - avail_mb if total_mb >= avail_mb else 0
         return (total_mb, used_mb)
 
+    def mem_total_mb(self):
+        """MemTotal in MiB, or None. Only MemTotal: comparing dom0 sizes across hosts needs
+        nothing else, and memory() would also demand MemAvailable."""
+        f = self.fact("meminfo")
+        if not f.ok:
+            return None
+        return parsers.parse_mem_total_mb(f.value)
+
     def ntp_state(self):
+        """{"ntp", "sync"} as timedatectl says them, plus "error" when it could not be read -
+        the reason travels with the Unknown rather than being dropped here."""
         f = self.fact("timedatectl")
         if not f.ok:
-            return {"ntp": "Unknown", "sync": "Unknown"}
+            return {"ntp": "Unknown", "sync": "Unknown", "error": f.error}
         return parsers.parse_timedatectl(f.value)
 
     def clock_drift(self):
@@ -80,7 +90,8 @@ class Host(object):
         return abs(self.local_now - f.value)
 
     def pool_role(self):
-        """('master', None) | ('slave', address) | (None, None)."""
+        """('master', None) | ('slave', address) | ('broken', None) | (None, None) - the
+        last for a file that could not be read or that xapi itself would read as broken."""
         f = self.fact("pool_conf")
         if not f.ok:
             return (None, None)
@@ -101,6 +112,9 @@ class Pool(object):
     def fact(self, key):
         node = self.payload.get(key)
         if node is None:
+            if self.payload.get("ok") is False and self.payload.get("error"):
+                # the whole pool collection failed: every pool fact carries its reason
+                return result.Fact(False, error=self.payload["error"])
             return result.Fact(False, error="not collected")
         return result.wrap(self.payload, key)
 
@@ -112,31 +126,3 @@ class Pool(object):
         return bool(f.ok and f.value)
 
 
-def ram_match(hosts):
-    """True when every host we could read reports the same dom0 RAM, to the nearest GB.
-
-    Hosts whose memory we could not read are skipped rather than counted as a mismatch:
-    unknown is not a difference.
-    """
-    seen = set()
-    for host in hosts:
-        mem = host.memory()
-        if mem is None:
-            continue
-        seen.add(int(mem[0] / 1024.0 + 0.5))
-    return len(seen) <= 1
-
-
-def ntp_match(hosts):
-    """True when every collected host has NTP on, says it is synchronised, and agrees
-    with our clock inside the allowance."""
-    for host in hosts:
-        if not host.reachable:
-            continue
-        state = host.ntp_state()
-        if state["ntp"] != "yes" or state["sync"] != "yes":
-            return False
-        drift = host.clock_drift()
-        if drift is None or drift > config.TIME_SYNC_ALLOWANCE_SECS:
-            return False
-    return True

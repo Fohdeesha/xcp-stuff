@@ -110,14 +110,19 @@ def guard(key, fn, *args, **kwargs):
     """Run a check; turn any escaped exception into a yellow Unknown for that line.
 
     A check that blows up must not kill the run and must never be silently skipped -
-    a skipped line reads as 'not applicable', which is a claim of its own.
+    a skipped line reads as 'not applicable', which is a claim of its own. `key` may be a
+    tuple, for a check that prints several lines: each gets its Unknown, so the second
+    line of a check that raised is not simply missing (from --json too).
     """
+    keys = key if isinstance(key, tuple) else (key,)
     try:
         return fn(*args, **kwargs)
     except Exception as exc:  # noqa: BLE001 - deliberate: one bad check, one bad line
         import sys
-        sys.stderr.write("internal error in %s:\n%s\n" % (key, traceback.format_exc()))
-        return unknown(key, "Unknown (internal error: %s)" % exc)
+        sys.stderr.write("internal error in %s:\n%s\n" % (" / ".join(keys),
+                                                         traceback.format_exc()))
+        lines = [unknown(k, "Unknown (internal error: %s)" % exc) for k in keys]
+        return lines[0] if len(lines) == 1 else lines
 
 
 class Fact(object):

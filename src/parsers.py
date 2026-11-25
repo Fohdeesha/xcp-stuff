@@ -247,22 +247,29 @@ def parse_pending_tasks(text, now, max_age):
 
     Returns None when the listing cannot be read as what xe prints - a record without a
     field it was asked for, or a pending task whose 'created' is not xapi's UTC stamp -
-    else [(name_label, uuid, age_seconds, progress, resident_on)], oldest first. Only a
-    pending task is judged: a finished one is xapi's to clean up.
+    else [(name_label, uuid, age_seconds, progress, resident_on, status)], oldest first.
+
+    Every task xapi does not count as completed is judged - pending, and 'cancelling', a
+    cancel that never finished and still holds its object. xapi's own partition is the same
+    (xen-api v26.1.19 taskHelper.ml status_is_completed: success, failure, cancelled), so a
+    finished task is xapi's to clean up and anything else is not finished.
     """
     old = []
     for rec in parse_xe_records(text):
         if not {"uuid", "name-label", "status", "created", "progress", "resident-on"} <= set(rec):
             return None
-        if rec["status"] != "pending":
+        if rec["status"] in TASK_COMPLETED:
             continue
         created = xapi_utc(rec["created"])
         if created is None:
             return None
         if now - created > max_age:
             old.append((rec["name-label"], rec["uuid"], now - created, rec["progress"],
-                        rec["resident-on"]))
+                        rec["resident-on"], rec["status"]))
     return sorted(old, key=lambda t: -t[2])
+
+
+TASK_COMPLETED = ("success", "failure", "cancelled")
 
 
 def unit_display(name):
@@ -378,9 +385,11 @@ def host_records_from_state_db(rows):
 
 
 def parse_dns_gw_pifs(text):
-    """True when any non-management PIF carries a gateway or a DNS server."""
+    """True when any non-management PIF carries a gateway (IPv4 or IPv6) or a DNS server.
+    An IPv6 default gateway on a storage or VM network is the same second-default-route
+    problem as an IPv4 one."""
     for line in text.splitlines():
-        if not re.match(r"^\s*(gateway|DNS)\s*\([^)]*\)\s*:", line):
+        if not re.match(r"^\s*(gateway|IPv6-gateway|DNS)\s*\([^)]*\)\s*:", line):
             continue
         value = line.split(":", 1)[1].strip() if ":" in line else ""
         if value:
@@ -434,6 +443,29 @@ def parse_other_config(text):
 # /proc, timedatectl, df, ip
 # --------------------------------------------------------------------------------------
 
+_HEAP_FLAG_RE = re.compile(r"^--max[-_]old[-_]space[-_]size(?:=(\d+))?$")
+
+
+def node_heap_flag(args):
+    """The --max-old-space-size value (MB) in a list of node arguments, or None.
+
+    V8 takes the flag with dashes or underscores, as `=N` or with N as the next argument,
+    and the LAST occurrence wins - all three are honoured here, so a flag given twice is
+    read the way node reads it."""
+    value = None
+    i = 0
+    while i < len(args):
+        m = _HEAP_FLAG_RE.match(args[i])
+        if m:
+            if m.group(1) is not None:
+                value = int(m.group(1))
+            elif i + 1 < len(args) and args[i + 1].isdigit():
+                value = int(args[i + 1])
+                i += 1
+        i += 1
+    return value
+
+
 def parse_meminfo(text):
     """(total_mb, avail_mb), or None when the numbers are not there.
 
@@ -452,6 +484,15 @@ def parse_meminfo(text):
     if avail is None:
         return None
     return (total // 1024, avail // 1024)
+
+
+def parse_mem_total_mb(text):
+    """MemTotal in MiB, or None when it is not there (never 0)."""
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "MemTotal:" and parts[1].isdigit():
+            return int(parts[1]) // 1024 or None
+    return None
 
 
 def parse_timedatectl(text):
@@ -476,6 +517,11 @@ def parse_timedatectl(text):
         ntp = "yes"
     elif ntp == "inactive":
         ntp = "no"
+    # 'n/a' is systemd's word for "no NTP service known to me" - an established no
+    if ntp == "n/a":
+        ntp = "no"
+    if sync == "n/a":
+        sync = "no"
     return {"ntp": ntp or "Unknown", "sync": sync or "Unknown"}
 
 
@@ -791,13 +837,21 @@ def leaf_coalesce_vdis(vdi_text, vbd_text, vm_text, busy_vm_ops, busy_vdi_ops):
     return disks, busy
 
 
+# The SR other-config switches SM's GC obeys (SM 1680f106 drivers/cleanup.py): each one,
+# set to "false", stops leaf-coalesce on the whole SR - gc stops the GC run outright,
+# coalesce stops every coalesce, leaf-coalesce the leaf ones.
+GC_SR_SWITCHES = ("gc", "coalesce", "leaf-coalesce")
+
+
 def leaf_coalesce_srs(sr_text):
-    """[(uuid, name)] of the SRs whose own other-config says leaf-coalesce: false - GC then
-    leaf-coalesces nothing on that SR ("Leaf-coalesce disabled for this SR")."""
+    """[(uuid, name, [switch, ...])] of the SRs where GC will leaf-coalesce nothing: their
+    own other-config sets one of GC_SR_SWITCHES to false."""
     out = []
     for rec in parse_xe_records(sr_text or ""):
-        if _xe_map(rec.get("other-config")).get("leaf-coalesce", "").lower() == "false":
-            out.append((rec.get("uuid", ""), rec.get("name-label", "")))
+        other = _xe_map(rec.get("other-config"))
+        off = [k for k in GC_SR_SWITCHES if other.get(k, "").lower() == "false"]
+        if off:
+            out.append((rec.get("uuid", ""), rec.get("name-label", ""), off))
     return sorted(out, key=lambda s: (s[1].lower(), s[0]))
 
 
@@ -833,10 +887,16 @@ def windows_vm_findings(vm_text, keys):
             continue
         windows += 1
         problems = []
-        if guest_win and not template_win and (ref or base):
+        # wrong template only on positive evidence: a stock template's reference-label
+        # (xapi copies it on clone) that is not a Windows one, or, without a label, the
+        # stock 'Other install media' by name. A custom golden template ('WS2022-gold',
+        # built from an imported VM) carries no label and its own name - not judged.
+        if guest_win and not template_win and (
+                ref or base.lower() == "other install media"):
             problems.append("made from the '%s' template, not a Windows one" % (base or ref))
         platform = _xe_map(rec.get("platform"))
-        short = [k for k in keys if platform.get(k, "").lower() != "true"]
+        # xapi's own reading of a platform boolean: true or 1 (vm_platform.ml is_true)
+        short = [k for k in keys if platform.get(k, "").strip().lower() not in ("true", "1")]
         if short:
             problems.append("platform %s not set to true" % ", ".join(short))
         if problems:
@@ -926,8 +986,10 @@ def parse_dm_multipath_maps(text):
 
 
 def multipathd_alive(text):
-    """`multipathd show daemon` says 'pid 1305 running'. Anything else is not an answer."""
-    return bool(re.search(r"\bpid\s+\d+\s+running\b", text or ""))
+    """`multipathd show daemon` says 'pid 1305 running' - or 'idle', which is what newer
+    multipath-tools print between checker passes (0.4.9-136 on both dom0s prints running,
+    measured 20 of 20). startup/configure/shutdown, or anything else, is not an answer."""
+    return bool(re.search(r"\bpid\s+\d+\s+(running|idle)\b", text or ""))
 
 
 def _int_or_none(value):
@@ -1026,18 +1088,22 @@ def parse_pool_conf(text):
     apart from it here, because a caller that could not read the file must not be told
     what the file says.
     """
-    first = (text or "").replace("\r", "").strip().splitlines()
-    if not first:
+    # read the way xapi reads it (xen-api v26.1.19 pool_role.ml read_pool_role): the WHOLE
+    # file trimmed, split on ':', matched case-sensitively - so 'Master', or a role with a
+    # second line under it, is a file xapi starts as broken, not a master
+    whole = (text or "").replace("\r", "").strip()
+    if not whole:
         return (None, None)
-    line = first[0].strip()
-    low = line.lower()
-    if low == "master":
+    parts = whole.split(":")
+    if parts == ["master"]:
         return ("master", None)
-    if low == "broken":
+    if parts == ["broken"]:
         return ("broken", None)
-    if low.startswith("slave:"):
-        addr = re.sub(r"\s+", "", line.split(":", 1)[1])
-        return ("slave", addr) if addr else (None, None)
+    if parts[0] == "slave" and len(parts) > 1:
+        # xapi takes the rest verbatim, empty included (a slave of nothing). Whitespace is
+        # dropped here as it always was - a pointer xapi might stumble on is still judged
+        # by where it points
+        return ("slave", re.sub(r"\s+", "", ":".join(parts[1:])))
     return (None, None)
 
 
@@ -1093,7 +1159,7 @@ def dmesg_issue_lines(text, words, phrases, ignore_rules):
     that matches an issue word.
     """
     lowered_words = [w.lower() for w in words if w]
-    lowered_phrases = [p.lower().strip() for p in phrases if p and p.strip()]
+    lowered_phrases = [_normalise(p).strip() for p in phrases if p and p.strip()]
     rules = _ignore_rules(ignore_rules)
     word_res = [_word_re(w) for w in lowered_words]
 
@@ -1111,8 +1177,11 @@ def dmesg_issue_lines(text, words, phrases, ignore_rules):
 
 
 def find_phrase_lines(text, phrase):
-    low = phrase.lower()
-    return [i for i, line in enumerate(text.splitlines(), 1) if low in line.lower()]
+    """1-based numbers of the lines containing phrase - case and runs of whitespace
+    ignored on both sides, the way every other dmesg match here is made."""
+    want = _normalise(phrase).strip()
+    return [i for i, line in enumerate(text.splitlines(), 1)
+            if want and want in _normalise(line)]
 
 
 def context_block(text, line_numbers, ctx=3, rollup=False, max_lines=None, rollup_min=3):
@@ -1287,8 +1356,9 @@ def manifest_packages(text):
 
 def leading_version(text):
     """'9.2.11' out of '9.2.11-1.xcpng8.3', '9.2.11_4.19.0+1' or '9.2.11 (api:2)' -
-    the part the module and its rpm both carry, so the two can be compared."""
-    m = re.match(r"\s*(\d+(?:\.\d+)*)", text or "")
+    the part the module and its rpm both carry, so the two can be compared. An rpm epoch
+    ('1:9.2.11-1') is skipped: the module has none, and '1' is not its version."""
+    m = re.match(r"\s*(?:\d+:)?(\d+(?:\.\d+)*)", text or "")
     return m.group(1) if m else ""
 
 
@@ -1426,6 +1496,8 @@ def plugin_block(third_party, autoload, autoload_known):
         out.append("    %s" % plugin["path"])
         if plugin["link"]:
             out.append("    -> %s" % plugin["link"])
+        if plugin.get("why"):
+            out.append("    (%s)" % plugin["why"])
     return "\n".join(out)
 
 
@@ -1507,7 +1579,7 @@ def _ids_among(ids, known):
     return any(i in known for i in ids)
 
 
-def job_touches_pool(job, pool_uuid, vm_uuids, sr_uuids):
+def job_touches_pool(job, pool_uuid, vm_uuids, sr_uuids, schedule_ids=None):
     """Does this XO job move data to or from this pool? True, False, or None when that
     cannot be told from here.
 
@@ -1536,13 +1608,23 @@ def job_touches_pool(job, pool_uuid, vm_uuids, sr_uuids):
     ids = xo_simple_ids(vms)
     if ids is not None:
         answers.append(_ids_among(ids, vm_uuids))
-    elif isinstance(vms, dict) and "$pool" not in vms:
-        answers.append(True)
-    elif isinstance(vms, dict) and pool_uuid:
-        try:
-            answers.append(xo_pattern_match(vms["$pool"], pool_uuid))
-        except ValueError:
-            answers.append(None)
+    elif isinstance(vms, dict):
+        # smart mode: VMs matched by a pattern. Definitely this pool only when nothing but
+        # the pool (if anything) narrows it; with tags or any other filter, this pool's
+        # VMs may all fall outside it - "may touch", which can keep the XOA in the answer
+        # but must never take it out (a proxied tag-only job used to read green)
+        narrowed = [k for k in vms if k not in ("type", "$pool")]
+        if "$pool" in vms:
+            if not pool_uuid:
+                answers.append(None)
+            else:
+                try:
+                    hit = xo_pattern_match(vms["$pool"], pool_uuid)
+                except ValueError:
+                    hit = None
+                answers.append(None if (hit and narrowed) else hit)
+        else:
+            answers.append(None if narrowed else True)
     else:
         answers.append(None)
 
@@ -1553,9 +1635,15 @@ def job_touches_pool(job, pool_uuid, vm_uuids, sr_uuids):
 
     settings = job_field(job, "settings")
     if isinstance(settings, dict):
-        restore_into = [s.get("healthCheckSr") for s in settings.values()
-                        if isinstance(s, dict) and isinstance(s.get("healthCheckSr"), str)]
-        answers.append(_ids_among(restore_into, sr_uuids))
+        # XO restores into job.settings[schedule.id].healthCheckSr, falling back to the
+        # job-wide '' entry: a match there is definite only for '' or a schedule that runs;
+        # any other entry's is "may"
+        for key, entry in settings.items():
+            if not (isinstance(entry, dict) and isinstance(entry.get("healthCheckSr"), str)):
+                continue
+            hit = _ids_among([entry["healthCheckSr"]], sr_uuids)
+            definite = key == "" or (schedule_ids is not None and key in schedule_ids)
+            answers.append(hit if (hit is not True or definite) else None)
 
     if True in answers:
         return True
@@ -1569,29 +1657,38 @@ def backup_runners(jobs, schedules, pool_uuid, vm_uuids, sr_uuids):
 
     A job counts when one of its schedules is enabled - a job whose every schedule is off
     moves nothing - and every job counts when the schedules could not be read
-    (schedules=None). A job whose reach cannot be told counts as touching the pool, so an
-    unreadable job can keep the XOA in the answer but never take it out. And the XOA is
-    the default: with no job touching the pool, what moves its data is whatever somebody
-    starts from XOA - an export, a restore - so it is the XOA that needs the network.
+    (schedules=None). The XOA is the default: with no job touching the pool, what moves
+    its data is whatever somebody starts from XOA - an export, a restore - so it is the
+    XOA that needs the network.
+
+    Three-valued, and asymmetric on purpose. An XOA-run job that touches the pool, or MAY
+    (its reach cannot be told), keeps the XOA in the answer. Only a proxied job KNOWN to
+    touch the pool takes it out: an unreadable or may-touch proxied job used to, so a pool
+    whose VM list could not be read, or whose only job was a proxied tag-filtered one,
+    read green off facts that were never established.
     """
     active = None
     if schedules is not None:
         active = set(s.get("jobId") for s in schedules
                      if s.get("enabled") is True or s.get("enabled") == "true")
-    xoa, touched, proxies = False, False, []
+        schedule_ids = set(s.get("id") for s in schedules
+                           if s.get("enabled") is True or s.get("enabled") == "true")
+    else:
+        schedule_ids = None
+    xoa, proxies = False, []
     for job in jobs:
         if active is not None and job.get("id") not in active:
             continue
-        if job_touches_pool(job, pool_uuid, vm_uuids, sr_uuids) is False:
+        reach = job_touches_pool(job, pool_uuid, vm_uuids, sr_uuids, schedule_ids)
+        if reach is False:
             continue
-        touched = True
         proxy = job_field(job, "proxy")
         if isinstance(proxy, str) and proxy:
-            if proxy not in proxies:
+            if reach is True and proxy not in proxies:
                 proxies.append(proxy)
         else:
             xoa = True
-    return (xoa or not touched), proxies
+    return (xoa or not proxies), proxies
 
 
 def http_proxy_address(url):

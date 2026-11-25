@@ -89,7 +89,7 @@ def test_the_helper_is_preferred_and_installs_nothing(monkeypatch, tmp_path):
     so no run reaches an apt-get that cannot work."""
     monkeypatch.delenv("HEALTH_SSH_AUTH", raising=False)
     monkeypatch.setattr(transport, "write_askpass", lambda work_dir: "/tmp/x/askpass")
-    monkeypatch.setattr(transport, "ensure_sshpass",
+    monkeypatch.setattr(transport, "sshpass_present",
                         lambda run_env: unreachable("sshpass must not be reached"))
     tr = a_transport(tmp_path)
     assert tr.enable_password_auth("xoa") is True
@@ -99,7 +99,7 @@ def test_the_helper_is_preferred_and_installs_nothing(monkeypatch, tmp_path):
 def test_sshpass_is_the_fallback_when_the_helper_will_not_run(monkeypatch, tmp_path):
     monkeypatch.delenv("HEALTH_SSH_AUTH", raising=False)
     monkeypatch.setattr(transport, "write_askpass", lambda work_dir: "")
-    monkeypatch.setattr(transport, "ensure_sshpass", lambda run_env: True)
+    monkeypatch.setattr(transport, "sshpass_present", lambda run_env: True)
     tr = a_transport(tmp_path)
     assert tr.enable_password_auth("xoa") is True
     assert tr.auth == transport.AUTH_SSHPASS
@@ -108,7 +108,7 @@ def test_sshpass_is_the_fallback_when_the_helper_will_not_run(monkeypatch, tmp_p
 def test_neither_working_names_both(monkeypatch, tmp_path):
     monkeypatch.delenv("HEALTH_SSH_AUTH", raising=False)
     monkeypatch.setattr(transport, "write_askpass", lambda work_dir: "")
-    monkeypatch.setattr(transport, "ensure_sshpass", lambda run_env: False)
+    monkeypatch.setattr(transport, "sshpass_present", lambda run_env: False)
     tr = a_transport(tmp_path)
     assert tr.enable_password_auth("xoa") is False
     assert tr.auth == ""
@@ -120,7 +120,7 @@ def test_the_choice_can_be_pinned_either_way(monkeypatch, tmp_path):
     """Both halves are live code on every box that has sshpass, so both have to be
     testable there - the same reason HEALTH_REMOTE_PYTHON exists."""
     monkeypatch.setattr(transport, "write_askpass", lambda work_dir: "/tmp/x/askpass")
-    monkeypatch.setattr(transport, "ensure_sshpass", lambda run_env: True)
+    monkeypatch.setattr(transport, "sshpass_present", lambda run_env: True)
 
     monkeypatch.setenv("HEALTH_SSH_AUTH", "sshpass")
     tr = a_transport(tmp_path)
@@ -136,7 +136,7 @@ def test_the_choice_can_be_pinned_either_way(monkeypatch, tmp_path):
 def test_pinning_askpass_never_falls_back(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("HEALTH_SSH_AUTH", "askpass")
     monkeypatch.setattr(transport, "write_askpass", lambda work_dir: "")
-    monkeypatch.setattr(transport, "ensure_sshpass",
+    monkeypatch.setattr(transport, "sshpass_present",
                         lambda run_env: unreachable("sshpass must not be reached"))
     tr = a_transport(tmp_path)
     assert tr.enable_password_auth("xoa") is False
@@ -249,7 +249,8 @@ def test_the_appliance_is_still_reported_when_the_pool_cannot_be_reached(monkeyp
 def test_it_says_how_to_get_the_pool_checked(monkeypatch, tmp_path):
     _code, text = drive_no_auth(monkeypatch, tmp_path, [])
     assert "TMPDIR=/root" in text
-    assert "apt-get install sshpass" in text
+    assert "sshpass is used when it is already installed" in text
+    assert "apt-get" not in text
 
 
 def test_the_suggested_command_can_never_carry_a_password(monkeypatch, tmp_path):
@@ -289,7 +290,7 @@ def test_a_host_sweep_that_cannot_authenticate_still_checks_this_host(monkeypatc
     run.pool_size = 2
     run.transport = transport.Transport("host", "")
     monkeypatch.setattr(transport, "write_askpass", lambda work_dir: "")
-    monkeypatch.setattr(transport, "ensure_sshpass", lambda run_env: False)
+    monkeypatch.setattr(transport, "sshpass_present", lambda run_env: False)
     monkeypatch.delenv("HEALTH_SSH_AUTH", raising=False)
     main.prepare_host_sweep(run, "a-password")
     assert run.host_sweep is False
@@ -307,7 +308,7 @@ def test_a_solo_host_run_never_looks_for_a_way_to_authenticate(monkeypatch):
     run.transport = transport.Transport("host", "")
     monkeypatch.setattr(transport, "write_askpass",
                         lambda work_dir: unreachable("nothing to reach"))
-    monkeypatch.setattr(transport, "ensure_sshpass",
+    monkeypatch.setattr(transport, "sshpass_present",
                         lambda run_env: unreachable("nothing to reach"))
     main.prepare_host_sweep(run, "a-password")
     assert run.host_sweep is False

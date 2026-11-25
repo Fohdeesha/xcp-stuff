@@ -20,6 +20,7 @@ of results that had been ready the whole time.
 import atexit
 import getopt
 import os
+import signal
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
@@ -266,8 +267,18 @@ class Run(object):
             elif opt in ("-s", "--single"):
                 self.pool_mode = False
             elif opt in ("-n", "--name"):
+                if not value.strip():
+                    # every later test of -n is "if run.name_filter", so an empty one would
+                    # read as no -n at all - and the password after it as the host, printed
+                    # in the banner and handed to DNS
+                    sys.stderr.write("ERROR: -n/--name needs a pool name.\n")
+                    usage(self.run_env)
                 self.name_filter = value
             elif opt in ("-c", "--command"):
+                if not value.strip():
+                    # an empty -c would read as no -c and run the whole health report
+                    sys.stderr.write("ERROR: -c/--command needs a command to run.\n")
+                    usage(self.run_env)
                 self.run_cmd = value
             elif opt == "--json":
                 self.json_output = True
@@ -495,6 +506,15 @@ def resolve_target_xoa(run, args):
         # by name. A member's address finds the pool's password: every member shares it.
         if run.server is None:
             run.server = xodb.server_for_host(host)[0]
+        user = xodb.record_user(run.server)
+        if user and user != "root":
+            # XO logs in to xapi as this user; its password is not root's, and sending it
+            # to sshd as root's would read as a wrong root password (and hand that
+            # account's password to a root login attempt)
+            sys.stderr.write("ERROR: xo-db holds the credentials of xapi user '%s' for %s, "
+                             "not root's.\n       Give the root password as an argument "
+                             "instead.\n" % (user, host))
+            sys.exit(1)
         password, has_backslash = xodb.record_password(run.server)
         run.pw_has_backslash = has_backslash
         if not password:
@@ -565,7 +585,9 @@ def prepare_host_sweep(run, argument_password):
             sys.stderr.flush()
             try:
                 password = getpass.getpass("")
-            except (EOFError, KeyboardInterrupt):
+            except EOFError:
+                # end of input is the blank answer; a ctrl-C is a stop, and goes on up to
+                # entry() like one anywhere else
                 password = ""
             sys.stderr.write("\n")
     if not password:
@@ -749,9 +771,14 @@ def _collect_one(run, host, pool_spec):
         host.error = str(exc)
         note = "Failed when trying to check %s: %s\n" % (host.address, exc)
     host.local_now = _now()
+    incomplete = (host.payload or {}).get("__incomplete__")
+    if incomplete:
+        note = "Only part of %s was checked: %s\n" % (host.address, incomplete)
     # whichever way it went, say so now: the note is held back until every host is in, and
     # by then the thing worth knowing - which host the run was waiting on - has passed
-    progress("  %s %s (%.1fs)\n" % (host.address, "failed" if host.error else "answered",
+    progress("  %s %s (%.1fs)\n" % (host.address,
+                                    "failed" if host.error else
+                                    "answered in part" if incomplete else "answered",
                                     host.local_now - started))
     return note
 
@@ -769,6 +796,11 @@ def parallel_workers(host_count):
     override = os.environ.get("HEALTH_MAX_PARALLEL", "")
     if override.isdigit() and int(override) > 0:
         limit = int(override)
+    elif override:
+        # =1 is how the concurrent path is diffed against the sequential one: a typo must
+        # not quietly run the concurrent path while claiming the sequential one
+        sys.stderr.write("Warning: ignoring HEALTH_MAX_PARALLEL=%r (expected a whole "
+                         "number of 1 or more).\n" % override)
     return max(1, min(limit, host_count))
 
 
@@ -843,9 +875,16 @@ def collect_hosts(run):
     if run.pool_mode:
         cmd_host = run.host_by_address(run.pool_cmd_host)
         if cmd_host is not None and cmd_host.reachable:
-            run.pool.payload = cmd_host.payload.get("pool") or {}
+            pool_doc = cmd_host.payload.get("pool")
+            stopped = cmd_host.payload.get("__incomplete__")
+            if pool_doc is None and stopped:
+                # the host stopped before the pool questions: every pool line says so
+                pool_doc = {"ok": False, "error": "not asked - %s %s"
+                                                  % (cmd_host.address, stopped)}
+            run.pool.payload = pool_doc or {}
             run.pool.payload["yum_check"] = cmd_host.payload.get("yum_check") or {
-                "ok": False, "error": "not collected"}
+                "ok": False, "error": ("not asked - %s %s" % (cmd_host.address, stopped)
+                                       if stopped else "not collected")}
         else:
             # the host we meant to ask is unreachable - xapi answers pool-wide questions
             # from any member, so ask one we can reach rather than losing the section
@@ -910,10 +949,8 @@ def pool_status_section(run, rep):
         rep.check("Pool Roles", checks.pool_roles, run.hosts)
 
         reachable = [h for h in run.hosts if h.reachable]
-        rep.add(result.ok("Dom0 RAM Allocations", "Matched") if model.ram_match(reachable)
-                else result.flag("Dom0 RAM Allocations", "Mismatched"))
-        rep.add(result.ok("Pool Time Synchronization", "Matched") if model.ntp_match(reachable)
-                else result.flag("Pool Time Synchronization", "Mismatched"))
+        rep.check("Dom0 RAM Allocations", checks.dom0_ram_allocations, reachable)
+        rep.check("Pool Time Synchronization", checks.pool_time_sync, reachable)
         # like the two above, a comparison ACROSS hosts, so it belongs to the pool rather
         # than to any one host and has nothing to say when only one host was looked at
         rep.check("Multipath Path Counts", checks.multipath_path_counts, reachable)
@@ -940,11 +977,10 @@ def pool_status_section(run, rep):
     if run.pw_has_backslash:
         rep.add(result.info("Root Password", "Contains Backslash", "yellow"))
 
-    cmd_host = run.host_by_address(run.pool_cmd_host)
-    memory = cmd_host.memory() if cmd_host else None
     rep.check("XOSTOR In Use", checks.xostor_in_use, run.pool)
     if run.pool.xostor_in_use():
-        rep.check("XOSTOR RAM", checks.xostor_ram, run.pool, memory)
+        # every node this run looked at: each one runs DRBD and a LINSTOR satellite
+        rep.check("XOSTOR RAM", checks.xostor_ram, [h for h in run.hosts if h.reachable])
         if not run.host_solo():
             # the master always prints its own XOSTOR lines, but a slave's discrepancy
             # is only spelled out if slaves run them too
@@ -984,9 +1020,9 @@ installed and no internet access is to point the run at one it may execute from:
 
     TMPDIR=/root python3 health.py %(args)s
 
-Failing that, 'apt-get install sshpass' is used instead when it is there. An XCP-ng 8.3
-host can also be checked by running health.py on the host itself, which needs no
-credentials at all for the machine it is running on."""
+Failing that, sshpass is used when it is already installed (nothing is installed for it).
+An XCP-ng 8.3 host can also be checked by running health.py on the host itself, which
+needs no credentials at all for the machine it is running on."""
 
 
 def _target_hint(run):
@@ -1026,10 +1062,11 @@ def xoa_only_report(run, rep_meta, xoa_worker):
     rep.blank()
     rep.end_section()
 
-    rep.begin_section("xoa")
-    rep.heading("== XOA Status ==")
-    rep.add_all(xoa_worker.result(), "XOA")
-    rep.end_section()
+    if xoa_worker is not None:          # none under -c, which reports no verdict
+        rep.begin_section("xoa")
+        rep.heading("== XOA Status ==")
+        rep.add_all(xoa_worker.result(), "XOA")
+        rep.end_section()
     return rep.finish()
 
 
@@ -1065,7 +1102,7 @@ def per_host_checks():
     return [
         ("dom0_disk_usage", "Dom0 Disk Usage", checks.dom0_disk_usage),
         ("read_only_filesystems", "Read-Only Filesystems", checks.read_only_filesystems),
-        ("dom0_memory", "Dom0 Memory", checks.dom0_memory),
+        ("dom0_memory", ("Dom0 Memory", "Dom0 Memory Usage"), checks.dom0_memory),
         ("mtu_issues", "MTU Issues", checks.mtu_issues),
         ("dmesg_content", "Dmesg Content", checks.dmesg_content),
         ("oom_events", "OOM Events", checks.oom_events),
@@ -1123,6 +1160,9 @@ def host_section(run, rep, host):
         rep.add(result.info("Root Password", "Contains Backslash", "yellow"))
 
     rep.check("Hypervisor Version", checks.hypervisor_version, host)
+    # a collector that stopped part way: what it gathered follows, everything it did not
+    # reads Unknown, and this says why
+    rep.check("Host Collection", checks.host_collection, host)
     rep.check("Last Booted", checks.last_booted, host)
     rep.check("Last Patched", checks.last_patched, host)
     # the conclusion drawn from the two dates above, so it prints beside them
@@ -1146,7 +1186,7 @@ def host_section(run, rep, host):
         rep.check("Yum Patch Level", checks.yum_patch_level, host, host.is_master,
                   run.master_manifest())
     if gated(run, host, "xostor_versions"):
-        rep.check("XOSTOR Packages", checks.xostor_versions, host,
+        rep.check(("XOSTOR Packages", "XOSTOR DRBD Module"), checks.xostor_versions, host,
                   run.pool.xostor_in_use())
     if run.pool.xostor_in_use() and gated(run, host, "xostor_missing_devices"):
         rep.check("XOSTOR Missing Devices", checks.xostor_missing_devices, host)
@@ -1203,33 +1243,43 @@ def main(argv=None):
     colors.init()
     run = Run()
 
-    if run.run_env == "host":
-        # dom0's PATH is complete for an interactive root shell but not under cron, and
-        # several tools live in sbin. Over ssh the remote login shell did this for us.
-        os.environ["PATH"] = os.environ.get("PATH", "") + ":/usr/sbin:/sbin:/usr/local/sbin"
-    else:
+    # PATH first, in both environments: under cron it is /usr/bin:/bin, and on the XOA
+    # xo-server-db, xoa-updater and xoa live in /usr/local/bin (measured - a cron run could
+    # not even read xo-db), while dom0 keeps several tools in sbin. Over ssh the remote
+    # login shell does this for the hosts.
+    path = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    for extra in ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/sbin"):
+        if extra not in path:
+            path.append(extra)
+    os.environ["PATH"] = os.pathsep.join(path)
+
+    # arguments before any gate, so -h and a usage error answer on any machine, for anyone
+    args = run.parse_args(argv)
+    if run.json_output:
+        colors.init(force_off=True)
+
+    if run.run_env != "host":
         ok_version, detected = xoa.debian_version_ok()
         if not ok_version:
             sys.stderr.write("This script requires Debian 11 or later (or an XCP-ng host). "
                              "Detected version: %s\n" % detected)
             return 1
 
-    args = run.parse_args(argv)
-    if run.json_output:
-        colors.init(force_off=True)
-
-    work_dir = transport.make_work_dir()
-    # Registered before the work dir's cleanup so it runs first (atexit is LIFO): the
-    # children hold the ControlPath sockets that live in it. On a run that finishes this
-    # is a no-op - nothing is left running by then. It is for the exits that do not:
-    # sys.exit on an unreadable xo-db or a seed that will not answer, with the XOA
-    # section's daemon thread still part way through a 'xoa check'.
-    atexit.register(transport.kill_all_children)
-    atexit.register(transport.cleanup_work_dir, work_dir)
-    run.transport = transport.Transport(run.run_env, work_dir)
-
+    # before the work dir, the db read and the XOA thread: a refused run attempts nothing
     if not require_root(run.run_env):
         return 1
+
+    work_dir = transport.make_work_dir()
+    # atexit runs LAST-registered FIRST, so these are registered in the reverse of the
+    # order they must run in: kill every child (they hold the ControlPath sockets that
+    # live in the work dir), then ask the ssh masters - which no kill reaches - to exit,
+    # then remove the dir. On a run that finishes the kill is a no-op. It is for the exits
+    # that do not: sys.exit on an unreadable xo-db or a seed that will not answer, with the
+    # XOA section's daemon thread still part way through a 'xoa check'.
+    atexit.register(transport.cleanup_work_dir, work_dir)
+    atexit.register(transport.close_masters, work_dir)
+    atexit.register(transport.kill_all_children)
+    run.transport = transport.Transport(run.run_env, work_dir)
 
     argument_password = ""
     pool_reachable = True
@@ -1259,7 +1309,12 @@ def main(argv=None):
     #
     # It is also started BEFORE the no-password-mechanism exit below, which is the one
     # case where this section is the entire report: there is nothing else left to overlap.
-    xoa_worker = _Background(xoa.lines) if run.run_env != "host" else None
+    #
+    # Not under -c: its result is never read, and it would spend the appliance's two cores
+    # on a 'xoa check' and five node start-ups while the command fans out, only to be
+    # killed at exit.
+    xoa_worker = (_Background(xoa.lines) if run.run_env != "host" and not run.run_cmd
+                  else None)
 
     if not pool_reachable:
         return xoa_only_report(run, rep_meta=run_meta(run), xoa_worker=xoa_worker)
@@ -1381,11 +1436,37 @@ def entry():
     /dev/fd/63. 130 is the shell's own convention for a SIGINT death, and the atexit
     handlers still take the children and the work dir with them.
     """
+    for name in ("SIGTERM", "SIGHUP"):
+        if hasattr(signal, name):
+            try:
+                signal.signal(getattr(signal, name), _stop_signal)
+            except ValueError:
+                pass            # not the main thread: a test driving entry()
     try:
         return main()
-    except KeyboardInterrupt:
-        sys.stderr.write("\nInterrupted.\n")
-        return 130
+    except KeyboardInterrupt as exc:
+        signum = getattr(exc, "signum", 2)
+        try:
+            sys.stderr.write("\n%s.\n" % ("Interrupted" if signum == 2 else "Stopped"))
+        except (IOError, OSError, ValueError):
+            pass                # SIGHUP: the terminal it would be written to is gone
+        return 128 + signum
+
+
+class Stopped(KeyboardInterrupt):
+    """SIGTERM or SIGHUP, raised in the main thread so it takes the same path as a ctrl-C:
+    queued work cancelled, every child killed, the work dir removed. Python's default for
+    both is to die on the spot, running no atexit handler - which left the work dir, the
+    askpass helper and every child behind (measured: a SIGTERM mid-run left the dir and two
+    ssh clients). The dropped ssh session to an XOA is the common SIGHUP."""
+
+    def __init__(self, signum):
+        KeyboardInterrupt.__init__(self)
+        self.signum = signum
+
+
+def _stop_signal(signum, _frame):
+    raise Stopped(signum)
 
 
 if __name__ == "__main__":

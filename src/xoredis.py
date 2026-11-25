@@ -314,7 +314,13 @@ def _fetch_collection(addr, timeout, namespace):
     records = []
     for ident, blob in zip(ids, blobs):
         if blob is None:
-            continue                      # deleted between the two calls
+            # not necessarily deleted between the two calls: MGET answers nil for a key
+            # holding a HASH too, and XO wrote every record that way until Dec 2023
+            # (32afd5c46) with no migration since - an old job never edited is still one.
+            # Skipping it could drop an XOA-run job and read Backup Network green, so
+            # decline: xo-server-db reads hash records through XO's own code
+            raise RedisError("%s%s has no string value (deleted mid-read, or stored the "
+                             "pre-2024 way, as a hash)" % (prefix, ident))
         if blob.startswith(ENCRYPTION_PREFIX):
             raise RedisError("%s records are encrypted (%s%s)" % (namespace, prefix, ident))
         record = json.loads(blob)

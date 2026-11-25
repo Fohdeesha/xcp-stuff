@@ -214,7 +214,7 @@ def test_a_refused_connection_does_not_stop_later_calls(fresh_xapi, monkeypatch)
 def test_a_timeout_the_run_budget_imposed_is_not_blamed_on_xapi(fresh_xapi, monkeypatch):
     """Five seconds left of the budget and a 60s call: when it times out, that is the
     budget speaking, and run() already answers every later call with exactly that."""
-    monkeypatch.setattr(collector, "DEADLINE", [time.time() + 5])
+    monkeypatch.setattr(collector, "DEADLINE", [collector._mono() + 5])
     fake = FakeRun(collector.Ran(124, "", "", True))
     monkeypatch.setattr(collector, "run", fake)
     collector.xe(["pool-list"], timeout=60)
@@ -478,11 +478,17 @@ def test_a_broken_host_is_a_finding():
 
 
 def test_a_role_xapi_would_not_recognise_is_a_finding():
-    for conf, shown in (("slave:", "'slave:'"), ("", "'(empty)'"), ("mastr", "'mastr'")):
+    for conf, shown in (("", "'(empty)'"), ("mastr", "'mastr'"), ("Master", "'Master'")):
         line = roles(member("10.0.0.1", "xen-a", "master"),
                      member("10.0.0.2", "xen-b", conf))
         assert line.status == FLAG, conf
         assert shown in line.text and "reads as broken" in line.text
+
+
+def test_a_slave_of_no_address_is_a_finding_said_as_what_xapi_reads():
+    """xapi reads 'slave:' as Slave "" (pool_role.ml), not as broken."""
+    line = roles(member("10.0.0.1", "xen-a", "master"), member("10.0.0.2", "xen-b", "slave:"))
+    assert line.status == FLAG and "'slave:', a slave of no address" in line.text
 
 
 def test_a_slave_pointing_at_another_slave_is_a_finding():

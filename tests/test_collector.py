@@ -30,7 +30,8 @@ def test_patch_predicate_installed_only_for_kernel_and_xen():
     # yum installs a new kernel BESIDE the old one rather than upgrading it, so that is
     # an XCP-ng update too
     assert collector._is_patch_line("Installed", "kernel-4.19.x86_64") is True
-    assert collector._is_patch_line("Installed", "xen-dom0-tools-4.13.x86_64") is True
+    # by exact name: a first install of xen-dom0-tools is a new package, not a patch
+    assert collector._is_patch_line("Installed", "xen-dom0-tools-4.13.x86_64") is False
     # ...but a plain Installed of anything else is a NEW package, not a patch. This is
     # the line that stops the script's own sshpass install from redating the host.
     assert collector._is_patch_line("Installed", "sshpass-1.06-2.el7.x86_64") is False
@@ -125,10 +126,9 @@ def test_task_timeout_values_reads_only_live_settings():
     assert collector.task_timeout_values(TASK_TIMEOUT_CONF) == ["86400", "3600"]
 
 
-def test_task_timeout_values_strips_all_whitespace_from_the_value():
-    # '1 hour' becomes '1hour': the line is a verbatim echo of whatever is configured,
-    # and this is what the bash script it was ported from does
-    assert collector.task_timeout_values("pending_task_timeout = 1 hour\n") == ["1hour"]
+def test_task_timeout_values_echo_what_xapi_reads():
+    # the value as xapi's Config_file sees it: inner whitespace kept, edges trimmed
+    assert collector.task_timeout_values("pending_task_timeout = 1 hour\n") == ["1 hour"]
     # a setting with no value at all is not a value
     assert collector.task_timeout_values("pending_task_timeout =   \n") == []
 
@@ -144,6 +144,7 @@ def test_task_timeout_values_tolerates_crlf():
 
 def test_task_timeout_collection_states(tmp_path, monkeypatch):
     # no drop-in directory at all is a real answer - 'no override' - not an error
+    monkeypatch.setattr(collector, "TASK_TIMEOUT_CONF", str(tmp_path / "xapi.conf"))
     monkeypatch.setattr(collector, "TASK_TIMEOUT_CONF_DIR", str(tmp_path / "absent"))
     assert collector.collect_task_timeout_override() == {"ok": True, "value": []}
 
@@ -152,12 +153,20 @@ def test_task_timeout_collection_states(tmp_path, monkeypatch):
     monkeypatch.setattr(collector, "TASK_TIMEOUT_CONF_DIR", str(conf))
     assert collector.collect_task_timeout_override() == {"ok": True, "value": []}
 
-    # files are read in name order, so the reported values do not shuffle between runs
+    # files are read in name order, so the reported values do not shuffle between runs;
+    # dot-files too, since xapi parses every entry readdir gives it
     (conf / "20-later.conf").write_text("pending_task_timeout = 2\n")
     (conf / "10-first.conf").write_text("pending_task_timeout = 1\n")
     (conf / ".10-first.conf.swp").write_text("pending_task_timeout = 999\n")
     (conf / "subdir").mkdir()
-    assert collector.collect_task_timeout_override() == {"ok": True, "value": ["1", "2"]}
+    assert collector.collect_task_timeout_override() == {"ok": True,
+                                                         "value": ["999", "1", "2"]}
+
+    # the shipped file carries the line commented; an uncommented one is an edit of it
+    (tmp_path / "xapi.conf").write_text("# pending_task_timeout = 86400 # 1 day in seconds\n"
+                                        "pending_task_timeout = 600\n")
+    assert collector.collect_task_timeout_override()["value"][0] == \
+        "600 (in %s)" % (tmp_path / "xapi.conf")
 
 
 def test_other_config_parse_matches_the_local_one():
@@ -326,9 +335,11 @@ def test_a_command_the_budget_refused_is_still_recorded(monkeypatch):
     """'run budget exhausted' at 0.0s is itself the finding: it says the budget was gone
     before this command, which is what points at the ones before it."""
     del collector.TIMINGS[:]
-    monkeypatch.setattr(collector, "DEADLINE", [0.0])
+    monkeypatch.setattr(collector, "DEADLINE", [collector._mono() - 10])
     r = collector.run(["true"])
-    assert r.timed_out is True
+    # never started, so no exit status and no "timed out": it did not run and hang
+    assert r.rc is None and r.timed_out is False and not r.ok
+    assert r.why() == "not run - the run budget was used up"
     assert [row[1] for row in collector.TIMINGS] == ["true"]
 
 
@@ -416,7 +427,7 @@ def test_the_watchdog_names_the_command_it_could_not_get_away_from(capsys, monke
     collector.TIMINGS.append([0.2, "timedatectl"])
     exited = []
     monkeypatch.setattr(collector.os, "_exit", lambda code: exited.append(code))
-    monkeypatch.setattr(collector, "DEADLINE", [time.time() - 100])   # past the grace
+    monkeypatch.setattr(collector, "DEADLINE", [collector._mono() - 100])   # past the grace
 
     collector.watchdog(15)
 
@@ -434,7 +445,7 @@ def test_the_watchdog_says_so_when_nothing_was_running(capsys, monkeypatch):
     as one - the collector was between commands, so the stall is somewhere else."""
     reset_collector_state()
     monkeypatch.setattr(collector.os, "_exit", lambda code: None)
-    monkeypatch.setattr(collector, "DEADLINE", [time.time() - 100])
+    monkeypatch.setattr(collector, "DEADLINE", [collector._mono() - 100])
 
     collector.watchdog(15)
 
@@ -464,7 +475,8 @@ def test_a_command_that_will_not_die_is_abandoned_rather_than_waited_on(monkeypa
     """
     reset_collector_state()
     del collector.ABANDONED[:]
-    monkeypatch.setattr(collector, "_kill", lambda proc: None)   # the signal never lands
+    # the signal is "delivered" and has no effect, as for a process in D state
+    monkeypatch.setattr(collector, "_kill", lambda proc: True)
     monkeypatch.setattr(collector, "KILL_GRACE", 0.3)
 
     started = time.time()
@@ -479,6 +491,31 @@ def test_a_command_that_will_not_die_is_abandoned_rather_than_waited_on(monkeypa
     assert collector.ABANDONED == ["%s -c import time; time.sleep(30)" % sys.executable]
     # ...and the next command still runs, which is the fact that used to be lost
     assert collector.run([sys.executable, "-c", "print(1)"]).ok is True
+
+
+def test_a_kill_that_could_not_be_sent_does_not_blame_the_storage(monkeypatch):
+    """_kill returning False means the signal never left: the host's storage is not
+    wedged on the evidence of a kill that did not happen."""
+    reset_collector_state()
+    del collector.ABANDONED[:]
+    monkeypatch.setattr(collector, "_kill", lambda proc: False)
+    monkeypatch.setattr(collector, "KILL_GRACE", 0.3)
+    r = collector.run([sys.executable, "-c", "import time; time.sleep(30)"], timeout=0.5)
+    assert r.timed_out is True
+    assert "kill could not be sent" in r.err and "storage" not in r.err
+
+
+def test_the_watchdog_that_loses_the_race_lets_the_main_document_finish(capsys, monkeypatch):
+    """The main thread took the emit first: the watchdog must not os._exit underneath it,
+    which would cut that document off mid-write."""
+    reset_collector_state()
+    exited = []
+    monkeypatch.setattr(collector.os, "_exit", lambda code: exited.append(code))
+    monkeypatch.setattr(collector, "DEADLINE", [collector._mono() - 100])
+    assert collector.emit({"main": 1}) is True
+    collector.watchdog(15)
+    assert exited == []
+    assert capsys.readouterr().out.count(collector.BEGIN_MARKER) == 1
 
 
 def test_a_killable_command_that_overruns_is_still_reported_as_timed_out(monkeypatch):
@@ -629,7 +666,41 @@ def test_parse_mirrorlist_reads_ip_and_only_the_mirrors_table():
 def test_parse_yum_ini_keeps_a_hash_inside_a_value():
     ini = collector.parse_yum_ini("[main]\n# comment\nproxy=http://p:3128\n"
                                   "proxy_password=a#b\n")
-    assert ini["main"] == {"proxy": "http://p:3128", "proxy_password": "a#b"}
+    assert ini == [("main", {"proxy": "http://p:3128", "proxy_password": "a#b"})]
+
+
+def test_parse_yum_ini_keeps_file_order_and_reads_continuation_lines():
+    """A list so python2 and python3 walk the sections in the same (file) order; an
+    indented line continues the previous key, as in yum's own parser."""
+    text = ("[zz-local]\nbaseurl=http://repo.example.net/a/\n"
+            "\thttp://repo.example.net/b/\nenabled=YES\n[aa-other]\nenabled=0\n")
+    ini = collector.parse_yum_ini(text)
+    assert [s for s, _kv in ini] == ["zz-local", "aa-other"]
+    assert ini[0][1]["baseurl"] == "http://repo.example.net/a/ http://repo.example.net/b/"
+
+
+def test_yum_booleans_are_read_the_way_yum_reads_them():
+    for value in ("1", "yes", "YES", "True", "TRUE", " true "):
+        assert collector._yum_true(value), value
+    for value in ("0", "no", "False", "", "maybe"):
+        assert not collector._yum_true(value), value
+
+
+def test_task_timeout_values_are_read_the_way_xapi_reads_them():
+    """xen-api Config_file: everything from the first '#' is a comment, inline ones too,
+    and one pair of surrounding quotes is stripped."""
+    text = ('pending_task_timeout = 3600  # one hour\n'
+            'pending_task_timeout="7200"\n'
+            '# pending_task_timeout = 86400 # 1 day in seconds\n')
+    assert collector.task_timeout_values(text) == ["3600", "7200"]
+
+
+def test_the_patch_predicate_takes_exact_package_names():
+    assert collector._is_patch_line("Installed", "kernel-4.19.19-8.0.46.12.xcpng8.3.x86_64")
+    assert collector._is_patch_line("Installed", "2:xen-hypervisor-4.17.7-2.5.xcpng8.3.x86_64")
+    assert not collector._is_patch_line("Installed", "kernel-devel-4.19.19-8.0.46.x86_64")
+    assert not collector._is_patch_line("Installed", "xen-dom0-tools-4.17.7-2.5.x86_64")
+    assert collector._is_patch_line("Updated", "anything-1.0-1.x86_64")
 
 
 def _mirror_env(tmp_path, monkeypatch, repo, answers, yum_conf=""):
@@ -755,17 +826,24 @@ REAL = b'12:Nov  4 21:00:01 xcp-a01 SM: [4242] ***** sr_scan: EXCEPTION <class S
 
 
 class _FakeGrep(object):
-    def __init__(self, out):
+    pid = 424242
+
+    def __init__(self, out, rc=0):
         import io
         self.stdout = io.BytesIO(out)
+        self.rc = rc
 
     def wait(self):
-        return 0
+        return self.rc
 
 
-def _grep_returning(monkeypatch, out):
+def _grep_returning(monkeypatch, out, rc=0):
     import io
-    monkeypatch.setattr(collector, "_popen", lambda argv: (_FakeGrep(out), io.BytesIO()))
+    monkeypatch.setattr(collector, "_popen", lambda argv: (_FakeGrep(out, rc), io.BytesIO()))
+
+
+def _lines(hits):
+    return dict((i, hit[0]) for i, hit in hits.items())
 
 
 def test_an_ignored_line_is_no_hit_and_an_earlier_real_one_is_still_found(tmp_path, monkeypatch):
@@ -773,10 +851,14 @@ def test_an_ignored_line_is_no_hit_and_an_earlier_real_one_is_still_found(tmp_pa
     log.write_text("x\n")
     _grep_returning(monkeypatch, REAL + NET_RESET)
     rules = [["check_network_reset", "/var/tmp/network-reset", "enoent"]]
-    assert collector.grep_scan(str(log), ["except"], ignore=rules) == {0: 12}
+    hits, why = collector.grep_scan(str(log), ["except"], ignore=rules)
+    assert why is None and _lines(hits) == {0: 12}
+    # the matched line itself rides along, so the hit survives a context read failing
+    assert "sr_scan: EXCEPTION" in hits[0][1]
     # without the rule the startup line is the last hit, and the real one is never shown
     _grep_returning(monkeypatch, REAL + NET_RESET)
-    assert collector.grep_scan(str(log), ["except"]) == {0: 40}
+    hits, why = collector.grep_scan(str(log), ["except"])
+    assert why is None and _lines(hits) == {0: 40}
 
 
 def test_a_rule_needs_all_of_its_substrings(tmp_path, monkeypatch):
@@ -786,10 +868,138 @@ def test_a_rule_needs_all_of_its_substrings(tmp_path, monkeypatch):
                     b'Unix.Unix_error(Unix.ENOENT, "open", "/var/tmp/something-else")\n')
     _grep_returning(monkeypatch, REAL + NET_RESET + other_enoent)
     rules = [["check_network_reset", "/var/tmp/network-reset", "enoent"]]
-    assert collector.grep_scan(str(log), ["except"], ignore=rules) == {0: 41}
+    hits, _why = collector.grep_scan(str(log), ["except"], ignore=rules)
+    assert _lines(hits) == {0: 41}
+
+
+def test_a_scan_that_could_not_look_says_so_and_is_never_a_clean_log(tmp_path, monkeypatch):
+    """The four ways grep_scan used to answer None - read by its caller as "no hits" -
+    each come back with a reason, and collect_log_scan carries it to the report."""
+    log = tmp_path / "SMlog"
+    log.write_text("x\n")
+    # missing
+    assert collector.grep_scan(str(tmp_path / "absent"), ["except"]) == ({}, collector.MISSING)
+    # budget gone
+    monkeypatch.setattr(collector, "DEADLINE", [collector._mono() - 10])
+    hits, why = collector.grep_scan(str(log), ["except"])
+    assert hits == {} and "budget" in why
+    monkeypatch.setattr(collector, "DEADLINE", [None])
+    # grep itself failed
+    _grep_returning(monkeypatch, b"", rc=2)
+    hits, why = collector.grep_scan(str(log), ["except"])
+    assert why == "grep failed (exit 2)"
+    # the log scan: nothing found AND a scan failed is a failure, not "none"
+    out = collector.collect_log_scan([str(log)], ["except"], 1)
+    assert out["ok"] and out["value"]["blocks"] == []
+    assert out["value"]["failed"] == ["%s: grep failed (exit 2)" % log]
+
+
+def test_a_missing_rotated_log_is_no_failure_but_a_missing_live_one_is(tmp_path, monkeypatch):
+    """.1 does not exist until the first rotation - that is an answer. The live log not
+    existing is not one: these are dom0's standard logs."""
+    log = tmp_path / "kern.log"
+    log.write_text("x\n")
+    _grep_returning(monkeypatch, b"")
+    out = collector.collect_log_scan([str(log)], ["Failing path"], 1)
+    assert out["value"] == {"blocks": [], "failed": []}
+    out = collector.collect_log_scan([str(tmp_path / "gone.log")], ["Failing path"], 1)
+    assert out["value"]["failed"] == ["%s: not found" % (tmp_path / "gone.log")]
+
+
+def test_a_found_hit_is_kept_when_its_context_cannot_be_read(tmp_path, monkeypatch):
+    log = tmp_path / "SMlog"
+    log.write_text("x\n")
+    _grep_returning(monkeypatch, REAL)
+    monkeypatch.setattr(collector, "context_lines", lambda path, lineno, ctx: None)
+    out = collector.collect_log_scan([str(log)], ["except"], 3)
+    block = out["value"]["blocks"][0]
+    assert block["line"] == 12 and "sr_scan: EXCEPTION" in block["context"][0]
+    assert block["note"] == "the lines around it could not be read"
 
 
 def test_the_shipped_rule_matches_the_line_xapi_writes():
     import config
     body = NET_RESET.decode("ascii").split(":", 1)[1].lower()
     assert any(all(s in body for s in rule) for rule in config.LOG_ERROR_IGNORE_RULES)
+
+
+# --------------------------------------------------------------------------------------
+# Update mirror: the states added by the 2026-11-24 audit (A06/A07)
+# --------------------------------------------------------------------------------------
+
+FALLBACK_REPO = ("[xcp-ng-base]\nbaseurl=http://mirrors.xcp-ng.org/8/8.3/base/x86_64/\n"
+                 "        http://updates.xcp-ng.org/8/8.3/base/x86_64/\n")
+HTTP_RL = "http://mirrors.xcp-ng.org/8/8.3/base/x86_64/repodata/repomd.xml"
+
+
+def test_update_mirror_tries_the_repos_fallback_when_the_redirector_fails(tmp_path,
+                                                                         monkeypatch):
+    _mirror_env(tmp_path, monkeypatch, FALLBACK_REPO, [
+        ("http://updates.xcp-ng.org/", collector.Ran(0, REPOMD + "\n200", "", False)),
+    ])
+    v = collector.collect_update_mirror(OPTS)["value"]
+    assert v["redirector_error"]
+    assert v["fallbacks"] == [{"host": "updates.xcp-ng.org", "ok": True, "error": "",
+                               "url": "http://updates.xcp-ng.org/8/8.3/base/x86_64/"
+                                      "repodata/repomd.xml"}]
+
+
+def test_update_mirror_a_fallback_that_answers_with_an_error_is_not_ok(tmp_path,
+                                                                      monkeypatch):
+    _mirror_env(tmp_path, monkeypatch, FALLBACK_REPO, [
+        ("http://updates.xcp-ng.org/", collector.Ran(0, "denied\n403", "", False)),
+    ])
+    row = collector.collect_update_mirror(OPTS)["value"]["fallbacks"][0]
+    assert not row["ok"] and row["error"] == "HTTP 403"
+
+
+def test_update_mirror_tests_yums_own_http_first_hop(tmp_path, monkeypatch):
+    """The redirector 301s http to https, so the mirrors probed are the https set - but
+    yum's first request is still the http one, and a proxy answering it 407 is a broken
+    yum whatever the mirrors say."""
+    _mirror_env(tmp_path, monkeypatch, BASE_REPO, [
+        (RL + "?mirrorlist", collector.Ran(0, MIRRORLIST, "", False)),
+        (HTTP_RL, collector.Ran(0, "407", "", False)),
+        ("https://mirror-", collector.Ran(0, REPOMD + "\n200", "", False)),
+    ])
+    v = collector.collect_update_mirror(OPTS)["value"]
+    assert v["first_hop_error"] == "HTTP 407"
+    assert v["repo_url"] == HTTP_RL
+
+
+def test_update_mirror_a_redirect_on_the_first_hop_is_an_answer(tmp_path, monkeypatch):
+    _mirror_env(tmp_path, monkeypatch, BASE_REPO, [
+        (RL + "?mirrorlist", collector.Ran(0, MIRRORLIST, "", False)),
+        (HTTP_RL, collector.Ran(0, "301", "", False)),
+        ("https://mirror-", collector.Ran(0, REPOMD + "\n200", "", False)),
+    ])
+    assert collector.collect_update_mirror(OPTS)["value"]["first_hop_error"] == ""
+
+
+def test_update_mirror_a_page_without_a_mirror_list_is_not_unreachable(tmp_path,
+                                                                      monkeypatch):
+    _mirror_env(tmp_path, monkeypatch, BASE_REPO, [
+        (RL + "?mirrorlist", collector.Ran(0, "<html>maintenance</html>", "", False)),
+        (HTTP_RL, collector.Ran(0, "301", "", False)),
+    ])
+    v = collector.collect_update_mirror(OPTS)["value"]
+    assert "no mirror list could be read" in v["page_error"]
+    assert v["mirrors"] == [] and not v["redirector_error"]
+
+
+def test_update_mirror_counts_the_mirrors_it_did_not_probe(tmp_path, monkeypatch):
+    _mirror_env(tmp_path, monkeypatch, BASE_REPO, [
+        (RL + "?mirrorlist", collector.Ran(0, MIRRORLIST, "", False)),
+        ("https://mirror-", collector.Ran(0, REPOMD + "\n200", "", False)),
+    ])
+    v = collector.collect_update_mirror(dict(OPTS, max_mirrors=1))["value"]
+    assert len(v["mirrors"]) == 1 and v["not_probed"] == 1
+
+
+def test_update_mirror_marks_a_mirror_the_budget_left_untried(tmp_path, monkeypatch):
+    _mirror_env(tmp_path, monkeypatch, BASE_REPO, [
+        (RL + "?mirrorlist", collector.Ran(0, MIRRORLIST, "", False)),
+    ])
+    v = collector.collect_update_mirror(dict(OPTS, budget=1))["value"]
+    assert v["mirrors"] and all(not m["tried"] for m in v["mirrors"])
+    assert all("out of time" in m["error"] for m in v["mirrors"])

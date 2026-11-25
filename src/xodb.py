@@ -18,6 +18,7 @@ a password split one record into two.
 Values are only ever read as data. Nothing here evaluates anything.
 """
 
+import os
 import re
 import socket
 import sys
@@ -136,18 +137,33 @@ def _sort_key(name):
     fallback order, so a cron run with no -n takes entry #1 of THIS ordering.
     """
     folded = unicodedata.normalize("NFKD", clean(name).lower())
-    folded = "".join(c for c in folded if not unicodedata.combining(c))
+    folded = "".join(_FOLD.get(c, c) for c in folded if not unicodedata.combining(c))
     parts = []
-    for chunk in re.split(r"(\d+)", folded):
+    for chunk in re.findall(r"\d+|[^\W\d_]+|\s+|.", folded):
         if chunk.isdigit():
             # digits sort BEFORE letters in the root collation ICU gives localeCompare,
             # so a pool named '1st Avenue' is menu entry 1, not 3. Verified against node
             # on the live db - getting this backwards silently changes which pool a
             # no-args cron run checks.
-            parts.append((0, int(chunk), ""))
-        elif chunk:
-            parts.append((1, 0, chunk))
+            parts.append((1, int(chunk), ""))
+        elif chunk.isspace():
+            parts.append((0, -1, ""))
+        elif re.match(r"[^\W\d_]", chunk):
+            parts.append((2, 0, chunk))
+        else:
+            # punctuation and symbols sort before digits, in CLDR's own order (node, on
+            # the test XOA: _infra < (old) pool < #1 site < ~lab < 1st Avenue < alpha)
+            pos = _CLDR_PUNCT.find(chunk)
+            parts.append((0, pos if pos >= 0 else len(_CLDR_PUNCT) + ord(chunk), ""))
     return parts
+
+
+# CLDR root collation's order for the ASCII punctuation and symbols - all of which come
+# before digits, which come before letters (alternate=non-ignorable, ICU's default)
+_CLDR_PUNCT = "_-,;:!?.'\"()[]{}@*/\\&#%`^+<=>|~$"
+# letters NFKD does not decompose, which root collation sorts as their base letters
+_FOLD = {u"ø": "o", u"æ": "ae", u"œ": "oe", u"ß": "ss",
+         u"đ": "d", u"ł": "l", u"þ": "th", u"ð": "d"}
 
 
 class Server(object):
@@ -190,18 +206,50 @@ def _describe_failure(rc, err):
         first = first[:-2]
     if first.startswith("[") and first.endswith("]"):
         first = first[1:-1]
+    if re.search(r"password|is not valid JSON|Unexpected token|in JSON at position", first,
+                 re.I):
+        # node's JSON.parse errors quote the text around the fault - a corrupt record's
+        # own bytes, password field and all - and this line is printed, and pasted into
+        # tickets. The error's class is enough to say what happened
+        first = "%s (the rest is withheld: it quotes a record)" % first.split(":")[0]
     if first:
         return "exit code %d: %s" % (rc, first)
     return "exit code %d" % rc
 
 
+_RECORDS_HEADER = re.compile(r"^(\d+) record\(s\) found$", re.M)
+
+
 def _ls(args):
-    """(output, "") or (None, why-not). rc 127 is the transport's own 'not found'."""
+    """(output, "") or (None, why-not). rc 127 is the transport's own 'not found'.
+
+    Only what follows db-cli's own 'N record(s) found' header is returned (packages/
+    xo-server/src/db-cli.mjs writes it before the records): anything xo-server's startup
+    logs to stdout ahead of it - @xen-orchestra/log sends INFO to console.info - could
+    carry a lone quote that throws the record scanner off for the whole rest of the
+    output. LOG_LEVEL=warn keeps those lines out to begin with (configure.js reads it).
+
+    A non-zero exit after every record was printed is accepted when the count matches:
+    the tool can die in its shutdown hook (ClientClosedError at Servers._add, measured on
+    the test XOA) with its output already whole.
+    """
+    env = dict(os.environ)
+    env["LOG_LEVEL"] = "warn"
     rc, out, err = transport.run_local_cmd(["xo-server-db", "ls"] + list(args),
-                                           timeout=config.LOCAL_CMD_TIMEOUT * 3)
+                                           timeout=config.LOCAL_CMD_TIMEOUT * 3, env=env)
+    m = _RECORDS_HEADER.search(out or "")
+    body = out[m.end():] if m else out
     if rc != 0:
+        if m and len(scan_records(body)) == int(m.group(1)):
+            transport.debug("xo-server-db exited %d after printing all %s record(s); "
+                            "using them" % (rc, m.group(1)))
+            return body, ""
         return None, _describe_failure(rc, err)
-    return out, ""
+    return body, ""
+
+
+# util.inspect cuts any string over maxStringLength (10000) and says so after it
+_INSPECT_CUT = re.compile(r"\.\.\. \d+ more characters?")
 
 
 def _read_servers():
@@ -284,7 +332,11 @@ def enabled_servers():
         # -n matches EITHER name: a pool can show as XEN-PRIMARY while the server label a
         # user remembers it by is XEN-MAIN-01
         rows.append(Server(rec["host"], name, (pool_name + " " + label).lower(), rec))
-    rows.sort(key=lambda r: _sort_key(r.name))
+    # a fixed tie-break after the name: two pools that compare equal (both "(unnamed)",
+    # or equal once case and accents are folded) must not swap places between runs - the
+    # first is what a cron run checks, and redis set order changes at every restart
+    rows.sort(key=lambda r: (_sort_key(r.name), db_address(r.record),
+                             str(r.record.get("id") or "")))
     return rows
 
 
@@ -374,6 +426,13 @@ def match_record(want, records, resolve_want=False):
         want = parsers.xo_server_address(want)[0]
     if not want:
         return None, ""
+    # Within each kind of evidence the first match wins, so the order decides between two
+    # records that both answer: an ENABLED record before a disabled one (a stale disabled
+    # record must not supply the password while the banner names the live pool), then a
+    # fixed order - redis 7.0 keeps the id set as a hashtable whose iteration order
+    # changes at every restart, so db order is no tie-breaker.
+    records = sorted(records, key=lambda r: (str(r.get("enabled")) != "true",
+                                             db_address(r), str(r.get("id") or "")))
     for rec in records:
         if rec.get("host") == want or _same_address(db_address(rec), want):
             return rec, "host"
@@ -424,6 +483,12 @@ def password_for(host):
     """
     rec, _how = server_for_host(host)
     return record_password(rec)
+
+
+def record_user(rec):
+    """The xapi user XO connects as for this record ('' when not recorded). XO logs in with
+    `server.username` (xen-servers.mjs), and only root's password is root's."""
+    return clean((rec or {}).get("username")) if rec else ""
 
 
 def record_password(rec):
@@ -480,7 +545,13 @@ def collection(namespace):
                                 % (namespace, exc))
         if records is None:
             out, why = _ls([namespace])
-            records = scan_records(out) if out is not None else []
+            if out is not None and _INSPECT_CUT.search(out):
+                # a job's vms/settings longer than 10000 characters (a hand-picked job of
+                # a few hundred VMs) arrives cut short: never parse half a value
+                records, why = [], ("xo-server-db printed some %s values cut short, so "
+                                    "they could not be read whole" % namespace)
+            else:
+                records = scan_records(out) if out is not None else []
         _COLLECTIONS[namespace] = (records, why)
     return _COLLECTIONS[namespace]
 
@@ -506,6 +577,13 @@ def backup_routes(server, pool_uuid, vm_uuids, sr_uuids):
     if proxy_ids:
         proxies, why = collection("proxy")
         known = {} if why else dict((p.get("id"), p.get("name")) for p in proxies)
+        if not why:
+            dangling = [i for i in proxy_ids if i not in known]
+            if dangling:
+                # XO would fail those jobs (callProxyMethod on a proxy it no longer has),
+                # so nothing moves that traffic: it must not read as "through a proxy"
+                return {"error": "backup job(s) pinned to XO Proxy %s, which no longer "
+                                 "exists" % ", ".join(dangling)}
         names = [known.get(i) or i for i in proxy_ids]
     return {"xoa": xoa, "proxies": names, "error": "",
             "http_proxy": parsers.http_proxy_address((server or {}).get("httpProxy"))}

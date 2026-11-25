@@ -35,6 +35,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -42,6 +43,7 @@ import tempfile
 import threading
 import time
 import traceback
+import types
 import unicodedata
 
 
@@ -49,7 +51,7 @@ import unicodedata
 # ======================================================================================
 # --- config ----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "3.27"
+SCRIPT_VERSION = "3.28"
 
 SSH_TIMEOUT = 45                 # ssh connect timeout, seconds
 REMOTE_CMD_TIMEOUT = 300         # max seconds one collector run may take on a host
@@ -73,6 +75,7 @@ DOM0_MAX_USED = 75               # dom0 disk use % allowed before flagging
 DOM0_MEM_USED_MAX_PCT = 65       # dom0 memory use % allowed before flagging
 XOSTOR_MIN_RAM_GB = 15           # minimum dom0 RAM (GB) when XOSTOR is in use
 TIME_SYNC_ALLOWANCE_SECS = 300   # max clock difference between a host and this machine
+RAM_MATCH_TOLERANCE_MB = 256     # dom0 MemTotal this close counts as the same allocation
 
 # Read-Only Filesystems judges the root filesystem, what fstab mounts without asking for ro,
 # and two kinds of mount that are only ever made writable: what SM mounts from a block device
@@ -84,18 +87,22 @@ RO_FS_SR_DIRS = ["/run/sr-mount/", "/var/run/sr-mount/"]
 RO_FS_EXTRA = ["/var/lib/linstor"]
 RO_FS_NATIVE_RO = ["iso9660", "udf", "squashfs", "cramfs", "erofs"]  # read-only by nature
 
-# Long-Running Tasks: a xapi task still pending after this many hours. xapi destroys a pending
-# task itself after pending_task_timeout (86400 s by default, /etc/xapi.conf), so this has to
-# stay under 24 to be able to say anything at all.
+# Long-Running Tasks: a xapi task not finished after this many hours. xapi destroys a task
+# older than pending_task_timeout (86400 s by default) only when its progress has not moved
+# since its previous GC pass (xen-api v26.1.19 db_gc_util.ml timeout_tasks) - a hung task
+# goes at about 24 h, one that keeps creeping can live on and is seen here at any age. A
+# pending_task_timeout override under this threshold destroys a hung task before it can be.
 TASK_PENDING_MAX_HOURS = 16
 
-# Leaf-Coalesce Disabled: a VDI with other-config:leaf-coalesce=false is never leaf-coalesced
+# Leaf-Coalesce Disabled: a VDI with other-config:leaf-coalesce=false is not leaf-coalesced
 # by SM's GC ("Leaf-coalesce disabled for <vdi>"). SM itself writes it (VDI.py
-# disable_leaf_on_secondary) when a storage migration starts mirroring the disk, and writes
-# it again when the mirror is stopped; a migration that completes takes the source disk away
-# with it, one that fails or is cancelled leaves the flag behind for good. Nothing in xapi or
-# XO sets it (xen-api and xen-orchestra master, 2026-11). A disk whose VM or VDI is in one of
-# these operations right now is in the middle of that, and is not counted.
+# disable_leaf_on_secondary) when a storage migration starts mirroring the disk, and again
+# when the mirror is stopped; a migration that completes takes the source disk away with
+# it, one that fails or is cancelled leaves the flag behind - until the disk's next
+# snapshot, whose path removes the key before deciding whether to set it again (SM
+# 1680f106 VDI.py:895-904), or until someone removes it. Nothing in xapi or XO sets it
+# (xen-api and xen-orchestra master, 2026-11). A disk whose VM or VDI is in one of these
+# operations right now is in the middle of that, and is not counted.
 LEAF_COALESCE_BUSY_VM_OPS = ["migrate_send", "pool_migrate", "export", "import"]
 LEAF_COALESCE_BUSY_VDI_OPS = ["mirror", "copy"]
 LEAF_COALESCE_MAX_LINES = 40
@@ -295,6 +302,16 @@ LUN_CHANGE_FILES = [
     "/var/log/kern.log",
 ]
 
+# --- "XO-Server Memory Limit" check ------------------------------------------------------
+# Vates' sizing rule since XO 6.8 (docs, getting-started/troubleshooting.md): the heap limit
+# is 70% of the VM's RAM, 1 GiB minimum. The docs say xo-server sets it itself; on the
+# test XOA (6.9.2, xo-server 5.211.4, 2026-11-25) nothing did - no flag in the unit, its
+# drop-in, the process' argv or NODE_OPTIONS, and no code in xo-server - so the process
+# ran on node's own default (~50% of RAM, at most ~4 GB). The line therefore judges the
+# limit the running process actually has, wherever it came from, against this rule.
+XO_HEAP_TARGET_PCT = 70
+XO_HEAP_MIN_MB = 1024
+
 # --- "XOA Plugins" check ---------------------------------------------------------------
 # Where xo-server looks for plugins, and what it accepts as one. Mirrors
 # packages/xo-server/config.toml's `plugins.lookupPaths` and registerPlugins() in
@@ -302,11 +319,15 @@ LUN_CHANGE_FILES = [
 # `server-` and each entry of `<path>` starting `xo-server-`, and the remainder of the
 # entry name IS the plugin's name. First path that has a name wins.
 #
-# Two of the three shipped lookup paths are relative to the process' cwd, which for a
-# systemd unit with no WorkingDirectory - and xo-server.service sets none - is "/". Hence
-# /node_modules and / here: neither holds a plugin on a stock appliance, and both are a
-# place somebody could put one. Listing "/" is one readdir.
-XO_PLUGIN_LOOKUP_PATHS = ["/usr/local/lib/node_modules", "/node_modules", "/"]
+# In XO's OWN order - xo-server keeps the first path that has a name, so the scan must walk
+# them as it does: config.toml's lookupPaths is ['./node_modules', '../',
+# '/usr/local/lib/node_modules'] (checked on the test XOA), and two of those are relative
+# to the process' cwd, which for a systemd unit with no WorkingDirectory - and
+# xo-server.service sets none - is "/". Hence /node_modules and / first: neither holds a
+# plugin on a stock appliance, and a copy there under a stock name is the one XO loads.
+XO_PLUGIN_LOOKUP_PATHS = ["/node_modules", "/", "/usr/local/lib/node_modules"]
+# where xoa-updater installs Vates' own plugins: a stock name anywhere else is not theirs
+XO_PLUGIN_STOCK_DIR = "/usr/local/lib/node_modules"
 XO_PLUGIN_PREFIX = "xo-server-"
 XO_PLUGIN_SCOPE_DIR = "@xen-orchestra"
 XO_PLUGIN_SCOPE_PREFIX = "server-"
@@ -448,20 +469,14 @@ def cyan(text):
 
 
 def strip_ansi(text):
-    """Defensive: some tools colourise even when told not to."""
-    out = []
-    i = 0
-    n = len(text)
-    while i < n:
-        if text[i] == "\033" and i + 1 < n and text[i + 1] == "[":
-            j = i + 2
-            while j < n and text[j] not in "ABCDEFGHJKSTfmnsulh":
-                j += 1
-            i = j + 1
-            continue
-        out.append(text[i])
-        i += 1
-    return "".join(out)
+    """Defensive: some tools colourise even when told not to.
+
+    An ECMA-48 control sequence is ESC [, parameter bytes 0x30-0x3F, intermediate bytes
+    0x20-0x2F, then exactly ONE final byte 0x40-0x7E. Scanning for a final byte from a
+    short list of letters instead ate real text after any other sequence - after ESC[2d
+    a whole line of xoa-updater output vanished up to the next listed letter. The
+    collector carries the same pattern (collector.ANSI_RE)."""
+    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
 
 
 # ======================================================================================
@@ -552,14 +567,19 @@ def guard(key, fn, *args, **kwargs):
     """Run a check; turn any escaped exception into a yellow Unknown for that line.
 
     A check that blows up must not kill the run and must never be silently skipped -
-    a skipped line reads as 'not applicable', which is a claim of its own.
+    a skipped line reads as 'not applicable', which is a claim of its own. `key` may be a
+    tuple, for a check that prints several lines: each gets its Unknown, so the second
+    line of a check that raised is not simply missing (from --json too).
     """
+    keys = key if isinstance(key, tuple) else (key,)
     try:
         return fn(*args, **kwargs)
     except Exception as exc:  # noqa: BLE001 - deliberate: one bad check, one bad line
         import sys
-        sys.stderr.write("internal error in %s:\n%s\n" % (key, traceback.format_exc()))
-        return unknown(key, "Unknown (internal error: %s)" % exc)
+        sys.stderr.write("internal error in %s:\n%s\n" % (" / ".join(keys),
+                                                         traceback.format_exc()))
+        lines = [unknown(k, "Unknown (internal error: %s)" % exc) for k in keys]
+        return lines[0] if len(lines) == 1 else lines
 
 
 class Fact(object):
@@ -824,22 +844,29 @@ def parse_pending_tasks(text, now, max_age):
 
     Returns None when the listing cannot be read as what xe prints - a record without a
     field it was asked for, or a pending task whose 'created' is not xapi's UTC stamp -
-    else [(name_label, uuid, age_seconds, progress, resident_on)], oldest first. Only a
-    pending task is judged: a finished one is xapi's to clean up.
+    else [(name_label, uuid, age_seconds, progress, resident_on, status)], oldest first.
+
+    Every task xapi does not count as completed is judged - pending, and 'cancelling', a
+    cancel that never finished and still holds its object. xapi's own partition is the same
+    (xen-api v26.1.19 taskHelper.ml status_is_completed: success, failure, cancelled), so a
+    finished task is xapi's to clean up and anything else is not finished.
     """
     old = []
     for rec in parse_xe_records(text):
         if not {"uuid", "name-label", "status", "created", "progress", "resident-on"} <= set(rec):
             return None
-        if rec["status"] != "pending":
+        if rec["status"] in TASK_COMPLETED:
             continue
         created = xapi_utc(rec["created"])
         if created is None:
             return None
         if now - created > max_age:
             old.append((rec["name-label"], rec["uuid"], now - created, rec["progress"],
-                        rec["resident-on"]))
+                        rec["resident-on"], rec["status"]))
     return sorted(old, key=lambda t: -t[2])
+
+
+TASK_COMPLETED = ("success", "failure", "cancelled")
 
 
 def unit_display(name):
@@ -955,9 +982,11 @@ def host_records_from_state_db(rows):
 
 
 def parse_dns_gw_pifs(text):
-    """True when any non-management PIF carries a gateway or a DNS server."""
+    """True when any non-management PIF carries a gateway (IPv4 or IPv6) or a DNS server.
+    An IPv6 default gateway on a storage or VM network is the same second-default-route
+    problem as an IPv4 one."""
     for line in text.splitlines():
-        if not re.match(r"^\s*(gateway|DNS)\s*\([^)]*\)\s*:", line):
+        if not re.match(r"^\s*(gateway|IPv6-gateway|DNS)\s*\([^)]*\)\s*:", line):
             continue
         value = line.split(":", 1)[1].strip() if ":" in line else ""
         if value:
@@ -1011,6 +1040,29 @@ def parse_other_config(text):
 # /proc, timedatectl, df, ip
 # --------------------------------------------------------------------------------------
 
+_HEAP_FLAG_RE = re.compile(r"^--max[-_]old[-_]space[-_]size(?:=(\d+))?$")
+
+
+def node_heap_flag(args):
+    """The --max-old-space-size value (MB) in a list of node arguments, or None.
+
+    V8 takes the flag with dashes or underscores, as `=N` or with N as the next argument,
+    and the LAST occurrence wins - all three are honoured here, so a flag given twice is
+    read the way node reads it."""
+    value = None
+    i = 0
+    while i < len(args):
+        m = _HEAP_FLAG_RE.match(args[i])
+        if m:
+            if m.group(1) is not None:
+                value = int(m.group(1))
+            elif i + 1 < len(args) and args[i + 1].isdigit():
+                value = int(args[i + 1])
+                i += 1
+        i += 1
+    return value
+
+
 def parse_meminfo(text):
     """(total_mb, avail_mb), or None when the numbers are not there.
 
@@ -1029,6 +1081,15 @@ def parse_meminfo(text):
     if avail is None:
         return None
     return (total // 1024, avail // 1024)
+
+
+def parse_mem_total_mb(text):
+    """MemTotal in MiB, or None when it is not there (never 0)."""
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "MemTotal:" and parts[1].isdigit():
+            return int(parts[1]) // 1024 or None
+    return None
 
 
 def parse_timedatectl(text):
@@ -1053,6 +1114,11 @@ def parse_timedatectl(text):
         ntp = "yes"
     elif ntp == "inactive":
         ntp = "no"
+    # 'n/a' is systemd's word for "no NTP service known to me" - an established no
+    if ntp == "n/a":
+        ntp = "no"
+    if sync == "n/a":
+        sync = "no"
     return {"ntp": ntp or "Unknown", "sync": sync or "Unknown"}
 
 
@@ -1368,13 +1434,21 @@ def leaf_coalesce_vdis(vdi_text, vbd_text, vm_text, busy_vm_ops, busy_vdi_ops):
     return disks, busy
 
 
+# The SR other-config switches SM's GC obeys (SM 1680f106 drivers/cleanup.py): each one,
+# set to "false", stops leaf-coalesce on the whole SR - gc stops the GC run outright,
+# coalesce stops every coalesce, leaf-coalesce the leaf ones.
+GC_SR_SWITCHES = ("gc", "coalesce", "leaf-coalesce")
+
+
 def leaf_coalesce_srs(sr_text):
-    """[(uuid, name)] of the SRs whose own other-config says leaf-coalesce: false - GC then
-    leaf-coalesces nothing on that SR ("Leaf-coalesce disabled for this SR")."""
+    """[(uuid, name, [switch, ...])] of the SRs where GC will leaf-coalesce nothing: their
+    own other-config sets one of GC_SR_SWITCHES to false."""
     out = []
     for rec in parse_xe_records(sr_text or ""):
-        if _xe_map(rec.get("other-config")).get("leaf-coalesce", "").lower() == "false":
-            out.append((rec.get("uuid", ""), rec.get("name-label", "")))
+        other = _xe_map(rec.get("other-config"))
+        off = [k for k in GC_SR_SWITCHES if other.get(k, "").lower() == "false"]
+        if off:
+            out.append((rec.get("uuid", ""), rec.get("name-label", ""), off))
     return sorted(out, key=lambda s: (s[1].lower(), s[0]))
 
 
@@ -1410,10 +1484,16 @@ def windows_vm_findings(vm_text, keys):
             continue
         windows += 1
         problems = []
-        if guest_win and not template_win and (ref or base):
+        # wrong template only on positive evidence: a stock template's reference-label
+        # (xapi copies it on clone) that is not a Windows one, or, without a label, the
+        # stock 'Other install media' by name. A custom golden template ('WS2022-gold',
+        # built from an imported VM) carries no label and its own name - not judged.
+        if guest_win and not template_win and (
+                ref or base.lower() == "other install media"):
             problems.append("made from the '%s' template, not a Windows one" % (base or ref))
         platform = _xe_map(rec.get("platform"))
-        short = [k for k in keys if platform.get(k, "").lower() != "true"]
+        # xapi's own reading of a platform boolean: true or 1 (vm_platform.ml is_true)
+        short = [k for k in keys if platform.get(k, "").strip().lower() not in ("true", "1")]
         if short:
             problems.append("platform %s not set to true" % ", ".join(short))
         if problems:
@@ -1503,8 +1583,10 @@ def parse_dm_multipath_maps(text):
 
 
 def multipathd_alive(text):
-    """`multipathd show daemon` says 'pid 1305 running'. Anything else is not an answer."""
-    return bool(re.search(r"\bpid\s+\d+\s+running\b", text or ""))
+    """`multipathd show daemon` says 'pid 1305 running' - or 'idle', which is what newer
+    multipath-tools print between checker passes (0.4.9-136 on both dom0s prints running,
+    measured 20 of 20). startup/configure/shutdown, or anything else, is not an answer."""
+    return bool(re.search(r"\bpid\s+\d+\s+(running|idle)\b", text or ""))
 
 
 def _int_or_none(value):
@@ -1603,18 +1685,22 @@ def parse_pool_conf(text):
     apart from it here, because a caller that could not read the file must not be told
     what the file says.
     """
-    first = (text or "").replace("\r", "").strip().splitlines()
-    if not first:
+    # read the way xapi reads it (xen-api v26.1.19 pool_role.ml read_pool_role): the WHOLE
+    # file trimmed, split on ':', matched case-sensitively - so 'Master', or a role with a
+    # second line under it, is a file xapi starts as broken, not a master
+    whole = (text or "").replace("\r", "").strip()
+    if not whole:
         return (None, None)
-    line = first[0].strip()
-    low = line.lower()
-    if low == "master":
+    parts = whole.split(":")
+    if parts == ["master"]:
         return ("master", None)
-    if low == "broken":
+    if parts == ["broken"]:
         return ("broken", None)
-    if low.startswith("slave:"):
-        addr = re.sub(r"\s+", "", line.split(":", 1)[1])
-        return ("slave", addr) if addr else (None, None)
+    if parts[0] == "slave" and len(parts) > 1:
+        # xapi takes the rest verbatim, empty included (a slave of nothing). Whitespace is
+        # dropped here as it always was - a pointer xapi might stumble on is still judged
+        # by where it points
+        return ("slave", re.sub(r"\s+", "", ":".join(parts[1:])))
     return (None, None)
 
 
@@ -1670,7 +1756,7 @@ def dmesg_issue_lines(text, words, phrases, ignore_rules):
     that matches an issue word.
     """
     lowered_words = [w.lower() for w in words if w]
-    lowered_phrases = [p.lower().strip() for p in phrases if p and p.strip()]
+    lowered_phrases = [_normalise(p).strip() for p in phrases if p and p.strip()]
     rules = _ignore_rules(ignore_rules)
     word_res = [_word_re(w) for w in lowered_words]
 
@@ -1688,8 +1774,11 @@ def dmesg_issue_lines(text, words, phrases, ignore_rules):
 
 
 def find_phrase_lines(text, phrase):
-    low = phrase.lower()
-    return [i for i, line in enumerate(text.splitlines(), 1) if low in line.lower()]
+    """1-based numbers of the lines containing phrase - case and runs of whitespace
+    ignored on both sides, the way every other dmesg match here is made."""
+    want = _normalise(phrase).strip()
+    return [i for i, line in enumerate(text.splitlines(), 1)
+            if want and want in _normalise(line)]
 
 
 def context_block(text, line_numbers, ctx=3, rollup=False, max_lines=None, rollup_min=3):
@@ -1864,8 +1953,9 @@ def manifest_packages(text):
 
 def leading_version(text):
     """'9.2.11' out of '9.2.11-1.xcpng8.3', '9.2.11_4.19.0+1' or '9.2.11 (api:2)' -
-    the part the module and its rpm both carry, so the two can be compared."""
-    m = re.match(r"\s*(\d+(?:\.\d+)*)", text or "")
+    the part the module and its rpm both carry, so the two can be compared. An rpm epoch
+    ('1:9.2.11-1') is skipped: the module has none, and '1' is not its version."""
+    m = re.match(r"\s*(?:\d+:)?(\d+(?:\.\d+)*)", text or "")
     return m.group(1) if m else ""
 
 
@@ -2003,6 +2093,8 @@ def plugin_block(third_party, autoload, autoload_known):
         out.append("    %s" % plugin["path"])
         if plugin["link"]:
             out.append("    -> %s" % plugin["link"])
+        if plugin.get("why"):
+            out.append("    (%s)" % plugin["why"])
     return "\n".join(out)
 
 
@@ -2084,7 +2176,7 @@ def _ids_among(ids, known):
     return any(i in known for i in ids)
 
 
-def job_touches_pool(job, pool_uuid, vm_uuids, sr_uuids):
+def job_touches_pool(job, pool_uuid, vm_uuids, sr_uuids, schedule_ids=None):
     """Does this XO job move data to or from this pool? True, False, or None when that
     cannot be told from here.
 
@@ -2113,13 +2205,23 @@ def job_touches_pool(job, pool_uuid, vm_uuids, sr_uuids):
     ids = xo_simple_ids(vms)
     if ids is not None:
         answers.append(_ids_among(ids, vm_uuids))
-    elif isinstance(vms, dict) and "$pool" not in vms:
-        answers.append(True)
-    elif isinstance(vms, dict) and pool_uuid:
-        try:
-            answers.append(xo_pattern_match(vms["$pool"], pool_uuid))
-        except ValueError:
-            answers.append(None)
+    elif isinstance(vms, dict):
+        # smart mode: VMs matched by a pattern. Definitely this pool only when nothing but
+        # the pool (if anything) narrows it; with tags or any other filter, this pool's
+        # VMs may all fall outside it - "may touch", which can keep the XOA in the answer
+        # but must never take it out (a proxied tag-only job used to read green)
+        narrowed = [k for k in vms if k not in ("type", "$pool")]
+        if "$pool" in vms:
+            if not pool_uuid:
+                answers.append(None)
+            else:
+                try:
+                    hit = xo_pattern_match(vms["$pool"], pool_uuid)
+                except ValueError:
+                    hit = None
+                answers.append(None if (hit and narrowed) else hit)
+        else:
+            answers.append(None if narrowed else True)
     else:
         answers.append(None)
 
@@ -2130,9 +2232,15 @@ def job_touches_pool(job, pool_uuid, vm_uuids, sr_uuids):
 
     settings = job_field(job, "settings")
     if isinstance(settings, dict):
-        restore_into = [s.get("healthCheckSr") for s in settings.values()
-                        if isinstance(s, dict) and isinstance(s.get("healthCheckSr"), str)]
-        answers.append(_ids_among(restore_into, sr_uuids))
+        # XO restores into job.settings[schedule.id].healthCheckSr, falling back to the
+        # job-wide '' entry: a match there is definite only for '' or a schedule that runs;
+        # any other entry's is "may"
+        for key, entry in settings.items():
+            if not (isinstance(entry, dict) and isinstance(entry.get("healthCheckSr"), str)):
+                continue
+            hit = _ids_among([entry["healthCheckSr"]], sr_uuids)
+            definite = key == "" or (schedule_ids is not None and key in schedule_ids)
+            answers.append(hit if (hit is not True or definite) else None)
 
     if True in answers:
         return True
@@ -2146,29 +2254,38 @@ def backup_runners(jobs, schedules, pool_uuid, vm_uuids, sr_uuids):
 
     A job counts when one of its schedules is enabled - a job whose every schedule is off
     moves nothing - and every job counts when the schedules could not be read
-    (schedules=None). A job whose reach cannot be told counts as touching the pool, so an
-    unreadable job can keep the XOA in the answer but never take it out. And the XOA is
-    the default: with no job touching the pool, what moves its data is whatever somebody
-    starts from XOA - an export, a restore - so it is the XOA that needs the network.
+    (schedules=None). The XOA is the default: with no job touching the pool, what moves
+    its data is whatever somebody starts from XOA - an export, a restore - so it is the
+    XOA that needs the network.
+
+    Three-valued, and asymmetric on purpose. An XOA-run job that touches the pool, or MAY
+    (its reach cannot be told), keeps the XOA in the answer. Only a proxied job KNOWN to
+    touch the pool takes it out: an unreadable or may-touch proxied job used to, so a pool
+    whose VM list could not be read, or whose only job was a proxied tag-filtered one,
+    read green off facts that were never established.
     """
     active = None
     if schedules is not None:
         active = set(s.get("jobId") for s in schedules
                      if s.get("enabled") is True or s.get("enabled") == "true")
-    xoa, touched, proxies = False, False, []
+        schedule_ids = set(s.get("id") for s in schedules
+                           if s.get("enabled") is True or s.get("enabled") == "true")
+    else:
+        schedule_ids = None
+    xoa, proxies = False, []
     for job in jobs:
         if active is not None and job.get("id") not in active:
             continue
-        if job_touches_pool(job, pool_uuid, vm_uuids, sr_uuids) is False:
+        reach = job_touches_pool(job, pool_uuid, vm_uuids, sr_uuids, schedule_ids)
+        if reach is False:
             continue
-        touched = True
         proxy = job_field(job, "proxy")
         if isinstance(proxy, str) and proxy:
-            if proxy not in proxies:
+            if reach is True and proxy not in proxies:
                 proxies.append(proxy)
         else:
             xoa = True
-    return (xoa or not touched), proxies
+    return (xoa or not proxies), proxies
 
 
 def http_proxy_address(url):
@@ -2242,10 +2359,20 @@ class Host(object):
         used_mb = total_mb - avail_mb if total_mb >= avail_mb else 0
         return (total_mb, used_mb)
 
+    def mem_total_mb(self):
+        """MemTotal in MiB, or None. Only MemTotal: comparing dom0 sizes across hosts needs
+        nothing else, and memory() would also demand MemAvailable."""
+        f = self.fact("meminfo")
+        if not f.ok:
+            return None
+        return parsers.parse_mem_total_mb(f.value)
+
     def ntp_state(self):
+        """{"ntp", "sync"} as timedatectl says them, plus "error" when it could not be read -
+        the reason travels with the Unknown rather than being dropped here."""
         f = self.fact("timedatectl")
         if not f.ok:
-            return {"ntp": "Unknown", "sync": "Unknown"}
+            return {"ntp": "Unknown", "sync": "Unknown", "error": f.error}
         return parsers.parse_timedatectl(f.value)
 
     def clock_drift(self):
@@ -2260,7 +2387,8 @@ class Host(object):
         return abs(self.local_now - f.value)
 
     def pool_role(self):
-        """('master', None) | ('slave', address) | (None, None)."""
+        """('master', None) | ('slave', address) | ('broken', None) | (None, None) - the
+        last for a file that could not be read or that xapi itself would read as broken."""
         f = self.fact("pool_conf")
         if not f.ok:
             return (None, None)
@@ -2281,6 +2409,9 @@ class Pool(object):
     def fact(self, key):
         node = self.payload.get(key)
         if node is None:
+            if self.payload.get("ok") is False and self.payload.get("error"):
+                # the whole pool collection failed: every pool fact carries its reason
+                return result.Fact(False, error=self.payload["error"])
             return result.Fact(False, error="not collected")
         return result.wrap(self.payload, key)
 
@@ -2290,36 +2421,6 @@ class Pool(object):
     def xostor_in_use(self):
         f = self.fact("xostor_srs")
         return bool(f.ok and f.value)
-
-
-def ram_match(hosts):
-    """True when every host we could read reports the same dom0 RAM, to the nearest GB.
-
-    Hosts whose memory we could not read are skipped rather than counted as a mismatch:
-    unknown is not a difference.
-    """
-    seen = set()
-    for host in hosts:
-        mem = host.memory()
-        if mem is None:
-            continue
-        seen.add(int(mem[0] / 1024.0 + 0.5))
-    return len(seen) <= 1
-
-
-def ntp_match(hosts):
-    """True when every collected host has NTP on, says it is synchronised, and agrees
-    with our clock inside the allowance."""
-    for host in hosts:
-        if not host.reachable:
-            continue
-        state = host.ntp_state()
-        if state["ntp"] != "yes" or state["sync"] != "yes":
-            return False
-        drift = host.clock_drift()
-        if drift is None or drift > config.TIME_SYNC_ALLOWANCE_SECS:
-            return False
-    return True
 
 
 # ======================================================================================
@@ -2367,6 +2468,7 @@ import errno
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -2418,6 +2520,19 @@ KILL_GRACE = 5
 WATCHDOG_GRACE = 15
 
 
+_TEXT = type(u"")
+
+
+def _arg_text(arg):
+    """One argv element as text. str() would ASCII-encode a 2.7 unicode argument - a mount
+    point with an accented name - and raise."""
+    if isinstance(arg, _TEXT):
+        return arg
+    if isinstance(arg, bytes):
+        return arg.decode("utf-8", "replace")
+    return str(arg)
+
+
 def _argv_text(argv):
     """Enough of an argv to identify it, on one line.
 
@@ -2426,21 +2541,40 @@ def _argv_text(argv):
     newlines, and a long one is elided in the MIDDLE rather than the tail: the path is at
     the end, and "a grep took 90 seconds" is not an answer without the file it was reading.
     """
-    text = " ".join(" ".join(str(arg).split()) for arg in argv)
+    text = " ".join(" ".join(_arg_text(arg).split()) for arg in argv)
     if len(text) > 110:
         text = text[:60] + " ... " + text[-45:]
     return text
 
 
+def _mono():
+    """Seconds on a clock nothing can step. The run budget is measured on it: chronyd or
+    an admin correcting the wall clock mid-run - on exactly the hosts the NTP lines are
+    about - would otherwise make the budget jump, refusing every later command at once or
+    outliving the transport's own timeout. time.monotonic on 3.3+; on 2.7 the kernel's
+    uptime, which is the same clock."""
+    if hasattr(time, "monotonic"):
+        return time.monotonic()
+    try:
+        f = open("/proc/uptime", "rb")
+        try:
+            return float(f.read().split()[0])
+        finally:
+            f.close()
+    except (IOError, OSError, ValueError, IndexError):
+        return time.time()
+
+
 def timed(argv, started):
-    """Record one command's elapsed seconds, with enough argv to identify it."""
-    TIMINGS.append([round(time.time() - started, 2), _argv_text(argv)])
+    """Record one command's elapsed seconds, with enough argv to identify it. `started`
+    is a _mono() reading."""
+    TIMINGS.append([round(_mono() - started, 2), _argv_text(argv)])
 
 
 def budget_left():
     if DEADLINE[0] is None:
         return None
-    return DEADLINE[0] - time.time()
+    return DEADLINE[0] - _mono()
 
 
 # --------------------------------------------------------------------------------------
@@ -2493,6 +2627,13 @@ def _decode(b):
     return b
 
 
+# Every child running right now, so a SIGTERM to the collector can take them with it: each
+# is in its own session (setsid), so nothing else would. A dict used as a set, guarded by
+# its lock - run() threads and the signal handler both touch it.
+LIVE = {}
+LIVE_LOCK = threading.Lock()
+
+
 def _popen(argv, stdout=subprocess.PIPE):
     devnull = open(os.devnull, "rb")
     try:
@@ -2504,23 +2645,53 @@ def _popen(argv, stdout=subprocess.PIPE):
         }
         if hasattr(os, "setsid"):
             # own process group, so a timeout kills the whole tree and not just the
-            # front of a pipeline - the same reason bash used 'timeout -k 5'
-            kwargs["preexec_fn"] = os.setsid
-        return subprocess.Popen(argv, **kwargs), devnull
+            # front of a pipeline - the same reason bash used 'timeout -k 5'. On 3.x the
+            # setsid happens in C: preexec_fn runs Python between fork and exec, which is
+            # not safe in a process that always has other threads (the watchdog)
+            if sys.version_info[0] >= 3:
+                kwargs["start_new_session"] = True
+            else:
+                kwargs["preexec_fn"] = os.setsid
+        if os.name == "posix":
+            # bytes, so an argument that is not ASCII (an accented mount point) reaches
+            # exec whatever the locale: 2.7 would encode unicode as ASCII and raise, and
+            # 3.6 under LANG=C encodes with the ascii filesystem codec and raises too
+            argv = [a.encode("utf-8") if isinstance(a, _TEXT) else a for a in argv]
+        proc = subprocess.Popen(argv, **kwargs)
+        with LIVE_LOCK:
+            LIVE[proc.pid] = proc
+        return proc, devnull
     except Exception:
         devnull.close()
         raise
 
 
+def _forget(proc):
+    with LIVE_LOCK:
+        LIVE.pop(proc.pid, None)
+
+
 def _kill(proc):
+    """SIGKILL the child's process group. True when the signal was delivered (or the group
+    is already gone); False when it could not be sent, so run() does not blame the host's
+    storage for a kill that never happened. setsid made the child its group's leader, so
+    its pid is the group id."""
     try:
         if hasattr(os, "killpg"):
-            os.killpg(os.getpgid(proc.pid), 9)
+            os.killpg(proc.pid, 9)
         else:
             proc.kill()
+        return True
     except OSError as exc:
-        if exc.errno != errno.ESRCH:
-            pass
+        return exc.errno == errno.ESRCH
+
+
+def kill_live_children():
+    """Every running child's group, SIGKILLed - for the SIGTERM/SIGHUP handler."""
+    with LIVE_LOCK:
+        procs = list(LIVE.values())
+    for proc in procs:
+        _kill(proc)
 
 
 def run(argv, timeout=DEFAULT_CMD_TIMEOUT):
@@ -2544,14 +2715,17 @@ def run(argv, timeout=DEFAULT_CMD_TIMEOUT):
     next fact. One line then reads Unknown with the reason, instead of every line about
     that host disappearing.
     """
-    started = time.time()
+    started = _mono()
     timeout = _clamp(timeout)
     if timeout is None:
         timed(argv, started)
-        return Ran(124, "", "run budget exhausted", True)
+        # never started, so no exit status: rc None is why()'s "say the reason" shape, and
+        # "timed out" would claim the command ran and hung
+        return Ran(None, "", "not run - the run budget was used up", False)
     try:
         proc, devnull = _popen(argv)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
+        # ValueError: an argument Popen could not encode (UnicodeEncodeError is one)
         timed(argv, started)
         return Ran(127, "", "%s: %s" % (argv[0], exc), False)
 
@@ -2574,8 +2748,9 @@ def run(argv, timeout=DEFAULT_CMD_TIMEOUT):
     worker.join(timeout)
 
     killed = worker.is_alive()
+    delivered = True
     if killed:
-        _kill(proc)
+        delivered = _kill(proc)
         worker.join(KILL_GRACE)      # a killable child dies here and the thread ends
 
     abandoned = worker.is_alive()
@@ -2585,8 +2760,11 @@ def run(argv, timeout=DEFAULT_CMD_TIMEOUT):
 
     if abandoned:
         ABANDONED.append(_argv_text(argv))
+        if not delivered:
+            return Ran(124, "", "timed out, and the kill could not be sent", True)
         return Ran(124, "", "did not die when killed - uninterruptible, so the host's "
                             "storage or a mount is most likely wedged", True)
+    _forget(proc)
     if "failed" in box:
         return Ran(127, "", box["failed"], False)
     return Ran(proc.returncode, _decode(box.get("out")), _decode(box.get("err")), killed)
@@ -2618,7 +2796,7 @@ def which(name):
 XAPI_WEDGED = [""]
 
 
-def xe(args, timeout=DEFAULT_CMD_TIMEOUT):
+def xe(args, timeout=DEFAULT_CMD_TIMEOUT, canary=True):
     """One xe command - or, once xapi has sat on one until it timed out, not.
 
     A wedged xapi accepts the connection and never answers, so every call waits out its
@@ -2630,14 +2808,44 @@ def xe(args, timeout=DEFAULT_CMD_TIMEOUT):
     the budget is gone, not that xapi is, and run() already answers every later call with
     exactly that. A refused connection does not count either: it fails in milliseconds,
     so every call can go on reporting its own reason, which is the more useful answer.
+
+    canary=False is for the listings whose size grows with the pool (every VM, VDI, VBD,
+    task): one of them taking its whole timeout on a big, busy pool says the pool is big,
+    not that xapi is wedged, and must not cost every later question its answer.
     """
     if XAPI_WEDGED[0]:
         return Ran(None, "", "not asked - xapi did not answer %s" % XAPI_WEDGED[0], False)
     full = _clamp(timeout) == timeout
     r = run(["xe"] + list(args), timeout=timeout)
-    if r.timed_out and full:
+    if canary and r.timed_out and full:
         XAPI_WEDGED[0] = "'xe %s' within %ds" % (args[0], timeout)
     return r
+
+
+def read_bounded(path, timeout=2.0, limit=None):
+    """read_file on a thread given up after `timeout`: (text or None, answered).
+
+    For the /proc files of a process in D state that take THAT process's locks - io and
+    stack take its cred_guard_mutex, which execve holds while it opens the binary, and
+    cmdline takes its mmap_sem (linux 4.19 fs/proc/base.c) - so a process exec'ing off a
+    dead mount blocks a plain read of them, with no timeout, on the very host this is
+    diagnosing. A read that does not answer is left behind on its daemon thread.
+    """
+    box = {}
+
+    def reader():
+        box["text"] = read_file(path) if limit is None else read_file(path, limit)
+
+    worker = threading.Thread(target=reader)
+    worker.daemon = True
+    CURRENT[0] = "read " + path
+    worker.start()
+    worker.join(timeout)
+    CURRENT[0] = ""
+    if worker.is_alive():
+        ABANDONED.append("read " + path)
+        return None, False
+    return box.get("text"), True
 
 
 def read_file(path, limit=None):
@@ -2692,7 +2900,9 @@ def short_hostname():
 def collect_identity():
     out = {}
     out["now"] = fact(time.time())
-    out["hostname"] = fact(short_hostname())
+    name = short_hostname()
+    # an empty name is "could not tell", not a host called ""
+    out["hostname"] = fact(name) if name else err("hostname answered nothing")
     out["os_release"] = os_release()
 
     uuid = inventory_uuid()
@@ -2826,11 +3036,70 @@ def collect_dmesg():
     return fact(r.out)
 
 
-def collect_df():
-    r = run(["df", "-hP"], timeout=30)
-    if not r.ok:
-        return err("df failed (%s)" % r.why())
-    return fact(r.out)
+# Filesystems df leaves out by default (no blocks, or not storage at all). tmpfs and
+# devtmpfs stay in, as df shows them; the report skips them by name.
+DF_PSEUDO = set(["proc", "sysfs", "devpts", "cgroup", "cgroup2", "securityfs", "debugfs",
+                 "tracefs", "pstore", "mqueue", "hugetlbfs", "configfs", "fusectl",
+                 "binfmt_misc", "autofs", "rpc_pipefs", "nfsd", "bpf", "rootfs",
+                 "selinuxfs", "xenfs", "efivarfs"])
+
+
+def collect_df(network_types=None):
+    """Every local filesystem's usage in df's own layout - without running df.
+
+    df statfs()es every mount, network SRs included, and coreutils 8.22 also stat()s every
+    mount point to tell duplicates apart - even under -l (measured on 8.3: three calls on
+    /run/sr-mount NFS paths). A mount whose server has gone parks it in D state for good:
+    the line is lost to a timeout, and every run leaves one more unkillable df that the
+    next run counts as a stuck process. Network mounts are Network Mounts' business, which
+    probes them deliberately and names the dead one. So this reads /proc/mounts - kernel
+    memory, never blocking - and statvfs()es local filesystems only, whose counters are in
+    memory too.
+
+    Use% is df's own arithmetic: used / (used + available to non-root), rounded up. A
+    local mount that cannot be read is listed in "failed" - not left out, which would read
+    as a filesystem with room on it.
+    """
+    text = read_file("/proc/mounts")
+    if text is None:
+        return err("could not read /proc/mounts")
+    network = set(network_types or [])
+    rows, failed, by_dev = [], [], {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        source, target, fstype = parts[0], _unescape_mount(parts[1]), parts[2]
+        if fstype in network or fstype in DF_PSEUDO or fstype.startswith("fuse"):
+            continue
+        if target.startswith("/run/sr-mount/") or target.startswith("/var/run/sr-mount/"):
+            continue                      # SRs: storage, not dom0's (and the report agrees)
+        try:
+            st = os.statvfs(target)
+            dev = os.stat(target).st_dev
+        except OSError as exc:
+            failed.append("%s (%s)" % (target, exc.strerror or exc))
+            continue
+        if not st.f_blocks:
+            continue
+        unit = float(st.f_frsize or st.f_bsize or 1024) / 1024
+        used = st.f_blocks - st.f_bfree
+        total = used + st.f_bavail
+        pct = "-" if total <= 0 else "%d%%" % ((used * 100 + total - 1) // total)
+        row = [source, int(st.f_blocks * unit), int(used * unit), int(st.f_bavail * unit),
+               pct, target]
+        # one filesystem mounted twice (a bind mount) is one row, under its shortest path
+        # - df's own rule - so a full disk is not reported twice
+        if dev in by_dev:
+            index = by_dev[dev]
+            if len(target) < len(rows[index][5]):
+                rows[index] = row
+            continue
+        by_dev[dev] = len(rows)
+        rows.append(row)
+    lines = ["Filesystem 1K-blocks Used Available Use% Mounted on"]
+    lines.extend("%s %d %d %d %s %s" % tuple(row) for row in rows)
+    return fact({"text": "\n".join(lines) + "\n", "failed": failed})
 
 
 def collect_failed_units():
@@ -3022,16 +3291,50 @@ def _proc_io(pid):
 
     "" when the kernel was built without CONFIG_TASK_IO_ACCOUNTING, which is not an error:
     it then contributes no evidence in either direction and the CPU figure decides alone.
+
+    Read on a bounded thread: io takes the process's cred_guard_mutex, which a process
+    exec'ing off a dead mount holds. One that does not answer reads as a fixed text, so
+    two samples of it compare equal and the CPU figure decides - and a process whose io
+    cannot be read is itself evidence of where it is stuck.
     """
-    return read_file("/proc/%d/io" % pid) or ""
+    text, answered = read_bounded("/proc/%d/io" % pid)
+    if not answered:
+        return "(io not readable)"
+    return text or ""
+
+
+# PF_KTHREAD from include/linux/sched.h (4.19): the kernel's own word on what a kernel
+# thread is. An empty cmdline is not the same thing - a userspace task that has already
+# released its memory (stuck in exit on a dead mount, after a kill -9) has one too.
+PF_KTHREAD = 0x00200000
+
+
+def proc_flags(text):
+    """The flags field (9th) of one /proc/PID/stat, or None."""
+    close = (text or "").rfind(")")
+    if close < 0:
+        return None
+    rest = text[close + 1:].split()
+    try:
+        return int(rest[6])
+    except (IndexError, ValueError):
+        return None
+
+
+def proc_comm(text):
+    """The comm field of /proc/PID/stat - the name between the parentheses."""
+    text = text or ""
+    start, close = text.find("("), text.rfind(")")
+    return text[start + 1:close] if 0 <= start < close else ""
 
 
 def _d_state_procs(pids=None):
     """{pid: (starttime, cpu_ticks, io)} for the processes in uninterruptible sleep now.
 
-    Everything read here is served out of kernel memory by procfs, so none of it can block
-    on the very mount being investigated - which is the whole reason this is the primary
-    signal rather than stat()ing mount points and seeing what hangs.
+    /proc/PID/stat is served out of kernel memory without taking the process's locks, so
+    the scan itself cannot block on the very mount being investigated - which is the whole
+    reason this is the primary signal rather than stat()ing mount points and seeing what
+    hangs. io is the exception, and is read on a bounded thread (see _proc_io).
 
     The value carries the identity AND the progress evidence, so two samples compare with
     a single ==: the same process (starttime pins it - a pid freed and reused in between
@@ -3057,16 +3360,44 @@ def _d_state_procs(pids=None):
 
 
 def _proc_cmdline(pid):
-    """The command, or "" for a kernel thread - which is how kernel threads are told apart.
+    """The command line, or "" when it is empty or could not be read.
 
     NUL-separated, and deliberately not /proc/PID/cmdline's neighbours cwd/exe/root: those
     are symlinks INTO the filesystem, so resolving one belonging to a process stuck on a
-    dead mount blocks this collector in exactly the way it is here to detect.
+    dead mount blocks this collector in exactly the way it is here to detect. cmdline
+    itself takes the process's mmap_sem, so it is read on a bounded thread too.
     """
-    raw = read_file("/proc/%d/cmdline" % pid)
+    raw, _answered = read_bounded("/proc/%d/cmdline" % pid)
     if not raw:
         return ""
     return " ".join(part for part in raw.split("\0") if part).strip()
+
+
+# argv prefixes of the commands this collector runs that can be left parked in D state by
+# a run - abandoned when their SIGKILL did not take. A later run names them as this tool's
+# own leavings, the way it names the mount probe, rather than counting one more foreign
+# stuck process per run.
+# Each is anchored on the exact argv the collector builds (cmdline is NUL-separated, read
+# back space-joined), so an admin's own `sed -n` or `rpm -qa` is never taken for ours.
+OWN_COMMANDS = [re.compile(p) for p in (
+    r"^df -hP$",
+    r"^pvs --noheadings --separator \| -o pv_name,vg_name,pv_attr,pv_uuid$",
+    r"^tap-ctl list$",
+    r"^multipathd show (daemon|maps raw format|paths raw format) ",
+    r"^multipathd show daemon$",
+    r"^dmsetup ls --target multipath$",
+    r"^grep -ainF -e .* -- /var/log/",
+    r"^grep -ai hidden leaf /var/log/SMlog$",
+    r"^sed -n \d+,\d+p;\d+q /var/log/",
+    r"^yum (--setopt=exit_on_lock=1 )?check-update -q$",
+    r"^rpm -qa? --qf ",
+    r"^ovs-appctl lacp/show$",
+    r"^dmesg -T$",
+)]
+
+
+def _own_command(cmd):
+    return bool(cmd) and (MOUNT_PROBE_MARK in cmd or any(p.match(cmd) for p in OWN_COMMANDS))
 
 
 # The mount probe never returns on a dead mount, so it is left parked in D state and the
@@ -3145,11 +3476,21 @@ def collect_stuck_processes(spec):
 
     rows = []
     for pid, seen in watching.items():
-        stack = read_file("/proc/%d/stack" % pid) or ""
+        # stack takes the process's cred_guard_mutex, so bounded like io and cmdline
+        stack, _answered = read_bounded("/proc/%d/stack" % pid)
+        stack = stack or ""
+        stat = read_file("/proc/%d/stat" % pid) or ""
+        flags = proc_flags(stat)
+        cmd = _proc_cmdline(pid)[:120]
         rows.append({
             "pid": pid,
             "age": int(now - (seen[0] / ticks)),
-            "cmd": _proc_cmdline(pid)[:120],
+            "cmd": cmd,
+            "comm": proc_comm(stat)[:40],
+            # None when the flags could not be read: the report then falls back to the
+            # empty-cmdline reading, saying which it used
+            "kernel": (bool(flags & PF_KTHREAD) if flags is not None else None),
+            "own": _own_command(cmd),
             "module": fs_module_of(stack),
             "frame": (stack.splitlines() or [""])[0].strip()[:120],
         })
@@ -3158,11 +3499,12 @@ def collect_stuck_processes(spec):
     # tally taken from the sample would be printed as if it described the whole, and on
     # the host this was built for that is 24 of 25 shown being reported as 24 of 589
     return fact({"total": len(rows),
-                 "userspace": len([row for row in rows if row["cmd"]]),
-                 # the script's own probes from earlier runs, counted rather than hidden:
+                 "userspace": len([row for row in rows
+                                   if not (row["kernel"] if row["kernel"] is not None
+                                           else not row["cmd"])]),
+                 # the script's own leavings from earlier runs, counted rather than hidden:
                  # they really are stuck, and they really were left by this tool
-                 "own_probes": len([row for row in rows
-                                    if MOUNT_PROBE_MARK in (row["cmd"] or "")]),
+                 "own_probes": len([row for row in rows if row["own"]]),
                  "watched": int(watched),
                  "rows": rows[:cap] if cap else rows})
 
@@ -3206,10 +3548,10 @@ def collect_network_mounts(spec):
             row["why"] = ("not enough of the run budget left to wait %ds for an answer"
                           % timeout)
         else:
-            started = time.time()
+            started = _mono()
             r = run(["stat", "-c", MOUNT_PROBE_MARK + " %i", "--", target],
                     timeout=timeout)
-            row["seconds"] = round(time.time() - started, 2)
+            row["seconds"] = round(_mono() - started, 2)
             if r.ok:
                 row["state"] = "ok"
             elif r.timed_out:
@@ -3243,10 +3585,10 @@ def collect_lacp():
     """ovs-appctl answers rc 0 with empty output when there are simply no LACP bonds,
     and rc != 0 when it cannot reach ovs-vswitchd at all. Those are different facts."""
     r = run(["ovs-appctl", "lacp/show"], timeout=30)
-    if r.timed_out:
-        return err("could not query Open vSwitch (timed out)")
-    if r.rc != 0:
-        return err("could not query Open vSwitch")
+    if not r.ok:
+        # ovs-vswitchd down, ovs-appctl missing, the control socket refusing: why() says
+        # which, rather than one sentence for all of them
+        return err("could not query Open vSwitch (%s)" % r.why())
     return fact(r.out)
 
 
@@ -3440,49 +3782,56 @@ def collect_coredumps(coredump_dir):
     return fact(rows)
 
 
+TASK_TIMEOUT_CONF = "/etc/xapi.conf"
 TASK_TIMEOUT_CONF_DIR = "/etc/xapi.conf.d"
-_TASK_TIMEOUT_RE = re.compile(r"^\s*pending_task_timeout\s*=(.*)$")
+_TASK_TIMEOUT_RE = re.compile(r"^\s*pending_task_timeout[ \t]*=[ \t]*(.*)$")
 
 
 def task_timeout_values(text):
-    """The pending_task_timeout settings in one drop-in file's text.
-
-    All whitespace is stripped out of the value rather than just trimmed, so a setting
-    written as '1 hour' is reported as '1hour' - which is what the bash script this was
-    ported from does, and the line is a verbatim echo of the override either way.
-    A commented-out setting cannot match: the key has to start the line.
+    """The pending_task_timeout settings in one xapi config file, read the way xapi
+    reads it (xen-api v26.1.19 xcp_service.ml Config_file): everything from the first '#'
+    is a comment - inline ones too - trailing whitespace goes, and one pair of surrounding
+    quotes is stripped. A commented-out setting cannot match: the key has to start the
+    line once the comment is gone.
     """
     values = []
     for line in text.replace("\r", "").split("\n"):
-        m = _TASK_TIMEOUT_RE.match(line)
+        m = _TASK_TIMEOUT_RE.match(line.split("#", 1)[0].rstrip())
         if not m:
             continue
-        value = re.sub(r"\s+", "", m.group(1))
+        value = m.group(1).strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
         if value:
             values.append(value)
     return values
 
 
 def collect_task_timeout_override():
-    """xapi's default pending_task_timeout lives in /etc/xapi.conf; a drop-in under
-    /etc/xapi.conf.d/ can override it for this host.
+    """Every pending_task_timeout xapi will read on this host, in the order it reads them -
+    /etc/xapi.conf, then every entry of /etc/xapi.conf.d sorted, dot-files included
+    (xen-api read_config_file parses everything Sys.readdir returns); the last one wins.
 
-    No directory and no matching line are both real answers ('no override'), which is why
-    they return an empty list rather than an error - but a directory we cannot read is
-    NOT, and says so, because 'no override found' would be a claim we did not establish.
-    Dot-files are skipped: the shell glob this replaces did not match them either, and
-    an editor's leftover .swp is not a live configuration file.
+    A value from /etc/xapi.conf itself is labelled with that file: XCP-ng ships the line
+    there commented out, so an uncommented one is an edit of the shipped file rather than
+    a drop-in. No directory and no matching line are both real answers ('no override'),
+    which is why they return an empty list rather than an error - but a file or directory
+    we cannot read is NOT, and says so, because 'no override found' would be a claim we
+    did not establish.
     """
+    values = []
+    if os.path.exists(TASK_TIMEOUT_CONF):
+        text = read_file(TASK_TIMEOUT_CONF)
+        if text is None:
+            return err("could not read %s" % TASK_TIMEOUT_CONF)
+        values.extend("%s (in %s)" % (v, TASK_TIMEOUT_CONF) for v in task_timeout_values(text))
     if not os.path.isdir(TASK_TIMEOUT_CONF_DIR):
-        return fact([])
+        return fact(values)
     try:
         names = sorted(os.listdir(TASK_TIMEOUT_CONF_DIR))
     except OSError as exc:
         return err("could not list %s (%s)" % (TASK_TIMEOUT_CONF_DIR, exc))
-    values = []
     for name in names:
-        if name.startswith("."):
-            continue
         path = os.path.join(TASK_TIMEOUT_CONF_DIR, name)
         if not os.path.isfile(path):
             continue
@@ -3503,19 +3852,36 @@ def collect_smapi_hidden_leaves():
         return err("grep on SMlog timed out")
     if r.rc not in (0, 1):
         return err("grep on SMlog failed (%s)" % r.why())
-    seen = {}
-    out = []
-    for line in r.out.splitlines():
-        if line in seen:
-            continue
-        seen[line] = 1
-        out.append(line)
-    return fact(out)
+    return fact(dedupe_hidden_leaves(r.out))
+
+
+def dedupe_hidden_leaves(text):
+    """One line per hidden leaf, the latest, with how often SM logged it.
+
+    Every SMlog line carries its timestamp and [pid][thread], so de-duplicating whole lines
+    never collapsed anything: a leaf that stays hidden is logged by every scan of its SR,
+    all day ("Scan found hidden leaf (<vdi>), ignoring" - SM 1680f106 LVMSR/FileSR). Keyed
+    on the uuid in the parentheses, else on the text after the [pid][thread] prefix.
+    """
+    order, last, count = [], {}, {}
+    for line in (text or "").splitlines():
+        m = re.search(r"hidden leaf \(([^)]+)\)", line, re.I)
+        if m:
+            key = m.group(1)
+        else:
+            key = re.sub(r"^.*?SM: (\[[^\]]*\])*\s*", "", line)
+        if key not in last:
+            order.append(key)
+        last[key] = line
+        count[key] = count.get(key, 0) + 1
+    return [last[k] + ("   (logged %d times)" % count[k] if count[k] > 1 else "")
+            for k in order]
 
 
 def collect_rpm_manifest():
-    """sshpass is filtered out on every host, because host mode installs it on the one
-    host it sweeps from - otherwise the script reports its own footprint as pool drift."""
+    """sshpass is filtered out on every host: older builds installed it on the host a host
+    mode sweep ran from, and the hosts that have it still differ from the ones that do not
+    - otherwise the script reports its own footprint as pool drift."""
     r = run(["rpm", "-qa", "--qf", "%{NAME} %{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n"],
             timeout=90)
     if not r.ok:
@@ -3608,21 +3974,44 @@ YUM_REPOS_DIR = "/etc/yum.repos.d"
 
 
 def parse_yum_ini(text):
-    """{section: {key: value}} from a yum .conf/.repo file. yum's own parser takes only
-    whole-line comments, so a '#' inside a value (a proxy password) is kept."""
-    out, cur = {}, None
+    """[(section, {key: value})] from a yum .conf/.repo file, in file order.
+
+    A list, not a dict: 2.7's dict order is hash order, so a python2 and a python3 run of
+    the same host could otherwise pick different repos. yum's own parser takes only
+    whole-line comments, so a '#' inside a value (a proxy password) is kept, and an
+    indented line continues the previous key's value - a second baseurl on its own line.
+    """
+    out, cur, last = [], None, None
     for raw in (text or "").splitlines():
         line = raw.strip()
         if not line or line[0] in "#;":
             continue
+        if raw[:1] in (" ", "\t") and cur is not None and last is not None:
+            cur[last] = (cur[last] + " " + line).strip()
+            continue
         m = re.match(r"^\[([^\]]+)\]$", line)
         if m:
-            cur = out.setdefault(m.group(1).strip(), {})
+            cur, last = {}, None
+            out.append((m.group(1).strip(), cur))
             continue
         if cur is not None and "=" in line:
             k, v = line.split("=", 1)
-            cur[k.strip().lower()] = v.strip()
+            last = k.strip().lower()
+            cur[last] = v.strip()
     return out
+
+
+def yum_section(text, name):
+    """One section's {key: value} from parse_yum_ini's list, or {}."""
+    for section, kv in parse_yum_ini(text):
+        if section == name:
+            return kv
+    return {}
+
+
+def _yum_true(value):
+    """yum's BoolOption: case-folded, and 1 / yes / true are true."""
+    return (value or "").strip().lower() in ("1", "yes", "true")
 
 
 def _url_host(url):
@@ -3638,8 +4027,8 @@ def enabled_repo_urls():
         return None
     urls = []
     for name in names:
-        for section, kv in parse_yum_ini(read_file(os.path.join(YUM_REPOS_DIR, name))).items():
-            if kv.get("enabled", "1").strip() not in ("1", "yes", "true", "True"):
+        for section, kv in parse_yum_ini(read_file(os.path.join(YUM_REPOS_DIR, name))):
+            if not _yum_true(kv.get("enabled", "1")):
                 continue
             for key in ("baseurl", "mirrorlist", "metalink"):
                 for u in re.split(r"[\s,]+", kv.get(key, "")):
@@ -3651,20 +4040,36 @@ def enabled_repo_urls():
 def yum_proxy():
     """yum's [main] proxy as a URL curl reads from its environment, credentials folded in,
     or ''. Credentials never go on an argv: argv is in ps, and in the debug timings."""
-    main = parse_yum_ini(read_file(YUM_CONF)).get("main", {})
+    main = yum_section(read_file(YUM_CONF), "main")
     proxy = main.get("proxy", "")
     if not proxy or proxy == "_none_":
         return ""
     user = main.get("proxy_username", "")
     if user and "@" not in proxy and "://" in proxy:
-        try:
-            from urllib import quote          # 2.7
-        except ImportError:
-            from urllib.parse import quote    # 3
         scheme, rest = proxy.split("://", 1)
-        proxy = "%s://%s:%s@%s" % (scheme, quote(user, ""),
-                                   quote(main.get("proxy_password", ""), ""), rest)
+        proxy = "%s://%s:%s@%s" % (scheme, _url_quote(user),
+                                   _url_quote(main.get("proxy_password", "")), rest)
     return proxy
+
+
+def _url_quote(text):
+    """Percent-encode every byte of a URL credential. 2.7's quote maps characters through a
+    table keyed by byte strings, so a non-ASCII unicode argument raises KeyError (measured
+    on 8.3's python2): it gets UTF-8 bytes, which is what the URL means anyway."""
+    try:
+        from urllib import quote              # 2.7
+    except ImportError:
+        from urllib.parse import quote        # 3
+    if sys.version_info[0] < 3 and isinstance(text, _TEXT):
+        text = text.encode("utf-8")
+    return quote(text, "")
+
+
+def _env_value(text):
+    """A value os.environ can hold on both interpreters: 2.7's putenv needs bytes."""
+    if sys.version_info[0] < 3 and isinstance(text, _TEXT):
+        return text.encode("utf-8")
+    return text
 
 
 _MIRRORLIST_IP_RE = re.compile(r"connecting with IP address <i>([^<]+)</i>"
@@ -3742,11 +4147,13 @@ def collect_update_mirror(opts):
         others = sorted(set(_url_host(u) for _s, u in urls if _url_host(u)))
         return fact({"skipped": True, "repo_hosts": others})
 
-    # base repo's own path when it has no unexpanded yum variables in it
-    path = ""
+    # base repo's own path when it has no unexpanded yum variables in it, and its own URL
+    path, repo_url, base_section = "", "", ""
     for section, u in ours:
         if "$" not in u and (section.endswith("-base") or not path):
             path = re.sub(r"^[a-zA-Z]+://[^/]+", "", u).rstrip("/") + "/repodata/repomd.xml"
+            repo_url = u.rstrip("/") + "/repodata/repomd.xml"
+            base_section = section
     if not path:
         osr = os_release()
         ver = osr["value"].get("VERSION_ID", "") if osr["ok"] else ""
@@ -3755,24 +4162,55 @@ def collect_update_mirror(opts):
             return err("could not tell the XCP-ng version to build a repo URL from")
         path = "/%s/%s.%s/base/x86_64/repodata/repomd.xml" % (mm.group(1), mm.group(1),
                                                               mm.group(2))
+    # The redirector answers a plain http request with a 301 to https (measured on 8.3),
+    # so yum - whose stock baseurl is http:// - ends up on the https mirror set, which is
+    # the set probed below. What it does first is the http hop, tested separately.
     url = "https://%s%s" % (redirector, path)
+    # the base repo's other hosts (the stock files list http://updates.xcp-ng.org after the
+    # redirector), which yum falls back to when the redirector cannot be reached
+    fallbacks = [u.rstrip("/") + "/repodata/repomd.xml" for s, u in urls
+                 if s == base_section and _url_host(u) and _url_host(u) != redirector
+                 and "$" not in u]
 
     timeout = int(opts.get("timeout") or 10)
-    budget_end = time.time() + int(opts.get("budget") or 60)
+    budget_end = _mono() + int(opts.get("budget") or 60)
     proxy = yum_proxy()
     saved = dict((k, os.environ.get(k)) for k in ("http_proxy", "https_proxy"))
-    out = {"url": url, "proxy": bool(proxy), "public_ip": "", "asn": "", "selected": "",
-           "redirector_error": "", "mirrors": []}
+    out = {"url": url, "repo_url": repo_url, "proxy": bool(proxy), "public_ip": "",
+           "asn": "", "selected": "", "redirector_error": "", "first_hop_error": "",
+           "page_error": "", "fallbacks": [], "not_probed": 0, "mirrors": []}
     try:
         if proxy:
-            os.environ["http_proxy"] = os.environ["https_proxy"] = proxy
+            os.environ["http_proxy"] = os.environ["https_proxy"] = _env_value(proxy)
 
         r = _curl(["-L", "--max-redirs", "3", url + "?mirrorlist"], timeout)
         if not r.ok:
             out["redirector_error"] = _curl_fail(r)
+            for furl in fallbacks:
+                row = {"host": _url_host(furl), "url": furl, "ok": False, "error": ""}
+                out["fallbacks"].append(row)
+                r = _curl(["-L", "--max-redirs", "3", "-w", "\n%{http_code}", furl], timeout)
+                if not r.ok:
+                    row["error"] = _curl_fail(r)
+                    continue
+                body, _, code = r.out.rpartition("\n")
+                if code.strip() == "200" and "<repomd" in body:
+                    row["ok"] = True
+                else:
+                    row["error"] = "HTTP %s" % code.strip()
             return fact(out)
         ip, asn, listed = parse_mirrorlist(r.out)
         out["public_ip"], out["asn"] = ip, asn
+
+        # yum's own first request, when its repo URL is not https: unfollowed, since all
+        # that is asked is whether that hop answers at all (port 80, a proxy's plain GET)
+        if repo_url and not repo_url.lower().startswith("https://"):
+            r = _curl(["-o", os.devnull, "-w", "%{http_code}", repo_url], timeout)
+            if not r.ok:
+                out["first_hop_error"] = _curl_fail(r)
+            elif r.out.strip()[:1] not in ("2", "3"):
+                # a proxy or a portal answering for it: an error status is not a path
+                out["first_hop_error"] = "HTTP %s" % r.out.strip()
 
         r = _curl(["-o", os.devnull, "-w", "%{http_code} %{redirect_url}", url], timeout)
         picked = ""
@@ -3786,16 +4224,22 @@ def collect_update_mirror(opts):
         probe = [(h, u, share) for h, u, share in listed if share] or listed[:3]
         if picked and _url_host(picked) not in [_url_host(u) for _h, u, _s in probe]:
             probe.insert(0, (_url_host(picked), picked, None))
-        probe = probe[:int(opts.get("max_mirrors") or 6)]
+        cap = int(opts.get("max_mirrors") or 6)
+        out["not_probed"] = max(0, len(probe) - cap)
+        probe = probe[:cap]
         if not probe and not listed:
-            out["redirector_error"] = "redirector answered but listed no mirrors"
+            # it ANSWERED: a page whose mirror list cannot be read is not unreachability
+            out["page_error"] = "%s answered, but no mirror list could be read from it" \
+                                % redirector
             return fact(out)
 
         for host, murl, share in probe:
-            left = int(budget_end - time.time())
-            row = {"host": host, "url": murl, "share": share, "ok": False, "error": ""}
+            left = int(budget_end - _mono())
+            row = {"host": host, "url": murl, "share": share, "ok": False, "error": "",
+                   "tried": True}
             out["mirrors"].append(row)
             if left < 2:
+                row["tried"] = False
                 row["error"] = "not tried - out of time"
                 continue
             t = min(timeout, left)
@@ -3821,8 +4265,12 @@ def collect_update_mirror(opts):
 
 def collect_yum_check_update():
     """yum check-update: rc 0 = nothing to do, rc 100 = updates listed, anything else
-    means yum itself failed (broken repo, no network) - which must never read as zero."""
-    r = run(["yum", "check-update", "-q"], timeout=180)
+    means yum itself failed (broken repo, no network) - which must never read as zero.
+
+    exit_on_lock: with another yum holding /var/run/yum.pid (an admin's yum update, a
+    patch install from XO) yum otherwise waits for it, and this spent its whole timeout
+    learning nothing. It now exits at once with its own reason, which why() carries."""
+    r = run(["yum", "--setopt=exit_on_lock=1", "check-update", "-q"], timeout=180)
     if r.timed_out:
         return err("yum check-update timed out")
     if r.rc == 0:
@@ -3867,6 +4315,12 @@ def count_yum_updates(text):
 _YUM_UPDATE_RE = re.compile(r"^(\S+)\s+(\d+)\s+(\d\d:\d\d:\d\d)\s+(Updated|Installed):\s+(\S+)")
 
 
+# Packages yum installs BESIDE the running version rather than over it, which only a
+# reboot activates. XCP-ng ships installonlypkgs= empty (measured on 8.3), so these log
+# as Updated anyway; the list matters for a host configured otherwise.
+BOOT_PACKAGES = ("kernel", "kernel-alt", "xen-hypervisor")
+
+
 def _is_patch_line(action, pkg):
     """One predicate shared by Last Patched and Rebooted After Updates.
 
@@ -3877,9 +4331,14 @@ def _is_patch_line(action, pkg):
     """
     if action == "Updated":
         return True
-    # yum.log writes a non-zero epoch in front of the name: 'Installed: 2:xen-...'
-    name = re.sub(r"^\d+:", "", pkg)
-    return action == "Installed" and (name.startswith("kernel") or name.startswith("xen"))
+    if action != "Installed":
+        return False
+    # yum.log writes a non-zero epoch in front of the name: 'Installed: 2:xen-...'; the
+    # package name is everything before the first '-<digit>' (where the version starts)
+    m = re.match(r"^(?:\d+:)?(.+?)-\d", pkg)
+    # exact names, not prefixes: kernel-devel or xen-dom0-tools installed for the first
+    # time is a new package, not a patch, and must not redate the host
+    return bool(m) and m.group(1) in BOOT_PACKAGES
 
 
 def find_last_update_line(text):
@@ -4002,12 +4461,20 @@ def collect_patch_facts():
 # log scanning
 # --------------------------------------------------------------------------------------
 
+MISSING = "not found"
+
+
 def grep_scan(path, phrases, timeout=180, ignore=None):
-    """Line numbers of the LAST hit of each phrase in one file.
+    """The LAST hit of each phrase in one file: (hits, why).
+
+    hits is {phrase_index: (lineno, line)} - the matched line's text rides along, so a hit
+    survives even when its context cannot be read afterwards. why is None when the file
+    was read through, MISSING when it does not exist, or the reason it could not be read:
+    every caller must keep "could not look" apart from "looked, nothing there".
 
     One grep pass for all phrases together (these files run to 30 MB+), then attribution
     over just the matched lines. Streamed, so a phrase that matches constantly cannot
-    blow memory. Returns {phrase_index: lineno} or None if the file could not be read.
+    blow memory.
 
     ignore is a list of rules, each a list of substrings: a matched line containing ALL of
     one rule's is no hit at all. It has to be decided here, while the last hit is picked -
@@ -4019,16 +4486,18 @@ def grep_scan(path, phrases, timeout=180, ignore=None):
         if subs:
             rules.append(subs)
     if not phrases:
-        return {}
+        return {}, None
     try:
-        if not os.path.exists(path) or not os.access(path, os.R_OK):
-            return None
-    except OSError:
-        return None
+        if not os.path.exists(path):
+            return {}, MISSING
+        if not os.access(path, os.R_OK):
+            return {}, "not readable"
+    except OSError as exc:
+        return {}, "could not look (%s)" % exc
 
     timeout = _clamp(timeout)
     if timeout is None:
-        return None
+        return {}, "not read - the run budget was used up"
 
     # -a is load-bearing, not defensive. A single NUL or non-UTF-8 byte anywhere in the
     # file makes grep call it binary: 2.20 (dom0) then prints "Binary file X matches"
@@ -4039,11 +4508,11 @@ def grep_scan(path, phrases, timeout=180, ignore=None):
         argv += ["-e", p]
     argv += ["--", path]
 
-    started = time.time()
+    started = _mono()
     try:
         proc, devnull = _popen(argv)
-    except OSError:
-        return None
+    except (OSError, ValueError) as exc:
+        return {}, "grep could not be run (%s)" % exc
 
     state = {"killed": False}
 
@@ -4065,25 +4534,29 @@ def grep_scan(path, phrases, timeout=180, ignore=None):
             num = line[:sep]
             if not num.isdigit():
                 continue
-            body = line[sep + 1:].lower()
+            text = line[sep + 1:].rstrip("\r\n")
+            body = text.lower()
             if rules and any(all(s in body for s in r) for r in rules):
                 continue
             for i, needle in enumerate(lowered):
                 if needle and needle in body:
-                    last[i] = int(num)
+                    last[i] = (int(num), text)
         proc.stdout.close()
         rc = proc.wait()
     finally:
         timer.cancel()
         devnull.close()
+        _forget(proc)
         # the attribution loop above runs once per MATCHED line, so this is grep's time
         # plus ours - which is the number that matters on a log full of hits
         timed(argv, started)
         CURRENT[0] = ""
+    if state["killed"]:
+        return last, "grep did not finish within %ds" % int(timeout)
     # rc 1 is grep's "no match", which is a real answer; 2+ means grep itself failed
-    if state["killed"] or rc > 1:
-        return None
-    return last
+    if rc > 1:
+        return last, "grep failed (exit %d)" % rc
+    return last, None
 
 
 def context_lines(path, lineno, ctx):
@@ -4101,37 +4574,51 @@ def context_lines(path, lineno, ctx):
 
 
 def collect_log_scan(files, phrases, ctx, ignore=None):
-    """For every (file, phrase) pair, the most recent hit with context.
+    """For every (file, phrase) pair, the most recent hit with context: {"blocks", "failed"}.
 
     Each base log is tried first and its rotated .1 only for phrases the live file
     lacks: these rotate daily around 04:00, so right after a rotation the live file is
     nearly empty - but reporting a stale .1 hit beside a current one would be worse.
     One block per phrase, so a phrase that matches constantly ('except') can never
     crowd out a rare, serious one. ignore: see grep_scan.
+
+    "failed" names every scan that did not happen - a live log missing or unreadable, a
+    grep killed or refused for lack of budget, a .1 that exists and could not be read -
+    so a scan that never ran cannot read as a clean log. A missing .1 is not a failure:
+    the log has simply not rotated yet. A hit whose context could not be read is kept,
+    with the matched line alone and a note saying so - a found hit is never dropped.
     """
     if not files or not phrases:
-        return fact([])
-    blocks = []
+        return fact({"blocks": [], "failed": []})
+    blocks, failed = [], []
     for base in files:
-        live = grep_scan(base, phrases, ignore=ignore)
-        rotated = None
-        rotated_scanned = False
+        live, why = grep_scan(base, phrases, ignore=ignore)
+        if why:
+            failed.append("%s: %s" % (base, why))
+        rotated, rotated_scanned = {}, False
         for i, phrase in enumerate(phrases):
             path = base
-            hit = live.get(i) if live is not None else None
+            hit = live.get(i)
             if hit is None:
                 if not rotated_scanned:
                     rotated_scanned = True
-                    rotated = grep_scan(base + ".1", phrases, ignore=ignore)
+                    rotated, why = grep_scan(base + ".1", phrases, ignore=ignore)
+                    if why and why != MISSING:
+                        failed.append("%s.1: %s" % (base, why))
                 path = base + ".1"
-                hit = rotated.get(i) if rotated is not None else None
+                hit = rotated.get(i)
             if hit is None:
                 continue
-            lines = context_lines(path, hit, ctx)
+            lineno, text = hit
+            block = {"phrase": phrase, "file": path, "line": lineno}
+            lines = context_lines(path, lineno, ctx)
             if lines is None:
-                continue
-            blocks.append({"phrase": phrase, "file": path, "line": hit, "context": lines})
-    return fact(blocks)
+                block["context"] = [text]
+                block["note"] = "the lines around it could not be read"
+            else:
+                block["context"] = lines
+            blocks.append(block)
+    return fact({"blocks": blocks, "failed": failed})
 
 
 # --------------------------------------------------------------------------------------
@@ -4139,19 +4626,27 @@ def collect_log_scan(files, phrases, ctx, ignore=None):
 # --------------------------------------------------------------------------------------
 
 def _pif_ips(network_uuid):
-    """--minimal with a SINGLE param across many objects is the form that works: it
-    prints one comma-separated line with an empty field per PIF that has no IP."""
+    """(ips fact, number of PIFs with no IP) for one network.
+
+    --minimal with a SINGLE param across many objects is the form that works: it prints
+    one comma-separated line with an empty field per PIF that has no IP. Those empty
+    fields are counted, not dropped: XO takes a host's backup-network PIF IP verbatim, so
+    a host whose PIF has none has its exports sent to an empty address, and dropping it
+    left the hosts that DO have one to answer the ping and read green.
+    """
     r = xe(["pif-list", "network-uuid=" + network_uuid, "params=IP", "--minimal"])
     if not r.ok:
-        return err("xe pif-list params=IP failed (%s)" % r.why())
-    ips = []
-    for piece in r.out.strip().split(","):
+        return err("xe pif-list params=IP failed (%s)" % r.why()), 0
+    ips, missing = [], 0
+    out = r.out.strip()
+    for piece in (out.split(",") if out else []):
         piece = piece.strip()
         if not piece or piece == "0.0.0.0":
+            missing += 1
             continue
         if re.match(r"^\d+\.\d+\.\d+\.\d+$", piece):
             ips.append(piece)
-    return fact(ips)
+    return fact(ips), missing
 
 
 def _backup_scope():
@@ -4181,14 +4676,15 @@ def _network_info(network_uuid, want_ips):
     else:
         info["bond"] = fact(r.out)
     if want_ips:
-        info["ips"] = _pif_ips(network_uuid)
+        info["ips"], info["pifs_without_ip"] = _pif_ips(network_uuid)
     return info
 
 
 LINSTOR_TIMEOUT = 120
 LINSTOR_PROP_TIMEOUT = 30       # one node's properties, not a whole-cluster listing
 
-ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+# ECMA-48 CSI: parameter bytes 0x30-0x3F, intermediates 0x20-0x2F, one final byte 0x40-0x7E
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 def strip_ansi(text):
@@ -4198,12 +4694,27 @@ def strip_ansi(text):
     return ANSI_RE.sub("", text)
 
 
+# the first linstor call that ran out its whole timeout, once one has: a controller that
+# accepts the connection and never answers would otherwise cost every later call its full
+# timeout too, and starve the questions after them
+LINSTOR_WEDGED = [""]
+
+
 def _linstor(controllers, args, timeout=LINSTOR_TIMEOUT):
     if which("linstor") is None:
         return err("linstor CLI not found")
-    argv = ["linstor", "--controllers=" + ",".join(controllers)] + list(args)
+    if LINSTOR_WEDGED[0]:
+        return err("not asked - linstor did not answer %s" % LINSTOR_WEDGED[0])
+    # ASCII tables whatever the locale: linstor-client >= 1.29 draws UTF-8 box borders
+    # under a UTF-8 locale even into a pipe, and the table readers key on '|'. Both options
+    # exist back to linstor-client 1.13 (checked); LC_ALL=C alone would also do it.
+    argv = (["linstor", "--no-utf8", "--no-color", "--controllers=" + ",".join(controllers)]
+            + list(args))
+    full = _clamp(timeout) == timeout
     r = run(argv, timeout=timeout)
     if not r.ok:
+        if r.timed_out and full:
+            LINSTOR_WEDGED[0] = "'linstor %s' within %ds" % (" ".join(args), timeout)
         return err("linstor %s failed (%s)" % (" ".join(args), r.why()))
     return fact(r.out)
 
@@ -4313,9 +4824,11 @@ def _qcow2_vdis(sr_uuids, cap):
     """
     rows = []
     for sr in sr_uuids:
-        r = xe(["vdi-list", "sr-uuid=" + sr, "params=uuid,name-label,sm-config"])
+        r = xe(["vdi-list", "sr-uuid=" + sr, "params=uuid,name-label,sm-config"], canary=False)
         if not r.ok:
-            return err("xe vdi-list failed (%s)" % r.why())
+            # two values, like the success path: the caller unpacks a pair, and a lone
+            # err() unpacked into its two KEYS lost the reason entirely
+            return err("xe vdi-list failed (%s)" % r.why()), None
         uuid = name = smc = ""
         for line in r.out.splitlines():
             stripped = line.strip()
@@ -4420,7 +4933,8 @@ def collect_pool(spec, self_uuid):
     # Long-Running Tasks: every task, labelled, with this host's clock beside it - 'created'
     # is UTC, and the age is worked out against the clock of the host xapi answered on,
     # never the XOA's
-    r = xe(["task-list", "params=uuid,name-label,status,created,progress,resident-on"])
+    r = xe(["task-list", "params=uuid,name-label,status,created,progress,resident-on"],
+           canary=False)
     out["tasks"] = fact({"text": r.out, "now": time.time()}) if r.ok else \
         err("xe task-list failed (%s)" % r.why())
 
@@ -4431,7 +4945,7 @@ def collect_pool(spec, self_uuid):
     # made-up name: 0 exceptions)
     r = xe(["vm-list", "is-control-domain=false",
             "params=uuid,name-label,power-state,current-operations,platform,"
-            "reference-label,other-config,os-version"])
+            "reference-label,other-config,os-version"], canary=False)
     out["vms"] = fact(r.out) if r.ok else err("xe vm-list failed (%s)" % r.why())
 
     # Leaf-Coalesce Disabled: xe filters on the map key itself (measured: 0 of 127 VDIs back
@@ -4439,20 +4953,25 @@ def collect_pool(spec, self_uuid):
     # VBDs are only worth a call when there is a disk to name the VMs of.
     lc = {}
     r = xe(["vdi-list", "other-config:leaf-coalesce=false",
-            "params=uuid,name-label,sr-name-label,is-a-snapshot,current-operations,other-config"])
+            "params=uuid,name-label,sr-name-label,is-a-snapshot,current-operations,other-config"],
+           canary=False)
     if not r.ok:
         out["leaf_coalesce"] = err("xe vdi-list failed (%s)" % r.why())
     else:
         lc["vdis"] = r.out
         lc["vbds"] = ""
         if r.out.strip():
-            r = xe(["vbd-list", "params=uuid,vdi-uuid,vm-uuid,vm-name-label"])
+            r = xe(["vbd-list", "params=uuid,vdi-uuid,vm-uuid,vm-name-label"], canary=False)
             if r.ok:
                 lc["vbds"] = r.out
             else:
                 lc["vbds"] = None
                 lc["vbd_error"] = "xe vbd-list failed (%s)" % r.why()
-        r = xe(["sr-list", "other-config:leaf-coalesce=false", "params=uuid,name-label,other-config"])
+        # every SR's other-config, judged report-side: GC honours three SR switches -
+        # leaf-coalesce=false, coalesce=false (no coalescing at all) and gc=false (GC
+        # aborts for the SR) - SM 1680f106 cleanup.py leafCoalesceForbidden /
+        # findCoalesceable / the gc switch. One call; SRs are few.
+        r = xe(["sr-list", "params=uuid,name-label,other-config"])
         if r.ok:
             lc["srs"] = r.out
         else:
@@ -4497,6 +5016,12 @@ def collect_pool(spec, self_uuid):
         out["backup_scope"] = _backup_scope()
 
     if sr_uuids:
+        # xapi's own question first: it needs no controller, and a controller that does
+        # not answer must not take it down with the linstor ones
+        rows, total = _qcow2_vdis(sr_uuids, spec.get("qcow2_max") or 0)
+        out["qcow2"] = rows
+        out["qcow2_total"] = fact(total) if total is not None else rows
+
         controllers = spec.get("controllers") or []
         nodes_r = _linstor(controllers, ["n", "l"])
         out["linstor_nodes"] = nodes_r
@@ -4515,9 +5040,6 @@ def collect_pool(spec, self_uuid):
             else:
                 out["linstor_pref_nics"] = fact(
                     {"nodes": names, "nics": _linstor_pref_nics(controllers, names)})
-        rows, total = _qcow2_vdis(sr_uuids, spec.get("qcow2_max") or 0)
-        out["qcow2"] = rows
-        out["qcow2_total"] = fact(total)
     return out
 
 
@@ -4538,13 +5060,54 @@ def parse_other_config(text):
 # entry point
 # --------------------------------------------------------------------------------------
 
+def guarded(fn, *args):
+    """One collector's fact, or an error naming the exception it raised.
+
+    The collector-side twin of result.guard: a collector that blows up on input nobody
+    foresaw costs its own fact - which then reads Unknown with the reason - and not every
+    fact the host had already established. Broad on purpose, and only here.
+    """
+    try:
+        return fn(*args)
+    except Exception as exc:  # noqa: BLE001 - deliberate: one bad collector, one bad fact
+        return err("internal error in the collector: %s: %s" % (type(exc).__name__, exc))
+
+
+def guarded_many(keys, fn, *args):
+    """guarded() for a collector that answers several facts at once: on an exception each
+    of its keys carries the error, so none of them is merely missing."""
+    try:
+        return fn(*args)
+    except Exception as exc:  # noqa: BLE001 - see guarded()
+        why = err("internal error in the collector: %s: %s" % (type(exc).__name__, exc))
+        return dict((key, why) for key in keys)
+
+
+IDENTITY_KEYS = ("now", "hostname", "os_release", "self_uuid", "self_address", "pool_conf")
+PATCH_KEYS = ("boot_epoch", "boot_disp", "update_epoch", "update_disp", "update_source",
+              "newest_rpm")
+
+
+def _xostor_here(vg):
+    """Positive evidence that XOSTOR has, or had, storage on this host: the DRBD module
+    loaded, the LINSTOR volume group present, or LVM's backup of it. pvs is asked only
+    then - it opens every block device LVM's filter admits, multipath SAN LUNs included,
+    and one with all paths down and I/O queueing (queue_if_no_path, no_path_retry queue -
+    measured in the lab's multipathd config) parks it in D state for good."""
+    if os.path.isdir("/sys/module/drbd"):
+        return True
+    if vg and re.match(r"^[A-Za-z0-9_.+-]+$", vg):
+        return os.path.exists("/dev/" + vg) or os.path.exists(LVM_BACKUP_DIR + "/" + vg)
+    return False
+
+
 def collect(spec):
     want = set(spec.get("want") or [])
     # built in place, so the watchdog can hand back what was established if this call
     # never returns
     out = PARTIAL
     out["collector"] = {"python": sys.version.split()[0], "pid": os.getpid()}
-    ident = collect_identity()
+    ident = guarded_many(IDENTITY_KEYS, collect_identity)
     out.update(ident)
 
     self_uuid = ident["self_uuid"]["value"] if ident["self_uuid"]["ok"] else ""
@@ -4553,40 +5116,46 @@ def collect(spec):
         if spec.get("host_list") == "statedb":
             out["pool_hosts"] = err("not asked - the run asked for state.db instead")
         else:
-            out["pool_hosts"] = collect_pool_hosts()
+            out["pool_hosts"] = guarded(collect_pool_hosts)
         if not out["pool_hosts"]["ok"]:
             # the toolstack did not answer, but what it would have answered from is a
             # file, and every member keeps a copy of it
-            out["pool_hosts_db"] = collect_state_db_hosts()
+            out["pool_hosts_db"] = guarded(collect_state_db_hosts)
 
     if "host" in want:
-        out["meminfo"] = collect_meminfo()
-        out["timedatectl"] = collect_timedatectl()
-        out["df"] = collect_df()
-        out["proc_mounts"] = collect_text_file("/proc/mounts")
-        out["fstab"] = collect_text_file("/etc/fstab")
-        out["dmesg"] = collect_dmesg()
-        out["iplink"] = collect_iplink()
-        out["ipaddr"] = collect_ipaddr()
-        out["lacp"] = collect_lacp()
-        out["multipath"] = collect_multipath(spec.get("multipath"))
-        out["tap_status"] = collect_tap_status()
-        out["crash_dumps"] = collect_crash_dumps(spec.get("crash_ignore_file") or "")
-        out["coredumps"] = collect_coredumps(spec.get("coredump_dir") or "")
-        out["failed_units"] = collect_failed_units()
+        out["meminfo"] = guarded(collect_meminfo)
+        out["timedatectl"] = guarded(collect_timedatectl)
+        out["df"] = guarded(collect_df, (spec.get("mount_probe") or {}).get("types"))
+        out["proc_mounts"] = guarded(collect_text_file, "/proc/mounts")
+        out["fstab"] = guarded(collect_text_file, "/etc/fstab")
+        out["dmesg"] = guarded(collect_dmesg)
+        out["iplink"] = guarded(collect_iplink)
+        out["ipaddr"] = guarded(collect_ipaddr)
+        out["lacp"] = guarded(collect_lacp)
+        out["multipath"] = guarded(collect_multipath, spec.get("multipath"))
+        out["tap_status"] = guarded(collect_tap_status)
+        out["crash_dumps"] = guarded(collect_crash_dumps, spec.get("crash_ignore_file") or "")
+        out["coredumps"] = guarded(collect_coredumps, spec.get("coredump_dir") or "")
+        out["failed_units"] = guarded(collect_failed_units)
         if out["failed_units"]["ok"] and STATIC_VDIS_UNIT in out["failed_units"]["value"]:
-            out["static_vdis"] = collect_static_vdis()
-        out["task_timeout"] = collect_task_timeout_override()
-        out["rpm_manifest"] = collect_rpm_manifest()
-        out["drbd_module"] = collect_drbd_module()
-        out["pvs"] = collect_pvs()
-        out["lvm_backup"] = collect_lvm_backup(spec.get("xostor_vg") or "")
-        out.update(collect_patch_facts())
+            out["static_vdis"] = guarded(collect_static_vdis)
+        out["task_timeout"] = guarded(collect_task_timeout_override)
+        out["rpm_manifest"] = guarded(collect_rpm_manifest)
+        out["drbd_module"] = guarded(collect_drbd_module)
+        vg = spec.get("xostor_vg") or ""
+        if _xostor_here(vg):
+            out["pvs"] = guarded(collect_pvs)
+        else:
+            out["pvs"] = fact({"rows": "", "warnings": "",
+                               "skipped": "no XOSTOR here (no drbd module, no %s volume "
+                                          "group or LVM backup of one)" % (vg or "LINSTOR")})
+        out["lvm_backup"] = guarded(collect_lvm_backup, vg)
+        out.update(guarded_many(PATCH_KEYS, collect_patch_facts))
         if spec.get("update_mirror"):
-            out["update_mirror"] = collect_update_mirror(spec.get("update_mirror"))
+            out["update_mirror"] = guarded(collect_update_mirror, spec.get("update_mirror"))
 
         if self_uuid:
-            r = xe(["pif-list", "params=gateway,DNS", "management=false",
+            r = xe(["pif-list", "params=gateway,IPv6-gateway,DNS", "management=false",
                     "host-uuid=" + self_uuid])
             out["pifs_dns_gw"] = fact(r.out) if r.ok else \
                 err("xe pif-list gateway,DNS failed (%s)" % r.why())
@@ -4594,38 +5163,41 @@ def collect(spec):
             out["pifs_dns_gw"] = err("host uuid unknown")
 
         scan = spec.get("log_scan") or {}
-        out["log_scan"] = collect_log_scan(scan.get("files") or [],
-                                           scan.get("phrases") or [],
-                                           scan.get("context") or 3,
-                                           scan.get("ignore") or [])
+        out["log_scan"] = guarded(collect_log_scan, scan.get("files") or [],
+                                  scan.get("phrases") or [], scan.get("context") or 3,
+                                  scan.get("ignore") or [])
         lun = spec.get("lun_scan") or {}
-        out["lun_scan"] = collect_log_scan(lun.get("files") or [],
-                                           lun.get("phrases") or [],
-                                           lun.get("context") or 3)
+        out["lun_scan"] = guarded(collect_log_scan, lun.get("files") or [],
+                                  lun.get("phrases") or [], lun.get("context") or 3)
         mps = spec.get("multipath_scan") or {}
-        out["multipath_scan"] = collect_log_scan(mps.get("files") or [],
-                                                 mps.get("phrases") or [],
-                                                 mps.get("context") or 3)
+        out["multipath_scan"] = guarded(collect_log_scan, mps.get("files") or [],
+                                        mps.get("phrases") or [], mps.get("context") or 3)
         mstall = spec.get("mount_stall_scan") or {}
-        out["mount_stall_scan"] = collect_log_scan(mstall.get("files") or [],
-                                                   mstall.get("phrases") or [],
-                                                   mstall.get("context") or 3)
+        out["mount_stall_scan"] = guarded(collect_log_scan, mstall.get("files") or [],
+                                          mstall.get("phrases") or [],
+                                          mstall.get("context") or 3)
 
         # The order matters and is the only thing left of the old gate: the process scan
         # runs FIRST, so a probe this run parks on a dead mount is not then reported by
         # this same run as a process that was already stuck. It shows up on the next run,
         # marked, and counted as what it is.
-        out["stuck_procs"] = collect_stuck_processes(spec.get("stuck"))
-        out["network_mounts"] = collect_network_mounts(spec.get("mount_probe"))
+        out["stuck_procs"] = guarded(collect_stuck_processes, spec.get("stuck"))
+        out["network_mounts"] = guarded(collect_network_mounts, spec.get("mount_probe"))
         if spec.get("smapi"):
-            out["smapi"] = collect_smapi_hidden_leaves()
+            out["smapi"] = guarded(collect_smapi_hidden_leaves)
+
+    # The pool questions before yum: they are local xapi reads that take seconds, while
+    # yum check-update is network-bound and can spend up to 180s on a host whose egress is
+    # dropped - after which every pool line would read "run budget exhausted"
+    if "pool" in want:
+        out["pool"] = guarded(collect_pool, spec, self_uuid)
 
     if "yumcheck" in want:
-        out["yum_check"] = collect_yum_check_update()
+        out["yum_check"] = guarded(collect_yum_check_update)
 
-    if "pool" in want:
-        out["pool"] = collect_pool(spec, self_uuid)
-
+    # stamped at the END: the report compares this against its own clock when the document
+    # arrives, so a stamp from the start would count the whole collection as clock drift
+    out["now"] = fact(time.time())
     if spec.get("timings"):
         # slowest first: the question this answers is always "what took the time", and a
         # host runs enough commands that the whole list would bury the answer
@@ -4644,12 +5216,19 @@ def emit(payload):
     but two documents on one stdout is not a document: _extract takes the first BEGIN and
     the last END, so a second one would be read as a truncated first.
     """
+    # serialised BEFORE the flag is taken and BEGIN is written: a value json cannot encode
+    # would otherwise leave half a document on stdout that nothing could replace
+    try:
+        text = json.dumps(payload)
+    except (TypeError, ValueError) as exc:
+        text = json.dumps({"__collector_error__": "the document could not be encoded: %s"
+                                                  % exc})
     with _EMIT_LOCK:
         if _EMITTED[0]:
             return False
         _EMITTED[0] = True
     sys.stdout.write(BEGIN_MARKER + "\n")
-    sys.stdout.write(json.dumps(payload))
+    sys.stdout.write(text)
     sys.stdout.write("\n" + END_MARKER + "\n")
     sys.stdout.flush()
     return True
@@ -4685,18 +5264,43 @@ def watchdog(grace):
 
     payload = dict(PARTIAL)
     payload["__collector_stuck__"] = CURRENT[0] or "(no command was running)"
+    payload["now"] = fact(time.time())
     payload["collector"] = dict(payload.get("collector") or {})
     payload["collector"]["timings"] = sorted(TIMINGS, reverse=True)[:15]
     payload["collector"]["abandoned"] = list(ABANDONED)
-    emit(payload)
-    os._exit(0)
+    if emit(payload):
+        os._exit(0)
+    # the main thread got there first and is writing its own document: dying now would
+    # cut that document off mid-write, so let it finish
+
+
+def _on_signal(signum, _frame):
+    """SIGTERM/SIGHUP: take every running child down too, then go. Each child is in its
+    own session, so nothing else would - an xe left running with nobody reading its pipe
+    gets EPIPE, which xapi logs as an exception this tool would later report."""
+    kill_live_children()
+    os._exit(128 + signum)
 
 
 def main(argv):
     spec = {}
     if len(argv) > 1 and argv[1]:
         spec = json.loads(base64.b64decode(argv[1].encode("ascii")).decode("utf-8"))
-    DEADLINE[0] = time.time() + float(spec.get("budget") or 240)
+    DEADLINE[0] = _mono() + float(spec.get("budget") or 240)
+
+    # Every child gets the C locale. The ssh session brings the XOA user's LANG/LC_* along
+    # (Debian's SendEnv LANG LC_*, dom0's AcceptEnv - measured: LC_ALL=en_US.UTF-8 arrives),
+    # and yum translates the lines the parsers key on ('Obsoleting Packages'). Nothing here
+    # depends on the inherited locale: output is decoded as UTF-8 by the collector itself.
+    os.environ["LC_ALL"] = "C"
+    os.environ.pop("LANGUAGE", None)
+
+    for sig in ("SIGTERM", "SIGHUP"):
+        if hasattr(signal, sig):
+            try:
+                signal.signal(getattr(signal, sig), _on_signal)
+            except ValueError:
+                pass            # not the main thread (a test driving main()): no handler
 
     guard = threading.Thread(target=watchdog, args=(WATCHDOG_GRACE,))
     guard.daemon = True
@@ -4704,9 +5308,12 @@ def main(argv):
 
     try:
         payload = collect(spec)
-    except Exception:
+    except Exception:  # noqa: BLE001 - deliberate: whatever escapes, the facts already
+        # gathered still go back, with the reason beside them
         import traceback
-        payload = {"__collector_error__": traceback.format_exc()}
+        payload = dict(PARTIAL)
+        payload["__collector_error__"] = traceback.format_exc()
+        payload["now"] = fact(time.time())
     emit(payload)
     return 0
 
@@ -4759,6 +5366,30 @@ class CollectError(Exception):
     """Could not get a document out of a host. Never confused with 'the host is fine'."""
 
 
+def _mark_incomplete(payload, host):
+    """A document the collector sent back part way - stuck on a command it could not kill,
+    or failed - keeps every fact it did establish, with "__incomplete__" saying why the
+    rest is missing. Each missing fact then reads Unknown by construction, and the host
+    block carries one flagged line naming the cause: the evidence gathered on exactly the
+    host that is in trouble is not thrown away with it."""
+    if "__collector_stuck__" in payload:
+        # the host gave up on itself rather than being given up on: a command it could
+        # not kill, named. The old shape of this was the transport's own 300s timeout,
+        # which could say only that the host did not answer
+        debug("%s abandoned its run in: %s" % (host, payload["__collector_stuck__"]))
+        for elapsed, command in (payload.get("collector", {}).get("timings") or [])[:8]:
+            debug("%s   %6.2fs  %s" % (host, elapsed, command))
+        payload["__incomplete__"] = (
+            "gave up after %ds stuck in '%s' - that command cannot be killed, so the host's "
+            "storage or a driver is most likely wedged"
+            % (config.REMOTE_CMD_TIMEOUT - 60, payload["__collector_stuck__"]))
+    elif "__collector_error__" in payload:
+        trace = payload["__collector_error__"].strip().splitlines()
+        debug("collector failed on %s:\n%s" % (host, payload["__collector_error__"]))
+        payload["__incomplete__"] = "the collector failed part way: %s" % (
+            trace[-1] if trace else "no reason given")
+
+
 _DEBUG_LOCK = threading.Lock()
 
 
@@ -4782,26 +5413,35 @@ def debug(msg):
 # REMOTE_CMD_TIMEOUT waiting for the last collector to finish on its own.
 _LIVE = set()
 _LIVE_LOCK = threading.Lock()
+# Set once the run is stopping: a thread still working (the XOA section's daemon thread, a
+# collection worker between hosts) may not start a child after the kill that was meant to
+# take every child with it - nothing would ever kill that one.
+_STOPPING = [False]
+
+# A polite kill first: SIGTERM lets a collector take its own children down with it (they
+# are each in their own session, so nothing else reaches them); SIGKILL after this long.
+TERM_GRACE = 2.0
 
 
-def kill_all_children():
-    """Kill every child still running. For an interrupted run, not for normal shutdown."""
-    with _LIVE_LOCK:
-        procs = list(_LIVE)
-    for proc in procs:
-        _kill_tree(proc)
+class TimedOut(int):
+    """run_local_cmd's own timeout: it compares equal to 124, as it always has, so every
+    existing `rc == 124` keeps working - but a command that itself EXITED 124 (GNU timeout
+    inside -c) is a plain int, and the two can be told apart where it matters."""
 
 
-def _remote_launch(blob):
-    pinned = os.environ.get("HEALTH_REMOTE_PYTHON")
-    if pinned and re.match(r"^[A-Za-z0-9_./-]+$", pinned):
-        return (_REMOTE_LAUNCH_PINNED % pinned) % blob
-    return _REMOTE_LAUNCH % blob
+TIMED_OUT = TimedOut(124)
 
 
-def _kill_tree(proc):
+def is_timeout(rc):
+    return isinstance(rc, TimedOut)
+
+
+def _signal_group(proc, sig):
     try:
-        os.killpg(os.getpgid(proc.pid), 9)
+        if hasattr(os, "killpg"):
+            os.killpg(proc.pid, sig)          # start_new_session: pid is the group id
+        else:
+            proc.kill()
     except OSError:
         try:
             proc.kill()
@@ -4809,8 +5449,56 @@ def _kill_tree(proc):
             pass
 
 
+def kill_all_children():
+    """Stop every child still running, and any from starting. For an interrupted run, not
+    for normal shutdown. SIGTERM to all, a short grace, then SIGKILL the rest."""
+    with _LIVE_LOCK:
+        _STOPPING[0] = True
+        procs = list(_LIVE)
+    if not procs:
+        return
+    for proc in procs:
+        _signal_group(proc, getattr(signal, "SIGTERM", 15))
+    deadline = time.monotonic() + TERM_GRACE
+    for proc in procs:
+        try:
+            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            pass
+    for proc in procs:
+        if proc.poll() is None:
+            _signal_group(proc, 9)
+
+
+def _remote_launch(blob):
+    pinned = os.environ.get("HEALTH_REMOTE_PYTHON")
+    if pinned and re.match(r"^[A-Za-z0-9_./-]+$", pinned):
+        return (_REMOTE_LAUNCH_PINNED % pinned) % blob
+    if pinned:
+        # a regression run that believes it is forcing python2 must not quietly test
+        # python3 instead
+        sys.stderr.write("Warning: ignoring HEALTH_REMOTE_PYTHON=%r (expected an "
+                         "interpreter name or path).\n" % pinned)
+    return _REMOTE_LAUNCH % blob
+
+
+def _kill_tree(proc):
+    """SIGTERM the child's group, then SIGKILL it if it is still there after TERM_GRACE."""
+    _signal_group(proc, getattr(signal, "SIGTERM", 15))
+    try:
+        proc.wait(timeout=TERM_GRACE)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    _signal_group(proc, 9)
+
+
 def run_local_cmd(argv, timeout, env=None, stdin_text=None):
-    """Run a local command. Returns (rc, stdout_text, stderr_text); rc 124 = timed out."""
+    """Run a local command. Returns (rc, stdout_text, stderr_text); rc is TIMED_OUT (== 124)
+    when it ran out of time - see TimedOut."""
+    with _LIVE_LOCK:
+        if _STOPPING[0]:
+            return (130, "", "%s: not started - the run is stopping" % argv[0])
     try:
         proc = subprocess.Popen(
             argv,
@@ -4825,6 +5513,10 @@ def run_local_cmd(argv, timeout, env=None, stdin_text=None):
 
     with _LIVE_LOCK:
         _LIVE.add(proc)
+        stopping = _STOPPING[0]
+    if stopping:
+        # started in the instant the run was told to stop: it was never going to be killed
+        _kill_tree(proc)
     payload = stdin_text.encode("utf-8") if stdin_text is not None else None
     try:
         out, err = proc.communicate(input=payload, timeout=timeout)
@@ -4835,7 +5527,7 @@ def run_local_cmd(argv, timeout, env=None, stdin_text=None):
             out, err = proc.communicate(timeout=10)
         except subprocess.TimeoutExpired:
             out, err = b"", b""
-        rc = 124
+        rc = TIMED_OUT
     except KeyboardInterrupt:
         # only ever raised in the MAIN thread, so this is the serial path; the child is in
         # its own session and never saw the ctrl-C, so it has to be told
@@ -4847,6 +5539,55 @@ def run_local_cmd(argv, timeout, env=None, stdin_text=None):
     return (rc,
             out.decode("utf-8", "backslashreplace") if out else "",
             err.decode("utf-8", "backslashreplace") if err else "")
+
+
+# ssh binds its master at '<ControlPath>.<16 random characters>' and exits 255 when that
+# does not fit a unix socket's sun_path (108 bytes with its NUL: openssh mux.c
+# muxserver_listen, misc.c unix_listener - the same in 7.4 and 9.2)
+SOCKET_PATH_MAX = 107
+CONTROL_NAME = "cm-%C"            # %C: a 40-character hash of the connection (OpenSSH 6.7+)
+
+
+def control_options(work_dir):
+    """ssh's connection-sharing options for this run's work dir.
+
+    One master per host, its socket named by %C: a fixed length, where cm-%r@%h:%p grew
+    with the host name and a pool stored by a long FQDN could not be reached at all. The
+    work dir's own length still counts, though, and a long TMPDIR leaves no room for any
+    socket (measured: exit 255, 'ControlPath too long'). Then sharing is switched off and
+    every ssh makes its own connection - which costs one handshake, on the seed, since
+    each host is otherwise asked once."""
+    room = len(os.fsencode(work_dir)) + 1 + len(CONTROL_NAME) - 2 + 40 + 1 + 16
+    if room > SOCKET_PATH_MAX:
+        return ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
+    return ["-o", "ControlMaster=auto",
+            "-o", "ControlPath=%s" % os.path.join(work_dir, CONTROL_NAME),
+            "-o", "ControlPersist=60"]
+
+
+def close_masters(work_dir):
+    """Ask every ssh ControlMaster this run started to exit, so none outlives it.
+
+    With ControlPersist the first ssh to a host forks a master into its own session (out of
+    _LIVE's reach) that keeps the authenticated connection for 60 s after its last client;
+    and once the work dir is gone its socket is too, so nothing could ever ask it to go.
+    Measured: one per host, gone ~60 s after the run. `-O exit` over each socket ends them
+    now. No host is contacted - the master is local.
+    """
+    try:
+        names = os.listdir(work_dir)
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith("cm-"):
+            continue
+        # not run_local_cmd: this runs at exit, after kill_all_children has closed it
+        try:
+            subprocess.call(["ssh", "-S", os.path.join(work_dir, name), "-O", "exit",
+                             "health-master"], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
 
 class Transport(object):
@@ -4888,25 +5629,14 @@ class Transport(object):
             rc, out, err = self._run_ssh_collector(host, blob)
             what = "ssh to %s" % host
 
-        if rc == 124:
-            raise CollectError("%s timed out after %ds" % (what, config.REMOTE_CMD_TIMEOUT))
+        # the document first: one that arrived whole is the answer whatever the exit code
         payload = self._extract(out)
         if payload is None:
+            if is_timeout(rc):
+                raise CollectError("%s timed out after %ds" % (what, config.REMOTE_CMD_TIMEOUT))
             detail = (err.strip().splitlines() or [""])[-1][:300]
             raise CollectError("%s failed (exit %d)%s" % (what, rc, (": " + detail) if detail else ""))
-        if "__collector_error__" in payload:
-            raise CollectError("collector crashed on %s:\n%s" % (host, payload["__collector_error__"]))
-        if "__collector_stuck__" in payload:
-            # the host gave up on itself rather than being given up on: a command it could
-            # not kill, named. The old shape of this was the transport's own 300s timeout,
-            # which could say only that the host did not answer
-            debug("%s abandoned its run in: %s" % (host, payload["__collector_stuck__"]))
-            for elapsed, command in (payload.get("collector", {}).get("timings") or [])[:8]:
-                debug("%s   %6.2fs  %s" % (host, elapsed, command))
-            raise CollectError(
-                "gave up after %ds stuck in '%s' - that command cannot be killed, so the "
-                "host's storage or a driver is most likely wedged"
-                % (config.REMOTE_CMD_TIMEOUT - 60, payload["__collector_stuck__"]))
+        _mark_incomplete(payload, host)
         if err.strip():
             debug("stderr from %s:\n%s" % (host, err.strip()))
         info = payload.get("collector") or {}
@@ -4925,15 +5655,16 @@ class Transport(object):
         spec.setdefault("budget", config.REMOTE_CMD_TIMEOUT - 60)
         blob = base64.b64encode(json.dumps(spec).encode("utf-8")).decode("ascii")
         rc, out, err = self._run_local_collector(blob)
-        if rc == 124:
-            raise CollectError("local command timed out after %ds" % config.REMOTE_CMD_TIMEOUT)
         payload = self._extract(out)
         if payload is None:
+            if is_timeout(rc):
+                raise CollectError("local command timed out after %ds" % config.REMOTE_CMD_TIMEOUT)
             detail = (err.strip().splitlines() or [""])[-1][:300]
             raise CollectError("local command failed (exit %d)%s"
                                % (rc, (": " + detail) if detail else ""))
-        if "__collector_error__" in payload:
-            raise CollectError("collector crashed:\n%s" % payload["__collector_error__"])
+        # the same reading as collect(): this path used to ignore the stuck marker and use
+        # a partial document as if it were whole
+        _mark_incomplete(payload, "this host")
         return payload
 
     def _run_local_collector(self, blob):
@@ -4959,9 +5690,7 @@ class Transport(object):
             "-o", "LogLevel=ERROR",
             "-o", "ConnectTimeout=%d" % config.SSH_TIMEOUT,
             "-o", "NumberOfPasswordPrompts=1",
-            "-o", "ControlMaster=auto",
-            "-o", "ControlPath=%s" % os.path.join(self.work_dir, "cm-%r@%h:%p"),
-            "-o", "ControlPersist=60",
+        ] + control_options(self.work_dir) + [
             "-o", "BatchMode=no",
             "root@" + host,
             remote_command,
@@ -5058,11 +5787,11 @@ class Transport(object):
             debug("askpass helper unusable")
 
         if pinned != AUTH_ASKPASS:
-            if ensure_sshpass(run_env):
+            if sshpass_present(run_env):
                 self.auth = AUTH_SSHPASS
                 debug("password auth: sshpass")
                 return True
-            tried.append("sshpass is not installed and could not be installed")
+            tried.append("sshpass is not installed")
 
         # named individually: 'no way to authenticate' with no reason is the kind of
         # message that gets read as 'wrong password' and sends someone after the pool
@@ -5148,54 +5877,18 @@ def write_askpass(work_dir):
     return path
 
 
-def ensure_sshpass(run_env):
-    """Make sshpass available, or say why it is not.
+def sshpass_present(run_env):
+    """Is sshpass already installed? It is the fallback, reached only when the askpass
+    helper could not be run (a noexec work dir) - see enable_password_auth().
 
-    The fallback since v3.15, reached only when the askpass helper could not be run - see
-    enable_password_auth(). A run that gets here is on a machine where the work dir cannot
-    be executed from, so the install is the one way left to reach another host.
-
-    On a hypervisor it comes from 'extras', a stock XCP-ng repo that ships in
-    CentOS-Base.repo pointing at Vates' own mirror and is merely disabled by default.
-    --enablerepo is a one-shot, so the host's yum config is left exactly as it was, and
-    the package is 21KB with no dependencies. Note that plain 'yum list available sshpass'
-    finds nothing - it only searches ENABLED repos, which is what made an earlier look
-    conclude, wrongly, that it was not available.
+    Nothing is installed for it, on either side (the maintainer's call, 2026-11-25). The
+    install this replaces ran yum --enablerepo=extras on a dom0 and apt-get on an XOA: on
+    the offline appliances health.py is routinely pasted onto that was up to ten minutes
+    of timeouts before anything printed, and it left a package behind on a box the tool
+    is meant to leave as it found it. Without sshpass the run goes on to the XOA-only
+    report, or this host alone, saying why.
     """
-    if have("sshpass"):
-        return True
-    if run_env == "host":
-        sys.stderr.write("sshpass not found - installing it from the XCP-ng 'extras' repo "
-                         "to reach the other pool hosts...\n")
-        rc, out, err = run_local_cmd(
-            ["yum", "--enablerepo=extras", "install", "-y", "sshpass"], timeout=300)
-        if not have("sshpass"):
-            sys.stderr.write("ERROR: could not install sshpass (yum exit code %d).\n" % rc)
-            for line in (out + err).splitlines()[-5:]:
-                sys.stderr.write(line + "\n")
-            return False
-        sys.stderr.write("sshpass installed.\n")
-        return True
-
-    sys.stderr.write("sshpass not found. Installing via apt...\n")
-    env = dict(os.environ)
-    # stdin is /dev/null here, so anything that stops to ask (dpkg's conffile prompt,
-    # needrestart) would read EOF part way through an install nobody can see
-    env["DEBIAN_FRONTEND"] = "noninteractive"
-    rc, out, err = run_local_cmd(["apt-get", "update", "-y"], timeout=300, env=env)
-    if rc != 0:
-        # not fatal by itself: the package may well already be in the local index
-        sys.stderr.write("Warning: 'apt-get update' exited %d; trying the install anyway.\n" % rc)
-    rc, out, err = run_local_cmd(["apt-get", "install", "-y", "sshpass"], timeout=300, env=env)
-    if not have("sshpass"):
-        # the yum half has always said this much; the apt half said nothing at all, so a
-        # failure surfaced only as the caller's one-line 'sshpass is required'
-        sys.stderr.write("ERROR: could not install sshpass (apt-get exit code %d).\n" % rc)
-        for line in (out + err).splitlines()[-5:]:
-            sys.stderr.write(line + "\n")
-        return False
-    sys.stderr.write("sshpass installed.\n")
-    return True
+    return have("sshpass")
 
 
 # ======================================================================================
@@ -5480,7 +6173,13 @@ def _fetch_collection(addr, timeout, namespace):
     records = []
     for ident, blob in zip(ids, blobs):
         if blob is None:
-            continue                      # deleted between the two calls
+            # not necessarily deleted between the two calls: MGET answers nil for a key
+            # holding a HASH too, and XO wrote every record that way until Dec 2023
+            # (32afd5c46) with no migration since - an old job never edited is still one.
+            # Skipping it could drop an XOA-run job and read Backup Network green, so
+            # decline: xo-server-db reads hash records through XO's own code
+            raise RedisError("%s%s has no string value (deleted mid-read, or stored the "
+                             "pre-2024 way, as a hash)" % (prefix, ident))
         if blob.startswith(ENCRYPTION_PREFIX):
             raise RedisError("%s records are encrypted (%s%s)" % (namespace, prefix, ident))
         record = json.loads(blob)
@@ -5671,18 +6370,33 @@ def _sort_key(name):
     fallback order, so a cron run with no -n takes entry #1 of THIS ordering.
     """
     folded = unicodedata.normalize("NFKD", clean(name).lower())
-    folded = "".join(c for c in folded if not unicodedata.combining(c))
+    folded = "".join(_FOLD.get(c, c) for c in folded if not unicodedata.combining(c))
     parts = []
-    for chunk in re.split(r"(\d+)", folded):
+    for chunk in re.findall(r"\d+|[^\W\d_]+|\s+|.", folded):
         if chunk.isdigit():
             # digits sort BEFORE letters in the root collation ICU gives localeCompare,
             # so a pool named '1st Avenue' is menu entry 1, not 3. Verified against node
             # on the live db - getting this backwards silently changes which pool a
             # no-args cron run checks.
-            parts.append((0, int(chunk), ""))
-        elif chunk:
-            parts.append((1, 0, chunk))
+            parts.append((1, int(chunk), ""))
+        elif chunk.isspace():
+            parts.append((0, -1, ""))
+        elif re.match(r"[^\W\d_]", chunk):
+            parts.append((2, 0, chunk))
+        else:
+            # punctuation and symbols sort before digits, in CLDR's own order (node, on
+            # the test XOA: _infra < (old) pool < #1 site < ~lab < 1st Avenue < alpha)
+            pos = _CLDR_PUNCT.find(chunk)
+            parts.append((0, pos if pos >= 0 else len(_CLDR_PUNCT) + ord(chunk), ""))
     return parts
+
+
+# CLDR root collation's order for the ASCII punctuation and symbols - all of which come
+# before digits, which come before letters (alternate=non-ignorable, ICU's default)
+_CLDR_PUNCT = "_-,;:!?.'\"()[]{}@*/\\&#%`^+<=>|~$"
+# letters NFKD does not decompose, which root collation sorts as their base letters
+_FOLD = {u"ø": "o", u"æ": "ae", u"œ": "oe", u"ß": "ss",
+         u"đ": "d", u"ł": "l", u"þ": "th", u"ð": "d"}
 
 
 class Server(object):
@@ -5725,18 +6439,50 @@ def _describe_failure(rc, err):
         first = first[:-2]
     if first.startswith("[") and first.endswith("]"):
         first = first[1:-1]
+    if re.search(r"password|is not valid JSON|Unexpected token|in JSON at position", first,
+                 re.I):
+        # node's JSON.parse errors quote the text around the fault - a corrupt record's
+        # own bytes, password field and all - and this line is printed, and pasted into
+        # tickets. The error's class is enough to say what happened
+        first = "%s (the rest is withheld: it quotes a record)" % first.split(":")[0]
     if first:
         return "exit code %d: %s" % (rc, first)
     return "exit code %d" % rc
 
 
+_RECORDS_HEADER = re.compile(r"^(\d+) record\(s\) found$", re.M)
+
+
 def _ls(args):
-    """(output, "") or (None, why-not). rc 127 is the transport's own 'not found'."""
+    """(output, "") or (None, why-not). rc 127 is the transport's own 'not found'.
+
+    Only what follows db-cli's own 'N record(s) found' header is returned (packages/
+    xo-server/src/db-cli.mjs writes it before the records): anything xo-server's startup
+    logs to stdout ahead of it - @xen-orchestra/log sends INFO to console.info - could
+    carry a lone quote that throws the record scanner off for the whole rest of the
+    output. LOG_LEVEL=warn keeps those lines out to begin with (configure.js reads it).
+
+    A non-zero exit after every record was printed is accepted when the count matches:
+    the tool can die in its shutdown hook (ClientClosedError at Servers._add, measured on
+    the test XOA) with its output already whole.
+    """
+    env = dict(os.environ)
+    env["LOG_LEVEL"] = "warn"
     rc, out, err = transport.run_local_cmd(["xo-server-db", "ls"] + list(args),
-                                           timeout=config.LOCAL_CMD_TIMEOUT * 3)
+                                           timeout=config.LOCAL_CMD_TIMEOUT * 3, env=env)
+    m = _RECORDS_HEADER.search(out or "")
+    body = out[m.end():] if m else out
     if rc != 0:
+        if m and len(scan_records(body)) == int(m.group(1)):
+            transport.debug("xo-server-db exited %d after printing all %s record(s); "
+                            "using them" % (rc, m.group(1)))
+            return body, ""
         return None, _describe_failure(rc, err)
-    return out, ""
+    return body, ""
+
+
+# util.inspect cuts any string over maxStringLength (10000) and says so after it
+_INSPECT_CUT = re.compile(r"\.\.\. \d+ more characters?")
 
 
 def _read_servers():
@@ -5819,7 +6565,11 @@ def enabled_servers():
         # -n matches EITHER name: a pool can show as XEN-PRIMARY while the server label a
         # user remembers it by is XEN-MAIN-01
         rows.append(Server(rec["host"], name, (pool_name + " " + label).lower(), rec))
-    rows.sort(key=lambda r: _sort_key(r.name))
+    # a fixed tie-break after the name: two pools that compare equal (both "(unnamed)",
+    # or equal once case and accents are folded) must not swap places between runs - the
+    # first is what a cron run checks, and redis set order changes at every restart
+    rows.sort(key=lambda r: (_sort_key(r.name), db_address(r.record),
+                             str(r.record.get("id") or "")))
     return rows
 
 
@@ -5909,6 +6659,13 @@ def match_record(want, records, resolve_want=False):
         want = parsers.xo_server_address(want)[0]
     if not want:
         return None, ""
+    # Within each kind of evidence the first match wins, so the order decides between two
+    # records that both answer: an ENABLED record before a disabled one (a stale disabled
+    # record must not supply the password while the banner names the live pool), then a
+    # fixed order - redis 7.0 keeps the id set as a hashtable whose iteration order
+    # changes at every restart, so db order is no tie-breaker.
+    records = sorted(records, key=lambda r: (str(r.get("enabled")) != "true",
+                                             db_address(r), str(r.get("id") or "")))
     for rec in records:
         if rec.get("host") == want or _same_address(db_address(rec), want):
             return rec, "host"
@@ -5959,6 +6716,12 @@ def password_for(host):
     """
     rec, _how = server_for_host(host)
     return record_password(rec)
+
+
+def record_user(rec):
+    """The xapi user XO connects as for this record ('' when not recorded). XO logs in with
+    `server.username` (xen-servers.mjs), and only root's password is root's."""
+    return clean((rec or {}).get("username")) if rec else ""
 
 
 def record_password(rec):
@@ -6015,7 +6778,13 @@ def collection(namespace):
                                 % (namespace, exc))
         if records is None:
             out, why = _ls([namespace])
-            records = scan_records(out) if out is not None else []
+            if out is not None and _INSPECT_CUT.search(out):
+                # a job's vms/settings longer than 10000 characters (a hand-picked job of
+                # a few hundred VMs) arrives cut short: never parse half a value
+                records, why = [], ("xo-server-db printed some %s values cut short, so "
+                                    "they could not be read whole" % namespace)
+            else:
+                records = scan_records(out) if out is not None else []
         _COLLECTIONS[namespace] = (records, why)
     return _COLLECTIONS[namespace]
 
@@ -6041,6 +6810,13 @@ def backup_routes(server, pool_uuid, vm_uuids, sr_uuids):
     if proxy_ids:
         proxies, why = collection("proxy")
         known = {} if why else dict((p.get("id"), p.get("name")) for p in proxies)
+        if not why:
+            dangling = [i for i in proxy_ids if i not in known]
+            if dangling:
+                # XO would fail those jobs (callProxyMethod on a proxy it no longer has),
+                # so nothing moves that traffic: it must not read as "through a proxy"
+                return {"error": "backup job(s) pinned to XO Proxy %s, which no longer "
+                                 "exists" % ", ".join(dangling)}
         names = [known.get(i) or i for i in proxy_ids]
     return {"xoa": xoa, "proxies": names, "error": "",
             "http_proxy": parsers.http_proxy_address((server or {}).get("httpProxy"))}
@@ -6205,23 +6981,98 @@ def xapi_status(host):
 
 
 def ntp(host):
-    """One line, two facts. An explicit 'no' is a real finding; 'Unknown' (address not in
-    the xe maps) stays informational."""
+    """One line, two facts. An explicit 'no' is a real finding, and so is a half that was
+    not established: timedatectl unread or unparseable is a fact we failed to establish,
+    which flags the exit code like any other (v3.28 - it used to be an exit-neutral
+    yellow, on a reason left over from the bash script's xe-map source). systemd's 'n/a'
+    (no NTP service known) arrives here as 'no'."""
     from colors import green, yellow
     state = host.ntp_state()
     enabled, synced = state["ntp"], state["sync"]
     text = "Enabled - %s Synced - %s" % (
         (green if enabled == "yes" else yellow)(enabled),
         (green if synced == "yes" else yellow)(synced))
+    if state.get("error"):
+        text += " (%s)" % state["error"]
     line = result.Line("NTP", text, result.OK)
     if enabled == "no" or synced == "no":
         line.status = result.FLAG
     elif enabled != "yes" or synced != "yes":
-        # neither half was established, which -f must not hide: the yellow in the text is
-        # the same warning info(..., "yellow") carries, so it keeps its line the same way
-        line.status = result.INFO
-        line.keep = True
+        line.status = result.UNKNOWN
     return line
+
+
+def dom0_ram_allocations(hosts):
+    """Every reachable host's dom0 MemTotal, compared.
+
+    Within RAM_MATCH_TOLERANCE_MB counts as the same: MemTotal is dom0_mem less kernel
+    reservations that differ with hardware by tens of MiB, and rounding to the nearest
+    GiB (what this did) split two hosts 20 MiB apart across an N.5 GiB boundary while
+    calling two 480 MiB apart equal. A host whose memory was not read is not a
+    difference - but it is not agreement either, so a match then says Unknown and names
+    it; and one reading compares nothing.
+    """
+    readings, unread = [], []
+    for host in hosts:
+        total = host.mem_total_mb()
+        if total is None:
+            unread.append(host.label)
+        else:
+            readings.append((host.label, total))
+    if not readings:
+        return unknown("Dom0 RAM Allocations", "Unknown (no host's memory could be read)")
+    low, high = min(t for _l, t in readings), max(t for _l, t in readings)
+    if high - low > config.RAM_MATCH_TOLERANCE_MB:
+        return flag("Dom0 RAM Allocations", "Mismatched").with_detail(
+            "Dom0 RAM Allocations", "\n".join("  %s  %.1fG" % (label, total / 1024.0)
+                                              for label, total in readings))
+    if unread:
+        return unknown("Dom0 RAM Allocations", "Unknown - matched on %d of %d hosts, not "
+                       "read: %s" % (len(readings), len(readings) + len(unread),
+                                     ", ".join(unread)))
+    if len(readings) < 2:
+        return ok("Dom0 RAM Allocations", "N/A - Nothing to compare")
+    return ok("Dom0 RAM Allocations", "Matched")
+
+
+def pool_time_sync(hosts):
+    """Every reachable host has NTP on, says it is synchronised, and agrees with this
+    machine's clock inside TIME_SYNC_ALLOWANCE_SECS.
+
+    "Mismatched" only for what was established - an explicit no, or a drift measured over
+    the allowance - naming the host and why. A host whose state or clock was not read is
+    Unknown with its reason: it was claimed as a mismatch before, which it was not known to
+    be. With no host read at all there is nothing to call matched.
+    """
+    bad, unread = [], []
+    for host in hosts:
+        state = host.ntp_state()
+        if state.get("error") or "Unknown" in (state["ntp"], state["sync"]):
+            unread.append("%s (%s)" % (host.label, state.get("error") or
+                                       "NTP state not in timedatectl's output"))
+            continue
+        if state["ntp"] != "yes" or state["sync"] != "yes":
+            bad.append("%s: NTP enabled %s, synchronised %s"
+                       % (host.label, state["ntp"], state["sync"]))
+            continue
+        drift = host.clock_drift()
+        if drift is None:
+            unread.append("%s (its clock was not read)" % host.label)
+        elif drift > config.TIME_SYNC_ALLOWANCE_SECS:
+            bad.append("%s: %ds from this machine's clock (allowed %ds)"
+                       % (host.label, int(drift), config.TIME_SYNC_ALLOWANCE_SECS))
+    if bad:
+        detail = list(bad)
+        if unread:
+            detail.append("not read: " + "; ".join(unread))
+        return flag("Pool Time Synchronization", "Mismatched").with_detail(
+            "Pool Time Synchronization", "\n".join("  " + d for d in detail))
+    if unread:
+        return unknown("Pool Time Synchronization", "Unknown - not read: %s"
+                       % "; ".join(unread))
+    if not hosts:
+        return unknown("Pool Time Synchronization", "Unknown (no host was read)")
+    return ok("Pool Time Synchronization", "Matched")
 
 
 # --------------------------------------------------------------------------------------
@@ -6229,13 +7080,21 @@ def ntp(host):
 # --------------------------------------------------------------------------------------
 
 def dom0_disk_usage(host):
+    """Local filesystems over DOM0_MAX_USED. The collector reads usage without df, from
+    /proc/mounts and statvfs, so a dead network mount can neither hang this line nor
+    leave a df behind; a local mount it could not read makes a clean answer Unknown."""
     f = host.fact("df")
     if not f.ok:
         return unknown("Dom0 Disk Usage", "Unknown (%s)" % f.error)
-    bad = parsers.parse_df(f.value, config.DOM0_MAX_USED)
-    if not bad:
-        return ok("Dom0 Disk Usage", "OK")
-    return flag("Dom0 Disk Usage", "Fail", " - " + ", ".join(bad))
+    v = f.value
+    text, failed = ((v.get("text") or "", v.get("failed") or []) if isinstance(v, dict)
+                    else (v or "", []))
+    bad = parsers.parse_df(text, config.DOM0_MAX_USED)
+    if bad:
+        return flag("Dom0 Disk Usage", "Fail", " - " + ", ".join(bad))
+    if failed:
+        return unknown("Dom0 Disk Usage", "Unknown - could not read %s" % ", ".join(failed))
+    return ok("Dom0 Disk Usage", "OK")
 
 
 def read_only_filesystems(host):
@@ -6434,6 +7293,16 @@ def coredumps(host):
         "Coredumps (%s)" % config.COREDUMP_DIR, "\n".join(shown))
 
 
+def host_collection(host):
+    """Printed only when the host's collector stopped part way - stuck on a command it
+    could not kill, or failed - and sent back what it had. A complete document prints
+    nothing here: None is "no line", and a host that answered whole needs none."""
+    why = (host.payload or {}).get("__incomplete__")
+    if not why:
+        return None
+    return flag("Host Collection", "Incomplete", " - " + why)
+
+
 def failed_units(host):
     """A systemd unit in the failed state: a service that did not start, or died since.
 
@@ -6606,7 +7475,12 @@ def _multipath_read(host):
         config.MULTIPATH_OK_DEV_STATES, config.MULTIPATH_STANDBY_CHK_STATES)
 
     known = set(entry["name"] for entry in summary["maps"])
-    unmanaged = [name for name in (dm_maps or []) if name not in known]
+    if dm_maps is None:
+        # the kernel's side was not read: unmanaged is None - "not looked for" - and never
+        # an empty list, which would read as "looked, there are none"
+        return (summary, None, bool(rechecked.ok and rechecked.value),
+                "dmsetup ls --target multipath was not read (%s)" % dm.error)
+    unmanaged = [name for name in dm_maps if name not in known]
     return summary, unmanaged, bool(rechecked.ok and rechecked.value), None
 
 
@@ -6622,6 +7496,8 @@ def multipath_health(host):
     summary, unmanaged, rechecked, reason = _multipath_read(host)
     if summary is None:
         return unknown("Multipath Path Health", "Unknown (%s)" % reason)
+    dm_unread = unmanaged is None
+    unmanaged = unmanaged or []
     detail = _multipath_detail(summary, unmanaged, rechecked)
 
     if not summary["maps"]:
@@ -6629,8 +7505,12 @@ def multipath_health(host):
             return flag("Multipath Path Health",
                         "%d device-mapper map(s) multipathd does not manage, See Below"
                         % len(unmanaged)).with_detail("Multipath Paths", detail)
-        # dm could not be read here only means the corroboration was missing: multipathd
-        # is alive and says there is nothing, which is itself an established answer
+        if dm_unread:
+            # an alive multipathd answering empty is exactly what a daemon that came up
+            # without adopting the kernel's maps looks like: without the kernel's side
+            # there is no telling it from a host with no multipath, so no green
+            return unknown("Multipath Path Health", "Unknown - multipathd lists no maps, "
+                                                    "but %s" % reason)
         return ok("Multipath Path Health", "N/A - No multipath maps")
 
     usable = summary["ok_paths"] + summary["standby_paths"]
@@ -6658,6 +7538,9 @@ def multipath_health(host):
         # normal on an active/passive array, and worth saying out loud so nobody reads
         # 4/4 and assumes four paths are carrying I/O
         text += " (%d standby)" % summary["standby_paths"]
+    if dm_unread:
+        # every path multipathd knows is fine; what it does not know was not looked for
+        text += " - maps multipathd does not manage not looked for (dmsetup not read)"
     return ok("Multipath Path Health", text)
 
 
@@ -6767,16 +7650,15 @@ def multipath_events(host):
     reloads: that would leave a permanent yellow behind a switch reboot last month. These
     two windows both close by themselves.
     """
-    scan = host.fact("multipath_scan")
+    blocks, failed = _scan_result(host.fact("multipath_scan"))
     dmesg = host.fact("dmesg")
 
-    blocks = list(scan.value) if (scan.ok and scan.value) else []
     if dmesg.ok:
         blocks = blocks + _dmesg_phrase_blocks(dmesg.value, config.MULTIPATH_EVENT_PHRASES,
                                                config.LOG_ERROR_CONTEXT)
     if blocks:
         # a finding is established whatever the other source did or did not manage to say
-        detail = _render_scan_blocks(blocks)
+        detail = _render_scan_blocks(blocks, failed)
         if len(blocks) > 1:
             detail += ("\n\n(the same event can appear under both sources - dmesg -T "
                        "recomputes its timestamps each run, so they sit a second or two "
@@ -6784,8 +7666,8 @@ def multipath_events(host):
         return flag("Multipath Path Events", "Yes, See Error Output").with_detail(
             "Multipath Path Events", detail)
     # nothing found, so every source has to have actually been read before this is a "None"
-    if not scan.ok:
-        return unknown("Multipath Path Events", "Unknown (%s)" % scan.error)
+    if failed:
+        return unknown("Multipath Path Events", "Unknown (%s)" % "; ".join(failed))
     if not dmesg.ok:
         return unknown("Multipath Path Events", "Unknown (could not read dmesg)")
     return ok("Multipath Path Events", "None")
@@ -6893,37 +7775,56 @@ def duplicate_ips_across_hosts(hosts, xoa_addrs=None):
               % (scope, len(owners), "" if len(owners) == 1 else "es", tail))
 
 
-def _render_scan_blocks(blocks):
-    """The scanner's blocks, laid out the way the report has always shown them."""
+def _scan_result(f):
+    """(blocks, failed) of a log-scan fact. `failed` names every scan that did not happen;
+    a fact that is itself an error is one failure with its reason. Nothing found plus
+    anything failed is not "nothing found". (An older collector's plain list of blocks
+    recorded no failures - it could not tell them apart.)"""
+    if not f.ok:
+        return [], [f.error]
+    v = f.value
+    if isinstance(v, dict):
+        return list(v.get("blocks") or []), list(v.get("failed") or [])
+    return list(v or []), []
+
+
+def _render_scan_blocks(blocks, failed=None):
+    """The scanner's blocks, laid out the way the report has always shown them, and the
+    scans that did not happen after them - a finding stands, but the reader is told what
+    was not looked at."""
     out = []
     for block in blocks:
         out.append("--- %s (%s) ---" % (block["phrase"], block["file"]))
+        if block.get("note"):
+            out.append("  (%s - the matching line alone)" % block["note"])
         for line in block["context"]:
             out.append("  " + line)
         out.append("")
+    if failed:
+        out.append("Not read: " + "; ".join(failed))
     # blocks are separated by a blank line, but the blob itself does not end with one:
     # the detail printer adds its own spacing
     return "\n".join(out).rstrip("\n")
 
 
 def log_errors(host):
-    f = host.fact("log_scan")
-    if not f.ok:
-        return unknown("Log Errors", "Unknown (%s)" % f.error)
-    if not f.value:
-        return ok("Log Errors", "None")
-    return flag("Log Errors", "Yes, See Error Output").with_detail(
-        "Log Errors", _render_scan_blocks(f.value))
+    blocks, failed = _scan_result(host.fact("log_scan"))
+    if blocks:
+        return flag("Log Errors", "Yes, See Error Output").with_detail(
+            "Log Errors", _render_scan_blocks(blocks, failed))
+    if failed:
+        return unknown("Log Errors", "Unknown (%s)" % "; ".join(failed))
+    return ok("Log Errors", "None")
 
 
 def lun_assignments(host):
-    f = host.fact("lun_scan")
-    if not f.ok:
-        return unknown("LUN Assignments", "Unknown (%s)" % f.error)
-    if not f.value:
-        return ok("LUN Assignments", "Unchanged")
-    return flag("LUN Assignments", "Changed - see below").with_detail(
-        "LUN Assignment Changes", _render_scan_blocks(f.value))
+    blocks, failed = _scan_result(host.fact("lun_scan"))
+    if blocks:
+        return flag("LUN Assignments", "Changed - see below").with_detail(
+            "LUN Assignment Changes", _render_scan_blocks(blocks, failed))
+    if failed:
+        return unknown("LUN Assignments", "Unknown (%s)" % "; ".join(failed))
+    return ok("LUN Assignments", "Unchanged")
 
 
 def smapi_hidden_leaves(host):
@@ -6970,6 +7871,12 @@ def yum_patch_level(host, is_master, master_manifest):
     re-fetching on mismatch meant two different snapshots, which produced a
     'Mismatch, See Below' over an empty difference block."""
     if is_master:
+        own = host.fact("rpm_manifest")
+        if not own.ok or not (own.value or "").strip():
+            # the green value claims a baseline exists, and every slave is Unknown "no
+            # baseline" for exactly this reason - the master's line has to say so too
+            return unknown("Yum Patch Level", "Unknown (the master's package list could not "
+                                              "be read, so no host was compared)")
         # guarded like the slaves' Match line: unguarded, -f showed the master's baseline
         # while hiding every slave's passing line, reading as though they were not checked
         return ok("Yum Patch Level", "Reference (Master)")
@@ -7015,19 +7922,18 @@ def xostor_version_consistency(hosts, details_shown=True):
     the pool section. details_shown is False when those per-host lines are switched off
     for slaves, and then the line must not send the reader to look for them.
     """
-    key = "XOSTOR Version Consistency"
     sigs = [s for s in (_xostor_signature(h) for h in hosts) if s is not None]
     if not sigs:
-        return unknown(key, "Unknown (could not read versions from any host)")
+        return unknown("XOSTOR Version Consistency", "Unknown (could not read versions from any host)")
     stale = any(loaded and dict(tracked).get("kmod-drbd")
                 and _drbd_stale(loaded, dict(tracked)["kmod-drbd"])
                 for tracked, loaded in sigs)
     if stale or len(set(sigs)) > 1:
-        return flag(key, "Mismatched, See Host Results" if details_shown else "Mismatched")
+        return flag("XOSTOR Version Consistency", "Mismatched, See Host Results" if details_shown else "Mismatched")
     if len(sigs) < len(hosts):
-        return unknown(key, "Matched on %d of %d hosts (rest unreadable)"
+        return unknown("XOSTOR Version Consistency", "Matched on %d of %d hosts (rest unreadable)"
                        % (len(sigs), len(hosts)))
-    return ok(key, "Matched")
+    return ok("XOSTOR Version Consistency", "Matched")
 
 
 def xostor_versions(host, pool_uses_xostor):
@@ -7045,10 +7951,15 @@ def xostor_versions(host, pool_uses_xostor):
     tracked = [(n, pkgs[n]) for n in config.XOSTOR_PACKAGES if n in pkgs]
     loaded = module.value if module.ok else ""
     if not pool_uses_xostor and not tracked and not loaded:
-        if manifest.ok and module.ok:
-            return None   # established: no XOSTOR here, so nothing to say
-        if not manifest.ok and not module.ok:
+        if module.ok:
+            # DRBD established as not loaded on a pool that does not use XOSTOR: nothing to
+            # say, whatever the manifest did (Yum Patch Level carries a failed one). The
+            # mixed case used to fall through and FLAG "DRBD Module: Not Loaded" about a
+            # feature this pool does not use
+            return None
+        if not manifest.ok:
             return None   # cannot tell whether XOSTOR applies; the pool line says if so
+        # module unreadable means /sys/module/drbd exists: DRBD is here, so say so
 
     lines = []
     if not manifest.ok or not manifest.value.strip():
@@ -7059,24 +7970,23 @@ def xostor_versions(host, pool_uses_xostor):
         lines.append(info("XOSTOR Packages", ", ".join(
             "%s %s" % (n, " + ".join(v)) for n, v in tracked)))
 
-    key = "XOSTOR DRBD Module"
     if not module.ok:
-        lines.append(unknown(key, "Unknown (%s)" % module.error))
+        lines.append(unknown("XOSTOR DRBD Module", "Unknown (%s)" % module.error))
         return lines
     kmod = pkgs.get("kmod-drbd") or []
     if not loaded:
-        lines.append(flag(key, "Not Loaded"))
+        lines.append(flag("XOSTOR DRBD Module", "Not Loaded"))
         return lines
     if not manifest.ok:
-        lines.append(unknown(key, "Loaded %s (installed kmod-drbd unknown)" % loaded))
+        lines.append(unknown("XOSTOR DRBD Module", "Loaded %s (installed kmod-drbd unknown)" % loaded))
         return lines
     if not kmod:
-        lines.append(flag(key, "Loaded %s, but kmod-drbd is not installed" % loaded))
+        lines.append(flag("XOSTOR DRBD Module", "Loaded %s, but kmod-drbd is not installed" % loaded))
         return lines
     if not _drbd_stale(loaded, kmod):
-        lines.append(ok(key, "Loaded %s (matches kmod-drbd)" % loaded))
+        lines.append(ok("XOSTOR DRBD Module", "Loaded %s (matches kmod-drbd)" % loaded))
     else:
-        lines.append(flag(key, "Loaded %s, Installed kmod-drbd %s (reboot pending?)"
+        lines.append(flag("XOSTOR DRBD Module", "Loaded %s, Installed kmod-drbd %s (reboot pending?)"
                           % (loaded, " + ".join(kmod))))
     return lines
 
@@ -7199,6 +8109,10 @@ def pool_roles(hosts):
                         % (len(masters), ", ".join(h.name for h in masters)))
     for e in slaves:
         target = e["target"]
+        if not e["pointer"]:
+            # 'slave:' with nothing after it: xapi reads it as a slave of no address
+            problems.append("%s holds '%s', a slave of no address" % (e["host"].name, e["text"]))
+            continue
         if target is e["host"]:
             problems.append("%s points at itself" % e["host"].name)
             continue
@@ -7348,14 +8262,15 @@ def sr_attachment(pool):
 
 
 def long_running_tasks(pool):
-    """A xapi task still pending after TASK_PENDING_MAX_HOURS.
+    """A xapi task not finished after TASK_PENDING_MAX_HOURS - pending, or cancelling.
 
     It holds whatever it was working on - a VM, a VDI, an SR operation - and every later
     operation on that object waits behind it or fails with an 'operation in progress'
     that names nothing. One reading only, so the line says how long a task has been
-    pending, never that it is stuck: progress is shown, not judged. xapi destroys a
-    pending task itself at pending_task_timeout (24 h by default), so the window this can
-    see is the hours before that.
+    unfinished, never that it is stuck: progress is shown, not judged. xapi destroys one
+    older than pending_task_timeout (24 h by default) only if its progress has not moved
+    since its previous GC pass (see config.TASK_PENDING_MAX_HOURS), so a task that keeps
+    creeping can be seen here at any age.
     """
     f = pool.fact("tasks")
     if not f.ok:
@@ -7375,11 +8290,12 @@ def long_running_tasks(pool):
     if att.ok and isinstance(att.value, dict):
         for rec in parsers.parse_xe_records(att.value.get("hosts") or ""):
             names[rec.get("uuid")] = rec.get("name-label") or rec.get("uuid")
-    lines = ["  %s (%s): pending for %.1fh, progress %s, on %s" % (
-        name, uuid, age / 3600.0, progress, names.get(host, host))
-        for name, uuid, age, progress, host in old]
-    lines.append("A task xapi still calls pending holds what it works on; if it is not "
-                 "moving, xe task-cancel uuid=<uuid> asks it to stop.")
+    lines = ["  %s (%s): %s for %.1fh, progress %s, on %s" % (
+        name, uuid, status, age / 3600.0, progress, names.get(host, host))
+        for name, uuid, age, progress, host, status in old]
+    lines.append("A task xapi has not finished holds what it works on; if it is not "
+                 "moving, xe task-cancel uuid=<uuid> asks it to stop (a 'cancelling' one "
+                 "already was asked, and did not stop).")
     return flag("Long-Running Tasks", "Yes",
                 " - %d pending over %dh: %s" % (len(old), config.TASK_PENDING_MAX_HOURS,
                                                 ", ".join(t[0] for t in old[:3]) +
@@ -7388,14 +8304,16 @@ def long_running_tasks(pool):
 
 
 def leaf_coalesce_disabled(pool):
-    """Disks SM's GC will never leaf-coalesce, and SRs where it will leaf-coalesce nothing.
+    """Disks SM's GC is not leaf-coalescing, and SRs where it leaf-coalesces nothing.
 
     other-config:leaf-coalesce=false on a VDI is written by SM when a storage migration
-    starts mirroring that disk (see config.LEAF_COALESCE_BUSY_VM_OPS for the trace), and a
-    migration that fails or is cancelled leaves it there: the disk's snapshot chain then
-    only ever grows. A disk whose VM or VDI is mid-migration, -export or -import right now
-    is where the flag belongs, so it is counted aside. On an SR's other-config the same key
-    turns leaf-coalesce off for every disk on it, and only a person sets that.
+    starts mirroring that disk (see config.LEAF_COALESCE_BUSY_VM_OPS for the trace). A
+    migration that fails or is cancelled leaves it there until the disk's next snapshot -
+    SM's snapshot path removes the key before deciding whether to set it again - or until
+    someone removes it; until then GC skips the disk. A disk whose VM or VDI is
+    mid-migration, -export or -import right now is where the flag belongs, so it is
+    counted aside. On an SR, any of three other-config switches set to false stops it for
+    every disk there (parsers.GC_SR_SWITCHES), and only a person sets those.
 
     The VM list is what busy-ness is judged by; without it every flagged disk is reported
     and the detail says why. The VBD list only names the VMs, so without it the disks are
@@ -7419,8 +8337,12 @@ def leaf_coalesce_disabled(pool):
         return ok("Leaf-Coalesce Disabled", "None" + aside)
 
     lines = []
-    for uuid, name in srs:
-        lines.append("  SR %s (%s): leaf-coalesce disabled for every disk on it" % (name, uuid))
+    what = {"gc": "garbage collection disabled for it - nothing is coalesced or cleaned up",
+            "coalesce": "coalescing disabled for every disk on it",
+            "leaf-coalesce": "leaf-coalesce disabled for every disk on it"}
+    for uuid, name, off in srs:
+        lines.append("  SR %s (%s): %s (other-config %s)"
+                     % (name, uuid, what[off[0]], ", ".join("%s=false" % k for k in off)))
     rows = []
     for d in disks:
         where = ", ".join("%s (%s)" % (n or "?", u) for u, n in d["vms"]) or "no VM"
@@ -7438,9 +8360,14 @@ def leaf_coalesce_disabled(pool):
                      "all are listed" % vms.error)
     if v.get("srs") is None:
         lines.append("  the SRs were not read (%s)" % (v.get("sr_error") or "not collected"))
-    lines.append("Left behind by a storage migration that did not finish: GC skips the disk "
-                 "until the key goes - xe vdi-param-remove uuid=<vdi> param-name=other-config "
-                 "param-key=leaf-coalesce (xe sr-param-remove for an SR).")
+    if disks:
+        lines.append("Left behind by a storage migration that did not finish: GC skips the "
+                     "disk until its next snapshot, or until the key goes - xe "
+                     "vdi-param-remove uuid=<vdi> param-name=other-config "
+                     "param-key=leaf-coalesce.")
+    if srs:
+        lines.append("An SR switch stays until removed: xe sr-param-remove uuid=<sr> "
+                     "param-name=other-config param-key=<switch>.")
     vm_count = len(set(u for d in disks for u, _n in d["vms"]))
     parts = []
     if disks:
@@ -7520,32 +8447,49 @@ def update_mirror_access(host):
 
     A host whose repos point somewhere else (a local mirror) is said, not flagged.
     """
-    key = "Update Mirror Access"
     f = host.fact("update_mirror")
     if not f.ok:
-        return unknown(key, "Unknown (%s)" % f.error)
+        return unknown("Update Mirror Access", "Unknown (%s)" % f.error)
     v = f.value or {}
     if v.get("skipped"):
-        return info(key, "N/A (repos use %s)" % (", ".join(v.get("repo_hosts") or [])
+        return info("Update Mirror Access", "N/A (repos use %s)" % (", ".join(v.get("repo_hosts") or [])
                                                   or "no enabled repos"))
     redirector = _url_host_of(v.get("url", "")) or config.UPDATE_MIRROR_REDIRECTOR
     seen = "Public IP: %s%s" % (v.get("public_ip") or "unknown",
                                 " - %s" % v["asn"] if v.get("asn") else "")
-    head = ["Repo URL:  %s" % v.get("url", "?"), seen,
+    head = ["Repo URL:  %s" % (v.get("repo_url") or v.get("url", "?")), seen,
             "Via yum proxy: %s" % ("yes" if v.get("proxy") else "no")]
+    if v.get("repo_url") and v.get("repo_url") != v.get("url"):
+        head.insert(1, "Probed:    %s (the redirector sends http requests there)"
+                    % v.get("url", "?"))
     if v.get("redirector_error"):
-        return flag(key, "Cannot reach %s, See Below" % redirector).with_detail(
-            "---update mirror access---",
-            "\n".join(head + ["", "%s: %s" % (redirector, v["redirector_error"])]))
+        # yum falls back to the repo's other hosts; the line still flags (the mirror
+        # network is down for this host) and says whether the fallback answers
+        fallbacks = v.get("fallbacks") or []
+        answering = [x.get("host", "?") for x in fallbacks if x.get("ok")]
+        text = "Cannot reach %s" % redirector
+        if answering:
+            text += " (yum falls back to %s, which answers)" % ", ".join(answering)
+        elif fallbacks:
+            text += " (nor its fallback %s)" % ", ".join(x.get("host", "?") for x in fallbacks)
+        lines = head + ["", "%s: %s" % (redirector, v["redirector_error"])]
+        for x in fallbacks:
+            lines.append("fallback %s: %s" % (x.get("host", "?"),
+                                              "OK" if x.get("ok") else x.get("error")))
+        return flag("Update Mirror Access", text + ", See Below").with_detail(
+            "---update mirror access---", "\n".join(lines))
+    if v.get("page_error"):
+        # it answered: an unreadable mirror list establishes nothing about reachability
+        return unknown("Update Mirror Access", "Unknown (%s)" % v["page_error"])
 
     mirrors = v.get("mirrors") or []
-    bad = [m for m in mirrors if not m.get("ok")]
+    tried = [m for m in mirrors if m.get("tried", True)]
+    bad = [m for m in tried if not m.get("ok")]
+    untried = [m for m in mirrors if not m.get("tried", True)]
+    first_hop = v.get("first_hop_error") or ""
     selected = v.get("selected") or ""
-    if mirrors and not bad:
-        return ok(key, "Yes (%s, via %s)" % (_plural(len(mirrors), "mirror"),
-                                             selected or mirrors[0].get("host")))
     if not mirrors:
-        return unknown(key, "Unknown (no mirror was tried)")
+        return unknown("Update Mirror Access", "Unknown (no mirror was tried)")
     rows = ["%-40s %-6s %s" % ("Mirror", "Share", "Result")]
     for m in mirrors:
         share = "%d%%" % m["share"] if m.get("share") is not None else "-"
@@ -7553,10 +8497,30 @@ def update_mirror_access(host):
         rows.append("%-40s %-6s %s" % (name, share, "OK" if m.get("ok") else m.get("error")))
     if selected:
         rows.append("(* = the mirror %s picked for this host)" % redirector)
-    what = "All %s" % _plural(len(mirrors), "mirror") if len(bad) == len(mirrors) \
-        else "%d of %s" % (len(bad), _plural(len(mirrors), "mirror"))
-    return flag(key, "%s Unreachable, See Below" % what).with_detail(
-        "---update mirror access---", "\n".join(head + [""] + rows))
+    if v.get("not_probed"):
+        rows.append("(%d more with a share were not tried: at most %d are)"
+                    % (v["not_probed"], len(mirrors)))
+    if first_hop:
+        rows = ["%s (yum's own first request): %s" % (v.get("repo_url"), first_hop), ""] + rows
+    if bad or first_hop:
+        parts = []
+        if first_hop:
+            parts.append("Cannot reach %s" % re.sub(r"^(\w+://[^/]+).*$", r"\1",
+                                                    v.get("repo_url") or ""))
+        if bad:
+            parts.append(("All %s" % _plural(len(tried), "mirror") if len(bad) == len(tried)
+                          else "%d of %s" % (len(bad), _plural(len(mirrors), "mirror")))
+                         + " Unreachable")
+        return flag("Update Mirror Access", "; ".join(parts) + ", See Below").with_detail(
+            "---update mirror access---", "\n".join(head + [""] + rows))
+    if untried:
+        # a mirror the budget never let us try is not established either way
+        return unknown("Update Mirror Access", "Unknown - %d of %s not tried (out of time)"
+                       % (len(untried), _plural(len(mirrors), "mirror"))).with_detail(
+            "---update mirror access---", "\n".join(head + [""] + rows))
+    how_many = (("%d of %d mirrors" % (len(mirrors), len(mirrors) + v["not_probed"]))
+                if v.get("not_probed") else _plural(len(mirrors), "mirror"))
+    return ok("Update Mirror Access", "Yes (%s, via %s)" % (how_many, selected or mirrors[0].get("host")))
 
 
 def _url_host_of(url):
@@ -7592,11 +8556,10 @@ def xostor_missing_devices(host):
     layout. No PVs and an unreadable backup is Unknown - that pair cannot tell a diskless
     node from one that lost everything.
     """
-    key = "XOSTOR Missing Devices"
     vg = config.XOSTOR_VG
     f = host.fact("pvs")
     if not f.ok:
-        return unknown(key, "Unknown (%s)" % f.error)
+        return unknown("XOSTOR Missing Devices", "Unknown (%s)" % f.error)
     rows = [r for r in parsers.parse_pvs(f.value.get("rows")) if r[1] == vg]
     present = dict((r[3], r[0]) for r in rows if not parsers.pv_missing(r[0], r[2]))
     flagged = [r for r in rows if parsers.pv_missing(r[0], r[2])]
@@ -7620,22 +8583,29 @@ def xostor_missing_devices(host):
         total += len(extra)
     else:
         if not rows:
+            if b.ok and b.value is None:
+                # no backup file at all: the VG never lived here - a diskless node
+                return info("XOSTOR Missing Devices", "None (no %s PVs on this host)" % vg)
             if b.ok:
-                return info(key, "None (no %s PVs on this host)" % vg)
-            return unknown(key, "Unknown (no %s PVs, and %s)" % (vg, b.error))
+                # the backup file exists, so the VG did live here, and it names no PV that
+                # could be read: that pair cannot tell a diskless node from one that lost
+                # every disk at once - the very case the backup half is for
+                return unknown("XOSTOR Missing Devices", "Unknown (no %s PVs, and its LVM "
+                               "backup names none)" % vg)
+            return unknown("XOSTOR Missing Devices", "Unknown (no %s PVs, and %s)" % (vg, b.error))
         total, n_missing = len(rows), len(flagged)
         detail = ["%-40s %-16s %s" % (r[3] or "?", r[0], r[2]) for r in rows]
         if not b.ok:
             detail.append("(%s backup unreadable: %s)" % (vg, b.error))
 
     if not n_missing:
-        return ok(key, "None (%s present)" % _plural(total, "PV"))
+        return ok("XOSTOR Missing Devices", "None (%s present)" % _plural(total, "PV"))
     warnings = [w.strip() for w in (f.value.get("warnings") or "").splitlines() if w.strip()]
     if warnings:
         detail += [""] + warnings
     what = "All %s" % _plural(total, "PV") if n_missing == total and total > 1 else \
         "%d of %s" % (n_missing, _plural(total, "PV"))
-    return flag(key, "%s in %s Missing, See Below" % (what, vg)).with_detail(
+    return flag("XOSTOR Missing Devices", "%s in %s Missing, See Below" % (what, vg)).with_detail(
         "---xostor missing devices---", "\n".join(["%-40s %-16s %s" % (
             "PV UUID", "Device (hint)", "State")] + detail))
 
@@ -7653,20 +8623,26 @@ def xostor_missing_devices_pool(hosts, details_shown=True):
 
 
 def _pool_rollup(key, hosts, host_check, details_shown=True, flagged_as="Yes, on",
-                 clean="None"):
+                 clean="None", all_na=None):
     """One pool line built from each host's own line for the same check, so the two can
     never disagree: the hosts it flags, then the hosts it could not read, else clean.
     An INFO host line (not applicable there) counts as neither. 'See Host Results' only
     when every flagged host prints its line - the master always does, a slave only when
-    details_shown (its POOL_RUN toggle) says so.
+    details_shown (its POOL_RUN toggle) says so. With all_na given, a pool where EVERY
+    host's line was not-applicable says that (green info) rather than the clean value,
+    which would claim something no host was asked.
     """
-    flagged, unread = [], []
+    flagged, unread, na = [], [], 0
     for h in hosts:
         line = host_check(h)
         if line.status == result.FLAG:
             flagged.append(h)
         elif line.status == result.UNKNOWN:
             unread.append(h.name)
+        elif line.status == result.INFO:
+            na += 1
+    if all_na and hosts and na == len(hosts):
+        return info(key, all_na)
     if flagged:
         text = "%s: %s" % (flagged_as, ", ".join(h.name for h in flagged))
         if details_shown or all(h.is_master for h in flagged):
@@ -7691,7 +8667,8 @@ def update_mirror_access_pool(hosts, details_shown=True):
     """Hosts that cannot reach the XCP-ng update mirrors. Hosts on a local mirror are
     left out rather than counted as fine or failing."""
     return _pool_rollup("Update Mirror Access", hosts, update_mirror_access,
-                        details_shown, flagged_as="Failing on", clean="OK")
+                        details_shown, flagged_as="Failing on", clean="OK",
+                        all_na="N/A (no host uses the XCP-ng mirrors)")
 
 
 def xostor_in_use(pool):
@@ -7705,14 +8682,31 @@ def xostor_in_use(pool):
     return info("XOSTOR In Use", "Yes")
 
 
-def xostor_ram(pool, memory):
-    if memory is None:
-        return unknown("XOSTOR RAM", "Unknown (could not read dom0 memory)")
-    total_gb = memory[0] / 1024.0
-    if int(round_1dp(total_gb) + 0.00001) < config.XOSTOR_MIN_RAM_GB:
-        return flag("XOSTOR RAM", "Not Enough: %.1fG (Need >=%dG)"
-                    % (total_gb, config.XOSTOR_MIN_RAM_GB))
-    return ok("XOSTOR RAM", "%.1fG" % total_gb)
+def xostor_ram(hosts):
+    """Every XOSTOR node's dom0 RAM against XOSTOR_MIN_RAM_GB - every node runs DRBD and a
+    LINSTOR satellite. It judged only the host the pool questions were asked of, so a
+    slave short of RAM printed a green value that read as the pool's."""
+    short, unread, sizes = [], [], []
+    for host in hosts:
+        total = host.mem_total_mb()
+        if total is None:
+            unread.append(host.label)
+            continue
+        total_gb = total / 1024.0
+        sizes.append(total_gb)
+        if int(round_1dp(total_gb) + 0.00001) < config.XOSTOR_MIN_RAM_GB:
+            short.append("%s %.1fG" % (host.label, total_gb))
+    if short:
+        return flag("XOSTOR RAM", "Not Enough on: %s (Need >=%dG)"
+                    % (", ".join(short), config.XOSTOR_MIN_RAM_GB))
+    if unread:
+        return unknown("XOSTOR RAM", "Unknown (could not read dom0 memory on: %s)"
+                       % ", ".join(unread))
+    if not sizes:
+        return unknown("XOSTOR RAM", "Unknown (no host's dom0 memory was read)")
+    if len(sizes) == 1:
+        return ok("XOSTOR RAM", "%.1fG" % sizes[0])
+    return ok("XOSTOR RAM", "%.1fG or more on all %d hosts" % (min(sizes), len(sizes)))
 
 
 def _linstor_unknown(label, f):
@@ -7720,15 +8714,6 @@ def _linstor_unknown(label, f):
     if "not found" in (f.error or ""):
         return unknown(label, "Unknown (linstor CLI not found)")
     return unknown(label, "Unknown (%s)" % f.error)
-
-
-def _linstor_line(pool, key, label, predicate, detail_title):
-    f = pool.fact(key)
-    if not f.ok:
-        return _linstor_unknown(label, f)
-    if predicate(f.value):
-        return flag(label, "Yes, See Below").with_detail(detail_title, f.value)
-    return ok(label, "No")
 
 
 def _linstor_table(text):
@@ -7773,13 +8758,37 @@ def _linstor_has_rows(text):
 
 
 def xostor_faulty_resources(pool):
-    return _linstor_line(pool, "linstor_faulty", "XOSTOR Faulty Resources",
-                         _linstor_has_rows, "---xostor faulty resources---")
+    """Rows of 'linstor r l --faulty' are the finding. Its header prints whether or not
+    anything is faulty, so output with no header is not a table at all - a banner, an
+    error on rc 0, a client whose borders this does not read - and establishes nothing."""
+    f = pool.fact("linstor_faulty")
+    if not f.ok:
+        return _linstor_unknown("XOSTOR Faulty Resources", f)
+    header, rows = _linstor_table(f.value)
+    if not header:
+        return unknown("XOSTOR Faulty Resources",
+                       "Unknown (no table in 'linstor r l --faulty' output)")
+    if rows:
+        return flag("XOSTOR Faulty Resources", "Yes, See Below").with_detail(
+            "---xostor faulty resources---", f.value)
+    return ok("XOSTOR Faulty Resources", "No")
 
 
 def xostor_nodes(pool):
-    return _linstor_line(pool, "linstor_nodes", "XOSTOR Faulty Nodes",
-                         _linstor_node_offline, "---xostor node status---")
+    """Any node whose State is not Online. Green needs a State column and at least one
+    node: the line prints only on a pool that uses XOSTOR, so no nodes is never the right
+    answer - it is a table this could not read (the collector's twin says the same)."""
+    f = pool.fact("linstor_nodes")
+    if not f.ok:
+        return _linstor_unknown("XOSTOR Faulty Nodes", f)
+    header, rows = _linstor_table(f.value)
+    if "State" not in header or not rows:
+        return unknown("XOSTOR Faulty Nodes",
+                       "Unknown (no node rows with a State column in 'linstor n l' output)")
+    if _linstor_node_offline(f.value):
+        return flag("XOSTOR Faulty Nodes", "Yes, See Below").with_detail(
+            "---xostor node status---", f.value)
+    return ok("XOSTOR Faulty Nodes", "No")
 
 
 def _linstor_node_addresses(text):
@@ -7868,6 +8877,18 @@ def xostor_pref_nic(pool):
         return unknown("XOSTOR PrefNic",
                        "Unknown (could not read PrefNic on any of %d node(s))" % len(nodes))
     missing = sorted(name for name in nics if not nics[name])
+    values = set(nic for nic in nics.values() if nic)
+    if missing and not values:
+        # set on none of the nodes read: SM reads an absent PrefNic as 'default'
+        # (linstorvolumemanager.py), so this is the cluster consistently using LINSTOR's
+        # default interface - no dedicated storage NIC. Worth a look, not a finding (the
+        # maintainer's call). With nodes unread, a mix cannot be ruled out.
+        if unread:
+            return unknown("XOSTOR PrefNic", "Unknown (not set on the nodes read; could "
+                                             "not read: %s)" % ", ".join(unread)).with_detail(
+                "---xostor prefnic---", detail)
+        return info("XOSTOR PrefNic", "Default interface on all %d nodes (no PrefNic set)"
+                    % len(nodes), "yellow")
     if missing:
         return flag("XOSTOR PrefNic", "Not set on: %s" % ", ".join(missing)).with_detail(
             "---xostor prefnic---", detail)
@@ -7954,6 +8975,12 @@ def backup_network(pool, run_env, pinger, routes=None):
         return unknown("Backup Network", "Unknown (could not read backup network PIFs)")
     if not ips.value:
         return flag("Backup Network", "Configured but no usable IP was found on the network")
+    missing = net.get("pifs_without_ip") or 0
+    if missing:
+        # XO sends that host's exports (and a proxy's) to its backup-network PIF IP, taken
+        # verbatim: with none, there is nowhere to send them - whoever runs the job
+        return flag("Backup Network", "Configured but %d PIF(s) on it have no IP" % missing,
+                    " - those hosts' backups have no address on this network")
 
     silent = pinger(ips.value)
     if not silent:
@@ -8046,6 +9073,26 @@ def stuck_processes(host):
                                          facts.value.get("own_probes")))
 
 
+def _stuck_what(row):
+    """What a stuck row is: its command, or for one with none, what the kernel says it is.
+
+    The kernel's PF_KTHREAD flag decides (row["kernel"]) when the collector read it; an
+    older collector's row has no such key, and then an empty command line is read as a
+    kernel thread, as it always was. A userspace task can have an empty command line too
+    - one stuck in exit on a dead mount has already released its memory - and is named by
+    its comm instead."""
+    frame = row.get("frame") or ""
+    kernel = row.get("kernel")
+    cmd = row.get("cmd") or ""
+    if kernel is True or (kernel is None and not cmd):
+        return "[kernel thread] " + frame
+    if not cmd:
+        return "[%s] (command line not readable) %s" % (row.get("comm") or "?", frame)
+    if row.get("own"):
+        return "%s   <- left by an earlier health check" % cmd
+    return cmd
+
+
 def _stuck_detail(rows, total, user_count, watched, own_probes):
     if user_count is None:
         head = "%d process(es) in uninterruptible sleep." % total
@@ -8065,15 +9112,15 @@ def _stuck_detail(rows, total, user_count, watched, own_probes):
         # named rather than hidden, and counted rather than dropped: they are genuinely
         # stuck, and a reader who does not know where they came from would read a growing
         # count as the host getting worse on its own
-        lines.append("%d of them are this script's own mount probes, parked by earlier "
-                     "runs on a mount that stopped answering. Each one names the mount "
-                     "it was asking about." % own_probes)
+        lines.append("%d of them were left by this script's earlier runs - mount probes "
+                     "parked on a mount that stopped answering, or commands a run could "
+                     "not kill - marked below. Each one names what it was asking about."
+                     % own_probes)
     lines.append("")
     for row in rows:
         lines.append("  %-8s %-9s %-10s %s"
                      % (row.get("pid"), parsers.format_age(row.get("age") or 0),
-                        row.get("module") or "-",
-                        row.get("cmd") or "[kernel thread] " + (row.get("frame") or "")))
+                        row.get("module") or "-", _stuck_what(row)))
     if len(rows) < total:
         # never a silent cut: 25 rows under a heading saying 589 still reads as "here they
         # are" unless the block says outright that it is showing a slice
@@ -8098,18 +9145,17 @@ def mount_stalls(host):
     for the rest of the uptime. A host wedged for days can therefore be completely silent
     here while dozens of processes pile up, which is why the process scan leads.
     """
-    scan = host.fact("mount_stall_scan")
+    blocks, failed = _scan_result(host.fact("mount_stall_scan"))
     dmesg = host.fact("dmesg")
 
-    blocks = list(scan.value) if (scan.ok and scan.value) else []
     if dmesg.ok:
         blocks = blocks + _dmesg_phrase_blocks(dmesg.value, config.MOUNT_STALL_PHRASES,
                                                config.LOG_ERROR_CONTEXT)
     if blocks:
         return flag("Mount Stalls", "Yes, See Error Output").with_detail(
-            "Mount Stalls", _render_scan_blocks(blocks))
-    if not scan.ok:
-        return unknown("Mount Stalls", "Unknown (%s)" % scan.error)
+            "Mount Stalls", _render_scan_blocks(blocks, failed))
+    if failed:
+        return unknown("Mount Stalls", "Unknown (%s)" % "; ".join(failed))
     if not dmesg.ok:
         return unknown("Mount Stalls", "Unknown (could not read dmesg)")
     return ok("Mount Stalls", "None")
@@ -8144,8 +9190,9 @@ def network_mounts(host):
                     "%d of %d not responding" % (len(dead), len(rows))).with_detail(
             "Network Mounts", _mount_detail(rows))
     if unprobed:
-        # not probed is not "fine": it is a question that was deliberately not asked, and
-        # the reason it was not asked is itself already flagged by Stuck Processes
+        # not probed is not "fine": there was not enough of the run budget left to wait
+        # for an answer (MOUNT_PROBE_RESERVE) - the only reason since v3.12, never the
+        # state of the host
         return unknown("Network Mounts",
                        "Unknown - %d mount(s) not probed (%s)"
                        % (len(unprobed), unprobed[0].get("why") or "no reason given")
@@ -8264,12 +9311,12 @@ def scan_plugins():
         for entry in entries:
             if not entry.startswith(prefix) or entry == prefix:
                 continue
+            full = os.path.join(directory, entry)
             name = entry[len(prefix):]
             if name in seen:
                 continue          # xo-server keeps the first path that has the name
             seen.add(name)
-            full = os.path.join(directory, entry)
-            plugins.append({
+            plugin = {
                 "name": name,
                 "package": entry,
                 "path": full,
@@ -8277,7 +9324,18 @@ def scan_plugins():
                 # an npm-linked or hand-symlinked plugin is worth naming outright: the
                 # directory says nothing about where its code actually came from
                 "link": os.path.realpath(full) if os.path.islink(full) else "",
-            })
+            }
+            if not os.path.isdir(full):
+                # xo-server takes every ENTRY, not only directories (findPluginsInPath),
+                # and loads it through require.resolve, which finds a plain file -
+                # xo-server-x, or xo-server-x.js - and imports it. So a file here is
+                # loaded as a plugin, and shadows a directory of the same name further
+                # down the lookup paths (isdir follows a link, so a linked plugin is a
+                # directory)
+                plugin["why"] = ("a file, not a package directory - XO tries to load it"
+                                 if os.path.exists(full)
+                                 else "a link to nothing - XO tries to load it and fails")
+            plugins.append(plugin)
     return plugins, errors
 
 
@@ -8312,6 +9370,10 @@ def collect_xoa():
     data["updater_timeout"] = (rc == 124)
     if rc == 124:
         return data
+    # every call's own result is kept: one that failed is that line's Unknown with the
+    # reason, never error text read as an answer (a failed getXoaPlan used to print a green
+    # plan made of its first word, and a failed isRegistered an 'Unregistered' finding)
+    data["status_error"] = "" if rc == 0 else _call_failure("xoa-updater", rc, out)
 
     channel = ""
     for line in out.splitlines():
@@ -8321,36 +9383,70 @@ def collect_xoa():
     data["channel"] = channel
     data["up_to_date"] = "All up to date" in out
 
-    _, reg = _updater("raw-api-call", "isRegistered")
-    m = re.search(r"email:\s*'([^']*)'", reg)
-    data["registration"] = m.group(1) if m else ""
+    rc, reg = _updater("raw-api-call", "isRegistered")
+    if rc != 0:
+        data["registration_error"] = _call_failure("isRegistered", rc, reg)
+    else:
+        # util.inspect quotes with ', or " when the value holds a ' (o'brien@...), or `
+        m = re.search(r"email:\s*(['\"`])(.*?)\1", reg)
+        registered = re.search(r"registered:\s*(true|false)", reg)
+        data["registration"] = m.group(2) if m else ""
+        data["registered"] = (registered.group(1) == "true") if registered else None
 
-    _, manifest = _updater("raw-api-call", "getLocalManifest")
+    rc, manifest = _updater("raw-api-call", "getLocalManifest")
     version = ""
-    for line in manifest.splitlines():
-        parts = line.split("'")
-        if len(parts) >= 4 and parts[1] == "xen-orchestra":
-            version = parts[3]
-            break
+    if rc == 0:
+        for line in manifest.splitlines():
+            parts = line.split("'")
+            if len(parts) >= 4 and parts[1] == "xen-orchestra":
+                version = parts[3]
+                break
+        # the same call already paid for, read twice: it also lists every npm package
+        # Vates offers this appliance, which is the golden list the plugin scan is judged
+        # against
+        data["manifest_plugins"] = parsers.manifest_plugin_names(manifest)
+    else:
+        data["version_error"] = _call_failure("getLocalManifest", rc, manifest)
     data["version"] = version
-    # the same call already paid for, read twice: it also lists every npm package Vates
-    # offers this appliance, which is the golden list the plugin scan is judged against
-    data["manifest_plugins"] = parsers.manifest_plugin_names(manifest)
 
-    _, plan = _updater("raw-api-call", "getXoaPlan")
-    data["plan"] = _first_token(plan)
-    _, lic = _updater("raw-api-call", "getSelfLicenses")
-    data["licenses"] = _first_token(lic)
+    rc, plan = _updater("raw-api-call", "getXoaPlan")
+    data["plan"] = _first_token(plan) if rc == 0 else ""
+    if rc != 0:
+        data["plan_error"] = _call_failure("getXoaPlan", rc, plan)
+    rc, lic = _updater("raw-api-call", "getSelfLicenses")
+    if rc != 0:
+        data["licenses"] = ""
+        data["plan_error"] = data.get("plan_error") or _call_failure("getSelfLicenses", rc, lic)
+    else:
+        # util.inspect of an array: '[]' is none bound, '[ {' or '[\n' is some - anything
+        # else is not an answer this can read. The updater prints its 'ℹ' glyph in front
+        # (measured on 6.9.2: "\nℹ [\n  {"), so non-ASCII goes first, as in _first_token
+        text = "".join(c for c in lic if ord(c) < 128).strip()
+        data["licenses"] = ("[]" if text == "[]" else
+                            "bound" if text.startswith("[") else "")
 
     # 'xoa check' does real network probes, so it gets its own longer timeout - and a
     # timed-out check produces no stderr, which used to read as a clean pass
     rc, _out, err = transport.run_local_cmd(["xoa", "check"], timeout=config.XOA_CHECK_TIMEOUT)
     data["check_timeout"] = (rc == 124)
+    data["check_missing"] = (rc == 127)
     data["check_output"] = err.strip()
     return data
 
 
+def _call_failure(what, rc, out):
+    """One phrase for an updater call that did not answer: its exit status and the first
+    line it printed."""
+    first = next((line.strip() for line in (out or "").splitlines() if line.strip()), "")
+    return "%s exited %d%s" % (what, rc, (": " + first[:120]) if first else "")
+
+
 def _os_version():
+    """os-release's PRETTY_NAME, which every systemd distribution carries; lsb_release
+    is a separate package a minimal Debian does not have."""
+    fields = _os_release()
+    if fields and fields.get("PRETTY_NAME"):
+        return fields["PRETTY_NAME"]
     rc, out, _err = transport.run_local_cmd(["lsb_release", "-a"],
                                             timeout=config.LOCAL_CMD_TIMEOUT)
     if rc == 0:
@@ -8368,14 +9464,72 @@ def _meminfo():
         return None
 
 
-def _max_old_space():
-    """The XO-Server heap cap, read out of the unit file."""
+_HEAP_PROBE = "process.stdout.write(String(require('v8').getHeapStatistics().heap_size_limit))"
+
+
+def _xo_server_heap():
+    """(limit_mb, source, error): the heap limit the RUNNING xo-server has.
+
+    Read off the process rather than the unit file, which only says what the next start
+    will do and misses a drop-in, NODE_OPTIONS, and a unit edited without a restart. On
+    the command line (which node applies after NODE_OPTIONS, so it wins), else in
+    NODE_OPTIONS, else node's own default - which is what xo-server gets when nobody sets
+    one, and is measured by asking the same node binary with no options. V8 sizes the heap
+    when the process starts, so nothing set later from inside it can change the number.
+
+    The default is measured in this run's cgroup, not the service's; a MemoryMax on
+    xo-server.service would make its real default smaller still (node sizes it from the
+    constrained memory), never larger.
+    """
+    rc, out, err = transport.run_local_cmd(
+        ["systemctl", "show", "-p", "MainPID", "--value", "xo-server"],
+        timeout=config.LOCAL_CMD_TIMEOUT)
+    pid = out.strip()
+    if rc != 0 or not pid.isdigit():
+        return None, None, "could not ask systemd for xo-server's process (%s)" % (
+            "timed out" if rc == 124 else (err.strip() or "exit %d" % rc))
+    if pid == "0":
+        return None, None, "xo-server is not running"
     try:
-        with open("/etc/systemd/system/xo-server.service", "r") as fh:
-            m = re.search(r"--max-old-space-size=(\d+)", fh.read())
-    except (IOError, OSError):
-        return None
-    return int(m.group(1)) if m else None
+        with open("/proc/%s/cmdline" % pid, "rb") as fh:
+            argv = fh.read().decode("utf-8", "replace").split("\0")
+        with open("/proc/%s/environ" % pid, "rb") as fh:
+            environ = fh.read().decode("utf-8", "replace").split("\0")
+    except (IOError, OSError) as exc:
+        return None, None, "could not read xo-server's process %s (%s)" % (pid, exc)
+    limit = parsers.node_heap_flag(argv)
+    if limit is not None:
+        return limit, "set on its command line", None
+    node_options = next((e[len("NODE_OPTIONS="):] for e in environ
+                         if e.startswith("NODE_OPTIONS=")), "")
+    limit = parsers.node_heap_flag(node_options.split())
+    if limit is not None:
+        return limit, "set in NODE_OPTIONS", None
+    try:
+        node = os.readlink("/proc/%s/exe" % pid)
+    except OSError:
+        node = "node"
+    env = dict(os.environ)
+    env.pop("NODE_OPTIONS", None)
+    rc, out, err = transport.run_local_cmd([node, "-e", _HEAP_PROBE],
+                                           timeout=config.LOCAL_CMD_TIMEOUT, env=env)
+    if rc != 0 or not out.strip().isdigit():
+        return None, None, "could not read node's default heap limit (%s)" % (
+            "timed out" if rc == 124 else (err.strip().splitlines() or ["exit %d" % rc])[0])
+    return int(out.strip()) // (1024 * 1024), "node's default, nothing sets it", None
+
+
+def heap_limit_line(total_mb, limit_mb, source, error):
+    """XO-Server Memory Limit, judged against Vates' 70%-of-RAM rule (config)."""
+    if error:
+        return unknown("XO-Server Memory Limit", "Unknown (%s)" % error)
+    target = max(config.XO_HEAP_MIN_MB, int(total_mb * config.XO_HEAP_TARGET_PCT / 100))
+    pct = 100.0 * limit_mb / total_mb if total_mb else 0.0
+    text = "%d MB, %s (%.0f%% of %d MB RAM" % (limit_mb, source, pct, total_mb)
+    if limit_mb < target:
+        return flag("XO-Server Memory Limit",
+                    text + "; XO's rule is %d%%, %d MB)" % (config.XO_HEAP_TARGET_PCT, target))
+    return ok("XO-Server Memory Limit", text + ")")
 
 
 def _dmesg():
@@ -8414,7 +9568,17 @@ def _plugins_line(data):
                        "Unknown (could not read %s)" % "; ".join(data["plugin_errors"]))
     found = data.get("plugins") or []
     vates_names = set(config.XOA_STOCK_PLUGINS) | set(data.get("manifest_plugins") or ())
-    _stock, third_party = parsers.classify_xo_plugins(found, vates_names)
+    stock, third_party = parsers.classify_xo_plugins(found, vates_names)
+    # a stock NAME outside the directory xoa-updater installs into is not Vates' copy: it
+    # is the one XO loads (an earlier lookup path wins), and a hand-replaced stock plugin
+    # is the stealthiest case this line exists for
+    home = os.path.join(config.XO_PLUGIN_STOCK_DIR, "")
+    for plugin in stock:
+        if not plugin.get("why") and not plugin["path"].startswith(home):
+            plugin["why"] = ("a stock plugin's name outside %s - XO loads this copy"
+                             % config.XO_PLUGIN_STOCK_DIR)
+        if plugin.get("why"):
+            third_party.append(plugin)
     if not third_party:
         return ok("XOA Plugins", "%d installed, all shipped with XOA" % len(found))
     return flag("XOA Plugins",
@@ -8442,13 +9606,25 @@ def lines():
                            "Timeout issues, unable to determine XOA status"))
     else:
         reg = data.get("registration")
-        out.append(ok("Registration", reg) if reg else flag("Registration", "Unregistered"))
+        if data.get("registration_error"):
+            out.append(unknown("Registration", "Unknown (%s)" % data["registration_error"]))
+        elif data.get("registered") is False:
+            out.append(flag("Registration", "Unregistered"))
+        elif reg:
+            out.append(ok("Registration", reg))
+        elif data.get("registered") is True:
+            out.append(ok("Registration", "Registered"))
+        else:
+            out.append(unknown("Registration", "Unknown (isRegistered's answer could not "
+                                               "be read)"))
 
         channel = data.get("channel")
         out.append(ok("XOA Channel", channel) if channel else unknown("XOA Channel", "(Unknown)"))
 
         version = data.get("version")
-        out.append(ok("XOA Version", version) if version else unknown("XOA Version", "Unknown"))
+        out.append(ok("XOA Version", version) if version else
+                   unknown("XOA Version", "Unknown (%s)" % data["version_error"]
+                           if data.get("version_error") else "Unknown"))
 
         # plan and licence binding share one printed line, so -f weighs them together:
         # deciding per half would drop a flagged licence along with a healthy plan
@@ -8466,15 +9642,21 @@ def lines():
         else:
             lic_txt = colors.green("Bound")
         combined = "%s (%s)" % (plan_txt, lic_txt)
+        if data.get("plan_error"):
+            combined += " - %s" % data["plan_error"]
         out.append(Line("XOA Plan", combined, FLAG if flagged else OK))
 
-        if data.get("up_to_date"):
+        if data.get("status_error"):
+            out.append(unknown("XOA Status", "Unknown (%s)" % data["status_error"]))
+        elif data.get("up_to_date"):
             out.append(ok("XOA Status", "Up to date"))
         else:
             out.append(flag("XOA Status", "Updates available"))
 
         if data.get("check_timeout"):
             out.append(unknown("XOA Check", "Timed out after %ds" % config.XOA_CHECK_TIMEOUT))
+        elif data.get("check_missing"):
+            out.append(unknown("XOA Check", "Unknown (the xoa command was not found)"))
         elif not data.get("check_output"):
             out.append(ok("XOA Check", "All OK"))
         else:
@@ -8491,6 +9673,8 @@ def lines():
         # skipping the memory lines silently would hide that the XO-Server heap cap never
         # got checked at all
         out.append(unknown("Memory Usage", "Unknown (could not read /proc/meminfo)"))
+        out.append(unknown("XO-Server Memory Limit",
+                           "Unknown (no RAM total to judge it against)"))
     else:
         total_mb, avail_mb = mem
         total_gb = total_mb / 1024.0
@@ -8505,16 +9689,7 @@ def lines():
                                                         colors.green("%.1f" % pct)),
                         INFO))
 
-        cap = _max_old_space()
-        if cap is None:
-            out.append(flag("XO-Server Memory Limit", "Not Set"))
-        else:
-            # total minus 500MB, in MB, is the sizing the appliance docs ask for
-            adjusted = int(round(total_mb - 500))
-            if cap < adjusted:
-                out.append(flag("XO-Server Memory Limit", str(cap)))
-            else:
-                out.append(ok("XO-Server Memory Limit", str(cap)))
+        out.append(heap_limit_line(total_mb, *_xo_server_heap()))
 
     dmesg_text = _dmesg()
     if dmesg_text is None:
@@ -8533,8 +9708,11 @@ def ping_silent(ips):
     unreachable backup network cost 2s per pool host (measured: 8 silent IPs, 16s serial
     versus 2.0s here). The result list is rebuilt in the original order so the report
     stays stable between runs.
+
+    A probe still running when the wait ends answered nothing, so it counts as silent: a
+    False default read it as an answer it never gave.
     """
-    results = [False] * len(ips)
+    results = [None] * len(ips)
 
     def probe(index, address):
         rc, _out, _err = transport.run_local_cmd(
@@ -8549,23 +9727,42 @@ def ping_silent(ips):
         threads.append(t)
     for t in threads:
         t.join(config.LOCAL_CMD_TIMEOUT + 5)
-    return [ips[i] for i in range(len(ips)) if results[i]]
+    return [ips[i] for i in range(len(ips)) if results[i] is not False]
 
 
-def debian_version_ok():
-    """XOA mode still has to be a Debian 11+ appliance."""
+def _os_release():
+    """/etc/os-release as a dict, or None when it cannot be read."""
     try:
         with open("/etc/os-release", "r") as fh:
             text = fh.read()
     except (IOError, OSError):
+        return None
+    fields = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key.strip() and not key.lstrip().startswith("#"):
+            fields[key.strip()] = value.strip().strip("\"'")
+    return fields
+
+
+def debian_version_ok():
+    """XOA mode still has to be a Debian 11+ appliance - Debian, or a distribution that
+    names Debian in ID_LIKE. VERSION_ID alone let any OS numbered 11 or more through (a
+    Fedora 40 passed), and the run then failed somewhere far less clear."""
+    fields = _os_release()
+    if fields is None:
         return (False, "unknown")
-    m = re.search(r"^VERSION_ID=\"?([^\"\n]+)", text, re.M)
-    if not m:
+    version = fields.get("VERSION_ID", "")
+    debian = (fields.get("ID") == "debian"
+              or "debian" in fields.get("ID_LIKE", "").split())
+    if not version:
         return (False, "unknown")
-    major = m.group(1).split(".")[0]
+    if not debian:
+        return (False, "%s %s" % (fields.get("ID", "unknown"), version))
+    major = version.split(".")[0]
     if not major.isdigit():
-        return (False, m.group(1))
-    return (int(major) >= 11, m.group(1))
+        return (False, version)
+    return (int(major) >= 11, version)
 
 
 def running_as_root():
@@ -8670,7 +9867,13 @@ class Report(object):
             section["name"] = host.name
             section["address"] = host.address
             section["master"] = bool(host.is_master)
-            section["reachable"] = True
+            # -s and a solo host run render their one host whether it answered or not -
+            # its checks are the report - so this must not simply say True
+            section["reachable"] = bool(host.reachable)
+            if not host.reachable and host.error:
+                section["error"] = host.error
+            if (host.payload or {}).get("__incomplete__"):
+                section["incomplete"] = host.payload["__incomplete__"]
         section["checks"] = []
         self._sections.append(section)
         self._section = section
@@ -8725,11 +9928,13 @@ class Report(object):
             # 'was this line in the output' identically, -f included
             if self.json_mode and self._section is not None:
                 self._section["checks"].append(_as_entry(line))
-        if line.detail_text:
-            if host_label is None:
-                self.add_pool_detail(line.detail_title, line.detail_text)
-            else:
-                self.add_host_detail(host_label, line.detail_title, line.detail_text)
+            # the detail too: under -f a line that was hidden must not leave its evidence
+            # printed at the end with nothing pointing at it
+            if line.detail_text:
+                if host_label is None:
+                    self.add_pool_detail(line.detail_title, line.detail_text)
+                else:
+                    self.add_host_detail(host_label, line.detail_title, line.detail_text)
 
     def add_all(self, lines, host_label=None):
         for line in lines:
@@ -8746,7 +9951,9 @@ class Report(object):
     def add_poolconf(self, host_label, text):
         first = (text or "").replace("\r", "").split("\n")[0]
         self._poolconf.append("%s\n%s\n\n" % (host_label, first))
-        if self.json_mode and self._section is not None:
+        # -f drops the block (no state of it is a finding), so it drops this too: "-f
+        # narrows the document identically"
+        if self.json_mode and self._section is not None and not self.filter_output:
             # in the document it belongs to the host it describes, rather than to a
             # separate block at the end that a consumer would have to re-attribute
             self._section["pool_conf"] = first
@@ -8849,10 +10056,11 @@ def _run_one(run, host):
         return (TRANSPORT_FAILED, "", str(exc))
 
 
-# Not an exit code any command can return: 0-255 are all reachable over ssh, and 255 in
-# particular is ssh's own 'the connection failed', which is a different thing from 'the
-# transport never started'. Printed as a reason, never as a number.
-TRANSPORT_FAILED = -1
+# Not an exit code any process can produce: 0-255 are all reachable over ssh (255 is ssh's
+# own 'the connection failed', a different thing from 'the transport never started'), and
+# Popen reports a death by signal N as -N - so -1 was an ssh killed by SIGHUP. None is
+# nothing a process returns. Printed as a reason, never as a number.
+TRANSPORT_FAILED = None
 
 
 def execute(run, workers):
@@ -8878,7 +10086,13 @@ def execute(run, workers):
             try:
                 results = [f.result() for f in futures]
             except BaseException:
-                # the workers are blocked in communicate() and never see the ctrl-C
+                # the workers are blocked in communicate() and never see the ctrl-C. The
+                # hosts still QUEUED go first: shutdown(wait=True) runs pending work rather
+                # than discarding it (cancel_futures is 3.9; the floor is 3.6), so without
+                # this a ctrl-C meant to stop the wrong command ran it on every host the
+                # pool had not reached yet. main's collection does the same.
+                for future in futures:
+                    future.cancel()
                 transport.kill_all_children()
                 raise
         finally:
@@ -8894,17 +10108,22 @@ def execute(run, workers):
         if out:
             sys.stdout.write(out if out.endswith("\n") else out + "\n")
         if rc != 0:
-            if rc == TRANSPORT_FAILED:
+            if rc is TRANSPORT_FAILED:
                 sys.stdout.write(colors.yellow("Could not run the command") + "\n")
-            elif rc == 124:
+            elif transport.is_timeout(rc):
+                # the transport's own timeout - a command that itself EXITED 124 (GNU
+                # timeout inside the command) is reported as the exit code it is
                 sys.stdout.write(colors.yellow(
                     "Command timed out after %ds" % config.RUN_CMD_TIMEOUT) + "\n")
+            elif rc < 0:
+                sys.stdout.write(colors.yellow("Command killed by signal %d" % -rc) + "\n")
             else:
                 sys.stdout.write(colors.yellow("Command failed (exit code %d)" % rc) + "\n")
-            # the reason goes to stderr, where every other transport failure goes, so it
-            # cannot contaminate output being piped somewhere
-            if err.strip():
-                sys.stderr.write(err if err.endswith("\n") else err + "\n")
+        # stderr whatever the exit code - "print what each said", and a tool that warns and
+        # exits 0 said something too. To stderr, where every other transport message goes,
+        # so it cannot contaminate output being piped somewhere
+        if err.strip():
+            sys.stderr.write(err if err.endswith("\n") else err + "\n")
         sys.stdout.write("\n")
     return 0
 
@@ -9142,8 +10361,18 @@ class Run(object):
             elif opt in ("-s", "--single"):
                 self.pool_mode = False
             elif opt in ("-n", "--name"):
+                if not value.strip():
+                    # every later test of -n is "if run.name_filter", so an empty one would
+                    # read as no -n at all - and the password after it as the host, printed
+                    # in the banner and handed to DNS
+                    sys.stderr.write("ERROR: -n/--name needs a pool name.\n")
+                    usage(self.run_env)
                 self.name_filter = value
             elif opt in ("-c", "--command"):
+                if not value.strip():
+                    # an empty -c would read as no -c and run the whole health report
+                    sys.stderr.write("ERROR: -c/--command needs a command to run.\n")
+                    usage(self.run_env)
                 self.run_cmd = value
             elif opt == "--json":
                 self.json_output = True
@@ -9371,6 +10600,15 @@ def resolve_target_xoa(run, args):
         # by name. A member's address finds the pool's password: every member shares it.
         if run.server is None:
             run.server = xodb.server_for_host(host)[0]
+        user = xodb.record_user(run.server)
+        if user and user != "root":
+            # XO logs in to xapi as this user; its password is not root's, and sending it
+            # to sshd as root's would read as a wrong root password (and hand that
+            # account's password to a root login attempt)
+            sys.stderr.write("ERROR: xo-db holds the credentials of xapi user '%s' for %s, "
+                             "not root's.\n       Give the root password as an argument "
+                             "instead.\n" % (user, host))
+            sys.exit(1)
         password, has_backslash = xodb.record_password(run.server)
         run.pw_has_backslash = has_backslash
         if not password:
@@ -9441,7 +10679,9 @@ def prepare_host_sweep(run, argument_password):
             sys.stderr.flush()
             try:
                 password = getpass.getpass("")
-            except (EOFError, KeyboardInterrupt):
+            except EOFError:
+                # end of input is the blank answer; a ctrl-C is a stop, and goes on up to
+                # entry() like one anywhere else
                 password = ""
             sys.stderr.write("\n")
     if not password:
@@ -9625,9 +10865,14 @@ def _collect_one(run, host, pool_spec):
         host.error = str(exc)
         note = "Failed when trying to check %s: %s\n" % (host.address, exc)
     host.local_now = _now()
+    incomplete = (host.payload or {}).get("__incomplete__")
+    if incomplete:
+        note = "Only part of %s was checked: %s\n" % (host.address, incomplete)
     # whichever way it went, say so now: the note is held back until every host is in, and
     # by then the thing worth knowing - which host the run was waiting on - has passed
-    progress("  %s %s (%.1fs)\n" % (host.address, "failed" if host.error else "answered",
+    progress("  %s %s (%.1fs)\n" % (host.address,
+                                    "failed" if host.error else
+                                    "answered in part" if incomplete else "answered",
                                     host.local_now - started))
     return note
 
@@ -9645,6 +10890,11 @@ def parallel_workers(host_count):
     override = os.environ.get("HEALTH_MAX_PARALLEL", "")
     if override.isdigit() and int(override) > 0:
         limit = int(override)
+    elif override:
+        # =1 is how the concurrent path is diffed against the sequential one: a typo must
+        # not quietly run the concurrent path while claiming the sequential one
+        sys.stderr.write("Warning: ignoring HEALTH_MAX_PARALLEL=%r (expected a whole "
+                         "number of 1 or more).\n" % override)
     return max(1, min(limit, host_count))
 
 
@@ -9719,9 +10969,16 @@ def collect_hosts(run):
     if run.pool_mode:
         cmd_host = run.host_by_address(run.pool_cmd_host)
         if cmd_host is not None and cmd_host.reachable:
-            run.pool.payload = cmd_host.payload.get("pool") or {}
+            pool_doc = cmd_host.payload.get("pool")
+            stopped = cmd_host.payload.get("__incomplete__")
+            if pool_doc is None and stopped:
+                # the host stopped before the pool questions: every pool line says so
+                pool_doc = {"ok": False, "error": "not asked - %s %s"
+                                                  % (cmd_host.address, stopped)}
+            run.pool.payload = pool_doc or {}
             run.pool.payload["yum_check"] = cmd_host.payload.get("yum_check") or {
-                "ok": False, "error": "not collected"}
+                "ok": False, "error": ("not asked - %s %s" % (cmd_host.address, stopped)
+                                       if stopped else "not collected")}
         else:
             # the host we meant to ask is unreachable - xapi answers pool-wide questions
             # from any member, so ask one we can reach rather than losing the section
@@ -9786,10 +11043,8 @@ def pool_status_section(run, rep):
         rep.check("Pool Roles", checks.pool_roles, run.hosts)
 
         reachable = [h for h in run.hosts if h.reachable]
-        rep.add(result.ok("Dom0 RAM Allocations", "Matched") if model.ram_match(reachable)
-                else result.flag("Dom0 RAM Allocations", "Mismatched"))
-        rep.add(result.ok("Pool Time Synchronization", "Matched") if model.ntp_match(reachable)
-                else result.flag("Pool Time Synchronization", "Mismatched"))
+        rep.check("Dom0 RAM Allocations", checks.dom0_ram_allocations, reachable)
+        rep.check("Pool Time Synchronization", checks.pool_time_sync, reachable)
         # like the two above, a comparison ACROSS hosts, so it belongs to the pool rather
         # than to any one host and has nothing to say when only one host was looked at
         rep.check("Multipath Path Counts", checks.multipath_path_counts, reachable)
@@ -9816,11 +11071,10 @@ def pool_status_section(run, rep):
     if run.pw_has_backslash:
         rep.add(result.info("Root Password", "Contains Backslash", "yellow"))
 
-    cmd_host = run.host_by_address(run.pool_cmd_host)
-    memory = cmd_host.memory() if cmd_host else None
     rep.check("XOSTOR In Use", checks.xostor_in_use, run.pool)
     if run.pool.xostor_in_use():
-        rep.check("XOSTOR RAM", checks.xostor_ram, run.pool, memory)
+        # every node this run looked at: each one runs DRBD and a LINSTOR satellite
+        rep.check("XOSTOR RAM", checks.xostor_ram, [h for h in run.hosts if h.reachable])
         if not run.host_solo():
             # the master always prints its own XOSTOR lines, but a slave's discrepancy
             # is only spelled out if slaves run them too
@@ -9860,9 +11114,9 @@ installed and no internet access is to point the run at one it may execute from:
 
     TMPDIR=/root python3 health.py %(args)s
 
-Failing that, 'apt-get install sshpass' is used instead when it is there. An XCP-ng 8.3
-host can also be checked by running health.py on the host itself, which needs no
-credentials at all for the machine it is running on."""
+Failing that, sshpass is used when it is already installed (nothing is installed for it).
+An XCP-ng 8.3 host can also be checked by running health.py on the host itself, which
+needs no credentials at all for the machine it is running on."""
 
 
 def _target_hint(run):
@@ -9902,10 +11156,11 @@ def xoa_only_report(run, rep_meta, xoa_worker):
     rep.blank()
     rep.end_section()
 
-    rep.begin_section("xoa")
-    rep.heading("== XOA Status ==")
-    rep.add_all(xoa_worker.result(), "XOA")
-    rep.end_section()
+    if xoa_worker is not None:          # none under -c, which reports no verdict
+        rep.begin_section("xoa")
+        rep.heading("== XOA Status ==")
+        rep.add_all(xoa_worker.result(), "XOA")
+        rep.end_section()
     return rep.finish()
 
 
@@ -9941,7 +11196,7 @@ def per_host_checks():
     return [
         ("dom0_disk_usage", "Dom0 Disk Usage", checks.dom0_disk_usage),
         ("read_only_filesystems", "Read-Only Filesystems", checks.read_only_filesystems),
-        ("dom0_memory", "Dom0 Memory", checks.dom0_memory),
+        ("dom0_memory", ("Dom0 Memory", "Dom0 Memory Usage"), checks.dom0_memory),
         ("mtu_issues", "MTU Issues", checks.mtu_issues),
         ("dmesg_content", "Dmesg Content", checks.dmesg_content),
         ("oom_events", "OOM Events", checks.oom_events),
@@ -9999,6 +11254,9 @@ def host_section(run, rep, host):
         rep.add(result.info("Root Password", "Contains Backslash", "yellow"))
 
     rep.check("Hypervisor Version", checks.hypervisor_version, host)
+    # a collector that stopped part way: what it gathered follows, everything it did not
+    # reads Unknown, and this says why
+    rep.check("Host Collection", checks.host_collection, host)
     rep.check("Last Booted", checks.last_booted, host)
     rep.check("Last Patched", checks.last_patched, host)
     # the conclusion drawn from the two dates above, so it prints beside them
@@ -10022,7 +11280,7 @@ def host_section(run, rep, host):
         rep.check("Yum Patch Level", checks.yum_patch_level, host, host.is_master,
                   run.master_manifest())
     if gated(run, host, "xostor_versions"):
-        rep.check("XOSTOR Packages", checks.xostor_versions, host,
+        rep.check(("XOSTOR Packages", "XOSTOR DRBD Module"), checks.xostor_versions, host,
                   run.pool.xostor_in_use())
     if run.pool.xostor_in_use() and gated(run, host, "xostor_missing_devices"):
         rep.check("XOSTOR Missing Devices", checks.xostor_missing_devices, host)
@@ -10079,33 +11337,43 @@ def main(argv=None):
     colors.init()
     run = Run()
 
-    if run.run_env == "host":
-        # dom0's PATH is complete for an interactive root shell but not under cron, and
-        # several tools live in sbin. Over ssh the remote login shell did this for us.
-        os.environ["PATH"] = os.environ.get("PATH", "") + ":/usr/sbin:/sbin:/usr/local/sbin"
-    else:
+    # PATH first, in both environments: under cron it is /usr/bin:/bin, and on the XOA
+    # xo-server-db, xoa-updater and xoa live in /usr/local/bin (measured - a cron run could
+    # not even read xo-db), while dom0 keeps several tools in sbin. Over ssh the remote
+    # login shell does this for the hosts.
+    path = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    for extra in ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/sbin"):
+        if extra not in path:
+            path.append(extra)
+    os.environ["PATH"] = os.pathsep.join(path)
+
+    # arguments before any gate, so -h and a usage error answer on any machine, for anyone
+    args = run.parse_args(argv)
+    if run.json_output:
+        colors.init(force_off=True)
+
+    if run.run_env != "host":
         ok_version, detected = xoa.debian_version_ok()
         if not ok_version:
             sys.stderr.write("This script requires Debian 11 or later (or an XCP-ng host). "
                              "Detected version: %s\n" % detected)
             return 1
 
-    args = run.parse_args(argv)
-    if run.json_output:
-        colors.init(force_off=True)
-
-    work_dir = transport.make_work_dir()
-    # Registered before the work dir's cleanup so it runs first (atexit is LIFO): the
-    # children hold the ControlPath sockets that live in it. On a run that finishes this
-    # is a no-op - nothing is left running by then. It is for the exits that do not:
-    # sys.exit on an unreadable xo-db or a seed that will not answer, with the XOA
-    # section's daemon thread still part way through a 'xoa check'.
-    atexit.register(transport.kill_all_children)
-    atexit.register(transport.cleanup_work_dir, work_dir)
-    run.transport = transport.Transport(run.run_env, work_dir)
-
+    # before the work dir, the db read and the XOA thread: a refused run attempts nothing
     if not require_root(run.run_env):
         return 1
+
+    work_dir = transport.make_work_dir()
+    # atexit runs LAST-registered FIRST, so these are registered in the reverse of the
+    # order they must run in: kill every child (they hold the ControlPath sockets that
+    # live in the work dir), then ask the ssh masters - which no kill reaches - to exit,
+    # then remove the dir. On a run that finishes the kill is a no-op. It is for the exits
+    # that do not: sys.exit on an unreadable xo-db or a seed that will not answer, with the
+    # XOA section's daemon thread still part way through a 'xoa check'.
+    atexit.register(transport.cleanup_work_dir, work_dir)
+    atexit.register(transport.close_masters, work_dir)
+    atexit.register(transport.kill_all_children)
+    run.transport = transport.Transport(run.run_env, work_dir)
 
     argument_password = ""
     pool_reachable = True
@@ -10135,7 +11403,12 @@ def main(argv=None):
     #
     # It is also started BEFORE the no-password-mechanism exit below, which is the one
     # case where this section is the entire report: there is nothing else left to overlap.
-    xoa_worker = _Background(xoa.lines) if run.run_env != "host" else None
+    #
+    # Not under -c: its result is never read, and it would spend the appliance's two cores
+    # on a 'xoa check' and five node start-ups while the command fans out, only to be
+    # killed at exit.
+    xoa_worker = (_Background(xoa.lines) if run.run_env != "host" and not run.run_cmd
+                  else None)
 
     if not pool_reachable:
         return xoa_only_report(run, rep_meta=run_meta(run), xoa_worker=xoa_worker)
@@ -10257,11 +11530,37 @@ def entry():
     /dev/fd/63. 130 is the shell's own convention for a SIGINT death, and the atexit
     handlers still take the children and the work dir with them.
     """
+    for name in ("SIGTERM", "SIGHUP"):
+        if hasattr(signal, name):
+            try:
+                signal.signal(getattr(signal, name), _stop_signal)
+            except ValueError:
+                pass            # not the main thread: a test driving entry()
     try:
         return main()
-    except KeyboardInterrupt:
-        sys.stderr.write("\nInterrupted.\n")
-        return 130
+    except KeyboardInterrupt as exc:
+        signum = getattr(exc, "signum", 2)
+        try:
+            sys.stderr.write("\n%s.\n" % ("Interrupted" if signum == 2 else "Stopped"))
+        except (IOError, OSError, ValueError):
+            pass                # SIGHUP: the terminal it would be written to is gone
+        return 128 + signum
+
+
+class Stopped(KeyboardInterrupt):
+    """SIGTERM or SIGHUP, raised in the main thread so it takes the same path as a ctrl-C:
+    queued work cancelled, every child killed, the work dir removed. Python's default for
+    both is to die on the spot, running no atexit handler - which left the work dir, the
+    askpass helper and every child behind (measured: a SIGTERM mid-run left the dir and two
+    ssh clients). The dropped ssh session to an XOA is the common SIGHUP."""
+
+    def __init__(self, signum):
+        KeyboardInterrupt.__init__(self)
+        self.signum = signum
+
+
+def _stop_signal(signum, _frame):
+    raise Stopped(signum)
 
 
 # ======================================================================================
@@ -10270,27 +11569,49 @@ def entry():
 # The sources are separate modules; stitched together they share one namespace,
 # so `config.X` and `from colors import green` are given something to resolve
 # against. Registered in sys.modules too, for the imports inside functions.
+#
+# Read LIVE from the flat namespace, never copied: a module global rebound later
+# (colors.init() sets the colour codes, xodb caches the db) must read the same
+# through `colors.YELLOW` as it does inside colors itself - a copy taken here
+# would go on serving the import-time value on the artifact alone.
+class _AliasModule(types.ModuleType):
+    def __init__(self, name, exported):
+        types.ModuleType.__init__(self, name)
+        object.__setattr__(self, '_exported', frozenset(exported))
+        object.__setattr__(self, '__file__', __file__)
+
+    def __getattr__(self, symbol):
+        if symbol in self._exported and symbol in globals():
+            return globals()[symbol]
+        raise AttributeError('module %r has no attribute %r' % (self.__name__, symbol))
+
+    def __setattr__(self, symbol, value):
+        if symbol in self._exported:
+            globals()[symbol] = value
+        else:
+            object.__setattr__(self, symbol, value)
+
+    def __dir__(self):
+        return sorted(self._exported)
+
+
 def _module(name, exported):
-    import types
-    module = types.ModuleType(name)
-    module.__file__ = __file__
-    for symbol in exported:
-        setattr(module, symbol, globals()[symbol])
+    module = _AliasModule(name, exported)
     sys.modules[name] = module
     return module
 
 
-config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DMESG_MAX_LINES', 'DMESG_ROLLUP_MIN', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'FAILED_UNITS_IGNORE', 'LEAF_COALESCE_BUSY_VDI_OPS', 'LEAF_COALESCE_BUSY_VM_OPS', 'LEAF_COALESCE_MAX_LINES', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_IGNORE_RULES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MOUNT_PROBE_RESERVE', 'MOUNT_PROBE_TIMEOUT', 'MOUNT_STALL_FILES', 'MOUNT_STALL_PHRASES', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'NETWORK_FS_TYPES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'PROGRESS_INTERVAL', 'REMOTE_CMD_TIMEOUT', 'RO_FS_DMESG', 'RO_FS_EXTRA', 'RO_FS_NATIVE_RO', 'RO_FS_SR_DIRS', 'RUN_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'STATIC_VDIS_UNIT', 'STUCK_MAX_LINES', 'STUCK_MIN_AGE', 'STUCK_RECHECK_DELAY', 'STUCK_SAMPLES', 'TASK_PENDING_MAX_HOURS', 'TIME_SYNC_ALLOWANCE_SECS', 'UPDATE_MIRROR_BUDGET', 'UPDATE_MIRROR_MAX_PROBES', 'UPDATE_MIRROR_REDIRECTOR', 'UPDATE_MIRROR_TIMEOUT', 'WINDOWS_MAX_LINES', 'WINDOWS_PLATFORM_KEYS', 'XOA_CHECK_TIMEOUT', 'XOA_STOCK_PLUGINS', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_PACKAGES', 'XOSTOR_QCOW2_MAX_LINES', 'XOSTOR_VG', 'XO_DNS_TIMEOUT', 'XO_PLUGIN_LOOKUP_PATHS', 'XO_PLUGIN_PREFIX', 'XO_PLUGIN_SCOPE_DIR', 'XO_PLUGIN_SCOPE_PREFIX', 'XO_REDIS_TIMEOUT'])
+config = _module('config', ['COREDUMP_DIR', 'COREDUMP_MAX_LINES', 'CRASH_IGNORE_FILE', 'DMESG_IGNORE_RULES', 'DMESG_ISSUE_PHRASES', 'DMESG_ISSUE_WORDS', 'DMESG_MAX_LINES', 'DMESG_ROLLUP_MIN', 'DOM0_MAX_USED', 'DOM0_MEM_USED_MAX_PCT', 'FAILED_UNITS_IGNORE', 'LEAF_COALESCE_BUSY_VDI_OPS', 'LEAF_COALESCE_BUSY_VM_OPS', 'LEAF_COALESCE_MAX_LINES', 'LOCAL_CMD_TIMEOUT', 'LOG_ERROR_CONTEXT', 'LOG_ERROR_FILES', 'LOG_ERROR_IGNORE_RULES', 'LOG_ERROR_PHRASES', 'LUN_CHANGE_FILES', 'LUN_CHANGE_PHRASES', 'MAX_PARALLEL_HOSTS', 'MOUNT_PROBE_RESERVE', 'MOUNT_PROBE_TIMEOUT', 'MOUNT_STALL_FILES', 'MOUNT_STALL_PHRASES', 'MTU_DMESG_KEYWORDS', 'MULTIPATH_EVENT_FILES', 'MULTIPATH_EVENT_PHRASES', 'MULTIPATH_MAX_LINES', 'MULTIPATH_OK_CHK_STATES', 'MULTIPATH_OK_DEV_STATES', 'MULTIPATH_OK_DM_STATES', 'MULTIPATH_RECHECK_DELAY', 'MULTIPATH_STANDBY_CHK_STATES', 'MULTIPATH_TRANSIENT_CHK_STATES', 'NETWORK_FS_TYPES', 'OOM_PHRASE', 'PKG_DIFF_MAX_LINES', 'POOL_RUN', 'PROGRESS_INTERVAL', 'RAM_MATCH_TOLERANCE_MB', 'REMOTE_CMD_TIMEOUT', 'RO_FS_DMESG', 'RO_FS_EXTRA', 'RO_FS_NATIVE_RO', 'RO_FS_SR_DIRS', 'RUN_CMD_TIMEOUT', 'SCRIPT_VERSION', 'SSH_TIMEOUT', 'STATIC_VDIS_UNIT', 'STUCK_MAX_LINES', 'STUCK_MIN_AGE', 'STUCK_RECHECK_DELAY', 'STUCK_SAMPLES', 'TASK_PENDING_MAX_HOURS', 'TIME_SYNC_ALLOWANCE_SECS', 'UPDATE_MIRROR_BUDGET', 'UPDATE_MIRROR_MAX_PROBES', 'UPDATE_MIRROR_REDIRECTOR', 'UPDATE_MIRROR_TIMEOUT', 'WINDOWS_MAX_LINES', 'WINDOWS_PLATFORM_KEYS', 'XOA_CHECK_TIMEOUT', 'XOA_STOCK_PLUGINS', 'XOSTOR_MIN_RAM_GB', 'XOSTOR_PACKAGES', 'XOSTOR_QCOW2_MAX_LINES', 'XOSTOR_VG', 'XO_DNS_TIMEOUT', 'XO_HEAP_MIN_MB', 'XO_HEAP_TARGET_PCT', 'XO_PLUGIN_LOOKUP_PATHS', 'XO_PLUGIN_PREFIX', 'XO_PLUGIN_SCOPE_DIR', 'XO_PLUGIN_SCOPE_PREFIX', 'XO_PLUGIN_STOCK_DIR', 'XO_REDIS_TIMEOUT'])
 colors = _module('colors', ['CYAN', 'GREEN', 'RESET', 'YELLOW', 'cyan', 'green', 'init', 'strip_ansi', 'yellow'])
 result = _module('result', ['FLAG', 'Fact', 'INFO', 'Line', 'MISSING', 'OK', 'UNKNOWN', 'flag', 'guard', 'info', 'ok', 'pinned', 'raw', 'unknown', 'wrap'])
-parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', 'SR_ATTACH_SKIP_TYPES', '_DIFF_KINDS', '_LINK_RE', '_LOOSE_URL_RE', '_MANIFEST_PKG_RE', '_MOUNT_FIELD_ESCAPES', '_MTU_RE', '_PARAM_RE', '_PREMIUM_SUFFIX', '_SCHEME_RE', '_TS_RE', '_XO_URL_RE', '_cidr_range', '_ids_among', '_ignore_rules', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', '_xe_map', 'backup_runners', 'cap_lines', 'classify_multipath_path', 'classify_xo_plugins', 'context_block', 'dmesg_issue_lines', 'duplicate_addresses', 'find_mtu_keywords', 'find_phrase_lines', 'format_age', 'has_overlapping_subnets', 'has_url_scheme', 'host_records_from_state_db', 'http_proxy_address', 'ip_literal', 'job_field', 'job_touches_pool', 'leading_version', 'leaf_coalesce_srs', 'leaf_coalesce_vdis', 'manifest_diff', 'manifest_diff_summary', 'manifest_packages', 'manifest_plugin_names', 'manifest_versions', 'mount_field', 'mount_table', 'multipath_summary', 'multipathd_alive', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_failed_units', 'parse_host_list', 'parse_ip_addrs', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_lvm_backup_pvs', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pending_tasks', 'parse_pool_conf', 'parse_pvs', 'parse_sr_attachment', 'parse_timedatectl', 'parse_xe_records', 'plugin_block', 'pool_member_addresses', 'pv_missing', 'read_only_mounts', 'rollup_repeats', 'round_1dp', 'split_host_port', 'split_timestamp', 'static_vdis_failure_moot', 'truncate_block', 'unit_display', 'unit_ignored', 'windows_vm_findings', 'xapi_utc', 'xe_ops', 'xo_pattern_match', 'xo_server_address', 'xo_simple_ids'])
-model = _module('model', ['Host', 'Pool', 'ntp_match', 'ram_match'])
+parsers = _module('parsers', ['BOND_MEMBER', 'BOND_NOT_MEMBER', 'BOND_NO_PIFS', 'GC_SR_SWITCHES', 'MP_HELP_MARKER', 'SKIP_FILESYSTEMS', 'SR_ATTACH_SKIP_TYPES', 'TASK_COMPLETED', '_DIFF_KINDS', '_HEAP_FLAG_RE', '_LINK_RE', '_LOOSE_URL_RE', '_MANIFEST_PKG_RE', '_MOUNT_FIELD_ESCAPES', '_MTU_RE', '_PARAM_RE', '_PREMIUM_SUFFIX', '_SCHEME_RE', '_TS_RE', '_XO_URL_RE', '_cidr_range', '_ids_among', '_ignore_rules', '_int_or_none', '_mp_unmapped', '_normalise', '_word_re', '_xe_map', 'backup_runners', 'cap_lines', 'classify_multipath_path', 'classify_xo_plugins', 'context_block', 'dmesg_issue_lines', 'duplicate_addresses', 'find_mtu_keywords', 'find_phrase_lines', 'format_age', 'has_overlapping_subnets', 'has_url_scheme', 'host_records_from_state_db', 'http_proxy_address', 'ip_literal', 'job_field', 'job_touches_pool', 'leading_version', 'leaf_coalesce_srs', 'leaf_coalesce_vdis', 'manifest_diff', 'manifest_diff_summary', 'manifest_packages', 'manifest_plugin_names', 'manifest_versions', 'mount_field', 'mount_table', 'multipath_summary', 'multipathd_alive', 'node_heap_flag', 'parse_bond_slave_of', 'parse_df', 'parse_dm_multipath_maps', 'parse_dns_gw_pifs', 'parse_failed_units', 'parse_host_list', 'parse_ip_addrs', 'parse_ipv4_addrs', 'parse_lacp', 'parse_link_mtus', 'parse_lvm_backup_pvs', 'parse_mem_total_mb', 'parse_meminfo', 'parse_multipath_maps', 'parse_multipath_paths', 'parse_other_config', 'parse_pending_tasks', 'parse_pool_conf', 'parse_pvs', 'parse_sr_attachment', 'parse_timedatectl', 'parse_xe_records', 'plugin_block', 'pool_member_addresses', 'pv_missing', 'read_only_mounts', 'rollup_repeats', 'round_1dp', 'split_host_port', 'split_timestamp', 'static_vdis_failure_moot', 'truncate_block', 'unit_display', 'unit_ignored', 'windows_vm_findings', 'xapi_utc', 'xe_ops', 'xo_pattern_match', 'xo_server_address', 'xo_simple_ids'])
+model = _module('model', ['Host', 'Pool'])
 collectorsrc = _module('collectorsrc', ['EMBEDDED', 'collector_source'])
-transport = _module('transport', ['ASKPASS_ENV', 'ASKPASS_SCRIPT', 'AUTH_ASKPASS', 'AUTH_SSHPASS', 'BEGIN_MARKER', 'CollectError', 'END_MARKER', 'Transport', '_DEBUG_LOCK', '_LIVE', '_LIVE_LOCK', '_REMOTE_LAUNCH', '_REMOTE_LAUNCH_PINNED', '_kill_tree', '_remote_launch', 'cleanup_work_dir', 'debug', 'ensure_sshpass', 'have', 'kill_all_children', 'make_work_dir', 'run_local_cmd', 'which', 'write_askpass'])
+transport = _module('transport', ['ASKPASS_ENV', 'ASKPASS_SCRIPT', 'AUTH_ASKPASS', 'AUTH_SSHPASS', 'BEGIN_MARKER', 'CONTROL_NAME', 'CollectError', 'END_MARKER', 'SOCKET_PATH_MAX', 'TERM_GRACE', 'TIMED_OUT', 'TimedOut', 'Transport', '_DEBUG_LOCK', '_LIVE', '_LIVE_LOCK', '_REMOTE_LAUNCH', '_REMOTE_LAUNCH_PINNED', '_STOPPING', '_kill_tree', '_mark_incomplete', '_remote_launch', '_signal_group', 'cleanup_work_dir', 'close_masters', 'control_options', 'debug', 'have', 'is_timeout', 'kill_all_children', 'make_work_dir', 'run_local_cmd', 'sshpass_present', 'which', 'write_askpass'])
 xoredis = _module('xoredis', ['DEFAULT_ADDR', 'ENCRYPTION_PREFIX', 'IDS_KEY', 'PLUGIN_IDS_KEY', 'PLUGIN_RECORD_PREFIX', 'RECORD_PREFIX', 'RedisError', '_config_dirs', '_config_files', '_encode', '_fetch', '_fetch_autoload', '_fetch_collection', '_flatten', '_mentions_redis', '_read_reply', 'read_plugin_autoload', 'read_records', 'read_server_records'])
-xodb = _module('xodb', ['QUOTES', 'SELECT_NONE', 'SELECT_NO_MATCH', 'SELECT_OK', 'SELECT_QUIT', 'SELECT_UNREADABLE', 'Server', '_ALL_SERVERS', '_COLLECTIONS', '_ESCAPE_RE', '_KEY_RE', '_READ_ERROR', '_RESOLVED', '_SIMPLE_ESCAPES', '_describe_failure', '_ls', '_read_servers', '_resolve', '_same_address', '_sort_key', 'all_servers', 'backup_routes', 'clean', 'collection', 'db_address', 'enabled_server_for', 'enabled_servers', 'have_xo_server_db', 'match_record', 'password_for', 'pool_name_for_host', 'read_error', 'record_password', 'reset_cache', 'scan_records', 'select_pool', 'server_for_host', 'unescape'])
-checks = _module('checks', ['_backup_moved_elsewhere', '_dmesg_phrase_blocks', '_drbd_stale', '_first_line', '_ha_statefile_sr_text', '_linstor_column', '_linstor_has_rows', '_linstor_line', '_linstor_node_addresses', '_linstor_node_offline', '_linstor_table', '_linstor_unknown', '_maps', '_mount_detail', '_multipath_detail', '_multipath_read', '_network_line', '_plural', '_pool_conf_target', '_pool_roles_detail', '_pool_rollup', '_render_scan_blocks', '_ro_detail', '_ro_name', '_stuck_detail', '_url_host_of', '_xostor_signature', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_block', 'dmesg_content', 'dmesg_content_of', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'duplicate_ips', 'duplicate_ips_across_hosts', 'failed_units', 'ha_enabled', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'leaf_coalesce_disabled', 'log_errors', 'long_running_tasks', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mount_stalls', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'network_mounts', 'ntp', 'oom_events', 'overlapping_subnets', 'pending_reboot_pool', 'pool_host_list', 'pool_roles', 'read_only_filesystems', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'sr_attachment', 'stuck_processes', 'tap_status', 'task_timeout_override', 'update_mirror_access', 'update_mirror_access_pool', 'vlan0', 'windows_vms_not_optimized', 'xapi_status', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_missing_devices', 'xostor_missing_devices_pool', 'xostor_nodes', 'xostor_pref_nic', 'xostor_qcow2', 'xostor_ram', 'xostor_version_consistency', 'xostor_versions', 'yum_patch_level'])
-xoa = _module('xoa', ['_dmesg', '_first_token', '_max_old_space', '_meminfo', '_os_version', '_plugin_autoload', '_plugin_scan_targets', '_plugin_version', '_plugins_line', '_service_state', '_updater', 'collect_xoa', 'debian_version_ok', 'ip_addrs', 'lines', 'ping_silent', 'running_as_root', 'scan_plugins'])
+xodb = _module('xodb', ['QUOTES', 'SELECT_NONE', 'SELECT_NO_MATCH', 'SELECT_OK', 'SELECT_QUIT', 'SELECT_UNREADABLE', 'Server', '_ALL_SERVERS', '_CLDR_PUNCT', '_COLLECTIONS', '_ESCAPE_RE', '_FOLD', '_INSPECT_CUT', '_KEY_RE', '_READ_ERROR', '_RECORDS_HEADER', '_RESOLVED', '_SIMPLE_ESCAPES', '_describe_failure', '_ls', '_read_servers', '_resolve', '_same_address', '_sort_key', 'all_servers', 'backup_routes', 'clean', 'collection', 'db_address', 'enabled_server_for', 'enabled_servers', 'have_xo_server_db', 'match_record', 'password_for', 'pool_name_for_host', 'read_error', 'record_password', 'record_user', 'reset_cache', 'scan_records', 'select_pool', 'server_for_host', 'unescape'])
+checks = _module('checks', ['_backup_moved_elsewhere', '_dmesg_phrase_blocks', '_drbd_stale', '_first_line', '_ha_statefile_sr_text', '_linstor_column', '_linstor_has_rows', '_linstor_node_addresses', '_linstor_node_offline', '_linstor_table', '_linstor_unknown', '_maps', '_mount_detail', '_multipath_detail', '_multipath_read', '_network_line', '_plural', '_pool_conf_target', '_pool_roles_detail', '_pool_rollup', '_render_scan_blocks', '_ro_detail', '_ro_name', '_scan_result', '_stuck_detail', '_stuck_what', '_url_host_of', '_xostor_signature', 'backup_network', 'coredumps', 'crash_logs', 'dmesg_block', 'dmesg_content', 'dmesg_content_of', 'dns_gw_non_mgmt_pifs', 'dom0_disk_usage', 'dom0_memory', 'dom0_ram_allocations', 'duplicate_ips', 'duplicate_ips_across_hosts', 'failed_units', 'ha_enabled', 'host_collection', 'host_enabled', 'hypervisor_version', 'lacp', 'last_booted', 'last_patched', 'leaf_coalesce_disabled', 'log_errors', 'long_running_tasks', 'lun_assignments', 'migration_compression', 'migration_network', 'missing_patches', 'mount_stalls', 'mtu_issues', 'multipath_events', 'multipath_health', 'multipath_path_counts', 'multipathing', 'network_mounts', 'ntp', 'oom_events', 'overlapping_subnets', 'pending_reboot_pool', 'pool_host_list', 'pool_roles', 'pool_time_sync', 'read_only_filesystems', 'rebooted_after_updates', 'silly_mtus', 'smapi_hidden_leaves', 'sr_attachment', 'stuck_processes', 'tap_status', 'task_timeout_override', 'update_mirror_access', 'update_mirror_access_pool', 'vlan0', 'windows_vms_not_optimized', 'xapi_status', 'xostor_controller', 'xostor_faulty_resources', 'xostor_in_use', 'xostor_missing_devices', 'xostor_missing_devices_pool', 'xostor_nodes', 'xostor_pref_nic', 'xostor_qcow2', 'xostor_ram', 'xostor_version_consistency', 'xostor_versions', 'yum_patch_level'])
+xoa = _module('xoa', ['_HEAP_PROBE', '_call_failure', '_dmesg', '_first_token', '_meminfo', '_os_release', '_os_version', '_plugin_autoload', '_plugin_scan_targets', '_plugin_version', '_plugins_line', '_service_state', '_updater', '_xo_server_heap', 'collect_xoa', 'debian_version_ok', 'heap_limit_line', 'ip_addrs', 'lines', 'ping_silent', 'running_as_root', 'scan_plugins'])
 report = _module('report', ['Report', '_as_entry'])
 runcmd = _module('runcmd', ['TRANSPORT_FAILED', '_run_one', 'execute'])
 
